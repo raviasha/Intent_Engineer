@@ -1,0 +1,98 @@
+# Task 6 report — Markdown and Git connectors
+
+## Summary
+
+Implemented provider-neutral asynchronous capture contracts, deterministic local
+Markdown and Git connectors, and a typed checkpoint helper. Markdown uses sorted
+POSIX-relative paths, `ProjectConfig.source_exclusions`, and SHA-256 content
+versions. Git uses argument-list `subprocess.run` calls with `shell=False`,
+oldest-first SHA discovery, and captures commit metadata plus changed paths without
+storing diffs.
+
+## Files
+
+- `src/intent_engineering/capture/__init__.py`
+- `src/intent_engineering/capture/base.py`
+- `src/intent_engineering/capture/checkpoints.py`
+- `src/intent_engineering/capture/markdown/__init__.py`
+- `src/intent_engineering/capture/markdown/connector.py`
+- `src/intent_engineering/capture/git/__init__.py`
+- `src/intent_engineering/capture/git/connector.py`
+- `tests/contract/capture/__init__.py`
+- `tests/contract/capture/test_connector_contract.py`
+- `tests/integration/capture/__init__.py`
+- `tests/integration/capture/test_markdown_connector.py`
+- `tests/integration/capture/test_git_connector.py`
+
+## Design decisions
+
+- `RawSourceObject` contains only source-neutral fields; shared
+  `normalize_raw_source()` creates the existing immutable `EvidenceRecord` rather
+  than duplicating evidence vocabulary.
+- Evidence IDs are deterministic SHA-256 hashes of connector identity, external
+  ID, external version, and content hash.
+- Markdown versions are `sha256:` hashes of file bytes, so touching a file without
+  changing bytes does not create a new version. Filesystem reads and stats execute
+  through AnyIO thread boundaries.
+- Git external object IDs are `commit:<sha>` and their external version/checkpoint
+  cursor is the commit SHA. Git metadata and path lookups execute through AnyIO
+  thread boundaries; no Git diff is fetched or retained.
+- `checkpoint_after_discovery()` returns the existing `SyncCheckpoint` model for
+  a connector's `next_checkpoint()` cursor, leaving durable CAS persistence to the
+  established checkpoint store.
+
+## TDD and verification evidence
+
+### RED
+
+```text
+.venv/bin/pytest tests/contract/capture tests/integration/capture -v
+```
+
+Result: failed during collection with three expected
+`ModuleNotFoundError: No module named 'intent_engineering.capture'` errors for the
+new contract, Markdown integration, and Git integration tests. The command was
+rerun after adding the checkpoint-helper regression and failed for the same missing
+capture package.
+
+### GREEN
+
+```text
+.venv/bin/pytest tests/contract/capture tests/integration/capture -v
+```
+
+Result: `2 passed in 0.24s` after implementation and the shared evidence payload
+immutability expectation was corrected to tuples.
+
+### Focused lint and typing
+
+```text
+.venv/bin/ruff check src/intent_engineering/capture tests/contract/capture tests/integration/capture
+.venv/bin/mypy --strict src/intent_engineering/capture/base.py src/intent_engineering/capture/checkpoints.py src/intent_engineering/capture/markdown/connector.py src/intent_engineering/capture/git/connector.py
+```
+
+Result: `All checks passed!` and `Success: no issues found in 4 source files`.
+
+### Full suite
+
+```text
+.venv/bin/pytest -v
+```
+
+Result: `123 passed in 0.52s`.
+
+## Commit
+
+Product and test changes: `27ead2bdfa82ef1e7fb6f6c49259b013a31c21c0`
+(`feat: ingest markdown and git evidence`).
+
+## Risks and deviations
+
+- Markdown discovery rescans included Markdown files on each run; immutable
+  evidence IDs and content versions make an unchanged rescan a no-op when the
+  orchestrator persists evidence. A future incremental file index can optimize this
+  without changing the connector contract.
+- Git commit metadata is read via NUL-delimited Git output. Git commit messages
+  cannot contain NUL bytes, so this preserves subject/body field boundaries.
+- No diffs are stored by design; only the commit metadata and changed path list are
+  captured.
