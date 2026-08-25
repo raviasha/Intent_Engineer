@@ -358,16 +358,20 @@ def reconcile_show_command(
 def reconcile_resolve_command(
     case_id: str,
     action: ResolutionAction = typer.Option(ResolutionAction.UPDATE_IMPLEMENTATION, "--action"),
+    approve: str | None = typer.Option(None, "--approve"),
     project: Path = typer.Option(Path("."), "--project"),
     output_format: OutputFormat = typer.Option(OutputFormat.TEXT, "--format"),
 ) -> None:
     """Apply a validated ChangeSet, then persist the audited case transition."""
     runtime = _runtime(project)
     try:
-        resolved, changeset = runtime.resolution.resolve(case_id, action)
+        resolved, changeset, approval = runtime.resolution.resolve(case_id, action, approve=approve)
     except ResolutionUnavailable as error:
         _runtime_error(error)
         raise typer.Exit(1) from error
+    if approval is not None:
+        emit({"case": resolved, "changeset": changeset, "approval": approval}, output_format)
+        raise typer.Exit(4)
     emit({"case": resolved, "changeset": changeset}, output_format)
 
 

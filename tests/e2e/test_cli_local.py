@@ -230,6 +230,17 @@ intent_engineering:
     assert len(cases) == 1
     assert cases[0]["case_type"] == "CODE_LAG"
     assert cases[0]["evidence_sides"][0]["evidence_refs"][0].startswith("evidence:sha256:")
+    preview = run_intent(repo, "reconcile", "resolve", cases[0]["id"], "--format", "json")
+    assert preview.returncode == 4
+    preview_payload = preview.json()
+    assert preview_payload["case"]["status"] == "needs_human"
+    graph_before = (repo / ".intent/graph.yaml").read_bytes()
+    refused = run_intent(repo, "reconcile", "resolve", cases[0]["id"], "--approve", "wrong", "--format", "json")
+    assert refused.returncode == 1
+    assert (repo / ".intent/graph.yaml").read_bytes() == graph_before
+    resolved = run_intent(repo, "reconcile", "resolve", cases[0]["id"], "--approve", preview_payload["approval"], "--format", "json")
+    assert resolved.returncode == 0
+    assert resolved.json()["case"]["status"] == "resolved"
 
 
 def test_acl_protected_evidence_is_indistinguishable_from_unknown(tmp_path: Path) -> None:
@@ -262,13 +273,10 @@ def test_reconcile_resolve_records_a_changeset_before_case_transition(tmp_path: 
         ),
         encoding="utf-8",
     )
-    graph_before = (repo / ".intent/graph.yaml").read_text(encoding="utf-8")
+    graph_before = (repo / ".intent/graph.yaml").read_bytes()
     result = run_intent(repo, "reconcile", "resolve", "case:test", "--format", "json")
-    assert result.returncode == 0
-    payload = result.json()
-    assert payload["case"]["resolved_by_changeset"].startswith("changeset:")
-    assert (repo / ".intent/graph.yaml").read_text(encoding="utf-8") != graph_before
-    assert "case:test" in (repo / ".intent/history/changesets.jsonl").read_text(encoding="utf-8")
+    assert result.returncode == 1
+    assert (repo / ".intent/graph.yaml").read_bytes() == graph_before
 
 
 def test_reconcile_resolve_refuses_missing_case_evidence_without_graph_mutation(

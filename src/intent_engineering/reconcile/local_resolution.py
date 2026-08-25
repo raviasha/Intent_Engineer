@@ -43,8 +43,8 @@ class LocalResolutionService:
         self._actor = actor
 
     def resolve(
-        self, case_id: str, action: ResolutionAction, *, at: datetime | None = None
-    ) -> tuple[ReconciliationCase, ChangeSet]:
+        self, case_id: str, action: ResolutionAction, *, approve: str | None = None, at: datetime | None = None
+    ) -> tuple[ReconciliationCase, ChangeSet | None, str | None]:
         """Prevalidate all state, then commit graph/history/case or restore exact bytes."""
         paths = self._paths()
         with ExitStack() as locks:
@@ -55,17 +55,33 @@ class LocalResolutionService:
             try:
                 case = self._case_store.get(case_id)
                 graph = self._graph_store.load()
-                if case.status is not ReconciliationStatus.NEEDS_HUMAN:
-                    raise ResolutionUnavailable("resolution unavailable")
-                if action in {ResolutionAction.DEFER, ResolutionAction.MARK_FALSE_POSITIVE}:
-                    raise ResolutionUnavailable("resolution unavailable")
                 records = tuple(
                     self._evidence_store.get(reference) for reference in case.all_evidence_refs
                 )
                 if not refs_allowed(case.all_evidence_refs, records, self._actor):
                     raise ResolutionUnavailable("resolution unavailable")
                 timestamp = at or datetime.now(UTC)
+                if case.status is ReconciliationStatus.OPEN and action in {
+                    ResolutionAction.DEFER,
+                    ResolutionAction.MARK_FALSE_POSITIVE,
+                }:
+                    target = (ReconciliationStatus.DEFERRED if action is ResolutionAction.DEFER else ReconciliationStatus.FALSE_POSITIVE)
+                    updated = transition_case(case, target, self._actor, timestamp)
+                    self._case_store.put(updated)
+                    return updated, None, None
+                if case.status is ReconciliationStatus.OPEN:
+                    proposed = transition_case(case, ReconciliationStatus.PROPOSED, self._actor, timestamp)
+                    reviewed = transition_case(proposed, ReconciliationStatus.NEEDS_HUMAN, self._actor, timestamp)
+                    self._case_store.put(proposed)
+                    self._case_store.put(reviewed)
+                    changeset = self._changeset(reviewed, graph.version, action, reviewed.created_at)
+                    return reviewed, changeset, self._approval_hash(reviewed, graph.version, action, changeset)
+                if case.status is not ReconciliationStatus.NEEDS_HUMAN or approve is None:
+                    raise ResolutionUnavailable("resolution unavailable")
                 changeset = self._changeset(case, graph.version, action, timestamp)
+                expected = self._approval_hash(case, graph.version, action, self._changeset(case, graph.version, action, case.created_at))
+                if approve != expected:
+                    raise ResolutionUnavailable("resolution unavailable")
                 resolved = transition_case(
                     case,
                     ReconciliationStatus.RESOLVED,
@@ -78,13 +94,18 @@ class LocalResolutionService:
                 self._graph_store.apply(changeset)
                 self._case_store.put(resolved)
                 self._journal_path().unlink(missing_ok=True)
-                return resolved, changeset
+                return resolved, changeset, None
             except Exception as error:
                 self._restore(snapshots)
                 self._journal_path().unlink(missing_ok=True)
                 if isinstance(error, ResolutionUnavailable):
                     raise
                 raise ResolutionUnavailable("resolution unavailable") from error
+
+    @staticmethod
+    def _approval_hash(case: ReconciliationCase, graph_version: int, action: ResolutionAction, changeset: ChangeSet) -> str:
+        payload = {"action": action.value, "case": case.model_dump(mode="json"), "changeset": changeset.model_dump(mode="json"), "graph_version": graph_version}
+        return sha256(json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")).hexdigest()
 
     def _paths(self) -> tuple[Path, ...]:
         return (
