@@ -103,3 +103,70 @@ Follow-up redaction regression: `a9a2b21b59ca047ead01955b3e0ca5dc51d16f09`.
   detector path in the CLI.
 - `--force` intentionally recreates only known `.intent` file targets and never
   writes credentials or secrets. It does not delete unknown workspace contents.
+
+## Fix round 1 — security and workflow hardening
+
+Commit: `0839fa341df467e41acd5902aa30d24bb8f927e3`
+
+### Changes
+
+- Replaced path-based initialization with no-follow directory-FD traversal and
+  writes. A complete valid workspace is byte-preserving on re-init; force only
+  repairs a state-empty inconsistent workspace.
+- Added fail-closed local actor authorization for evidence, case, node, status,
+  explain, context, and reconciliation projections. Unreadable references are
+  treated as absent.
+- Added deterministic Markdown `intent_engineering` front-matter detection
+  projection (including top-level normalized input compatibility) to the Task 5
+  detector and durable case store.
+- Added locked local resolution service that validates lifecycle/evidence/action
+  before applying graph/history/case work and restores exact bytes on failure.
+- Added deep structured doctor diagnostics, pre-AnyIO source validation, and a
+  minimal scrubbed CLI subprocess environment.
+
+### RED/GREEN evidence
+
+```text
+.venv/bin/python -m pytest tests/e2e/test_cli_local.py::test_complete_init_is_idempotent_and_byte_preserving tests/e2e/test_cli_local.py::test_invalid_source_selection_is_usage_error_without_writes -v
+```
+
+RED: 2 failed (second init returned 1; duplicate sources returned 1). GREEN:
+2 passed in 0.89s.
+
+```text
+.venv/bin/python -m pytest tests/e2e/test_cli_local.py::test_markdown_sync_produces_a_deterministic_reconciliation_case -v
+```
+
+RED: no durable case was created. GREEN: 1 passed in 0.66s.
+
+```text
+.venv/bin/python -m pytest tests/e2e/test_cli_local.py::test_acl_protected_evidence_is_indistinguishable_from_unknown -v
+```
+
+RED: ACL evidence was returned by `explain`. GREEN: 1 passed in 1.19s.
+
+```text
+.venv/bin/python -m pytest tests/e2e/test_cli_local.py::test_reconcile_resolve_refuses_missing_case_evidence_without_graph_mutation -v
+```
+
+RED: resolution completed with missing evidence and mutated the graph. GREEN:
+1 passed in 0.41s.
+
+```text
+.venv/bin/python -m pytest tests/e2e/test_cli_local.py::test_doctor_reports_redacted_structured_diagnostics_for_corrupt_evidence -v
+```
+
+RED: doctor emitted a generic stderr failure. GREEN: 1 passed in 0.50s.
+
+### Final verification
+
+```text
+.venv/bin/ruff check src/intent_engineering/cli src/intent_engineering/core/policy src/intent_engineering/reconcile tests/e2e/test_cli_local.py tests/helpers/cli.py
+.venv/bin/mypy --strict src/intent_engineering/cli src/intent_engineering/core/policy src/intent_engineering/reconcile
+.venv/bin/python -m pytest
+.venv/bin/intent --help
+.venv/bin/intent reconcile --help
+```
+
+Results: Ruff clean; strict mypy clean across 12 modules; full pytest `213
+passed in 10.14s`; both help commands exited 0.
