@@ -108,6 +108,26 @@ def test_corrupt_graph_is_a_redacted_runtime_failure(tmp_path: Path) -> None:
     assert result.stderr == "intent error: local operation failed\n"
 
 
+def test_status_recovers_pending_resolution_journal_before_reading_state(tmp_path: Path) -> None:
+    """A non-resolution command must replay an interrupted transaction first."""
+    from intent_engineering.cli.runtime import load_runtime
+
+    repo = init_git_repo(tmp_path)
+    assert run_intent(repo, "init").returncode == 0
+    runtime = load_runtime(repo)
+    paths = runtime.resolution._paths()
+    snapshots = {path: path.read_bytes() if path.exists() else None for path in paths}
+    runtime.resolution._write_journal(snapshots)
+    graph = repo / ".intent/graph.yaml"
+    graph.write_text("not: [graph", encoding="utf-8")
+
+    result = run_intent(repo, "status", "--format", "json")
+
+    assert result.returncode == 0
+    assert graph.read_bytes() == snapshots[graph]
+    assert not runtime.resolution._journal_path().exists()
+
+
 def test_doctor_reports_redacted_structured_diagnostics_for_corrupt_evidence(
     tmp_path: Path,
 ) -> None:
