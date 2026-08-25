@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import multiprocessing
 from datetime import UTC, datetime
 from pathlib import Path
 from threading import Barrier, Thread
@@ -18,6 +19,7 @@ from intent_engineering.core.models import (
     RelationType,
     SourceMode,
 )
+from intent_engineering.storage._atomic import same_path_lock
 from intent_engineering.storage.interfaces import GraphStore
 from intent_engineering.storage.yaml.graph_store import YamlGraphStore
 
@@ -192,3 +194,25 @@ def test_graph_writers_do_not_both_commit_from_the_same_baseline(tmp_path: Path)
     loaded = YamlGraphStore(path, history_path=history_path).load()
     assert loaded.version == 5
     assert {item.id for item in loaded.nodes} in ({"req-1", "req-2", "req-3"}, {"req-1", "req-2", "req-4"})
+
+
+def _acquire_nested_same_path_lock(path: str, result: object) -> None:
+    with same_path_lock(Path(path)), same_path_lock(Path(path)):
+        result.put("entered")  # type: ignore[union-attr]
+
+
+def test_nested_same_path_lock_completes_without_self_deadlock(tmp_path: Path) -> None:
+    context = multiprocessing.get_context("spawn")
+    result = context.Queue()
+    process = context.Process(target=_acquire_nested_same_path_lock, args=(str(tmp_path / "graph.yaml"), result))
+
+    process.start()
+    process.join(timeout=1)
+    if process.is_alive():
+        process.terminate()
+        process.join()
+        pytest.fail("nested same-path lock acquisition self-deadlocked")
+
+    assert process.exitcode == 0
+    assert result.get(timeout=1) == "entered"
+    result.close()
