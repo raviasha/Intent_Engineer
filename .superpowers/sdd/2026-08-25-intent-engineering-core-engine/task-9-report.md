@@ -350,6 +350,39 @@ and renderer canonical immutability/containment).
 Fresh final results: Ruff clean; strict mypy clean across 9 modules; full
 pytest `226 passed in 11.62s`; root and reconcile help commands exited 0.
 
+## Fix round 5 — final assertion and recovery matrix
+
+Product/tests: `5130b93b146fde66970166da7cdac50b095336af`,
+`e615a052a49877b19ef42d76a87dbf417b50edca`, and
+`bba49561e0fa8db69f71bd0fb447e1f2ba35830b`.
+
+The unified assertion validator now accepts exactly one `$self` or explicit
+current-record ID, normalizes it to the durable record ID, and rejects empty,
+duplicate, noncurrent, malformed, or ACL-denied evidence references. Recovery
+tests now preserve exact bytes/existence and journal cleanup/idempotence across
+all graph/history/case commit stages and both preview case-append stages.
+
+Focused command:
+
+```text
+.venv/bin/python -m pytest tests/unit/reconcile/test_local_resolution_recovery.py tests/unit/cli/test_runtime_metadata.py tests/e2e/test_cli_local.py::test_markdown_sync_produces_a_deterministic_reconciliation_case tests/e2e/test_cli_local.py::test_status_recovers_pending_resolution_journal_before_reading_state tests/e2e/test_cli_local.py::test_acl_protected_evidence_is_indistinguishable_from_unknown -q
+```
+
+Result: `15 passed in 2.38s`.
+
+Final commands:
+
+```text
+.venv/bin/ruff check src/intent_engineering/cli src/intent_engineering/reconcile src/intent_engineering/core/policy/doctor.py tests/unit/reconcile/test_local_resolution_recovery.py tests/unit/cli/test_runtime_metadata.py tests/e2e/test_cli_local.py
+.venv/bin/mypy --strict src/intent_engineering/cli src/intent_engineering/reconcile src/intent_engineering/core/policy/doctor.py
+.venv/bin/python -m pytest -q
+.venv/bin/intent --help
+.venv/bin/intent reconcile --help
+```
+
+Results: Ruff clean; strict mypy clean across 9 modules; full pytest `229
+passed in 11.33s`; both help commands exited 0.
+
 ## Fix round 4 — unified assertion validation and terminal review actions
 
 Product/tests: `5de14a89e24cd786aeb8136b7a37beaaff745f8c` and
