@@ -7,7 +7,6 @@ from types import ModuleType
 from typing import Any
 
 import pytest
-import structlog
 from pydantic import SecretStr, ValidationError
 from structlog.testing import capture_logs
 
@@ -62,24 +61,58 @@ def test_github_cli_token_is_used_only_when_environment_is_absent_or_blank(
     assert calls == [["gh", "auth", "token"]]
 
 
-def test_production_runner_uses_exact_shell_free_subprocess_contract(
+@pytest.mark.parametrize("environment", [{}, {"GH_TOKEN": " \t\n"}])
+def test_production_runner_sanitizes_overrides_and_keeps_cli_configuration(
     monkeypatch: pytest.MonkeyPatch,
+    environment: Mapping[str, str],
 ) -> None:
     auth = _auth()
     secret = _secret()
-    calls: list[tuple[object, dict[str, object]]] = []
+    override_names = (
+        "GH_TOKEN",
+        "GITHUB_TOKEN",
+        "GH_ENTERPRISE_TOKEN",
+        "GITHUB_ENTERPRISE_TOKEN",
+    )
+    retained = {
+        "HOME": "/safe/home",
+        "XDG_CONFIG_HOME": "/safe/config",
+        "GH_HOST": "github.example.test",
+        "PATH": "/safe/bin",
+        "SSL_CERT_FILE": "/safe/cert.pem",
+        "HTTPS_PROXY": "http://proxy.example.test",
+    }
+    for name in override_names:
+        monkeypatch.setenv(name, secret)
+    for name, value in retained.items():
+        monkeypatch.setenv(name, value)
+    calls: list[tuple[object, dict[str, object], bool, dict[str, str]]] = []
 
     def fake_run(argv: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
-        calls.append((argv, kwargs))
+        child_env = kwargs.pop("env")
+        assert type(child_env) is dict
+        calls.append(
+            (
+                argv,
+                kwargs,
+                all(name not in child_env for name in override_names),
+                {name: child_env[name] for name in retained},
+            )
+        )
         return subprocess.CompletedProcess(["gh", "auth", "token"], 0, f" {secret}\n", "")
 
     monkeypatch.setattr(subprocess, "run", fake_run)
 
-    assert auth.run_gh_token(["gh", "auth", "token"]) == secret
+    credentials = auth.GitHubCredentials.resolve(environment)
+
+    assert credentials.source is auth.CredentialSource.GITHUB_CLI
+    assert credentials.token.get_secret_value() == secret
     assert calls == [
         (
             ["gh", "auth", "token"],
             {"check": True, "capture_output": True, "text": True, "shell": False},
+            True,
+            retained,
         )
     ]
 
@@ -109,7 +142,31 @@ def test_cli_failures_raise_the_same_redacted_actionable_error(failure: str) -> 
     _assert_redacted(secret, error, error.args)
 
 
-def test_credentials_and_public_errors_do_not_expose_secret_in_serialization_or_logs() -> None:
+@pytest.mark.parametrize("failure", ["missing", "nonzero"])
+def test_default_production_runner_detaches_subprocess_failures(
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+) -> None:
+    auth = _auth()
+    secret = _secret()
+
+    def fake_run(argv: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+        if failure == "missing":
+            raise FileNotFoundError(secret)
+        raise subprocess.CalledProcessError(1, argv, output=secret, stderr=secret)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    with pytest.raises(auth.GitHubAuthError) as caught:
+        auth.run_gh_token(["gh", "auth", "token"])
+
+    error = caught.value
+    assert error.__cause__ is None
+    assert error.__context__ is None
+    _assert_redacted(secret, error, error.args)
+
+
+def test_credentials_and_public_errors_do_not_expose_secret_in_serialization() -> None:
     auth = _auth()
     secret = _secret()
     credentials = auth.GitHubCredentials.resolve({"GH_TOKEN": f" {secret} "}, lambda _: "")
@@ -126,10 +183,14 @@ def test_credentials_and_public_errors_do_not_expose_secret_in_serialization_or_
     )
     _assert_redacted(secret, *serialized)
 
-    with capture_logs() as events:
-        structlog.get_logger().info("github_auth", credentials=credentials, error=error)
 
-    _assert_redacted(secret, events)
+def test_credential_resolution_emits_no_structured_logs() -> None:
+    auth = _auth()
+
+    with capture_logs() as events:
+        auth.GitHubCredentials.resolve({"GH_TOKEN": _secret()}, lambda _: "")
+
+    assert events == []
 
 
 @pytest.mark.parametrize("raw", [" ", "\t\n"])
@@ -154,6 +215,17 @@ class _ExplodingEnvironment(Mapping[str, object]):
         raise ValueError(_secret())
 
 
+class _HostileString(str):
+    def strip(self, chars: str | None = None) -> str:
+        raise RuntimeError(SecretStr(_secret()))
+
+    def __str__(self) -> str:
+        return _secret()
+
+    def __repr__(self) -> str:
+        return _secret()
+
+
 @pytest.mark.parametrize("environment", [{"GH_TOKEN": 42}, _ExplodingEnvironment()])
 def test_malformed_environment_input_raises_only_the_redacted_auth_error(
     environment: Mapping[str, Any],
@@ -168,12 +240,51 @@ def test_malformed_environment_input_raises_only_the_redacted_auth_error(
     _assert_redacted(secret, caught.value, caught.value.args)
 
 
-def test_credentials_reject_unknown_fields_and_invalid_sources() -> None:
+def test_hostile_string_subclass_from_environment_yields_only_detached_auth_error() -> None:
+    auth = _auth()
+    secret = _secret()
+
+    with pytest.raises(auth.GitHubAuthError) as caught:
+        auth.GitHubCredentials.resolve({"GH_TOKEN": _HostileString(secret)}, lambda _: "unused")
+
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+    _assert_redacted(secret, caught.value, caught.value.args)
+
+
+def test_hostile_string_subclass_from_runner_yields_only_detached_auth_error() -> None:
+    auth = _auth()
+    secret = _secret()
+
+    with pytest.raises(auth.GitHubAuthError) as caught:
+        auth.GitHubCredentials.resolve({}, lambda _: _HostileString(secret))
+
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+    _assert_redacted(secret, caught.value, caught.value.args)
+
+
+def test_credentials_reject_unknown_fields_as_extra_forbidden() -> None:
     auth = _auth()
     secret = _secret()
     protected = SecretStr(secret)
 
-    with pytest.raises(ValidationError):
-        auth.GitHubCredentials(token=protected, source="environment", unexpected=True)
+    with pytest.raises(ValidationError) as caught:
+        auth.GitHubCredentials(
+            token=protected,
+            source=auth.CredentialSource.ENVIRONMENT,
+            unexpected=True,
+        )
+
+    errors = caught.value.errors(include_url=False, include_input=False)
+    assert [(error["loc"], error["type"]) for error in errors] == [
+        (("unexpected",), "extra_forbidden")
+    ]
+
+
+def test_credentials_reject_invalid_sources() -> None:
+    auth = _auth()
+    protected = SecretStr(_secret())
+
     with pytest.raises(ValidationError):
         auth.GitHubCredentials(token=protected, source="config_file")

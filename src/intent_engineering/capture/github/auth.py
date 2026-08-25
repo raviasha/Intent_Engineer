@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import subprocess
 from collections.abc import Callable, Mapping
 from enum import StrEnum
@@ -12,6 +13,12 @@ from intent_engineering.capture.github.errors import GitHubAuthError
 from intent_engineering.core.models._base import StrictModel
 
 _GH_AUTH_TOKEN_ARGV = ["gh", "auth", "token"]
+_GITHUB_TOKEN_OVERRIDE_NAMES = (
+    "GH_TOKEN",
+    "GITHUB_TOKEN",
+    "GH_ENTERPRISE_TOKEN",
+    "GITHUB_ENTERPRISE_TOKEN",
+)
 
 type GitHubTokenRunner = Callable[[list[str]], str]
 
@@ -23,8 +30,19 @@ class CredentialSource(StrEnum):
     GITHUB_CLI = "github_cli"
 
 
+def _normalize_token(value: object) -> str | None:
+    """Normalize only exact built-in strings without invoking provider overrides."""
+    if type(value) is not str:
+        return None
+    normalized = str.strip(value)
+    return normalized or None
+
+
 def run_gh_token(argv: list[str]) -> str:
     """Run GitHub CLI with structured arguments and return only normalized stdout."""
+    child_env = os.environ.copy()
+    for name in _GITHUB_TOKEN_OVERRIDE_NAMES:
+        child_env.pop(name, None)
     failed = False
     try:
         completed = subprocess.run(
@@ -33,12 +51,16 @@ def run_gh_token(argv: list[str]) -> str:
             capture_output=True,
             text=True,
             shell=False,
+            env=child_env,
         )
     except (OSError, subprocess.SubprocessError):
         failed = True
     if failed:
         raise GitHubAuthError()
-    return completed.stdout.strip()
+    token = _normalize_token(completed.stdout)
+    if token is None:
+        raise GitHubAuthError()
+    return token
 
 
 class GitHubCredentials(StrictModel):
@@ -64,17 +86,16 @@ class GitHubCredentials(StrictModel):
             invalid_environment = True
             raw_environment_token = None
         if invalid_environment or (
-            raw_environment_token is not None and not isinstance(raw_environment_token, str)
+            raw_environment_token is not None and type(raw_environment_token) is not str
         ):
             raise GitHubAuthError()
 
-        if isinstance(raw_environment_token, str):
-            environment_token = raw_environment_token.strip()
-            if environment_token:
-                return cls(
-                    token=SecretStr(environment_token),
-                    source=CredentialSource.ENVIRONMENT,
-                )
+        environment_token = _normalize_token(raw_environment_token)
+        if environment_token is not None:
+            return cls(
+                token=SecretStr(environment_token),
+                source=CredentialSource.ENVIRONMENT,
+            )
 
         runner_failed = False
         try:
@@ -83,10 +104,10 @@ class GitHubCredentials(StrictModel):
         except Exception:  # noqa: BLE001 - replace every runner failure with one safe error
             runner_failed = True
             cli_output = ""
-        if runner_failed or not isinstance(cli_output, str):
+        if runner_failed:
             raise GitHubAuthError()
 
-        cli_token = cli_output.strip()
-        if not cli_token:
+        cli_token = _normalize_token(cli_output)
+        if cli_token is None:
             raise GitHubAuthError()
         return cls(token=SecretStr(cli_token), source=CredentialSource.GITHUB_CLI)
