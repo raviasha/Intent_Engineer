@@ -3,11 +3,12 @@
 ## Commits
 
 - Base commit: `6d13a9ea06de84d32da69015812f5062eb224969`
-- Final implementation commit: `f871681c34bcfd053a1ba1be4cbcac99b6ec74b1`
+- Final implementation commit: `19df58fc56325c5bea4368bd1764fbf9814bd5dc`
 - Implementation commits:
   - `1a15e95` — `fix(sync): replay durable evidence past checkpoints`
   - `314bd99` — `fix(reconcile): derive lag chronology from evidence`
   - `f871681` — `fix(evidence): authenticate connector ingestion chains`
+  - `19df58f` — `fix(sync): enforce provenance ledger integrity`
 - This report is committed separately after the implementation commits.
 
 ## RED evidence
@@ -222,5 +223,97 @@ The exact whole-tree Ruff command still reports only `N999` for the preserved un
 - `tests/integration/sync/test_combined_detection.py`
 - `tests/integration/sync/test_recovery.py`
 - `tests/unit/cli/test_runtime_metadata.py`
+- `tests/unit/reconcile/test_evidence_detection.py`
+- `tests/unit/validation/test_service.py`
+
+## Fix round 2: scoped combined detection and strict ledger integrity
+
+Independent review found that combined detection projected connector-specific predecessors into an unscoped map, checkpoint consumption accepted non-prefix subsets, envelope parsing permitted non-standard or coercive JSON/model values, and the same-object permutation proof compared empty detector results. Commit `19df58fc56325c5bea4368bd1764fbf9814bd5dc` closes those findings.
+
+### Fix-round-2 RED evidence
+
+Combined multi-instance replay and runtime checkpoint-prefix tests:
+
+```bash
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 .venv/bin/python -m pytest -p anyio.pytest_plugin \
+  tests/integration/sync/test_recovery.py::test_divergent_provider_instances_advance_three_versions_in_combined_runs \
+  tests/integration/sync/test_recovery.py::test_runtime_rejects_non_prefix_consumption_without_mutation \
+  tests/integration/sync/test_recovery.py::test_runtime_accepts_exact_consumed_prefix_and_replays_only_suffix -q
+```
+
+Result before production changes: `3 failed, 2 passed`. The v3 combined run/retry failed on divergent predecessor IDs, while skipped and reordered consumed-ID subsets were accepted. The missing-ID case already failed and the valid-prefix case passed.
+
+Deep validation and strict-envelope tests:
+
+```bash
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 .venv/bin/python -m pytest -p anyio.pytest_plugin \
+  tests/unit/validation/test_service.py::test_checkpoint_consumption_must_be_an_exact_ledger_prefix \
+  tests/unit/validation/test_service.py::test_malformed_ingestion_envelopes_are_strictly_parsed_and_redacted -q
+```
+
+Result before production changes: `8 failed, 1 passed`. Missing, skipped, and reordered prefixes had no prefix diagnostic; duplicate keys, `NaN`, whitespace connector IDs, string sequences, and boolean schema versions were accepted. Only the valid prefix passed.
+
+The direct chronology and non-empty permutation tests were also run before production changes and passed `2 passed`, confirming that fix round 1 had already made the authenticated chronology behavior sound; round 2 makes that proof explicit and non-vacuous.
+
+### Fix-round-2 GREEN and verification
+
+New focused proofs:
+
+- Combined v1→v2→v3, no-op retry, and runtime exact-prefix cases: `5 passed`.
+- Validation exact-prefix and strict malformed-envelope cases: `9 passed`.
+- Direct same-object chronology and non-empty classification/fingerprint permutation: `2 passed`.
+
+Expanded focused gate:
+
+```bash
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 .venv/bin/python -m pytest -p anyio.pytest_plugin \
+  tests/integration/sync \
+  tests/contract/storage/test_evidence_store_contract.py \
+  tests/unit/reconcile/test_evidence_detection.py \
+  tests/unit/reconcile/test_detectors.py \
+  tests/unit/validation/test_service.py \
+  tests/integration/test_fixture_matrix.py -q
+```
+
+Result: `95 passed in 2.79s`.
+
+Full suite:
+
+```bash
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 .venv/bin/python -m pytest -p anyio.pytest_plugin -q
+```
+
+Fresh final result: `360 passed in 17.03s`.
+
+Tracked static checks:
+
+```bash
+git ls-files -z -- '*.py' | xargs -0 .venv/bin/ruff check
+.venv/bin/mypy src/intent_engineering
+```
+
+Results: `All checks passed!` and `Success: no issues found in 66 source files`.
+
+Schema regeneration plus validation/CLI-relevant tests passed `49 passed in 0.34s`. The exact whole-tree Ruff command reports only `N999` for the preserved untracked `src/intent_engineering/core/policy/dogfood 2.py` artifact.
+
+### Fix-round-2 decisions and tradeoffs
+
+- The detector-only combined delta deliberately leaves legacy `prior_versions` empty. Combined detection receives complete authenticated `EvidenceIngestion` envelopes, preserving connector instance, sequence, and predecessor scope without lossy external-object-key merging. Per-connector reasoner deltas retain their scoped legacy map.
+- Runtime replay now requires the checkpoint's consumed IDs to equal the exact ordered prefix of the connector's full ingestion ledger before any semantic work. Missing, skipped, reordered, duplicate, foreign, or suffix-only boundaries fail through the existing redacted connector boundary without graph, case, checkpoint, or reasoner mutation.
+- Deep validation applies the same prefix predicate and emits `checkpoint.consumed_evidence_prefix_invalid`; existing missing/foreign diagnostics remain available for more specific corruption classification.
+- A shared storage-layer strict JSON decoder rejects duplicate object keys and `NaN`/`Infinity`. `EvidenceIngestion` additionally uses strict model validation, a non-whitespace connector constraint, positive integer sequence validation, and explicit pre-validation so Python boolean equality cannot satisfy `Literal[1]`. Malformed rows remain redacted to `evidence.invalid`.
+- Authenticated same-object ordering is asserted directly across record permutations. A separate valid CODE_LAG scenario proves non-empty classification and fingerprint stability when both sides are current.
+- Cumulative consumed IDs provide auditable exact replay boundaries but grow linearly with connector history and rewrite a progressively larger YAML tuple whenever the checkpoint advances. A future sequence-watermark migration can bound checkpoint storage, but must preserve exact-prefix semantics and the safe legacy replay behavior.
+
+### Fix-round-2 changed files
+
+- `src/intent_engineering/core/models/__init__.py`
+- `src/intent_engineering/core/models/evidence.py`
+- `src/intent_engineering/storage/jsonl/evidence_store.py`
+- `src/intent_engineering/storage/jsonl/strict.py`
+- `src/intent_engineering/sync/orchestrator.py`
+- `src/intent_engineering/validation/service.py`
+- `tests/integration/sync/test_markdown_sync.py`
+- `tests/integration/sync/test_recovery.py`
 - `tests/unit/reconcile/test_evidence_detection.py`
 - `tests/unit/validation/test_service.py`
