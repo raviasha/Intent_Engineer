@@ -14,6 +14,7 @@ from intent_engineering.capture.git.connector import GitConnector
 from intent_engineering.capture.markdown.connector import MarkdownConnector
 from intent_engineering.context import ContextProvider
 from intent_engineering.core.models import (
+    CandidateAssertion,
     DriftObservation,
     EvidenceDelta,
     EvidenceRecord,
@@ -62,6 +63,8 @@ def _detection_input(record: EvidenceRecord) -> DetectionInput | None:
         copied_side = dict(cast(Mapping[str, Any], side))
         references = copied_side.get("evidence_refs")
         if isinstance(references, Sequence) and not isinstance(references, str):
+            if any(item != "$self" for item in references):
+                raise ValueError("fixture detection evidence must reference current record")
             copied_side["evidence_refs"] = [
                 record.id if item == "$self" else item for item in references
             ]
@@ -78,6 +81,35 @@ def _detect_cases(delta: EvidenceDelta, graph: Graph) -> Sequence[DriftObservati
         if detection_input is not None:
             observations.extend(detect_drift(detection_input))
     return tuple(observations)
+
+
+class _FrontMatterReasoner(DeterministicReasoner):
+    """Expose approved Markdown fixture metadata at the existing reasoner boundary."""
+
+    def extract_assertions(self, delta: EvidenceDelta) -> Sequence[CandidateAssertion]:
+        normalized = tuple(self._normalized(record) for record in delta.added)
+        return super().extract_assertions(delta.model_copy(update={"added": normalized}))
+
+    @staticmethod
+    def _normalized(record: EvidenceRecord) -> EvidenceRecord:
+        content = record.payload.get("content")
+        metadata = _front_matter(content) if isinstance(content, str) else None
+        if metadata is None:
+            return record
+        payload = dict(record.payload)
+        for key in ("intent_assertion", "detection_input"):
+            if key not in payload and key in metadata:
+                payload[key] = metadata[key]
+        assertion = payload.get("intent_assertion")
+        if isinstance(assertion, Mapping):
+            copied = dict(assertion)
+            references = copied.get("evidence_refs")
+            if isinstance(references, Sequence) and not isinstance(references, str):
+                copied["evidence_refs"] = [
+                    record.id if item == "$self" else item for item in references
+                ]
+            payload["intent_assertion"] = copied
+        return record.model_copy(update={"payload": payload})
 
 
 @dataclass(frozen=True)
@@ -140,7 +172,7 @@ def load_runtime(root: Path) -> Runtime:
         evidence_store=evidence_store,
         checkpoint_store=checkpoint_store,
         case_store=case_store,
-        reasoner=DeterministicReasoner(actor=config.local_actor),
+        reasoner=_FrontMatterReasoner(actor=config.local_actor),
         case_detector=_detect_cases,
     )
     resolution = LocalResolutionService(graph_store, evidence_store, case_store, config.local_actor)

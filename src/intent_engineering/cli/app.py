@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import cast
 
 import anyio
 import structlog
@@ -37,6 +38,7 @@ from intent_engineering.core.policy import (
 )
 from intent_engineering.reconcile import ResolutionUnavailable
 from intent_engineering.render import GraphRenderer
+from intent_engineering.storage.interfaces import GraphStore
 from intent_engineering.sync.models import SyncRunResult, SyncRunStatus
 
 app = typer.Typer(
@@ -123,6 +125,22 @@ def _authorized_cases(runtime: Runtime) -> tuple[ReconciliationCase, ...]:
     )
 
 
+def _authorized_graph(runtime: Runtime) -> Graph:
+    """Project canonical state to locally readable topology without mutating it."""
+    graph = _graph(runtime)
+    records = _evidence(runtime)
+    nodes = tuple(
+        node
+        for node in graph.nodes
+        if refs_allowed(node.evidence_refs, records, runtime.config.local_actor)
+    )
+    node_ids = {node.id for node in nodes}
+    edges = tuple(
+        edge for edge in graph.edges if edge.from_id in node_ids and edge.to_id in node_ids
+    )
+    return graph.model_copy(update={"nodes": nodes, "edges": edges})
+
+
 def _invoke_sync(runtime: Runtime, sources: str) -> SyncRunResult:
     """Cross exactly one AnyIO boundary for one CLI sync-like command."""
     return anyio.run(runtime.sync.run, new_run_id(), resolve_connectors(runtime, sources))
@@ -188,6 +206,7 @@ def ingest_command(
     output_format: OutputFormat = typer.Option(OutputFormat.TEXT, "--format"),
 ) -> None:
     """Capture local evidence through the selected local source connectors."""
+    _validate_sources(sources)
     _sync_command(_runtime(project), sources, output_format)
 
 
@@ -198,7 +217,16 @@ def sync_command(
     output_format: OutputFormat = typer.Option(OutputFormat.TEXT, "--format"),
 ) -> None:
     """Synchronize Markdown and Git evidence into the local graph runtime."""
+    _validate_sources(sources)
     _sync_command(_runtime(project), sources, output_format)
+
+
+def _validate_sources(sources: str) -> None:
+    """Reject command usage before touching project state or opening runtime stores."""
+    try:
+        parse_sources(sources)
+    except ValueError as error:
+        raise typer.BadParameter("invalid source selection", param_hint="--sources") from error
 
 
 @app.command("drift")
@@ -224,19 +252,13 @@ def status_command(
 ) -> None:
     """Summarize durable graph, evidence, and reconciliation state."""
     runtime = _runtime(project)
-    graph = _graph(runtime)
-    records = _evidence(runtime)
+    graph = _authorized_graph(runtime)
     cases = _authorized_cases(runtime)
-    nodes = tuple(
-        node
-        for node in graph.nodes
-        if refs_allowed(node.evidence_refs, records, runtime.config.local_actor)
-    )
     emit(
         {
             "project_id": runtime.config.project_id,
             "graph_version": graph.version,
-            "node_count": len(nodes),
+            "node_count": len(graph.nodes),
             "edge_count": len(graph.edges),
             "evidence_count": len(_authorized_evidence(runtime)),
             "open_case_count": sum(is_nonterminal_case_status(case.status) for case in cases),
@@ -359,9 +381,14 @@ def render_command(
     runtime = _runtime(project)
     output_dir = output if output is not None else runtime.workspace / "cache" / "render"
     try:
-        markdown, mermaid = GraphRenderer(runtime.graph_store, runtime.cases()).render_all(
-            output_dir
-        )
+
+        class _ProjectionStore:
+            def load(self) -> Graph:
+                return _authorized_graph(runtime)
+
+        markdown, mermaid = GraphRenderer(
+            cast(GraphStore, _ProjectionStore()), _authorized_cases(runtime)
+        ).render_all(output_dir)
     except Exception as error:
         _runtime_error(error)
         raise typer.Exit(1) from error

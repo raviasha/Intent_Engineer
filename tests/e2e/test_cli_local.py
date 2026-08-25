@@ -80,6 +80,14 @@ def test_invalid_source_selection_is_usage_error_without_writes(tmp_path: Path) 
     assert (repo / ".intent/graph.yaml").read_bytes() == before
 
 
+def test_invalid_sources_are_usage_errors_before_project_loading(tmp_path: Path) -> None:
+    """Catch source parsing after an uninitialized or corrupt runtime is opened."""
+    repo = init_git_repo(tmp_path)
+    result = run_intent(repo, "sync", "--sources", "missing")
+    assert result.returncode == 2
+    assert not (repo / ".intent").exists()
+
+
 def test_uninitialized_project_is_a_redacted_runtime_failure(tmp_path: Path) -> None:
     """Catch commands that bypass the typed local-project boundary."""
     repo = init_git_repo(tmp_path)

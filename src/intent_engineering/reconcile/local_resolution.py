@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import base64
+import json
 from contextlib import ExitStack
 from datetime import UTC, datetime
 from hashlib import sha256
@@ -48,11 +50,14 @@ class LocalResolutionService:
         with ExitStack() as locks:
             for path in sorted(paths, key=str):
                 locks.enter_context(same_path_lock(path))
+            self._recover()
             snapshots = {path: path.read_bytes() if path.exists() else None for path in paths}
             try:
                 case = self._case_store.get(case_id)
                 graph = self._graph_store.load()
                 if case.status is not ReconciliationStatus.NEEDS_HUMAN:
+                    raise ResolutionUnavailable("resolution unavailable")
+                if action in {ResolutionAction.DEFER, ResolutionAction.MARK_FALSE_POSITIVE}:
                     raise ResolutionUnavailable("resolution unavailable")
                 records = tuple(
                     self._evidence_store.get(reference) for reference in case.all_evidence_refs
@@ -69,11 +74,14 @@ class LocalResolutionService:
                     action,
                     changeset.id,
                 )
+                self._write_journal(snapshots)
                 self._graph_store.apply(changeset)
                 self._case_store.put(resolved)
+                self._journal_path().unlink(missing_ok=True)
                 return resolved, changeset
             except Exception as error:
                 self._restore(snapshots)
+                self._journal_path().unlink(missing_ok=True)
                 if isinstance(error, ResolutionUnavailable):
                     raise
                 raise ResolutionUnavailable("resolution unavailable") from error
@@ -85,6 +93,38 @@ class LocalResolutionService:
             self._case_store.path,
             self._evidence_store.path,
         )
+
+    def _journal_path(self) -> Path:
+        return self._graph_store._history_store.path.with_name(".resolution-journal.json")
+
+    def _write_journal(self, snapshots: dict[Path, bytes | None]) -> None:
+        payload = {
+            "version": 1,
+            "preimages": {
+                str(path): None if content is None else base64.b64encode(content).decode("ascii")
+                for path, content in snapshots.items()
+            },
+        }
+        atomic_write_bytes(
+            self._journal_path(),
+            json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8"),
+        )
+
+    def _recover(self) -> None:
+        journal = self._journal_path()
+        if not journal.exists():
+            return
+        try:
+            loaded = json.loads(journal.read_text(encoding="utf-8"))
+            encoded = loaded["preimages"]
+            snapshots = {
+                path: None if encoded[str(path)] is None else base64.b64decode(encoded[str(path)])
+                for path in self._paths()
+            }
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+            raise ResolutionUnavailable("resolution unavailable") from error
+        self._restore(snapshots)
+        journal.unlink()
 
     @staticmethod
     def _restore(snapshots: dict[Path, bytes | None]) -> None:
