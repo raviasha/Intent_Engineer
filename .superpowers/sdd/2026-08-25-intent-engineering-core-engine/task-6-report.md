@@ -96,3 +96,59 @@ Product and test changes: `27ead2bdfa82ef1e7fb6f6c49259b013a31c21c0`
   cannot contain NUL bytes, so this preserves subject/body field boundaries.
 - No diffs are stored by design; only the commit metadata and changed path list are
   captured.
+
+## Fix round 1 — review findings
+
+### Root causes and corrections
+
+- `checkpoint_after_discovery()` wrote `Connector.next_checkpoint(())` directly,
+  replacing a prior Git SHA with `None`. It now accepts the existing typed prior
+  checkpoint and retains its cursor for an empty successful discovery batch.
+- Git called `rev-list HEAD` before checking whether `HEAD` existed. It now verifies
+  that the path is a work tree and treats only a missing verified `HEAD` as the
+  expected empty repository result.
+- Git path collection did not request per-parent merge output. It now uses
+  `git diff-tree -m ... -z`; NUL-delimited paths are deduplicated and sorted, a
+  documented deterministic policy that preserves unusual filename characters.
+- Markdown and Git operational discovery/fetch failures escaped as native
+  filesystem/subprocess exceptions. Their async public boundaries now raise a safe
+  `ConnectorError` without command stderr or local filesystem details.
+- Markdown used only lexical `..` validation. Discovery skips and fetch rejects
+  candidates whose resolved path is outside the resolved project root.
+
+### RED regressions
+
+```text
+.venv/bin/pytest tests/contract/capture tests/integration/capture -v
+```
+
+Result: `6 failed, 2 passed in 0.82s`. The failures reproduced the missing prior
+checkpoint argument, unborn-HEAD `CalledProcessError`, absent merge paths,
+unwrapped Git/Markdown discovery failures, and discovery of an external Markdown
+symlink. The failure-contract tests include fetch failures; they completed after
+the public-boundary fixes. The merge regression's initial direct-parent assertion
+was corrected to the valid two-parent merge invariant before implementation; the
+corrected behavior is asserted by its changed-path expectation.
+
+### GREEN and quality verification
+
+```text
+.venv/bin/pytest tests/contract/capture tests/integration/capture -v
+.venv/bin/ruff check src/intent_engineering/capture tests/contract/capture tests/integration/capture
+.venv/bin/mypy --strict src/intent_engineering/capture/base.py src/intent_engineering/capture/checkpoints.py src/intent_engineering/capture/markdown/connector.py src/intent_engineering/capture/git/connector.py
+```
+
+Result: `8 passed in 0.80s`; `All checks passed!`; and `Success: no issues found
+in 4 source files`.
+
+### Full verification
+
+```text
+.venv/bin/pytest -v
+```
+
+Result: `129 passed in 1.13s`.
+
+### Fix commit
+
+`e762a7851b42a91d2e4ffba8fbb9fd49ae4f8f07` (`fix: harden local connector boundaries`).
