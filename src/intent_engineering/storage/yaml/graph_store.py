@@ -12,6 +12,7 @@ from intent_engineering.core.graph.applier import apply_changeset
 from intent_engineering.core.models import ChangeSet, Graph
 from intent_engineering.storage._atomic import atomic_write_bytes, same_path_lock
 from intent_engineering.storage.jsonl.history_store import JsonlHistoryStore
+from intent_engineering.storage.secure import SecureFile, coerce_secure_file
 
 
 def _yaml_bytes(graph: Graph) -> bytes:
@@ -37,34 +38,42 @@ def _canonical_graph_payload(loaded: dict[str, Any]) -> dict[str, Any]:
 class YamlGraphStore:
     """Atomically replace canonical graph YAML before recording applied history."""
 
-    def __init__(self, path: Path, *, history_path: Path | None = None) -> None:
-        self.path = path
-        resolved_history_path = history_path or path.with_suffix(".history.jsonl")
+    def __init__(
+        self,
+        path: Path | SecureFile,
+        *,
+        history_path: Path | SecureFile | None = None,
+    ) -> None:
+        self._file = coerce_secure_file(path)
+        self.path = self._file.path
+        resolved_history_path = history_path or self._file.sibling(
+            f"{self.path.stem}.history.jsonl"
+        )
         self._history_store = JsonlHistoryStore(resolved_history_path)
 
     def initialize(self, graph: Graph) -> None:
         """Durably establish canonical graph state."""
-        with same_path_lock(self.path):
-            atomic_write_bytes(self.path, _yaml_bytes(graph))
+        with same_path_lock(self._file):
+            atomic_write_bytes(self._file, _yaml_bytes(graph))
 
     def _load_unlocked(self) -> Graph:
         """Load graph state while the caller holds this graph's path lock."""
-        loaded = yaml.safe_load(self.path.read_text(encoding="utf-8"))
+        loaded = yaml.safe_load(self._file.read_bytes().decode("utf-8"))
         if not isinstance(loaded, dict):
-            raise TypeError(f"graph YAML must contain a mapping: {self.path}")
+            raise TypeError("graph YAML must contain a mapping")
         return Graph.model_validate(_canonical_graph_payload(cast(dict[str, Any], loaded)))
 
     def load(self) -> Graph:
         """Load and fully validate canonical graph YAML."""
-        with same_path_lock(self.path):
+        with same_path_lock(self._file):
             return self._load_unlocked()
 
     def apply(self, changeset: ChangeSet) -> Graph:
         """Validate, replace canonical state atomically, then append history."""
-        with same_path_lock(self.path):
+        with same_path_lock(self._file):
             next_graph = apply_changeset(self._load_unlocked(), changeset)
             next_graph.assert_invariants()
-            atomic_write_bytes(self.path, _yaml_bytes(next_graph))
+            atomic_write_bytes(self._file, _yaml_bytes(next_graph))
             self._history_store.append(changeset)
             return next_graph
 

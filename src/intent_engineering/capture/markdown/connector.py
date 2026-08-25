@@ -19,6 +19,7 @@ from intent_engineering.capture.base import (
     normalize_raw_source,
 )
 from intent_engineering.core.models import EvidenceRecord, ProjectConfig
+from intent_engineering.storage.secure import SecureDirectory, SecureRead, UnsafePathError
 
 
 def _content_hash(content: bytes) -> str:
@@ -82,45 +83,44 @@ class MarkdownConnector:
 
     connector_id = "markdown"
 
-    def __init__(self, root: Path, config: ProjectConfig) -> None:
-        self.root = root.resolve()
+    def __init__(self, root: Path | SecureDirectory, config: ProjectConfig) -> None:
+        self._root_directory = (
+            root.duplicate() if isinstance(root, SecureDirectory) else SecureDirectory.open(root)
+        )
+        self.root = self._root_directory.path
         self.config = config
         self._last_manifest: tuple[tuple[str, str], ...] = ()
+        self._discovered: dict[str, SecureRead] = {}
 
     def _is_excluded(self, relative: PurePosixPath) -> bool:
         path = relative.as_posix()
         return any(relative.match(pattern) or fnmatchcase(path, pattern) for pattern in self.config.source_exclusions)
 
-    def _is_within_root(self, path: Path) -> bool:
-        """Return whether a resolved candidate stays inside the configured root."""
-        return path.resolve().is_relative_to(self.root)
-
     def _discover_sync(self) -> tuple[SourceObject, ...]:
         sources: list[SourceObject] = []
-        for path in self.root.rglob("*.md"):
-            if not path.is_file():
-                continue
-            if not self._is_within_root(path):
-                continue
-            relative = PurePosixPath(path.relative_to(self.root).as_posix())
-            if self._is_excluded(relative):
-                continue
-            content = path.read_bytes()
+        snapshots: dict[str, SecureRead] = {}
+        for relative, snapshot in self._root_directory.walk_regular_files(
+            ".md",
+            excluded=self._is_excluded,
+        ):
             relative_path = relative.as_posix()
+            object_id = f"path:{relative_path}"
             sources.append(
                 SourceObject(
-                    external_object_id=f"path:{relative_path}",
-                    external_version=_content_hash(content),
+                    external_object_id=object_id,
+                    external_version=_content_hash(snapshot.content),
                     locator=relative_path,
                 )
             )
+            snapshots[object_id] = snapshot
+        self._discovered = snapshots
         return tuple(sorted(sources, key=lambda source: source.locator))
 
     async def discover(self, cursor: str | None) -> Sequence[SourceObject]:
         """Discover only source versions absent from the prior full manifest cursor."""
         try:
             sources = await anyio.to_thread.run_sync(self._discover_sync)
-        except (OSError, UnicodeError) as error:
+        except (OSError, UnicodeError, ValueError) as error:
             raise ConnectorError("Markdown discovery failed") from error
         self._last_manifest = tuple((source.locator, source.external_version) for source in sources)
         prior_manifest = _parse_manifest_cursor(cursor)
@@ -137,22 +137,35 @@ class MarkdownConnector:
             raise ValueError(f"unsupported Markdown object ID: {object_id}")
         relative_path = object_id.removeprefix("path:")
         relative = PurePosixPath(relative_path)
-        if relative.is_absolute() or ".." in relative.parts:
+        if (
+            relative.is_absolute()
+            or ".." in relative.parts
+            or relative.as_posix() != relative_path
+            or relative_path == "."
+        ):
             raise ValueError(f"invalid Markdown object ID: {object_id}")
-        path = self.root.joinpath(*relative.parts)
-        if not self._is_within_root(path):
-            raise ConnectorError("Markdown fetch rejected a path outside configured root")
-        content = path.read_bytes()
+        discovered = self._discovered.get(object_id)
+        try:
+            snapshot = self._root_directory.read_relative(
+                relative,
+                expected_identities=discovered.identities if discovered is not None else None,
+            )
+        except UnsafePathError:
+            if discovered is None and self._root_directory.final_is_symlink(relative):
+                raise ConnectorError(
+                    "Markdown fetch rejected a path outside configured root"
+                ) from None
+            raise
+        content = snapshot.content
         content_hash = _content_hash(content)
         if version != content_hash:
             raise ValueError(f"Markdown object changed before fetch: {object_id}")
-        stat = path.stat()
         return RawSourceObject(
             connector_type=self.connector_id,
             external_object_id=object_id,
             external_version=version,
             author=self.config.local_actor,
-            observed_at=datetime.fromtimestamp(stat.st_mtime, tz=UTC),
+            observed_at=datetime.fromtimestamp(snapshot.modified_ns / 1_000_000_000, tz=UTC),
             source_locator=relative_path,
             content_hash=content_hash,
             payload={"path": relative_path, "content": content.decode("utf-8")},

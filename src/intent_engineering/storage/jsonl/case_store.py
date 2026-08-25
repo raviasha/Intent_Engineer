@@ -11,6 +11,7 @@ from pydantic import ValidationError
 
 from intent_engineering.core.models import ReconciliationCase, ReconciliationStatus
 from intent_engineering.storage._atomic import append_durable_line, same_path_lock
+from intent_engineering.storage.secure import SecureFile, coerce_secure_file
 
 
 class CaseStoreError(ValueError):
@@ -66,11 +67,12 @@ def _migrate_legacy_case_payload(payload: object) -> dict[str, Any]:
 class JsonlCaseStore:
     """Durably append lifecycle versions and reconstruct the latest typed cases."""
 
-    def __init__(self, path: Path) -> None:
-        self.path = path
+    def __init__(self, path: Path | SecureFile) -> None:
+        self._file = coerce_secure_file(path)
+        self.path = self._file.path
         self._latest_by_id: dict[str, ReconciliationCase] = {}
         self._by_fingerprint: dict[str, ReconciliationCase] = {}
-        with same_path_lock(self.path):
+        with same_path_lock(self._file):
             self._rebuild_index_unlocked()
 
     def _record_version_unlocked(self, case: ReconciliationCase) -> None:
@@ -99,23 +101,27 @@ class JsonlCaseStore:
         """Refresh indexes from disk while the caller owns the shared path lock."""
         self._latest_by_id.clear()
         self._by_fingerprint.clear()
-        if not self.path.exists():
+        content = self._file.read_optional()
+        if content is None:
             return
-        with self.path.open(encoding="utf-8") as source:
-            for line_number, line in enumerate(source, start=1):
-                if not line.strip():
-                    raise CaseStoreError(f"blank case record at line {line_number} in {self.path}")
-                try:
-                    case = ReconciliationCase.model_validate(
-                        _migrate_legacy_case_payload(json.loads(line))
-                    )
-                    self._record_version_unlocked(case)
-                except CaseStoreError:
-                    raise
-                except (json.JSONDecodeError, ValueError) as error:
-                    raise CaseStoreError(
-                        f"invalid reconciliation case record at line {line_number} in {self.path}"
-                    ) from error
+        try:
+            lines = content.decode("utf-8").splitlines(keepends=True)
+        except UnicodeError as error:
+            raise CaseStoreError("invalid case store encoding") from error
+        for line_number, line in enumerate(lines, start=1):
+            if not line.strip():
+                raise CaseStoreError(f"blank case record at line {line_number}")
+            try:
+                case = ReconciliationCase.model_validate(
+                    _migrate_legacy_case_payload(json.loads(line))
+                )
+                self._record_version_unlocked(case)
+            except CaseStoreError:
+                raise
+            except (json.JSONDecodeError, ValueError) as error:
+                raise CaseStoreError(
+                    f"invalid reconciliation case record at line {line_number}"
+                ) from error
 
     def put(self, case: ReconciliationCase) -> bool:
         """Append a new case or lifecycle version, returning false for an exact duplicate."""
@@ -129,30 +135,30 @@ class JsonlCaseStore:
             separators=(",", ":"),
             sort_keys=True,
         ).encode("utf-8") + b"\n"
-        with same_path_lock(self.path):
+        with same_path_lock(self._file):
             self._rebuild_index_unlocked()
             previous = self._latest_by_id.get(case.id)
             if previous == case:
                 return False
             self._record_version_unlocked(case)
-            append_durable_line(self.path, serialized)
+            append_durable_line(self._file, serialized)
             return True
 
     def get(self, case_id: str) -> ReconciliationCase:
         """Return the latest durable version for a stable case ID."""
-        with same_path_lock(self.path):
+        with same_path_lock(self._file):
             self._rebuild_index_unlocked()
             return self._latest_by_id[case_id]
 
     def find_by_fingerprint(self, fingerprint: str) -> ReconciliationCase | None:
         """Return the latest case having a deterministic drift fingerprint."""
-        with same_path_lock(self.path):
+        with same_path_lock(self._file):
             self._rebuild_index_unlocked()
             return self._by_fingerprint.get(fingerprint)
 
     def list(self, status: ReconciliationStatus | None = None) -> Sequence[ReconciliationCase]:
         """Return latest cases in deterministic stable-ID order, optionally by status."""
-        with same_path_lock(self.path):
+        with same_path_lock(self._file):
             self._rebuild_index_unlocked()
             cases = tuple(self._latest_by_id.values())
             if status is not None:

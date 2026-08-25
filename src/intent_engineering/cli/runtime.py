@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -29,6 +30,11 @@ from intent_engineering.extract.deterministic import DeterministicReasoner
 from intent_engineering.reconcile import DetectionInput, LocalResolutionService, detect_drift
 from intent_engineering.storage.jsonl.case_store import JsonlCaseStore
 from intent_engineering.storage.jsonl.evidence_store import JsonlEvidenceStore
+from intent_engineering.storage.secure import (
+    SecureDirectory,
+    UnsafePathError,
+    configured_graph_relative,
+)
 from intent_engineering.storage.yaml.checkpoint_store import YamlCheckpointStore
 from intent_engineering.storage.yaml.graph_store import YamlGraphStore
 from intent_engineering.sync import SyncOrchestrator
@@ -162,10 +168,12 @@ class Runtime:
     checkpoint_store: YamlCheckpointStore
     sync: SyncOrchestrator
     resolution: LocalResolutionService
+    project_directory: SecureDirectory
+    workspace_directory: SecureDirectory
 
     def evidence(self) -> tuple[EvidenceRecord, ...]:
         """Load persisted evidence in append order for read-only CLI projections."""
-        return _records(self.workspace / "evidence" / "evidence.jsonl", EvidenceRecord)
+        return tuple(self.evidence_store.list())
 
     def cases(self) -> tuple[ReconciliationCase, ...]:
         """Return the current durable reconciliation-case versions."""
@@ -176,34 +184,32 @@ class Runtime:
         return ContextProvider(self.graph_store.load(), self.cases(), self.config, self.evidence())
 
 
-def _records(path: Path, model: type[EvidenceRecord | ReconciliationCase]) -> tuple[Any, ...]:
-    if not path.exists():
-        return ()
-    records: list[Any] = []
-    with path.open(encoding="utf-8") as source:
-        for line in source:
-            if line.strip():
-                records.append(model.model_validate_json(line))
-    return tuple(records)
-
-
 def load_runtime(root: Path) -> Runtime:
     """Locate one initialized workspace and assemble only reviewed local adapters."""
-    root = root.resolve()
+    root = Path(os.path.abspath(root))
+    try:
+        project_directory = SecureDirectory.open(root)
+        workspace_directory = project_directory.subdirectory(".intent")
+        config_file = workspace_directory.file("config.yaml")
+        loaded = yaml.safe_load(config_file.read_bytes().decode("utf-8"))
+    except UnsafePathError as error:
+        raise ProjectNotInitialized("local project is not initialized") from error
     workspace = workspace_path(root)
-    config_path = workspace / "config.yaml"
-    if not config_path.is_file():
-        raise ProjectNotInitialized("local project is not initialized")
-    loaded = yaml.safe_load(config_path.read_text(encoding="utf-8"))
     if not isinstance(loaded, dict):
         raise TypeError("project configuration is invalid")
     config = ProjectConfig.model_validate(cast(dict[str, Any], loaded))
+    try:
+        graph_file = workspace_directory.file(configured_graph_relative(config.graph_path))
+        graph_file.assert_regular()
+    except UnsafePathError as error:
+        raise UnsafePathError("configured graph path is unsafe") from error
     graph_store = YamlGraphStore(
-        workspace / "graph.yaml", history_path=workspace / "history" / "changesets.jsonl"
+        graph_file,
+        history_path=workspace_directory.file("history/changesets.jsonl"),
     )
-    evidence_store = JsonlEvidenceStore(workspace / "evidence" / "evidence.jsonl")
-    case_store = JsonlCaseStore(workspace / "reconciliation" / "cases.jsonl")
-    checkpoint_store = YamlCheckpointStore(workspace / "cache" / "checkpoints.yaml")
+    evidence_store = JsonlEvidenceStore(workspace_directory.file("evidence/evidence.jsonl"))
+    case_store = JsonlCaseStore(workspace_directory.file("reconciliation/cases.jsonl"))
+    checkpoint_store = YamlCheckpointStore(workspace_directory.file("cache/checkpoints.yaml"))
     sync = SyncOrchestrator(
         graph_store=graph_store,
         evidence_store=evidence_store,
@@ -224,6 +230,8 @@ def load_runtime(root: Path) -> Runtime:
         checkpoint_store=checkpoint_store,
         sync=sync,
         resolution=resolution,
+        project_directory=project_directory,
+        workspace_directory=workspace_directory,
     )
 
 
@@ -233,7 +241,7 @@ def resolve_connectors(runtime: Runtime, sources: str) -> tuple[Connector, ...]:
     connectors: list[Connector] = []
     for source in requested:
         if source == "markdown":
-            connectors.append(MarkdownConnector(runtime.root, runtime.config))
+            connectors.append(MarkdownConnector(runtime.project_directory, runtime.config))
         elif source == "git":
             connectors.append(GitConnector(runtime.root))
         else:  # pragma: no cover - parse_sources establishes this boundary

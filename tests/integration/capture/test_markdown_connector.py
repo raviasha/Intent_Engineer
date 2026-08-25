@@ -201,3 +201,64 @@ async def test_markdown_connector_wraps_content_version_mismatch(tmp_path: Path)
         await connector.fetch(source.external_object_id, source.external_version)
 
     assert "intent.md" not in str(error.value)
+
+
+@pytest.mark.anyio
+async def test_markdown_connector_rejects_hardlinked_source_files(tmp_path: Path) -> None:
+    outside = tmp_path.parent / "outside-hardlink.md"
+    outside.write_text("# Secret\n", encoding="utf-8")
+    os.link(outside, tmp_path / "linked.md")
+    connector = MarkdownConnector(
+        tmp_path,
+        ProjectConfig(project_id="capture-test", local_actor="tester"),
+    )
+
+    with pytest.raises(ConnectorError, match="Markdown discovery failed"):
+        await connector.discover(None)
+
+
+@pytest.mark.anyio
+async def test_markdown_fetch_rejects_a_swapped_parent_even_with_identical_bytes(
+    tmp_path: Path,
+) -> None:
+    docs = tmp_path / "docs"
+    docs.mkdir()
+    source_path = docs / "intent.md"
+    source_path.write_text("# Stable bytes\n", encoding="utf-8")
+    connector = MarkdownConnector(
+        tmp_path,
+        ProjectConfig(project_id="capture-test", local_actor="tester"),
+    )
+    source = (await connector.discover(None))[0]
+
+    docs.rename(tmp_path / "original-docs")
+    docs.mkdir()
+    (docs / "intent.md").write_text("# Stable bytes\n", encoding="utf-8")
+
+    with pytest.raises(ConnectorError, match="Markdown fetch failed"):
+        await connector.fetch(source.external_object_id, source.external_version)
+
+
+@pytest.mark.anyio
+async def test_markdown_connector_reads_from_its_held_root_after_root_path_swap(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "intent.md").write_text("# Original\n", encoding="utf-8")
+    connector = MarkdownConnector(
+        project,
+        ProjectConfig(project_id="capture-test", local_actor="tester"),
+    )
+    source = (await connector.discover(None))[0]
+
+    held = tmp_path / "held-project"
+    project.rename(held)
+    attacker = tmp_path / "attacker-project"
+    attacker.mkdir()
+    (attacker / "intent.md").write_text("# Attacker\n", encoding="utf-8")
+    project.symlink_to(attacker, target_is_directory=True)
+
+    record = await connector.fetch(source.external_object_id, source.external_version)
+
+    assert record.payload["content"] == "# Original\n"

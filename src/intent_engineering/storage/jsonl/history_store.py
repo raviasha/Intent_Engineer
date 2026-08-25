@@ -9,6 +9,7 @@ from pathlib import Path
 
 from intent_engineering.core.models import ChangeSet
 from intent_engineering.storage._atomic import append_durable_line, same_path_lock
+from intent_engineering.storage.secure import SecureFile, coerce_secure_file
 
 
 class HistoryStoreError(ValueError):
@@ -31,28 +32,33 @@ def _subjects(changeset: ChangeSet) -> Iterable[str]:
 class JsonlHistoryStore:
     """Durably append ChangeSets and index their affected subject identities."""
 
-    def __init__(self, path: Path) -> None:
-        self.path = path
+    def __init__(self, path: Path | SecureFile) -> None:
+        self._file = coerce_secure_file(path)
+        self.path = self._file.path
         self._by_subject: dict[str, list[ChangeSet]] = defaultdict(list)
-        with same_path_lock(self.path):
+        with same_path_lock(self._file):
             self._rebuild_index_unlocked()
 
     def _rebuild_index_unlocked(self) -> None:
         """Refresh indexes from disk while the caller holds this store's path lock."""
         self._by_subject.clear()
-        if not self.path.exists():
+        content = self._file.read_optional()
+        if content is None:
             return
-        with self.path.open(encoding="utf-8") as source:
-            for line_number, line in enumerate(source, start=1):
-                if not line.strip():
-                    continue
-                try:
-                    changeset = ChangeSet.model_validate_json(line)
-                except (json.JSONDecodeError, ValueError) as error:
-                    raise HistoryStoreError(
-                        f"invalid history record at line {line_number} in {self.path}"
-                    ) from error
-                self._index(changeset)
+        try:
+            lines = content.decode("utf-8").splitlines(keepends=True)
+        except UnicodeError as error:
+            raise HistoryStoreError("invalid history store encoding") from error
+        for line_number, line in enumerate(lines, start=1):
+            if not line.strip():
+                continue
+            try:
+                changeset = ChangeSet.model_validate_json(line)
+            except (json.JSONDecodeError, ValueError) as error:
+                raise HistoryStoreError(
+                    f"invalid history record at line {line_number}"
+                ) from error
+            self._index(changeset)
 
     def _index(self, changeset: ChangeSet) -> None:
         for subject_id in set(_subjects(changeset)):
@@ -66,13 +72,13 @@ class JsonlHistoryStore:
             separators=(",", ":"),
             sort_keys=True,
         ).encode("utf-8") + b"\n"
-        with same_path_lock(self.path):
+        with same_path_lock(self._file):
             self._rebuild_index_unlocked()
-            append_durable_line(self.path, serialized)
+            append_durable_line(self._file, serialized)
             self._index(changeset)
 
     def history(self, subject_id: str) -> Sequence[ChangeSet]:
         """Return all durable ChangeSets that changed a supplied subject."""
-        with same_path_lock(self.path):
+        with same_path_lock(self._file):
             self._rebuild_index_unlocked()
             return tuple(self._by_subject.get(subject_id, ()))

@@ -10,6 +10,7 @@ import yaml  # type: ignore[import-untyped]
 
 from intent_engineering.core.models import SyncCheckpoint
 from intent_engineering.storage._atomic import atomic_write_bytes, same_path_lock
+from intent_engineering.storage.secure import SecureFile, coerce_secure_file
 
 
 class CheckpointStoreError(ValueError):
@@ -27,21 +28,23 @@ class StaleCheckpoint(CheckpointStoreError):
 class YamlCheckpointStore:
     """Store one typed checkpoint per connector in atomically replaced YAML."""
 
-    def __init__(self, path: Path) -> None:
-        self.path = path
+    def __init__(self, path: Path | SecureFile) -> None:
+        self._file = coerce_secure_file(path)
+        self.path = self._file.path
 
     def _load_all_unlocked(self) -> dict[str, SyncCheckpoint]:
         """Load checkpoints while the caller holds this store's path lock."""
-        if not self.path.exists():
+        content = self._file.read_optional()
+        if content is None:
             return {}
-        loaded = yaml.safe_load(self.path.read_text(encoding="utf-8"))
+        loaded = yaml.safe_load(content.decode("utf-8"))
         if loaded is None:
             return {}
         if not isinstance(loaded, dict):
-            raise CheckpointStoreError(f"checkpoint YAML must contain a mapping: {self.path}")
+            raise CheckpointStoreError("checkpoint YAML must contain a mapping")
         records = loaded.get("checkpoints", {})
         if not isinstance(records, dict):
-            raise CheckpointStoreError(f"checkpoints must contain a mapping: {self.path}")
+            raise CheckpointStoreError("checkpoints must contain a mapping")
         return {
             connector_id: SyncCheckpoint.model_validate(cast(dict[str, Any], record))
             for connector_id, record in records.items()
@@ -55,11 +58,11 @@ class YamlCheckpointStore:
             }
         }
         content = cast(str, yaml.safe_dump(data, allow_unicode=True, sort_keys=True)).encode("utf-8")
-        atomic_write_bytes(self.path, content)
+        atomic_write_bytes(self._file, content)
 
     def get(self, connector_id: str) -> SyncCheckpoint | None:
         """Return the current durable checkpoint for a connector."""
-        with same_path_lock(self.path):
+        with same_path_lock(self._file):
             return self._load_all_unlocked().get(connector_id)
 
     def compare_and_set(
@@ -70,7 +73,7 @@ class YamlCheckpointStore:
         committed_at: datetime,
     ) -> SyncCheckpoint:
         """Atomically persist a new cursor only when the expected value still matches."""
-        with same_path_lock(self.path):
+        with same_path_lock(self._file):
             checkpoints = self._load_all_unlocked()
             if checkpoints.get(connector_id) != expected:
                 raise StaleCheckpoint(connector_id)

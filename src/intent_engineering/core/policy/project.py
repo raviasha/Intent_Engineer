@@ -43,7 +43,7 @@ class InitializedProject:
 
 def workspace_path(root: Path) -> Path:
     """Return the lexical workspace path below the selected, resolved project root."""
-    return root.resolve() / ".intent"
+    return Path(os.path.abspath(root)) / ".intent"
 
 
 def _yaml_bytes(value: dict[str, Any]) -> bytes:
@@ -146,7 +146,7 @@ def _state_is_empty(workspace_fd: int) -> bool:
 
 def initialize_project(root: Path, *, force: bool = False) -> InitializedProject:
     """Create or safely repair local state without traversing workspace links."""
-    root = root.resolve()
+    root = Path(os.path.abspath(root))
     workspace = workspace_path(root)
     root_fd = os.open(root, _DIRECTORY_FLAGS)
     try:
