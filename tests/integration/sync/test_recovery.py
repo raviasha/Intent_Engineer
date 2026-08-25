@@ -102,40 +102,15 @@ class TwoCaseDetector:
         )
         return tuple(
             DriftObservation(
-                subject_ref=f"requirement:fixture-{index}",
+                subject_ref="requirement:local-export",
                 case_type=ReconciliationCaseType.AMBIGUOUS_DIVERGENCE,
-                affected_refs=(f"requirement:fixture-{index}",),
+                affected_refs=("requirement:local-export",),
                 evidence_sides=(side,),
                 detector_id="fixture",
                 fingerprint=sha256(f"fixture-{index}".encode()).hexdigest(),
             )
             for index in (1, 2)
         )
-
-
-class FailSecondCaseStore:
-    """Delegate durable writes while failing exactly once after one stored case."""
-
-    def __init__(self, store: JsonlCaseStore) -> None:
-        self._store = store
-        self._calls = 0
-        self._failed = False
-
-    def put(self, case: Any) -> bool:
-        self._calls += 1
-        if self._calls == 2 and not self._failed:
-            self._failed = True
-            raise RuntimeError("case store private detail")
-        return self._store.put(case)
-
-    def get(self, case_id: str) -> Any:
-        return self._store.get(case_id)
-
-    def find_by_fingerprint(self, fingerprint: str) -> Any:
-        return self._store.find_by_fingerprint(fingerprint)
-
-    def list(self, status: Any = None) -> Any:
-        return self._store.list(status)
 
 
 class RawBrokenConnector:
@@ -265,22 +240,32 @@ async def test_retry_commits_checkpoint_after_detector_failure_with_graph_alread
 
 
 @pytest.mark.anyio
-async def test_retry_completes_partial_case_persistence_without_duplicate_case(tmp_path: Path) -> None:
-    """Fingerprint deduplication lets a retry persist only the unfinished case."""
+async def test_retry_replays_an_atomically_rolled_back_case_group(tmp_path: Path) -> None:
+    """An ordinary case-stage failure rolls back the entire declared case group."""
     raw_store = JsonlCaseStore(tmp_path / "cases.jsonl")
+    failed_once = False
+
+    def fail_case_stage(stage: str) -> None:
+        nonlocal failed_once
+        if stage == "target:cases" and not failed_once:
+            failed_once = True
+            raise RuntimeError("case transaction private detail")
+
     harness = SyncHarness(
         tmp_path,
         (FixtureConnector(),),
         case_detector=TwoCaseDetector(),
-        case_store=FailSecondCaseStore(raw_store),
+        case_store=raw_store,
+        transaction_fault_hook=fail_case_stage,
     )
 
     failed = await harness.run()
+    assert raw_store.list() == ()
     recovered = await harness.run()
 
     assert failed.status is SyncRunStatus.FAILED
-    assert failed.cases_created == 1
-    assert recovered.cases_created == 1
+    assert failed.cases_created == 0
+    assert recovered.cases_created == 2
     assert len(raw_store.list()) == 2
     assert recovered.connectors["markdown"].checkpoint_advanced is True
 

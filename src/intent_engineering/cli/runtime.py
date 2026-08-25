@@ -27,7 +27,9 @@ from intent_engineering.core.models import (
 from intent_engineering.core.policy.access import refs_allowed
 from intent_engineering.core.policy.project import ProjectNotInitialized, workspace_path
 from intent_engineering.extract.deterministic import DeterministicReasoner
-from intent_engineering.reconcile import DetectionInput, LocalResolutionService, detect_drift
+from intent_engineering.reconcile import LocalResolutionService
+from intent_engineering.reconcile.evidence_detection import detect_evidence_drift
+from intent_engineering.storage.executor import LocalChangeSetExecutor
 from intent_engineering.storage.jsonl.case_store import JsonlCaseStore
 from intent_engineering.storage.jsonl.evidence_store import JsonlEvidenceStore
 from intent_engineering.storage.secure import (
@@ -58,51 +60,9 @@ def _front_matter(content: str) -> Mapping[str, Any] | None:
     return cast(Mapping[str, Any], metadata) if isinstance(metadata, Mapping) else None
 
 
-def _detection_input(record: EvidenceRecord) -> DetectionInput | None:
-    """Validate one top-level or front-matter detector fixture against the Task 5 model."""
-    raw = record.payload.get("detection_input")
-    if raw is None:
-        content = record.payload.get("content")
-        metadata = _front_matter(content) if isinstance(content, str) else None
-        raw = metadata.get("detection_input") if metadata is not None else None
-    if not isinstance(raw, Mapping):
-        return None
-    payload = dict(cast(Mapping[str, Any], raw))
-    for side_name in ("requirement", "implementation", "test", "decision"):
-        side = payload.get(side_name)
-        if side is None:
-            continue
-        if not isinstance(side, Mapping):
-            return None
-        copied_side = dict(cast(Mapping[str, Any], side))
-        references = copied_side.get("evidence_refs")
-        if (
-            not isinstance(references, Sequence)
-            or isinstance(references, str)
-            or len(references) != 1
-            or not isinstance(references[0], str)
-            or references[0] not in {"$self", record.id}
-        ):
-            return None
-        copied_side["evidence_refs"] = [record.id]
-        payload[side_name] = copied_side
-    try:
-        return DetectionInput.model_validate(payload)
-    except ValidationError:
-        return None
-
-
 def _detect_cases(delta: EvidenceDelta, graph: Graph, actor: str) -> Sequence[DriftObservation]:
-    """Project fixture evidence into deterministic Task 5 observations without graph mutation."""
-    del graph
-    observations: list[DriftObservation] = []
-    for record in delta.added:
-        if not refs_allowed((record.id,), (record,), actor):
-            continue
-        detection_input = _detection_input(record)
-        if detection_input is not None:
-            observations.extend(detect_drift(detection_input))
-    return tuple(observations)
+    """Resolve combined-run fixture declarations against evidence and final graph state."""
+    return detect_evidence_drift(delta.added, graph, actor)
 
 
 class _FrontMatterReasoner(DeterministicReasoner):
@@ -221,6 +181,7 @@ def load_runtime(root: Path) -> Runtime:
     evidence_store = JsonlEvidenceStore(workspace_directory.file("evidence/evidence.jsonl"))
     case_store = JsonlCaseStore(case_file)
     checkpoint_store = YamlCheckpointStore(workspace_directory.file("cache/checkpoints.yaml"))
+    changeset_executor = LocalChangeSetExecutor(graph_store, case_store, transactions)
     sync = SyncOrchestrator(
         graph_store=graph_store,
         evidence_store=evidence_store,
@@ -228,6 +189,7 @@ def load_runtime(root: Path) -> Runtime:
         case_store=case_store,
         reasoner=_FrontMatterReasoner(actor=config.local_actor),
         case_detector=lambda delta, graph: _detect_cases(delta, graph, config.local_actor),
+        changeset_executor=changeset_executor,
     )
     resolution = LocalResolutionService(
         graph_store,

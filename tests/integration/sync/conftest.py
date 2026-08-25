@@ -17,8 +17,11 @@ from intent_engineering.capture.base import (
 from intent_engineering.core.models import Graph, NodeType, SourceMode
 from intent_engineering.extract.base import SemanticReasoner
 from intent_engineering.extract.deterministic import DeterministicReasoner
+from intent_engineering.storage.executor import LocalChangeSetExecutor
 from intent_engineering.storage.jsonl.case_store import JsonlCaseStore
 from intent_engineering.storage.jsonl.evidence_store import JsonlEvidenceStore
+from intent_engineering.storage.secure import SecureDirectory
+from intent_engineering.storage.transaction import LocalTransactionCoordinator
 from intent_engineering.storage.yaml.checkpoint_store import YamlCheckpointStore
 from intent_engineering.storage.yaml.graph_store import YamlGraphStore
 from intent_engineering.sync.models import SyncRunResult
@@ -144,16 +147,42 @@ class SyncHarness:
         case_detector: Any = None,
         checkpoint_store: Any = None,
         case_store: Any = None,
+        transaction_fault_hook: Any = None,
     ) -> None:
+        directory = SecureDirectory.open(root, create=True)
         self.graph_path = root / "graph.yaml"
         self.evidence_path = root / "evidence.jsonl"
         self.checkpoint_path = root / "checkpoints.yaml"
         self.case_path = root / "cases.jsonl"
-        self.graph_store = YamlGraphStore(self.graph_path, history_path=root / "history.jsonl")
+        raw_case_store = case_store or JsonlCaseStore(directory.file("cases.jsonl"))
+        executor_case_store = (
+            raw_case_store
+            if isinstance(raw_case_store, JsonlCaseStore)
+            else raw_case_store._store
+        )
+        transactions = LocalTransactionCoordinator(
+            directory.file(".local-transaction.json"),
+            {
+                "graph": directory.file("graph.yaml"),
+                "history": directory.file("history.jsonl"),
+                "cases": executor_case_store._file,
+            },
+            fault_hook=transaction_fault_hook,
+        )
+        self.graph_store = YamlGraphStore(
+            directory.file("graph.yaml"),
+            history_path=directory.file("history.jsonl"),
+            transactions=transactions,
+        )
         self.graph_store.initialize(Graph(id="fixture-graph", version=0, nodes=(), edges=()))
-        self.evidence_store = JsonlEvidenceStore(self.evidence_path)
+        self.evidence_store = JsonlEvidenceStore(directory.file("evidence.jsonl"))
         self.checkpoint_store = checkpoint_store or YamlCheckpointStore(self.checkpoint_path)
-        self.case_store = case_store or JsonlCaseStore(self.case_path)
+        self.case_store = raw_case_store
+        executor = LocalChangeSetExecutor(
+            self.graph_store,
+            executor_case_store,
+            transactions,
+        )
         orchestrator_options: dict[str, Any] = {}
         if case_detector is not None:
             orchestrator_options["case_detector"] = case_detector
@@ -163,6 +192,7 @@ class SyncHarness:
             checkpoint_store=self.checkpoint_store,
             case_store=self.case_store,
             reasoner=reasoner or DeterministicReasoner(actor="fixture"),
+            changeset_executor=executor,
             **orchestrator_options,
         )
         self.connectors = connectors

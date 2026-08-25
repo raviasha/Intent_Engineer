@@ -7,7 +7,14 @@ from datetime import UTC, datetime
 import pytest
 
 from intent_engineering.cli.runtime import _detect_cases, _FrontMatterReasoner
-from intent_engineering.core.models import EvidenceDelta, EvidenceRecord, Graph
+from intent_engineering.core.models import (
+    EvidenceDelta,
+    EvidenceRecord,
+    Graph,
+    Node,
+    NodeType,
+    SourceMode,
+)
 
 
 def _record(
@@ -169,8 +176,11 @@ def test_detector_rejects_unreadable_and_noncurrent_references() -> None:
     )
 
 
-def test_detector_accepts_current_self_but_rejects_acl_and_noncurrent_packets() -> None:
-    """The detector only consumes the current authorized evidence record, never a stale reference."""
+def test_detector_requires_independent_authorized_evidence_and_connected_graph() -> None:
+    """Every declared side resolves independently to authorized evidence and graph state."""
+    implementation = _record({}, record_id="evidence:implementation").model_copy(
+        update={"connector_type": "git", "author": "engineer@example.test"}
+    )
     payload = {
         "detection_input": {
             "subject_ref": "r",
@@ -179,17 +189,47 @@ def test_detector_accepts_current_self_but_rejects_acl_and_noncurrent_packets() 
             "requirement_version": 2,
             "implementation_version": 1,
             "requirement": _side_payload("$self"),
-            "implementation": _side_payload("$self"),
+            "implementation": _side_payload(implementation.id),
         }
     }
-    graph = Graph(id="g", version=0, nodes=(), edges=())
+    graph = Graph(
+        id="g",
+        version=0,
+        nodes=(
+            Node(
+                id="r",
+                type=NodeType.REQUIREMENT,
+                label="r",
+                status="active",
+                created_by="a",
+                created_at=datetime(2026, 8, 25, tzinfo=UTC),
+                last_modified_by="a",
+                last_modified_at=datetime(2026, 8, 25, tzinfo=UTC),
+                source_mode=SourceMode.EXPLICIT,
+                evidence_refs=("evidence:one",),
+            ),
+        ),
+        edges=(),
+    )
     current = _record(payload)
     assert (
-        len(_detect_cases(EvidenceDelta(added=(current,), prior_versions={}), graph, "local")) == 1
+        len(
+            _detect_cases(
+                EvidenceDelta(added=(current, implementation), prior_versions={}),
+                graph,
+                "local",
+            )
+        )
+        == 1
     )
     assert (
         _detect_cases(
-            EvidenceDelta(added=(_record(payload, ("other",)),), prior_versions={}), graph, "local"
+            EvidenceDelta(
+                added=(_record(payload, ("other",)), implementation),
+                prior_versions={},
+            ),
+            graph,
+            "local",
         )
         == ()
     )
@@ -197,7 +237,11 @@ def test_detector_accepts_current_self_but_rejects_acl_and_noncurrent_packets() 
         "detection_input": {**payload["detection_input"], "requirement": _side_payload("missing")}
     }
     assert (
-        _detect_cases(EvidenceDelta(added=(_record(stale),), prior_versions={}), graph, "local")
+        _detect_cases(
+            EvidenceDelta(added=(_record(stale), implementation), prior_versions={}),
+            graph,
+            "local",
+        )
         == ()
     )
 

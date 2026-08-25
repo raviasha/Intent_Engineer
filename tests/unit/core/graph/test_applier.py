@@ -18,11 +18,15 @@ from intent_engineering.core.models import (
     ChangeKind,
     ChangeSet,
     ConfidenceChange,
+    Edge,
+    EdgeUpdate,
     Graph,
     ImplementationStatus,
     ImplementationStatusChange,
     Node,
     NodeType,
+    NodeUpdate,
+    RelationType,
     SourceMode,
 )
 
@@ -46,6 +50,28 @@ def node(node_id: str) -> Node:
 
 def graph() -> Graph:
     return Graph(id="graph-1", version=4, nodes=(node("req-1"),), edges=())
+
+
+def edge(edge_id: str, *, status: str = "active") -> Edge:
+    return Edge(
+        id=edge_id,
+        **{"from": "req-1", "to": "req-2"},
+        relation=RelationType.VERIFIED_BY,
+        status=status,
+        created_by="tester",
+        created_at=NOW,
+        last_modified_by="tester",
+        last_modified_at=NOW,
+    )
+
+
+def connected_graph() -> Graph:
+    return Graph(
+        id="graph-1",
+        version=4,
+        nodes=(node("req-1"), node("req-2")),
+        edges=(edge("edge-1"),),
+    )
 
 
 def changeset(**changes: object) -> ChangeSet:
@@ -91,6 +117,53 @@ def test_apply_changeset_rejects_duplicate_added_identity() -> None:
 def test_apply_changeset_rejects_unknown_update_identity() -> None:
     with pytest.raises(UnknownIdentity, match="missing-node"):
         apply_changeset(graph(), changeset(nodes_superseded=("missing-node",)))
+
+
+def test_apply_changeset_materializes_node_update_and_supersession_groups() -> None:
+    replacement = node("req-1").model_copy(update={"label": "Updated"})
+    updated = apply_changeset(
+        graph(),
+        changeset(nodes_updated=(NodeUpdate(node_id="req-1", replacement=replacement),)),
+    )
+    superseded = apply_changeset(
+        updated,
+        changeset(
+            id="cs-2",
+            baseline_graph_version=5,
+            nodes_superseded=("req-1",),
+        ),
+    )
+
+    assert updated.nodes[0].label == "Updated"
+    assert superseded.nodes[0].status == "superseded"
+
+
+def test_apply_changeset_materializes_all_edge_groups() -> None:
+    added = apply_changeset(
+        connected_graph(),
+        changeset(edges_added=(edge("edge-2"),)),
+    )
+    replacement = edge("edge-1", status="reviewed")
+    updated = apply_changeset(
+        added,
+        changeset(
+            id="cs-2",
+            baseline_graph_version=5,
+            edges_updated=(EdgeUpdate(edge_id="edge-1", replacement=replacement),),
+        ),
+    )
+    superseded = apply_changeset(
+        updated,
+        changeset(
+            id="cs-3",
+            baseline_graph_version=6,
+            edges_superseded=("edge-2",),
+        ),
+    )
+
+    assert {item.id for item in added.edges} == {"edge-1", "edge-2"}
+    assert next(item for item in updated.edges if item.id == "edge-1").status == "reviewed"
+    assert next(item for item in superseded.edges if item.id == "edge-2").status == "superseded"
 
 
 def test_apply_changeset_materializes_confidence_change_as_canonical_node_update() -> None:

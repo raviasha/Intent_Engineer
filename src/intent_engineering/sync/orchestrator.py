@@ -5,12 +5,13 @@ from __future__ import annotations
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from hashlib import sha256
 from time import perf_counter
 from typing import Protocol
 
 import structlog
 
-from intent_engineering.capture.base import Connector
+from intent_engineering.capture.base import Connector, SourceObject
 from intent_engineering.capture.checkpoints import checkpoint_after_discovery
 from intent_engineering.core.models import (
     ChangeSet,
@@ -19,8 +20,10 @@ from intent_engineering.core.models import (
     EvidenceRecord,
     Graph,
     ReconciliationCase,
+    SyncCheckpoint,
 )
 from intent_engineering.extract.base import SemanticReasoner
+from intent_engineering.storage.executor import LocalChangeSetExecutor
 from intent_engineering.storage.interfaces import (
     CaseStore,
     CheckpointStore,
@@ -58,6 +61,17 @@ class _ConnectorProgress:
     cases_created: int = 0
 
 
+@dataclass(frozen=True)
+class _PendingConnector:
+    """Fetched connector work awaiting semantic and checkpoint completion."""
+
+    connector: Connector
+    prior: SyncCheckpoint | None
+    discovered: Sequence[SourceObject]
+    delta: EvidenceDelta
+    progress: _ConnectorProgress
+
+
 class SyncOrchestrator:
     """Advance each connector only after all of its durable work has completed."""
 
@@ -70,6 +84,7 @@ class SyncOrchestrator:
         case_store: CaseStore,
         reasoner: SemanticReasoner,
         case_detector: CaseDetector | Callable[[EvidenceDelta, Graph], Sequence[DriftObservation]] = _no_cases,
+        changeset_executor: LocalChangeSetExecutor | None = None,
         clock: Callable[[], datetime] = _utc_now,
     ) -> None:
         self._graph_store = graph_store
@@ -78,6 +93,7 @@ class SyncOrchestrator:
         self._case_store = case_store
         self._reasoner = reasoner
         self._case_detector = case_detector
+        self._changeset_executor = changeset_executor
         self._clock = clock
 
     async def run(self, run_id: str, connectors: Sequence[Connector]) -> SyncRunResult:
@@ -95,6 +111,7 @@ class SyncOrchestrator:
             raise ValueError(f"duplicate connector id: {duplicate_id}")
         started = perf_counter()
         results: dict[str, ConnectorRunResult] = {}
+        pending: list[_PendingConnector] = []
         for connector in connectors:
             progress = _ConnectorProgress()
             try:
@@ -102,8 +119,11 @@ class SyncOrchestrator:
                 discovered = await connector.discover(prior.cursor if prior is not None else None)
                 records: list[EvidenceRecord] = []
                 prior_versions: dict[str, str] = {}
-                for item in discovered:
-                    raw = await connector.fetch(item.external_object_id, item.external_version)
+                for source_object in discovered:
+                    raw = await connector.fetch(
+                        source_object.external_object_id,
+                        source_object.external_version,
+                    )
                     record = connector.normalize(raw)
                     predecessor = self._persist_evidence(record, progress)
                     if predecessor is not None:
@@ -113,27 +133,14 @@ class SyncOrchestrator:
                     added=tuple(records),
                     prior_versions=prior_versions,
                 )
-                if delta.added:
-                    self._apply_delta(delta, progress)
-                checkpoint = checkpoint_after_discovery(
-                    connector,
-                    discovered,
-                    self._clock(),
-                    prior=prior,
-                )
-                checkpoint_advanced = prior is None or checkpoint.cursor != prior.cursor
-                if checkpoint_advanced:
-                    self._checkpoint_store.compare_and_set(
-                        connector.connector_id,
-                        expected=prior,
-                        cursor=checkpoint.cursor,
-                        committed_at=checkpoint.committed_at,
+                pending.append(
+                    _PendingConnector(
+                        connector=connector,
+                        prior=prior,
+                        discovered=tuple(discovered),
+                        delta=delta,
+                        progress=progress,
                     )
-                results[connector.connector_id] = ConnectorRunResult.succeeded(
-                    progress.evidence_added,
-                    progress.changes_applied,
-                    progress.cases_created,
-                    checkpoint_advanced,
                 )
             except Exception as error:  # noqa: BLE001 - boundary intentionally preserves BaseException
                 results[connector.connector_id] = ConnectorRunResult.failed(
@@ -141,6 +148,68 @@ class SyncOrchestrator:
                     evidence_added=progress.evidence_added,
                     changes_applied=progress.changes_applied,
                     cases_created=progress.cases_created,
+                )
+
+        semantic_successes: list[_PendingConnector] = []
+        for pending_item in pending:
+            try:
+                if pending_item.delta.added:
+                    self._apply_reasoning(pending_item.delta, pending_item.progress)
+                semantic_successes.append(pending_item)
+            except Exception as error:  # noqa: BLE001 - connector isolation boundary
+                results[pending_item.connector.connector_id] = ConnectorRunResult.failed(
+                    self._redact_error(error),
+                    evidence_added=pending_item.progress.evidence_added,
+                    changes_applied=pending_item.progress.changes_applied,
+                    cases_created=pending_item.progress.cases_created,
+                )
+
+        if semantic_successes:
+            try:
+                combined = self._combined_delta(semantic_successes)
+                case_count, change_count = self._apply_detected_cases(combined)
+                if case_count:
+                    semantic_successes[0].progress.cases_created += case_count
+                    semantic_successes[0].progress.changes_applied += change_count
+            except Exception as error:  # noqa: BLE001 - shared detector transaction boundary
+                for successful_item in semantic_successes:
+                    results[successful_item.connector.connector_id] = ConnectorRunResult.failed(
+                        self._redact_error(error),
+                        evidence_added=successful_item.progress.evidence_added,
+                        changes_applied=successful_item.progress.changes_applied,
+                        cases_created=successful_item.progress.cases_created,
+                    )
+                semantic_successes = []
+
+        for successful_item in semantic_successes:
+            try:
+                prior = successful_item.prior
+                checkpoint = checkpoint_after_discovery(
+                    successful_item.connector,
+                    successful_item.discovered,
+                    self._clock(),
+                    prior=prior,
+                )
+                checkpoint_advanced = prior is None or checkpoint.cursor != prior.cursor
+                if checkpoint_advanced:
+                    self._checkpoint_store.compare_and_set(
+                        successful_item.connector.connector_id,
+                        expected=prior,
+                        cursor=checkpoint.cursor,
+                        committed_at=checkpoint.committed_at,
+                    )
+                results[successful_item.connector.connector_id] = ConnectorRunResult.succeeded(
+                    successful_item.progress.evidence_added,
+                    successful_item.progress.changes_applied,
+                    successful_item.progress.cases_created,
+                    checkpoint_advanced,
+                )
+            except Exception as error:  # noqa: BLE001 - checkpoint is connector-local
+                results[successful_item.connector.connector_id] = ConnectorRunResult.failed(
+                    self._redact_error(error),
+                    evidence_added=successful_item.progress.evidence_added,
+                    changes_applied=successful_item.progress.changes_applied,
+                    cases_created=successful_item.progress.cases_created,
                 )
         result = SyncRunResult.from_connector_results(
             run_id,
@@ -181,38 +250,86 @@ class SyncOrchestrator:
                 return versions[index - 1] if index else None
         return versions[-1] if versions else None
 
-    def _apply_delta(self, delta: EvidenceDelta, progress: _ConnectorProgress) -> None:
-        """Reason, validate/apply semantic changes, then persist detected cases."""
+    def _apply_reasoning(self, delta: EvidenceDelta, progress: _ConnectorProgress) -> None:
+        """Reason and apply one connector's graph groups before combined detection."""
         graph = self._graph_store.load()
         assertions = self._reasoner.extract_assertions(delta)
         changeset = ChangeSet.model_validate(self._reasoner.map_to_graph(assertions, graph).model_dump())
-        next_graph = self._graph_store.apply(changeset) if changeset.is_semantic else graph
+        if changeset.reconciliation_cases_created or changeset.reconciliation_cases_resolved:
+            raise ValueError("reasoner cannot supply reconciliation payloads")
+        if not changeset.is_semantic:
+            return
+        if self._changeset_executor is None:
+            self._graph_store.apply(changeset)
+        else:
+            self._changeset_executor.apply(changeset)
         progress.changes_applied += int(changeset.is_semantic)
-        self._persist_detected_cases(delta, next_graph, progress)
 
-    def _persist_detected_cases(
+    @staticmethod
+    def _combined_delta(items: Sequence[_PendingConnector]) -> EvidenceDelta:
+        records = tuple(record for item in items for record in item.delta.added)
+        prior_versions: dict[str, str] = {}
+        for item in items:
+            for object_id, evidence_id in item.delta.prior_versions.items():
+                previous = prior_versions.get(object_id)
+                if previous is not None and previous != evidence_id:
+                    raise ValueError("ambiguous combined evidence predecessor")
+                prior_versions[object_id] = evidence_id
+        return EvidenceDelta(added=records, prior_versions=prior_versions)
+
+    def _apply_detected_cases(
         self,
         delta: EvidenceDelta,
-        graph: Graph,
-        progress: _ConnectorProgress,
-    ) -> None:
-        """Persist each new deterministic fingerprint once, after graph application."""
+    ) -> tuple[int, int]:
+        """Commit all new combined-run cases through one complete ChangeSet."""
+        if not delta.added:
+            return 0, 0
+        graph = self._graph_store.load()
+        cases: list[ReconciliationCase] = []
         for observation in sorted(self._case_detector(delta, graph), key=lambda item: item.fingerprint):
             if self._case_store.find_by_fingerprint(observation.fingerprint) is not None:
                 continue
-            case = ReconciliationCase(
-                id=f"case:sha256:{observation.fingerprint}",
-                subject_ref=observation.subject_ref,
-                case_type=observation.case_type,
-                affected_refs=observation.affected_refs,
-                evidence_sides=observation.evidence_sides,
-                detector_id=observation.detector_id,
-                fingerprint=observation.fingerprint,
-                created_at=self._clock(),
-                created_by=f"detector:{observation.detector_id}",
-                requires_human=observation.requires_human,
+            cases.append(
+                ReconciliationCase(
+                    id=f"case:sha256:{observation.fingerprint}",
+                    subject_ref=observation.subject_ref,
+                    case_type=observation.case_type,
+                    affected_refs=observation.affected_refs,
+                    evidence_sides=observation.evidence_sides,
+                    detector_id=observation.detector_id,
+                    fingerprint=observation.fingerprint,
+                    created_at=self._clock(),
+                    created_by=f"detector:{observation.detector_id}",
+                    requires_human=observation.requires_human,
+                )
             )
-            progress.cases_created += int(self._case_store.put(case))
+        if not cases:
+            return 0, 0
+        if self._changeset_executor is None:
+            raise ValueError("case effects require transaction-level executor")
+        case_ids = tuple(case.id for case in cases)
+        evidence_refs = tuple(sorted({ref for case in cases for ref in case.all_evidence_refs}))
+        material = "\x00".join((str(graph.version), *case_ids, *evidence_refs))
+        changeset = ChangeSet(
+            id=f"changeset:detect:{sha256(material.encode('utf-8')).hexdigest()}",
+            actor="detector:sync",
+            timestamp=self._clock(),
+            baseline_graph_version=graph.version,
+            evidence_refs=evidence_refs,
+            nodes_added=(),
+            nodes_updated=(),
+            nodes_superseded=(),
+            edges_added=(),
+            edges_updated=(),
+            edges_superseded=(),
+            confidence_changes=(),
+            implementation_status_changes=(),
+            reconciliation_cases_created=case_ids,
+            reconciliation_cases_resolved=(),
+            validation_status="validated",
+        )
+        self._changeset_executor.apply(changeset, created_cases=tuple(cases))
+        return len(cases), 1
 
     @staticmethod
     def _redact_error(error: Exception) -> str:

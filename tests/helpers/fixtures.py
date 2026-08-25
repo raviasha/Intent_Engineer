@@ -35,24 +35,30 @@ class FixtureRun:
     evidence: tuple[EvidenceRecord, ...]
 
 
-def _side(label: str, claim: str, author: str = "fixture") -> dict[str, Any]:
+def _side(label: str, claim: str, evidence_ref: str) -> dict[str, Any]:
     return {
         "label": label,
         "claim": claim,
-        "evidence_refs": ["$self"],
-        "observed_at": _GIT_DATE,
-        "authors": [author],
+        "evidence_refs": [evidence_ref],
         "confidence": 0.9,
     }
 
 
 def _detection_input(kind: str, subject: str) -> dict[str, Any]:
     """Build explicit facts that exercise one reviewed detector branch."""
-    requirement = _side("requirement", "documented behavior")
-    implementation = _side("implementation", "current code")
-    test = _side("test", "current verification")
-    decision = _side("decision", "approved change")
-    payload: dict[str, Any] = {"subject_ref": subject, "affected_refs": [subject]}
+    requirement = _side("requirement", "documented behavior", "$self")
+    implementation = _side(
+        "implementation",
+        "current code",
+        "git-path:src/implementation.py",
+    )
+    test = _side("test", "current verification", "git-path:tests/test_implementation.py")
+    decision = _side("decision", "approved change", "git-path:docs/decision.txt")
+    payload: dict[str, Any] = {
+        "schema_version": 1,
+        "subject_ref": subject,
+        "affected_refs": [subject],
+    }
     if kind == "aligned":
         payload.update(
             compatibility="aligns",
@@ -109,8 +115,12 @@ def _detection_input(kind: str, subject: str) -> dict[str, Any]:
     elif kind == "cross_author_conflict":
         payload.update(
             compatibility="contradicts",
-            requirement=_side("requirement", "first position", "author-a"),
-            decision=_side("decision", "second position", "author-b"),
+            requirement=_side("requirement", "first position", "$self"),
+            decision=_side(
+                "decision",
+                "second position",
+                "git-path:docs/decision.txt",
+            ),
         )
     else:
         raise ValueError(f"unknown fixture kind: {kind}")
@@ -146,17 +156,94 @@ def _read_fixture(path: Path) -> Mapping[str, str]:
     return cast(Mapping[str, str], loaded)
 
 
+def _git(project: Path, *arguments: str, environment: Mapping[str, str] | None = None) -> None:
+    base_environment = {
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+        "PATH": "/usr/bin:/bin",
+    }
+    if environment is not None:
+        base_environment.update(environment)
+    subprocess.run(
+        ("git", *arguments),
+        cwd=project,
+        env=base_environment,
+        check=True,
+        capture_output=True,
+    )
+
+
+def _commit_path(
+    project: Path,
+    path: str,
+    message: str,
+    *,
+    author_name: str,
+    author_email: str,
+    date: str,
+) -> None:
+    _git(project, "add", "--", path)
+    identity = {
+        "GIT_AUTHOR_NAME": author_name,
+        "GIT_AUTHOR_EMAIL": author_email,
+        "GIT_COMMITTER_NAME": author_name,
+        "GIT_COMMITTER_EMAIL": author_email,
+        "GIT_AUTHOR_DATE": date,
+        "GIT_COMMITTER_DATE": date,
+    }
+    _git(project, "commit", "--quiet", "-m", message, environment=identity)
+
+
 def _commit_fixture_repository(project: Path) -> None:
-    environment = {"LANG": "C.UTF-8", "LC_ALL": "C.UTF-8", "PATH": "/usr/bin:/bin"}
-    environment.update({"GIT_AUTHOR_DATE": _GIT_DATE, "GIT_COMMITTER_DATE": _GIT_DATE})
-    for command in (
-        ("git", "init", "--quiet"),
-        ("git", "config", "user.name", "Intent Fixture"),
-        ("git", "config", "user.email", "fixture@example.test"),
-        ("git", "add", "--", "*.md"),
-        ("git", "commit", "--quiet", "-m", "fixture"),
-    ):
-        subprocess.run(command, cwd=project, env=environment, check=True, capture_output=True)
+    """Create independent code, test, decision, and Markdown evidence revisions."""
+    _git(project, "init", "--quiet")
+    (project / "src").mkdir()
+    (project / "src" / "implementation.py").write_text(
+        "def export() -> str:\n    return 'legacy'\n",
+        encoding="utf-8",
+    )
+    _commit_path(
+        project,
+        "src/implementation.py",
+        "implement export",
+        author_name="Implementation Author",
+        author_email="implementation@example.test",
+        date="2026-08-22T00:00:00+00:00",
+    )
+    (project / "tests").mkdir()
+    (project / "tests" / "test_implementation.py").write_text(
+        "def test_export_contract() -> None:\n    assert True\n",
+        encoding="utf-8",
+    )
+    _commit_path(
+        project,
+        "tests/test_implementation.py",
+        "verify export",
+        author_name="Test Author",
+        author_email="tests@example.test",
+        date="2026-08-23T00:00:00+00:00",
+    )
+    (project / "docs").mkdir()
+    (project / "docs" / "decision.txt").write_text(
+        "Approved export decision.\n",
+        encoding="utf-8",
+    )
+    _commit_path(
+        project,
+        "docs/decision.txt",
+        "record decision",
+        author_name="Decision Author",
+        author_email="decision@example.test",
+        date="2026-08-24T00:00:00+00:00",
+    )
+    _commit_path(
+        project,
+        "fixture.md",
+        "revise requirement",
+        author_name="Product Author",
+        author_email="product@example.test",
+        date=_GIT_DATE,
+    )
 
 
 def materialize_fixture_repository(path: Path, destination: Path) -> Path:
@@ -168,30 +255,20 @@ def materialize_fixture_repository(path: Path, destination: Path) -> Path:
     (project / ".intent" / "evidence" / "evidence.jsonl").write_text("", encoding="utf-8")
     (project / ".intent" / "reconciliation" / "cases.jsonl").write_text("", encoding="utf-8")
     kind, subject = descriptor["kind"], descriptor["subject"]
-    if kind == "cross_author_conflict":
-        _write_markdown(
-            project / "first.md",
-            {"intent_assertion": _assertion("requirement:first", "First")},
-            "First",
-        )
-        _write_markdown(
-            project / "second.md",
-            {"intent_assertion": _assertion("decision:second", "Second")},
-            "Second",
-        )
-        metadata: dict[str, Any] = {"detection_input": _detection_input(kind, subject)}
-    else:
-        metadata = {
-            "intent_assertion": _assertion(f"node:{path.name}", f"{path.name} assertion"),
-            "detection_input": _detection_input(kind, subject),
-        }
+    metadata: dict[str, Any] = {
+        "intent_assertion": _assertion(subject, f"{path.name} assertion"),
+        "detection_input": _detection_input(kind, subject),
+    }
     _write_markdown(project / "fixture.md", metadata, path.name)
     _commit_fixture_repository(project)
     return project
 
 
 def _run(
-    path: Path, *, second: bool
+    path: Path,
+    *,
+    second: bool,
+    sources: str = "markdown,git",
 ) -> tuple[
     SyncRunResult,
     SyncRunResult | None,
@@ -200,9 +277,9 @@ def _run(
     tuple[EvidenceRecord, ...],
 ]:
     with tempfile.TemporaryDirectory(prefix="intent-fixture-") as temporary:
-        project = materialize_fixture_repository(path, Path(temporary))
+        project = materialize_fixture_repository(path, Path(temporary).resolve())
         runtime = load_runtime(project)
-        connectors = resolve_connectors(runtime, "markdown,git")
+        connectors = resolve_connectors(runtime, sources)
         first = anyio.run(runtime.sync.run, "fixture-run", connectors)
         second_result = anyio.run(runtime.sync.run, "fixture-run-2", connectors) if second else None
         return first, second_result, runtime.cases(), runtime.graph_store.load(), runtime.evidence()
@@ -211,6 +288,12 @@ def _run(
 def run_fixture(path: Path) -> FixtureRun:
     """Execute a fresh materialized fixture through the production local runtime."""
     sync, _, cases, graph, evidence = _run(path, second=False)
+    return FixtureRun(sync=sync, cases=cases, graph=graph, evidence=evidence)
+
+
+def run_fixture_with_sources(path: Path, sources: str) -> FixtureRun:
+    """Execute one fixture with an explicit production connector selection."""
+    sync, _, cases, graph, evidence = _run(path, second=False, sources=sources)
     return FixtureRun(sync=sync, cases=cases, graph=graph, evidence=evidence)
 
 

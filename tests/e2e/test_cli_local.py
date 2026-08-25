@@ -111,21 +111,36 @@ def test_corrupt_graph_is_a_redacted_runtime_failure(tmp_path: Path) -> None:
 def test_status_recovers_pending_resolution_journal_before_reading_state(tmp_path: Path) -> None:
     """A non-resolution command must replay an interrupted transaction first."""
     from intent_engineering.cli.runtime import load_runtime
+    from intent_engineering.storage.transaction import LocalTransactionCoordinator
 
     repo = init_git_repo(tmp_path)
     assert run_intent(repo, "init").returncode == 0
     runtime = load_runtime(repo)
     paths = runtime.resolution._paths()
     snapshots = {path: path.read_bytes() if path.exists() else None for path in paths}
-    runtime.resolution._write_journal(snapshots)
     graph = repo / ".intent/graph.yaml"
-    graph.write_text("not: [graph", encoding="utf-8")
+
+    def crash(stage: str) -> None:
+        if stage == "target:graph":
+            raise SystemExit()
+
+    coordinator = LocalTransactionCoordinator(
+        runtime.workspace_directory.file("history/.local-transaction.json"),
+        {
+            "graph": runtime.workspace_directory.file("graph.yaml"),
+            "history": runtime.workspace_directory.file("history/changesets.jsonl"),
+            "cases": runtime.workspace_directory.file("reconciliation/cases.jsonl"),
+        },
+        fault_hook=crash,
+    )
+    with pytest.raises(SystemExit), coordinator.transaction() as transaction:
+        transaction.write("graph", b"not: [graph")
 
     result = run_intent(repo, "status", "--format", "json")
 
     assert result.returncode == 0
     assert graph.read_bytes() == snapshots[graph]
-    assert not runtime.resolution._journal_path().exists()
+    assert not coordinator.journal_path.exists()
 
 
 def test_doctor_reports_redacted_structured_diagnostics_for_corrupt_evidence(
@@ -240,11 +255,35 @@ def test_sync_partial_and_review_exit_codes_are_distinct(tmp_path: Path) -> None
 
 def test_markdown_sync_produces_a_deterministic_reconciliation_case(tmp_path: Path) -> None:
     """Catch a runtime that persists evidence but never wires Task 5 case detection."""
+    import subprocess
+
     repo = init_git_repo(tmp_path)
+    (repo / "src").mkdir()
+    (repo / "src/export.py").write_text(
+        "def export() -> str:\n    return 'old'\n",
+        encoding="utf-8",
+    )
+    subprocess.run(["git", "add", "src/export.py"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "commit", "--quiet", "-m", "implement export"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+    )
     (repo / "drift.md").write_text(
         """---
 intent_engineering:
+  intent_assertion:
+    id: assertion:export
+    subject_id: requirement:export
+    change_kind: initialize
+    node_type: REQUIREMENT
+    label: Local export
+    source_mode: explicit
+    evidence_refs: ["$self"]
+    confidence: 0.9
   detection_input:
+    schema_version: 1
     subject_ref: requirement:export
     affected_refs: [requirement:export]
     compatibility: aligns
@@ -254,15 +293,11 @@ intent_engineering:
       label: requirement
       claim: local export
       evidence_refs: ["$self"]
-      observed_at: "2026-08-25T00:00:00Z"
-      authors: [local]
       confidence: 0.9
     implementation:
       label: implementation
       claim: old export
-      evidence_refs: ["$self"]
-      observed_at: "2026-08-24T00:00:00Z"
-      authors: [local]
+      evidence_refs: ["git-path:src/export.py"]
       confidence: 0.9
 ---
 # Drift fixture
@@ -270,7 +305,7 @@ intent_engineering:
         encoding="utf-8",
     )
     assert run_intent(repo, "init").returncode == 0
-    assert run_intent(repo, "sync", "--sources", "markdown").returncode == 0
+    assert run_intent(repo, "sync", "--sources", "markdown,git").returncode == 0
     cases = run_intent(repo, "reconcile", "list", "--format", "json").json()["cases"]
     assert len(cases) == 1
     assert cases[0]["case_type"] == "CODE_LAG"
