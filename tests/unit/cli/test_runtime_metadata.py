@@ -57,6 +57,8 @@ def test_current_authorized_assertion_forms_project(payload: dict[str, object]) 
     [
         ({"intent_assertion": _assertion("missing")}, ()),
         ({"intent_assertion": _assertion("$self")}, ("other",)),
+        ({"intent_assertion": {**_assertion("$self"), "evidence_refs": []}}, ()),
+        ({"intent_assertion": {**_assertion("$self"), "evidence_refs": ["$self", "$self"]}}, ()),
     ],
 )
 def test_invalid_or_unreadable_assertions_do_not_project(

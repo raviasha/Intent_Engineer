@@ -105,15 +105,16 @@ class _FrontMatterReasoner(DeterministicReasoner):
         if isinstance(assertion, Mapping):
             copied = dict(assertion)
             references = copied.get("evidence_refs")
-            if isinstance(references, Sequence) and not isinstance(references, str):
-                if any(reference not in {"$self", record.id} for reference in references) or not refs_allowed(
-                    (record.id,), (record,), self._actor
-                ):
-                    payload.pop("intent_assertion", None)
-                    return record.model_copy(update={"payload": payload})
-                copied["evidence_refs"] = [
-                    record.id if item == "$self" else item for item in references
-                ]
+            valid_refs = (
+                isinstance(references, Sequence)
+                and not isinstance(references, str)
+                and len(references) == 1
+                and references[0] in {"$self", record.id}
+            )
+            if not valid_refs or not refs_allowed((record.id,), (record,), self._actor):
+                payload.pop("intent_assertion", None)
+                return record.model_copy(update={"payload": payload})
+            copied["evidence_refs"] = [record.id]
             payload["intent_assertion"] = copied
         return record.model_copy(update={"payload": payload})
 
