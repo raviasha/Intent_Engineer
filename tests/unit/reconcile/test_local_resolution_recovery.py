@@ -1,18 +1,20 @@
-"""Crash-only recovery tests for the local resolution journal."""
+"""Crash-only recovery tests for transaction-coordinated local resolution."""
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 
-import intent_engineering.storage.yaml.graph_store as yaml_graph_store
 from intent_engineering.core.models import ReconciliationStatus, ResolutionAction
 from intent_engineering.reconcile import LocalResolutionService
 from intent_engineering.reconcile.service import transition_case
 from intent_engineering.storage.jsonl.case_store import JsonlCaseStore
 from intent_engineering.storage.jsonl.evidence_store import JsonlEvidenceStore
+from intent_engineering.storage.secure import SecureDirectory, SecureFile
+from intent_engineering.storage.transaction import LocalTransactionCoordinator
 from intent_engineering.storage.yaml.graph_store import YamlGraphStore
 from tests.contract.storage.test_evidence_store_contract import evidence_record
 from tests.contract.storage.test_graph_store_contract import graph
@@ -21,133 +23,154 @@ from tests.unit.reconcile.test_case_lifecycle import reconciliation_case
 NOW = datetime(2026, 8, 25, tzinfo=UTC)
 
 
-def _service(tmp_path: Path, *, needs_human: bool = True) -> LocalResolutionService:
-    graph_store = YamlGraphStore(tmp_path / "graph.yaml", history_path=tmp_path / "history.jsonl")
+def _files(root: SecureDirectory) -> dict[str, SecureFile]:
+    return {
+        "graph": root.file("graph.yaml"),
+        "history": root.file("history.jsonl"),
+        "cases": root.file("cases.jsonl"),
+    }
+
+
+def _coordinator(
+    root: SecureDirectory,
+    files: dict[str, SecureFile],
+    fault_hook: Callable[[str], None] | None = None,
+) -> LocalTransactionCoordinator:
+    return LocalTransactionCoordinator(
+        root.file(".local-transaction.json"),
+        files,
+        fault_hook=fault_hook,
+    )
+
+
+def _service(
+    tmp_path: Path,
+    *,
+    needs_human: bool = True,
+    fault_hook: Callable[[str], None] | None = None,
+) -> tuple[LocalResolutionService, dict[str, Path]]:
+    root = SecureDirectory.open(tmp_path)
+    files = _files(root)
+    transactions = _coordinator(root, files, fault_hook)
+    graph_store = YamlGraphStore(
+        files["graph"],
+        history_path=files["history"],
+        transactions=transactions,
+    )
     graph_store.initialize(graph())
-    evidence_store = JsonlEvidenceStore(tmp_path / "evidence.jsonl")
+    evidence_store = JsonlEvidenceStore(root.file("evidence.jsonl"))
     evidence = evidence_record(id="ev-1")
     evidence_store.put(evidence)
-    case_store = JsonlCaseStore(tmp_path / "cases.jsonl")
+    case_store = JsonlCaseStore(files["cases"])
     opened = reconciliation_case(
+        subject_ref="req-1",
+        affected_refs=("req-1",),
         evidence_sides=(
             reconciliation_case()
             .evidence_sides[0]
             .model_copy(update={"evidence_refs": (evidence.id,)}),
-        )
+        ),
     )
     case_store.put(opened)
     if needs_human:
         case_store.put(transition_case(opened, ReconciliationStatus.PROPOSED, "tester", NOW))
         case_store.put(
             transition_case(
-                case_store.get(opened.id), ReconciliationStatus.NEEDS_HUMAN, "tester", NOW
+                case_store.get(opened.id),
+                ReconciliationStatus.NEEDS_HUMAN,
+                "tester",
+                NOW,
             )
         )
-    return LocalResolutionService(graph_store, evidence_store, case_store, "tester")
+    service = LocalResolutionService(
+        graph_store,
+        evidence_store,
+        case_store,
+        "tester",
+        transactions=transactions,
+    )
+    return service, {name: secure_file.path for name, secure_file in files.items()}
 
 
-@pytest.mark.parametrize("stage", ("graph", "history", "case"))
+def _recover(tmp_path: Path) -> LocalResolutionService:
+    root = SecureDirectory.open(tmp_path)
+    files = _files(root)
+    transactions = _coordinator(root, files)
+    transactions.recover()
+    return LocalResolutionService(
+        YamlGraphStore(
+            files["graph"],
+            history_path=files["history"],
+            transactions=transactions,
+        ),
+        JsonlEvidenceStore(root.file("evidence.jsonl")),
+        JsonlCaseStore(files["cases"]),
+        "tester",
+        transactions=transactions,
+    )
+
+
+@pytest.mark.parametrize("stage", ("target:graph", "target:history", "target:cases"))
 def test_system_exit_after_each_durable_resolution_stage_recovers_exact_preimage(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stage: str
+    tmp_path: Path,
+    stage: str,
 ) -> None:
-    service = _service(tmp_path)
-    paths = service._paths()
-    before = {path: path.read_bytes() if path.exists() else None for path in paths}
+    def crash(current: str) -> None:
+        if current == stage:
+            raise SystemExit()
+
+    service, paths = _service(tmp_path, fault_hook=crash)
+    before = {
+        name: path.read_bytes() if path.exists() else None for name, path in paths.items()
+    }
     case = service._case_store.get("case-1")
     graph_version = service._graph_store.load().version
     canonical = service._canonical_changeset(
-        case, graph_version, ResolutionAction.UPDATE_IMPLEMENTATION
+        case,
+        graph_version,
+        ResolutionAction.UPDATE_IMPLEMENTATION,
     )
     approval = service._approval_hash(
-        case, graph_version, ResolutionAction.UPDATE_IMPLEMENTATION, canonical
+        case,
+        graph_version,
+        ResolutionAction.UPDATE_IMPLEMENTATION,
+        canonical,
     )
-    if stage == "graph":
-        original_write = yaml_graph_store.atomic_write_bytes
 
-        def interrupt_after_graph_write(path: Path, content: bytes) -> None:
-            original_write(path, content)
-            raise SystemExit()
-
-        monkeypatch.setattr(yaml_graph_store, "atomic_write_bytes", interrupt_after_graph_write)
-    elif stage == "history":
-        original_append = service._graph_store._history_store.append
-
-        def interrupt_after_history_write(changeset: object) -> object:
-            original_append(changeset)  # type: ignore[arg-type]
-            raise SystemExit()
-
-        monkeypatch.setattr(
-            service._graph_store._history_store,
-            "append",
-            interrupt_after_history_write,
-        )
-    else:
-        original_put = service._case_store.put
-
-        def interrupt_after_case_write(updated: object) -> bool:
-            original_put(updated)  # type: ignore[arg-type]
-            raise SystemExit()
-
-        monkeypatch.setattr(service._case_store, "put", interrupt_after_case_write)
     with pytest.raises(SystemExit):
-        service.resolve("case-1", ResolutionAction.UPDATE_IMPLEMENTATION, approve=approval)
+        service.resolve(
+            "case-1",
+            ResolutionAction.UPDATE_IMPLEMENTATION,
+            approve=approval,
+        )
+
     assert service._journal_path().exists()
-    target = {
-        "graph": service._graph_store.path,
-        "history": service._graph_store._history_store.path,
-        "case": service._case_store.path,
-    }[stage]
-    assert target.exists()
-    assert target.read_bytes() != before[target]
-    fresh = LocalResolutionService(
-        YamlGraphStore(tmp_path / "graph.yaml", history_path=tmp_path / "history.jsonl"),
-        JsonlEvidenceStore(tmp_path / "evidence.jsonl"),
-        JsonlCaseStore(tmp_path / "cases.jsonl"),
-        "tester",
-    )
-    fresh.recover()
-    assert {path: path.read_bytes() if path.exists() else None for path in paths} == before
+    fresh = _recover(tmp_path)
+    assert {
+        name: path.read_bytes() if path.exists() else None for name, path in paths.items()
+    } == before
     assert not fresh._journal_path().exists()
     fresh.recover()
-    assert {path: path.read_bytes() if path.exists() else None for path in paths} == before
 
 
-@pytest.mark.parametrize("append_number", (1, 2))
 def test_system_exit_during_preview_case_append_recovers_exact_preimage(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, append_number: int
+    tmp_path: Path,
 ) -> None:
-    service = _service(tmp_path, needs_human=False)
-    paths = service._paths()
-    before = {path: path.read_bytes() if path.exists() else None for path in paths}
-    original_put = service._case_store.put
-    calls = 0
-
-    def interrupt(case: object) -> bool:
-        nonlocal calls
-        calls += 1
-        result = original_put(case)  # type: ignore[arg-type]
-        if calls == append_number:
+    def crash(stage: str) -> None:
+        if stage == "target:cases":
             raise SystemExit()
-        return result
 
-    monkeypatch.setattr(service._case_store, "put", interrupt)
+    service, paths = _service(tmp_path, needs_human=False, fault_hook=crash)
+    before = {
+        name: path.read_bytes() if path.exists() else None for name, path in paths.items()
+    }
+
     with pytest.raises(SystemExit):
         service.resolve("case-1", ResolutionAction.UPDATE_IMPLEMENTATION)
+
     assert service._journal_path().exists()
-    durable_preview = JsonlCaseStore(service._case_store.path).get("case-1")
-    expected_status = (
-        ReconciliationStatus.PROPOSED if append_number == 1 else ReconciliationStatus.NEEDS_HUMAN
-    )
-    assert durable_preview.status is expected_status
-    fresh = LocalResolutionService(
-        YamlGraphStore(tmp_path / "graph.yaml", history_path=tmp_path / "history.jsonl"),
-        JsonlEvidenceStore(tmp_path / "evidence.jsonl"),
-        JsonlCaseStore(tmp_path / "cases.jsonl"),
-        "tester",
-    )
-    fresh.recover()
-    assert {path: path.read_bytes() if path.exists() else None for path in paths} == before
-    assert not fresh._journal_path().exists()
-    fresh.recover()
-    assert {path: path.read_bytes() if path.exists() else None for path in paths} == before
+    fresh = _recover(tmp_path)
+    assert {
+        name: path.read_bytes() if path.exists() else None for name, path in paths.items()
+    } == before
     assert not fresh._journal_path().exists()

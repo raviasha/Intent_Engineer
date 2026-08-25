@@ -7,7 +7,12 @@ from typing import Annotated
 from pydantic import ConfigDict, Field, field_validator
 
 from intent_engineering.core.models._base import StrictModel
-from intent_engineering.core.models.enums import NodeType, RelationType, SourceMode
+from intent_engineering.core.models.enums import (
+    ImplementationStatus,
+    NodeType,
+    RelationType,
+    SourceMode,
+)
 
 Confidence = Annotated[float, Field(ge=0.0, le=1.0)]
 
@@ -57,6 +62,7 @@ class Node(StrictModel):
     intent_fidelity_confidence: Confidence | None = None
     confidence_basis: str | None = None
     last_reassessed_at: datetime | None = None
+    implementation_status: ImplementationStatus | None = None
     evidence_refs: tuple[str, ...] = ()
 
     @field_validator("type", mode="before")

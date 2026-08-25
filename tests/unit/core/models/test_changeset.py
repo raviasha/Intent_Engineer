@@ -239,3 +239,28 @@ def test_candidate_assertion_default_attributes_are_immutable() -> None:
     assert assertion.attributes == {}
     with pytest.raises(TypeError):
         assertion.attributes["reviewed"] = True  # type: ignore[index]
+
+
+def test_implementation_status_change_requires_evidence_and_material_change() -> None:
+    with pytest.raises(ValidationError, match="implementation status change requires evidence"):
+        ImplementationStatusChange(
+            claim_id="req-1",
+            prior=ImplementationStatus.UNKNOWN,
+            new=ImplementationStatus.PARTIAL,
+            evidence_refs=(),
+        )
+    with pytest.raises(ValidationError, match="must change status"):
+        ImplementationStatusChange(
+            claim_id="req-1",
+            prior=ImplementationStatus.UNKNOWN,
+            new=ImplementationStatus.UNKNOWN,
+            evidence_refs=("ev-1",),
+        )
+
+
+def test_changeset_rejects_explicit_and_derived_updates_for_same_node() -> None:
+    with pytest.raises(ValidationError, match="conflicting node mutation groups"):
+        changeset(
+            nodes_updated=(NodeUpdate(node_id="req-1", replacement=node("req-1")),),
+            confidence_changes=(confidence_change("req-1"),),
+        )

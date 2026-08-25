@@ -2,9 +2,8 @@
 
 from __future__ import annotations
 
-import base64
 import json
-from contextlib import ExitStack
+from collections.abc import Sequence
 from datetime import UTC, datetime
 from hashlib import sha256
 from pathlib import Path
@@ -17,9 +16,16 @@ from intent_engineering.core.models import (
 )
 from intent_engineering.core.policy.access import refs_allowed
 from intent_engineering.reconcile.service import transition_case
-from intent_engineering.storage._atomic import atomic_write_bytes, same_path_lock
-from intent_engineering.storage.jsonl.case_store import JsonlCaseStore
+from intent_engineering.storage.executor import LocalChangeSetExecutor
+from intent_engineering.storage.jsonl.case_store import (
+    JsonlCaseStore,
+    validate_case_appends,
+)
 from intent_engineering.storage.jsonl.evidence_store import JsonlEvidenceStore
+from intent_engineering.storage.transaction import (
+    LocalTransactionCoordinator,
+    TransactionRecoveryError,
+)
 from intent_engineering.storage.yaml.graph_store import YamlGraphStore
 
 
@@ -28,7 +34,7 @@ class ResolutionUnavailable(ValueError):
 
 
 class LocalResolutionService:
-    """Resolve one human-reviewed case over a locked graph/history/case snapshot."""
+    """Resolve one human-reviewed case over crash-consistent local state."""
 
     def __init__(
         self,
@@ -36,11 +42,26 @@ class LocalResolutionService:
         evidence_store: JsonlEvidenceStore,
         case_store: JsonlCaseStore,
         actor: str,
+        *,
+        transactions: LocalTransactionCoordinator | None = None,
     ) -> None:
         self._graph_store = graph_store
         self._evidence_store = evidence_store
         self._case_store = case_store
         self._actor = actor
+        self._transactions = transactions or LocalTransactionCoordinator(
+            graph_store._history_store._file.sibling(".local-transaction.json"),
+            {
+                "graph": graph_store._file,
+                "history": graph_store._history_store._file,
+                "cases": case_store._file,
+            },
+        )
+        self._executor = LocalChangeSetExecutor(
+            graph_store,
+            case_store,
+            self._transactions,
+        )
 
     def resolve(
         self,
@@ -50,87 +71,85 @@ class LocalResolutionService:
         approve: str | None = None,
         at: datetime | None = None,
     ) -> tuple[ReconciliationCase, ChangeSet | None, str | None]:
-        """Prevalidate all state, then commit graph/history/case or restore exact bytes."""
-        paths = self._paths()
-        with ExitStack() as locks:
-            for path in sorted(paths, key=str):
-                locks.enter_context(same_path_lock(path))
-            self._recover()
-            snapshots = {path: path.read_bytes() if path.exists() else None for path in paths}
-            try:
-                case = self._case_store.get(case_id)
-                graph = self._graph_store.load()
-                records = tuple(
-                    self._evidence_store.get(reference) for reference in case.all_evidence_refs
+        """Prevalidate all state, then atomically commit every canonical effect."""
+        try:
+            case = self._case_store.get(case_id)
+            graph = self._graph_store.load()
+            records = tuple(
+                self._evidence_store.get(reference) for reference in case.all_evidence_refs
+            )
+            if not refs_allowed(case.all_evidence_refs, records, self._actor):
+                raise ResolutionUnavailable("resolution unavailable")
+            timestamp = at or datetime.now(UTC)
+            if case.status is ReconciliationStatus.OPEN and action in {
+                ResolutionAction.DEFER,
+                ResolutionAction.MARK_FALSE_POSITIVE,
+            }:
+                target = (
+                    ReconciliationStatus.DEFERRED
+                    if action is ResolutionAction.DEFER
+                    else ReconciliationStatus.FALSE_POSITIVE
                 )
-                if not refs_allowed(case.all_evidence_refs, records, self._actor):
-                    raise ResolutionUnavailable("resolution unavailable")
-                timestamp = at or datetime.now(UTC)
-                if case.status is ReconciliationStatus.OPEN and action in {
-                    ResolutionAction.DEFER,
-                    ResolutionAction.MARK_FALSE_POSITIVE,
-                }:
-                    target = (
-                        ReconciliationStatus.DEFERRED
-                        if action is ResolutionAction.DEFER
-                        else ReconciliationStatus.FALSE_POSITIVE
-                    )
-                    updated = transition_case(case, target, self._actor, timestamp)
-                    self._case_store.put(updated)
-                    return updated, None, None
-                if case.status is ReconciliationStatus.OPEN:
-                    proposed = transition_case(
-                        case, ReconciliationStatus.PROPOSED, self._actor, timestamp
-                    )
-                    reviewed = transition_case(
-                        proposed, ReconciliationStatus.NEEDS_HUMAN, self._actor, timestamp
-                    )
-                    self._write_journal(snapshots)
-                    self._case_store.put(proposed)
-                    self._case_store.put(reviewed)
-                    changeset = self._canonical_changeset(reviewed, graph.version, action)
-                    self._journal_path().unlink(missing_ok=True)
-                    return (
-                        reviewed,
-                        changeset,
-                        self._approval_hash(reviewed, graph.version, action, changeset),
-                    )
-                if action in {ResolutionAction.DEFER, ResolutionAction.MARK_FALSE_POSITIVE}:
-                    raise ResolutionUnavailable("resolution unavailable")
-                if case.status is not ReconciliationStatus.NEEDS_HUMAN or approve is None:
-                    raise ResolutionUnavailable("resolution unavailable")
-                changeset = self._canonical_changeset(case, graph.version, action)
-                expected = self._approval_hash(
+                updated = transition_case(case, target, self._actor, timestamp)
+                self._append_case_versions((updated,))
+                return updated, None, None
+            if case.status is ReconciliationStatus.OPEN:
+                proposed = transition_case(
                     case,
-                    graph.version,
-                    action,
-                    changeset,
-                )
-                if approve != expected:
-                    raise ResolutionUnavailable("resolution unavailable")
-                resolved = transition_case(
-                    case,
-                    ReconciliationStatus.RESOLVED,
+                    ReconciliationStatus.PROPOSED,
                     self._actor,
                     timestamp,
-                    action,
-                    changeset.id,
                 )
-                self._write_journal(snapshots)
-                self._graph_store.apply(changeset)
-                self._case_store.put(resolved)
-                self._journal_path().unlink(missing_ok=True)
-                return resolved, changeset, None
-            except Exception as error:
-                self._restore(snapshots)
-                self._journal_path().unlink(missing_ok=True)
-                if isinstance(error, ResolutionUnavailable):
-                    raise
-                raise ResolutionUnavailable("resolution unavailable") from error
+                reviewed = transition_case(
+                    proposed,
+                    ReconciliationStatus.NEEDS_HUMAN,
+                    self._actor,
+                    timestamp,
+                )
+                changeset = self._canonical_changeset(reviewed, graph.version, action)
+                self._append_case_versions((proposed, reviewed))
+                return (
+                    reviewed,
+                    changeset,
+                    self._approval_hash(reviewed, graph.version, action, changeset),
+                )
+            if action in {ResolutionAction.DEFER, ResolutionAction.MARK_FALSE_POSITIVE}:
+                raise ResolutionUnavailable("resolution unavailable")
+            if case.status is not ReconciliationStatus.NEEDS_HUMAN or approve is None:
+                raise ResolutionUnavailable("resolution unavailable")
+            changeset = self._canonical_changeset(case, graph.version, action)
+            expected = self._approval_hash(case, graph.version, action, changeset)
+            if approve != expected:
+                raise ResolutionUnavailable("resolution unavailable")
+            resolved = transition_case(
+                case,
+                ReconciliationStatus.RESOLVED,
+                self._actor,
+                timestamp,
+                action,
+                changeset.id,
+            )
+            self._executor.apply(changeset, resolved_cases=(resolved,))
+            return resolved, changeset, None
+        except ResolutionUnavailable:
+            raise
+        except Exception as error:
+            raise ResolutionUnavailable("resolution unavailable") from error
+
+    def _append_case_versions(self, cases: Sequence[ReconciliationCase]) -> None:
+        with self._transactions.transaction() as transaction:
+            serialized = validate_case_appends(
+                transaction.read_optional("cases"),
+                cases,
+            )
+            transaction.append("cases", serialized)
 
     @staticmethod
     def _approval_hash(
-        case: ReconciliationCase, graph_version: int, action: ResolutionAction, changeset: ChangeSet
+        case: ReconciliationCase,
+        graph_version: int,
+        action: ResolutionAction,
+        changeset: ChangeSet,
     ) -> str:
         payload = {
             "action": action.value,
@@ -143,70 +162,38 @@ class LocalResolutionService:
         ).hexdigest()
 
     def _canonical_changeset(
-        self, case: ReconciliationCase, graph_version: int, action: ResolutionAction
+        self,
+        case: ReconciliationCase,
+        graph_version: int,
+        action: ResolutionAction,
     ) -> ChangeSet:
         return self._changeset(case, graph_version, action, case.history[-1].at)
 
     def recover(self) -> None:
-        """Replay any interrupted transaction before exposing runtime stores."""
-        with ExitStack() as locks:
-            for path in sorted(self._paths(), key=str):
-                locks.enter_context(same_path_lock(path))
-            self._recover()
+        """Recover raw preimages without exposing paths or content in failures."""
+        try:
+            self._transactions.recover()
+        except TransactionRecoveryError as error:
+            raise ResolutionUnavailable("resolution unavailable") from error
 
     def _paths(self) -> tuple[Path, ...]:
+        """Return path labels for compatibility with local diagnostics and tests."""
         return (
             self._graph_store.path,
             self._graph_store._history_store.path,
             self._case_store.path,
-            self._evidence_store.path,
         )
 
     def _journal_path(self) -> Path:
-        return self._graph_store._history_store.path.with_name(".resolution-journal.json")
-
-    def _write_journal(self, snapshots: dict[Path, bytes | None]) -> None:
-        payload = {
-            "version": 1,
-            "preimages": {
-                str(path): None if content is None else base64.b64encode(content).decode("ascii")
-                for path, content in snapshots.items()
-            },
-        }
-        atomic_write_bytes(
-            self._journal_path(),
-            json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8"),
-        )
-
-    def _recover(self) -> None:
-        journal = self._journal_path()
-        if not journal.exists():
-            return
-        try:
-            loaded = json.loads(journal.read_text(encoding="utf-8"))
-            encoded = loaded["preimages"]
-            snapshots = {
-                path: None if encoded[str(path)] is None else base64.b64decode(encoded[str(path)])
-                for path in self._paths()
-            }
-        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
-            raise ResolutionUnavailable("resolution unavailable") from error
-        self._restore(snapshots)
-        journal.unlink()
-
-    @staticmethod
-    def _restore(snapshots: dict[Path, bytes | None]) -> None:
-        for path, content in snapshots.items():
-            if content is None:
-                try:
-                    path.unlink()
-                except FileNotFoundError:
-                    pass
-            else:
-                atomic_write_bytes(path, content)
+        """Return the journal's diagnostic label; persistence remains descriptor-rooted."""
+        return self._transactions.journal_path
 
     def _changeset(
-        self, case: ReconciliationCase, version: int, action: ResolutionAction, timestamp: datetime
+        self,
+        case: ReconciliationCase,
+        version: int,
+        action: ResolutionAction,
+        timestamp: datetime,
     ) -> ChangeSet:
         material = f"{case.id}\x00{version}\x00{action.value}\x00" + "\x00".join(
             case.all_evidence_refs

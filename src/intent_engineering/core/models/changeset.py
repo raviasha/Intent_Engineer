@@ -65,6 +65,14 @@ class ImplementationStatusChange(StrictModel):
     new: ImplementationStatus
     evidence_refs: tuple[str, ...]
 
+    @model_validator(mode="after")
+    def require_material_change_with_evidence(self) -> ImplementationStatusChange:
+        if not self.evidence_refs:
+            raise ValueError("implementation status change requires evidence")
+        if self.prior is self.new:
+            raise ValueError("implementation status change must change status")
+        return self
+
 
 class CandidateAssertion(StrictModel):
     """A deterministic reasoner's typed, evidence-backed proposal boundary."""
@@ -177,6 +185,12 @@ class ChangeSet(StrictModel):
             raise ValueError("cannot both update and supersede node")
         if edge_updates & edge_supersessions:
             raise ValueError("cannot both update and supersede edge")
+        derived_node_updates = set(mutation_subjects["confidence_changes"]) | set(
+            mutation_subjects["implementation_status_changes"]
+        )
+        explicit_node_mutations = node_additions | node_updates | node_supersessions
+        if derived_node_updates & explicit_node_mutations:
+            raise ValueError("conflicting node mutation groups")
         if self.is_semantic and not self.evidence_refs:
             raise ValueError("semantic ChangeSet requires evidence")
         return self

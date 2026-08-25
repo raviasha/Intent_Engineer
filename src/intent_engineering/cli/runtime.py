@@ -35,6 +35,7 @@ from intent_engineering.storage.secure import (
     UnsafePathError,
     configured_graph_relative,
 )
+from intent_engineering.storage.transaction import LocalTransactionCoordinator
 from intent_engineering.storage.yaml.checkpoint_store import YamlCheckpointStore
 from intent_engineering.storage.yaml.graph_store import YamlGraphStore
 from intent_engineering.sync import SyncOrchestrator
@@ -170,6 +171,7 @@ class Runtime:
     resolution: LocalResolutionService
     project_directory: SecureDirectory
     workspace_directory: SecureDirectory
+    transactions: LocalTransactionCoordinator
 
     def evidence(self) -> tuple[EvidenceRecord, ...]:
         """Load persisted evidence in append order for read-only CLI projections."""
@@ -203,12 +205,21 @@ def load_runtime(root: Path) -> Runtime:
         graph_file.assert_regular()
     except UnsafePathError as error:
         raise UnsafePathError("configured graph path is unsafe") from error
+    history_file = workspace_directory.file("history/changesets.jsonl")
+    case_file = workspace_directory.file("reconciliation/cases.jsonl")
+    transactions = LocalTransactionCoordinator(
+        workspace_directory.file("history/.local-transaction.json"),
+        {"graph": graph_file, "history": history_file, "cases": case_file},
+    )
+    # Raw preimages must be restored before a torn YAML or JSONL file reaches a parser.
+    transactions.recover()
     graph_store = YamlGraphStore(
         graph_file,
-        history_path=workspace_directory.file("history/changesets.jsonl"),
+        history_path=history_file,
+        transactions=transactions,
     )
     evidence_store = JsonlEvidenceStore(workspace_directory.file("evidence/evidence.jsonl"))
-    case_store = JsonlCaseStore(workspace_directory.file("reconciliation/cases.jsonl"))
+    case_store = JsonlCaseStore(case_file)
     checkpoint_store = YamlCheckpointStore(workspace_directory.file("cache/checkpoints.yaml"))
     sync = SyncOrchestrator(
         graph_store=graph_store,
@@ -218,7 +229,13 @@ def load_runtime(root: Path) -> Runtime:
         reasoner=_FrontMatterReasoner(actor=config.local_actor),
         case_detector=lambda delta, graph: _detect_cases(delta, graph, config.local_actor),
     )
-    resolution = LocalResolutionService(graph_store, evidence_store, case_store, config.local_actor)
+    resolution = LocalResolutionService(
+        graph_store,
+        evidence_store,
+        case_store,
+        config.local_actor,
+        transactions=transactions,
+    )
     resolution.recover()
     return Runtime(
         root=root,
@@ -232,6 +249,7 @@ def load_runtime(root: Path) -> Runtime:
         resolution=resolution,
         project_directory=project_directory,
         workspace_directory=workspace_directory,
+        transactions=transactions,
     )
 
 

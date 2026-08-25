@@ -16,6 +16,16 @@ class HistoryStoreError(ValueError):
     """Raised when persisted ChangeSet history cannot be reconstructed."""
 
 
+def serialize_changeset(changeset: ChangeSet) -> bytes:
+    """Return one canonical JSONL representation for a validated ChangeSet."""
+    return json.dumps(
+        changeset.model_dump(mode="json", by_alias=True),
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8") + b"\n"
+
+
 def _subjects(changeset: ChangeSet) -> Iterable[str]:
     yield from (item.id for item in changeset.nodes_added)
     yield from (item.node_id for item in changeset.nodes_updated)
@@ -66,12 +76,7 @@ class JsonlHistoryStore:
 
     def append(self, changeset: ChangeSet) -> None:
         """Durably append one successfully applied ChangeSet."""
-        serialized = json.dumps(
-            changeset.model_dump(mode="json", by_alias=True),
-            ensure_ascii=False,
-            separators=(",", ":"),
-            sort_keys=True,
-        ).encode("utf-8") + b"\n"
+        serialized = serialize_changeset(changeset)
         with same_path_lock(self._file):
             self._rebuild_index_unlocked()
             append_durable_line(self._file, serialized)

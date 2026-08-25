@@ -61,6 +61,18 @@
       "title": "Edge",
       "type": "object"
     },
+    "ImplementationStatus": {
+      "enum": [
+        "implemented_baseline",
+        "partial",
+        "not_started",
+        "requirements_incomplete",
+        "unknown",
+        "stale_evidence"
+      ],
+      "title": "ImplementationStatus",
+      "type": "string"
+    },
     "Node": {
       "additionalProperties": false,
       "description": "A typed assertion in the canonical intent graph.",
@@ -97,6 +109,17 @@
         "id": {
           "title": "Id",
           "type": "string"
+        },
+        "implementation_status": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ImplementationStatus"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
         },
         "intent_fidelity_confidence": {
           "anyOf": [

@@ -22,6 +22,8 @@ from intent_engineering.core.models import (
 )
 from intent_engineering.storage._atomic import same_path_lock
 from intent_engineering.storage.interfaces import GraphStore
+from intent_engineering.storage.secure import SecureDirectory
+from intent_engineering.storage.transaction import LocalTransactionCoordinator
 from intent_engineering.storage.yaml.graph_store import YamlGraphStore
 
 NOW = datetime(2026, 8, 25, tzinfo=UTC)
@@ -133,6 +135,49 @@ def test_failed_apply_preserves_canonical_bytes_and_does_not_append_history(
     assert path.read_bytes() == before
     assert store.history("missing-node") == ()
     assert history_path.exists() is False
+
+
+@pytest.mark.parametrize("stage", ("target:graph", "target:history"))
+def test_crashed_graph_apply_recovers_graph_and_history_together(
+    tmp_path: Path,
+    stage: str,
+) -> None:
+    root = SecureDirectory.open(tmp_path)
+    graph_file = root.file("graph.yaml")
+    history_file = root.file("history.jsonl")
+    journal_file = root.file(".local-transaction.json")
+    YamlGraphStore(graph_file, history_path=history_file).initialize(graph())
+    before = {
+        "graph": graph_file.read_optional(),
+        "history": history_file.read_optional(),
+    }
+
+    def crash(current: str) -> None:
+        if current == stage:
+            raise SystemExit()
+
+    crashing = LocalTransactionCoordinator(
+        journal_file,
+        {"graph": graph_file, "history": history_file},
+        fault_hook=crash,
+    )
+    store = YamlGraphStore(
+        graph_file,
+        history_path=history_file,
+        transactions=crashing,
+    )
+    with pytest.raises(SystemExit):
+        store.apply(changeset(nodes_added=(node("req-3"),)))
+
+    recovery = LocalTransactionCoordinator(
+        journal_file,
+        {"graph": graph_file, "history": history_file},
+    )
+    recovery.recover()
+    assert {
+        "graph": graph_file.read_optional(),
+        "history": history_file.read_optional(),
+    } == before
 
 
 def test_graph_store_rejects_unknown_mutation_identity(tmp_path: Path) -> None:
