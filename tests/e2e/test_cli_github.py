@@ -867,8 +867,46 @@ def test_verified_report_write_rejects_a_hardlink_added_at_installation(
 
 
 @pytest.mark.parametrize("existing", [False, True])
-@pytest.mark.parametrize("failure_stage", ["rename", "parent_fsync"])
-def test_verified_report_write_rolls_back_cancellation_at_each_install_phase(
+def test_verified_report_strict_path_never_uses_pathname_unlink(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    existing: bool,
+) -> None:
+    target = tmp_path / "intent-drift.md"
+    if existing:
+        target.write_bytes(b"original report\n")
+    secure_file = SecureFile.from_path(target)
+
+    def reject_unlink(*args: object, **kwargs: object) -> None:
+        raise AssertionError("strict write used pathname unlink")
+
+    monkeypatch.setattr(secure_storage.os, "unlink", reject_unlink)
+    try:
+        secure_file.atomic_write(b"replacement report\n", reject_target_races=True)
+    finally:
+        secure_file.close()
+
+    assert target.read_bytes() == b"replacement report\n"
+    for tombstone in tmp_path.glob(".intent-drift.md.*.rollback"):
+        metadata = tombstone.stat(follow_symlinks=False)
+        assert metadata.st_size == 0
+        assert metadata.st_nlink == 1
+        assert tombstone.is_file() and not tombstone.is_symlink()
+
+
+@pytest.mark.parametrize(
+    ("existing", "failure_stage"),
+    [
+        (False, "prepared"),
+        (False, "new-installed"),
+        (False, "new-durable"),
+        (True, "prepared"),
+        (True, "existing-exchanged"),
+        (True, "existing-durable"),
+        (True, "original-quarantined"),
+    ],
+)
+def test_verified_report_named_cancellation_phases_restore_exact_preimage(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     existing: bool,
@@ -882,51 +920,13 @@ def test_verified_report_write_rolls_back_cancellation_at_each_install_phase(
     else:
         original_identity = None
     secure_file = SecureFile.from_path(target)
-    parent_fd = secure_file.parent_fd
     cancellation = CancelledError()
-    installed = False
-    injected = False
 
-    if existing:
-        original_rename = secure_storage._exchange_names
-
-        def cancel_after_rename(parent_fd: int, left: str, right: str) -> None:
-            nonlocal injected, installed
-            original_rename(parent_fd, left, right)
-            installed = True
-            if failure_stage == "rename" and not injected:
-                injected = True
-                raise cancellation
-
-        monkeypatch.setattr(secure_storage, "_exchange_names", cancel_after_rename)
-    else:
-        original_rename = secure_storage._rename_exclusive
-
-        def cancel_after_rename(parent_fd: int, left: str, right: str) -> None:
-            nonlocal injected, installed
-            original_rename(parent_fd, left, right)
-            installed = True
-            if failure_stage == "rename" and not injected:
-                injected = True
-                raise cancellation
-
-        monkeypatch.setattr(secure_storage, "_rename_exclusive", cancel_after_rename)
-
-    original_fsync = secure_storage.os.fsync
-
-    def cancel_parent_fsync(descriptor: int) -> None:
-        nonlocal injected
-        if (
-            failure_stage == "parent_fsync"
-            and installed
-            and descriptor == parent_fd
-            and not injected
-        ):
-            injected = True
+    def cancel_named_phase(owned: SecureFile, stage: str) -> None:
+        if stage == failure_stage:
             raise cancellation
-        original_fsync(descriptor)
 
-    monkeypatch.setattr(secure_storage.os, "fsync", cancel_parent_fsync)
+    monkeypatch.setattr(SecureFile, "_strict_fault", cancel_named_phase)
     try:
         with pytest.raises(CancelledError) as caught:
             secure_file.atomic_write(b"replacement report\n", reject_target_races=True)
@@ -940,92 +940,248 @@ def test_verified_report_write_rolls_back_cancellation_at_each_install_phase(
     else:
         assert not target.exists()
     assert not tuple(tmp_path.glob(".intent-drift.md.*.tmp"))
+    assert all(item.stat().st_size == 0 for item in tmp_path.glob(".*.rollback"))
 
-    retry = SecureFile.from_path(target)
+
+def test_verified_report_indeterminate_error_is_fixed_and_payload_free(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = tmp_path / "intent-drift.md"
+    replacement = b"private replacement report\n"
+    secure_file = SecureFile.from_path(target)
+
+    def cancel_prepared(owned: SecureFile, stage: str) -> None:
+        if stage == "prepared":
+            raise CancelledError()
+
+    monkeypatch.setattr(SecureFile, "_strict_fault", cancel_prepared)
+    monkeypatch.setattr(SecureFile, "_quarantine_owned_entry", lambda *args: False)
     try:
-        retry.atomic_write(b"replacement report\n", reject_target_races=True)
+        with pytest.raises(BaseException) as caught:
+            secure_file.atomic_write(replacement, reject_target_races=True)
     finally:
-        retry.close()
-    assert target.read_bytes() == b"replacement report\n"
-    assert not tuple(tmp_path.glob(".intent-drift.md.*.tmp"))
+        secure_file.close()
+
+    assert type(caught.value).__name__ == "AtomicWriteRollbackError"
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+    assert replacement.decode().strip() not in _source_traceback_locals(caught.value)
 
 
 @pytest.mark.parametrize("existing", [False, True])
-def test_verified_report_write_recovers_when_rollback_is_itself_interrupted(
+def test_verified_report_owned_descriptor_close_retries_before_success(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     existing: bool,
 ) -> None:
     target = tmp_path / "intent-drift.md"
-    original = b"original report\n"
     if existing:
-        target.write_bytes(original)
-        original_identity = (target.stat().st_dev, target.stat().st_ino)
-    else:
-        original_identity = None
+        target.write_bytes(b"original report\n")
     secure_file = SecureFile.from_path(target)
-    cancellation = CancelledError()
+    original_close = secure_storage.os.close
+    interrupted = False
 
-    if existing:
-        original_exchange = secure_storage._exchange_names
-        exchange_calls = 0
+    def interrupt_first_owned_close(descriptor: int) -> None:
+        nonlocal interrupted
+        if descriptor != secure_file.parent_fd and not interrupted:
+            interrupted = True
+            raise OSError("close interrupted before effect")
+        original_close(descriptor)
 
-        def interrupt_install_and_first_rollback(
-            parent_fd: int,
-            left: str,
-            right: str,
-        ) -> None:
-            nonlocal exchange_calls
-            exchange_calls += 1
-            if exchange_calls == 1:
-                original_exchange(parent_fd, left, right)
-                raise cancellation
-            if exchange_calls == 2:
-                raise KeyboardInterrupt("rollback interrupted")
-            original_exchange(parent_fd, left, right)
-
-        monkeypatch.setattr(
-            secure_storage,
-            "_exchange_names",
-            interrupt_install_and_first_rollback,
-        )
-    else:
-        original_rename = secure_storage._rename_exclusive
-
-        def cancel_after_install(parent_fd: int, left: str, right: str) -> None:
-            original_rename(parent_fd, left, right)
-            raise cancellation
-
-        monkeypatch.setattr(secure_storage, "_rename_exclusive", cancel_after_install)
-        original_unlink = secure_storage.os.unlink
-        unlink_interrupted = False
-
-        def interrupt_first_target_unlink(
-            path: os.PathLike[str] | str,
-            *args: object,
-            **kwargs: object,
-        ) -> None:
-            nonlocal unlink_interrupted
-            if path == target.name and not unlink_interrupted:
-                unlink_interrupted = True
-                raise KeyboardInterrupt("rollback interrupted")
-            original_unlink(path, *args, **kwargs)
-
-        monkeypatch.setattr(secure_storage.os, "unlink", interrupt_first_target_unlink)
-
+    monkeypatch.setattr(secure_storage.os, "close", interrupt_first_owned_close)
     try:
-        with pytest.raises(CancelledError) as caught:
-            secure_file.atomic_write(b"replacement report\n", reject_target_races=True)
+        secure_file.atomic_write(b"replacement report\n", reject_target_races=True)
     finally:
         secure_file.close()
 
-    assert caught.value is cancellation
-    if existing:
-        assert target.read_bytes() == original
-        assert (target.stat().st_dev, target.stat().st_ino) == original_identity
-    else:
-        assert not target.exists()
-    assert not tuple(tmp_path.glob(".intent-drift.md.*.tmp"))
+    assert interrupted is True
+    assert target.read_bytes() == b"replacement report\n"
+
+
+def test_verified_report_close_exhaustion_clears_prior_failure_payload(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = tmp_path / "intent-drift.md"
+    secret = "PRIVATE-CONTENT-TRACE-7719"
+    secure_file = SecureFile.from_path(target)
+    captured: list[int] = []
+
+    def fail_prepared(owned: SecureFile, stage: str) -> None:
+        if stage == "prepared":
+            raise CancelledError(secret)
+
+    def exhaust_close(descriptor: int) -> bool:
+        captured.append(descriptor)
+        return False
+
+    monkeypatch.setattr(SecureFile, "_strict_fault", fail_prepared)
+    monkeypatch.setattr(SecureFile, "_close_descriptor", staticmethod(exhaust_close))
+    try:
+        with pytest.raises(BaseException) as caught:
+            secure_file.atomic_write(secret.encode(), reject_target_races=True)
+    finally:
+        for descriptor in captured:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        secure_file.close()
+
+    assert type(caught.value).__name__ == "AtomicWriteRollbackError"
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+    assert secret not in _source_traceback_locals(caught.value)
+
+
+def test_verified_report_hardlinked_prepared_temp_uses_fixed_outcome(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = tmp_path / "intent-drift.md"
+    outside = tmp_path / "external-copy.md"
+    replacement = b"private replacement report\n"
+    secure_file = SecureFile.from_path(target)
+
+    def link_prepared(owned: SecureFile, stage: str) -> None:
+        if stage == "prepared":
+            temporary = next(tmp_path.glob(".intent-drift.md.*.tmp"))
+            os.link(temporary, outside)
+
+    original_rename = secure_storage._rename_exclusive
+    failed = False
+
+    def fail_install(parent_fd: int, left: str, right: str) -> None:
+        nonlocal failed
+        if right == target.name and not failed:
+            failed = True
+            raise OSError("install failed before effect")
+        original_rename(parent_fd, left, right)
+
+    monkeypatch.setattr(SecureFile, "_strict_fault", link_prepared)
+    monkeypatch.setattr(secure_storage, "_rename_exclusive", fail_install)
+    try:
+        with pytest.raises(BaseException) as caught:
+            secure_file.atomic_write(replacement, reject_target_races=True)
+    finally:
+        secure_file.close()
+
+    assert type(caught.value).__name__ == "AtomicWriteRollbackError"
+    assert outside.read_bytes() == b""
+    assert all(
+        replacement not in item.read_bytes()
+        for item in tmp_path.iterdir()
+        if item.is_file() and not item.is_symlink()
+    )
+
+
+def test_verified_report_terminal_quarantine_reauth_detects_external_swap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = tmp_path / "intent-drift.md"
+    foreign_source = tmp_path / "foreign.md"
+    stolen = tmp_path / "stolen-report.md"
+    foreign = b"foreign entry must survive\n"
+    foreign_source.write_bytes(foreign)
+    secure_file = SecureFile.from_path(target)
+    cancellation = CancelledError()
+    original_stat = secure_storage.os.stat
+    swapped = False
+
+    def cancel_installed(owned: SecureFile, stage: str) -> None:
+        if stage == "new-installed":
+            raise cancellation
+
+    def swap_after_first_quarantine_auth(
+        path: os.PathLike[str] | str,
+        *args: object,
+        **kwargs: object,
+    ) -> os.stat_result:
+        nonlocal swapped
+        observed = original_stat(path, *args, **kwargs)
+        if str(path).endswith(".rollback") and not swapped:
+            os.replace(tmp_path / str(path), stolen)
+            os.replace(foreign_source, tmp_path / str(path))
+            swapped = True
+        return observed
+
+    monkeypatch.setattr(SecureFile, "_strict_fault", cancel_installed)
+    monkeypatch.setattr(secure_storage.os, "stat", swap_after_first_quarantine_auth)
+    try:
+        with pytest.raises(BaseException) as caught:
+            secure_file.atomic_write(b"private report\n", reject_target_races=True)
+    finally:
+        secure_file.close()
+
+    assert swapped is True
+    assert type(caught.value).__name__ == "AtomicWriteRollbackError"
+    assert stolen.read_bytes() == b""
+    assert any(item.read_bytes() == foreign for item in tmp_path.iterdir() if item.is_file())
+
+
+def test_verified_report_terminal_rollback_reauth_detects_external_target_swap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = tmp_path / "intent-drift.md"
+    stolen = tmp_path / "stolen-original.md"
+    foreign_source = tmp_path / "foreign.md"
+    original = b"original report\n"
+    foreign = b"foreign entry must survive\n"
+    target.write_bytes(original)
+    original_identity = (target.stat().st_dev, target.stat().st_ino)
+    foreign_source.write_bytes(foreign)
+    secure_file = SecureFile.from_path(target)
+    cancellation = CancelledError()
+    original_stat = secure_storage.os.stat
+    rollback_started = False
+    swapped = False
+
+    def cancel_exchanged(owned: SecureFile, stage: str) -> None:
+        nonlocal rollback_started
+        if stage == "existing-exchanged":
+            rollback_started = True
+            raise cancellation
+
+    def swap_after_restored_target_auth(
+        path: os.PathLike[str] | str,
+        *args: object,
+        **kwargs: object,
+    ) -> os.stat_result:
+        nonlocal swapped
+        observed = original_stat(path, *args, **kwargs)
+        observed_identity = (observed.st_dev, observed.st_ino)
+        if (
+            str(path) == target.name
+            and rollback_started
+            and observed_identity == original_identity
+            and not swapped
+        ):
+            os.replace(target, stolen)
+            os.replace(foreign_source, target)
+            swapped = True
+        return observed
+
+    monkeypatch.setattr(SecureFile, "_strict_fault", cancel_exchanged)
+    monkeypatch.setattr(secure_storage.os, "stat", swap_after_restored_target_auth)
+    try:
+        with pytest.raises(BaseException) as caught:
+            secure_file.atomic_write(b"private report\n", reject_target_races=True)
+    finally:
+        secure_file.close()
+
+    assert swapped is True
+    assert type(caught.value).__name__ == "AtomicWriteRollbackError"
+    surviving = [
+        item.read_bytes()
+        for item in tmp_path.iterdir()
+        if item.is_file() and not item.is_symlink()
+    ]
+    assert foreign in surviving
+    assert original in surviving
+    assert all(b"private report" not in content for content in surviving)
 
 
 @pytest.mark.parametrize("existing", [False, True])
@@ -1045,37 +1201,26 @@ def test_verified_report_rollback_scrubs_a_raced_external_hardlink(
         original_identity = None
     secure_file = SecureFile.from_path(target)
     cancellation = CancelledError()
-    installed = False
+    injected = False
 
-    if existing:
-        original_exchange = secure_storage._exchange_names
-
-        def link_then_cancel(parent_fd: int, left: str, right: str) -> None:
-            nonlocal installed
-            original_exchange(parent_fd, left, right)
-            if not installed:
-                installed = True
-                os.link(target, outside)
-                raise cancellation
-
-        monkeypatch.setattr(secure_storage, "_exchange_names", link_then_cancel)
-    else:
-        original_rename = secure_storage._rename_exclusive
-
-        def link_then_cancel(parent_fd: int, left: str, right: str) -> None:
-            original_rename(parent_fd, left, right)
+    def link_then_cancel(owned: SecureFile, stage: str) -> None:
+        nonlocal injected
+        expected_stage = "existing-exchanged" if existing else "new-installed"
+        if stage == expected_stage and not injected:
+            injected = True
             os.link(target, outside)
             raise cancellation
 
-        monkeypatch.setattr(secure_storage, "_rename_exclusive", link_then_cancel)
+    monkeypatch.setattr(SecureFile, "_strict_fault", link_then_cancel)
 
     try:
-        with pytest.raises(CancelledError) as caught:
+        with pytest.raises(BaseException) as caught:
             secure_file.atomic_write(replacement, reject_target_races=True)
     finally:
         secure_file.close()
 
-    assert caught.value is cancellation
+    assert type(caught.value).__name__ == "AtomicWriteRollbackError"
+    assert injected is True
     if existing:
         assert target.read_bytes() == original
         assert (target.stat().st_dev, target.stat().st_ino) == original_identity
@@ -1150,7 +1295,7 @@ def test_verified_report_write_reauthenticates_after_parent_fsync(
     assert not tuple(tmp_path.glob(".intent-drift.md.*.tmp"))
 
 
-def test_verified_report_write_rolls_back_cancellation_before_displaced_unlink(
+def test_verified_report_write_rolls_back_cancellation_before_original_scrub(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1161,21 +1306,15 @@ def test_verified_report_write_rolls_back_cancellation_before_displaced_unlink(
     original_identity = (target.stat().st_dev, target.stat().st_ino)
     secure_file = SecureFile.from_path(target)
     cancellation = CancelledError()
-    original_unlink = secure_storage.os.unlink
     interrupted = False
 
-    def cancel_before_displaced_unlink(
-        path: os.PathLike[str] | str,
-        *args: object,
-        **kwargs: object,
-    ) -> None:
+    def cancel_before_original_scrub(owned: SecureFile, stage: str) -> None:
         nonlocal interrupted
-        if isinstance(path, str) and path.endswith(".tmp") and not interrupted:
+        if stage == "original-quarantined" and not interrupted:
             interrupted = True
             raise cancellation
-        original_unlink(path, *args, **kwargs)
 
-    monkeypatch.setattr(secure_storage.os, "unlink", cancel_before_displaced_unlink)
+    monkeypatch.setattr(SecureFile, "_strict_fault", cancel_before_original_scrub)
     try:
         with pytest.raises(CancelledError) as caught:
             secure_file.atomic_write(replacement, reject_target_races=True)
@@ -1197,7 +1336,7 @@ def test_verified_report_write_rolls_back_cancellation_before_displaced_unlink(
     assert not tuple(tmp_path.glob(".intent-drift.md.*.tmp"))
 
 
-def test_verified_report_write_commit_wins_after_displaced_unlink_completed(
+def test_verified_report_write_commit_wins_after_original_scrub_completed(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1207,21 +1346,15 @@ def test_verified_report_write_commit_wins_after_displaced_unlink_completed(
     target.write_bytes(original)
     secure_file = SecureFile.from_path(target)
     cancellation = CancelledError()
-    original_unlink = secure_storage.os.unlink
     interrupted = False
 
-    def cancel_after_displaced_unlink(
-        path: os.PathLike[str] | str,
-        *args: object,
-        **kwargs: object,
-    ) -> None:
+    def cancel_after_original_scrub(owned: SecureFile, stage: str) -> None:
         nonlocal interrupted
-        original_unlink(path, *args, **kwargs)
-        if isinstance(path, str) and path.endswith(".tmp") and not interrupted:
+        if stage == "original-scrubbed" and not interrupted:
             interrupted = True
             raise cancellation
 
-    monkeypatch.setattr(secure_storage.os, "unlink", cancel_after_displaced_unlink)
+    monkeypatch.setattr(SecureFile, "_strict_fault", cancel_after_original_scrub)
     try:
         secure_file.atomic_write(replacement, reject_target_races=True)
     finally:

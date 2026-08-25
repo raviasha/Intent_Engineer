@@ -40,7 +40,8 @@ _CREDENTIAL_PATTERN = re.compile(
     r"(?i)(?:github_pat_|gh[pousr]_[A-Za-z0-9_-]*|bearer\s+|authorization\s*[:=])"
 )
 _LOCAL_PATH_PATTERN = re.compile(
-    r"(?i:file:///)\S*|(?<![A-Za-z0-9:/])/(?!/)\S*|(?<!\\)\\\\\S*|"
+    r"(?i:file:///)\S*|(?<![A-Za-z0-9:/])//\S+|(?<![A-Za-z0-9:/])/(?!/)\S*|"
+    r"(?<!\\)\\\\\S*|"
     r"(?<![A-Za-z0-9])[A-Za-z]:[\\/](?![\\/])\S+"
 )
 _MARKDOWN_META = frozenset(r"\\*{}[]()#+!|_~")

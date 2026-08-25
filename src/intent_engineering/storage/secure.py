@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ctypes
+import errno
 import os
 import secrets
 import stat
@@ -28,6 +29,22 @@ class UnsafePathError(ValueError):
 
     def __init__(self, message: str = "unsafe canonical path") -> None:
         super().__init__(message)
+
+
+class AtomicWriteRollbackError(UnsafePathError):
+    """Raised when strict report output cannot authenticate its final state."""
+
+    def __init__(self) -> None:
+        super().__init__("atomic write state is indeterminate")
+
+
+@dataclass
+class _StrictWriteState:
+    committed: bool = False
+    cleaned: bool = False
+    indeterminate: bool = False
+    displaced_touched: bool = False
+    displaced_scrubbed: bool = False
 
 
 @dataclass(frozen=True)
@@ -513,130 +530,364 @@ class SecureFile:
             observed is not None and stat.S_ISREG(observed.st_mode) and observed.st_nlink == 1
         )
 
-    def _scrub_linked_owned_entry(self, name: str, expected: os.stat_result) -> None:
-        """Remove report bytes from every raced hardlink before rollback unlink."""
-        descriptor = os.open(
-            name,
-            os.O_WRONLY | _NOFOLLOW | _CLOEXEC,
-            dir_fd=self.parent_fd,
-        )
+    def _strict_fault(self, stage: str) -> None:
+        """Named test boundary for cancellation between strict transaction phases."""
+
+    @staticmethod
+    def _scrub_descriptor(
+        descriptor: int,
+        expected: os.stat_result,
+        *,
+        single_link: bool,
+    ) -> bool:
         try:
             observed = os.fstat(descriptor)
             if _identity(observed) != _identity(expected) or not stat.S_ISREG(observed.st_mode):
-                return
+                return False
             os.ftruncate(descriptor, 0)
             os.fsync(descriptor)
-        finally:
-            os.close(descriptor)
+            scrubbed = os.fstat(descriptor)
+        except BaseException:  # noqa: BLE001 - fixed indeterminate outcome at caller
+            return False
+        return bool(
+            _identity(scrubbed) == _identity(expected)
+            and stat.S_ISREG(scrubbed.st_mode)
+            and scrubbed.st_size == 0
+            and (not single_link or scrubbed.st_nlink == 1)
+        )
 
-    def _remove_installed_entry(self, expected: os.stat_result) -> None:
-        """Rollback a newly installed entry without unlinking a raced value."""
-        self._remove_owned_entry(self.name, expected)
-        try:
-            os.fsync(self.parent_fd)
-        except BaseException:  # noqa: BLE001, S110 - logical rollback is authenticated
-            pass
-
-    def _remove_owned_entry(self, name: str, expected: os.stat_result) -> None:
-        """Retry an authenticated unlink if interruption lands before the native operation."""
+    @staticmethod
+    def _close_descriptor(descriptor: int) -> bool:
         for _ in range(_ROLLBACK_ATTEMPTS):
-            observed = self._matching_entry(name, expected)
-            if observed is None:
-                return
-            if observed.st_nlink != 1:
-                try:
-                    self._scrub_linked_owned_entry(name, expected)
-                except BaseException:  # noqa: BLE001, S112 - preserve the control signal
-                    continue
             try:
-                os.unlink(name, dir_fd=self.parent_fd)
-            except BaseException:  # noqa: BLE001, S112 - preserve the control signal
-                continue
-        if self._entry_matches(name, expected):
-            return
+                os.close(descriptor)
+                return True
+            except OSError as error:
+                try:
+                    os.fstat(descriptor)
+                except OSError as observed:
+                    if observed.errno == errno.EBADF:
+                        return True
+                if error.errno == errno.EBADF:
+                    return True
+        return False
 
-    def _restore_exchanged_entry(
+    def _terminal_report_snapshot(
+        self,
+        report: os.stat_result,
+        report_descriptor: int,
+    ) -> bool:
+        """Authenticate the published report twice with no intervening mutation."""
+        for _ in range(2):
+            try:
+                held = os.fstat(report_descriptor)
+            except OSError:
+                return False
+            if (
+                not self._entry_is_safe(self.name, report)
+                or _identity(held) != _identity(report)
+                or not stat.S_ISREG(held.st_mode)
+                or held.st_nlink != 1
+                or held.st_size != report.st_size
+            ):
+                return False
+        return True
+
+    def _terminal_existing_snapshot(
+        self,
+        quarantine: str,
+        original: os.stat_result,
+        displaced_descriptor: int,
+        report: os.stat_result,
+        report_descriptor: int,
+    ) -> bool:
+        """Authenticate the report and durable zero tombstone as one terminal bundle."""
+        for _ in range(2):
+            tombstone = self._matching_entry(quarantine, original)
+            try:
+                displaced = os.fstat(displaced_descriptor)
+            except OSError:
+                return False
+            if (
+                tombstone is None
+                or not stat.S_ISREG(tombstone.st_mode)
+                or tombstone.st_nlink != 1
+                or tombstone.st_size != 0
+                or _identity(displaced) != _identity(original)
+                or displaced.st_nlink != 1
+                or displaced.st_size != 0
+                or not self._terminal_report_snapshot(report, report_descriptor)
+            ):
+                return False
+        return True
+
+    def _terminal_rollback_snapshot(
+        self,
+        original: os.stat_result | None,
+        displaced_descriptor: int,
+        report: os.stat_result,
+        report_descriptor: int,
+    ) -> bool:
+        """Authenticate the exact preimage and the scrubbed report after rollback."""
+        for _ in range(2):
+            try:
+                os.stat(self.name, dir_fd=self.parent_fd, follow_symlinks=False)
+                target_absent = False
+            except FileNotFoundError:
+                target_absent = True
+            except OSError:
+                return False
+            try:
+                held_report = os.fstat(report_descriptor)
+            except OSError:
+                return False
+            report_is_zero = bool(
+                _identity(held_report) == _identity(report)
+                and stat.S_ISREG(held_report.st_mode)
+                and held_report.st_nlink <= 1
+                and held_report.st_size == 0
+            )
+            if original is None:
+                if not target_absent or not report_is_zero:
+                    return False
+                continue
+            try:
+                held_original = os.fstat(displaced_descriptor)
+            except OSError:
+                return False
+            if (
+                target_absent
+                or not self._entry_is_safe(self.name, original)
+                or _identity(held_original) != _identity(original)
+                or held_original.st_nlink != 1
+                or held_original.st_size != original.st_size
+                or not report_is_zero
+            ):
+                return False
+        return True
+
+    def _quarantine_owned_entry(
+        self,
+        name: str,
+        expected: os.stat_result,
+        descriptor: int,
+    ) -> bool:
+        """Scrub an owned inode, then retain it under a private zero-byte name."""
+        if not self._scrub_descriptor(descriptor, expected, single_link=False):
+            return False
+        for _ in range(_ROLLBACK_ATTEMPTS):
+            try:
+                live = os.stat(name, dir_fd=self.parent_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                return True
+            except OSError:
+                return False
+            if _identity(live) != _identity(expected):
+                return False
+            quarantine = f".{self.name}.{secrets.token_hex(16)}.rollback"
+            try:
+                _rename_exclusive(self.parent_fd, name, quarantine)
+            except FileExistsError:
+                continue
+            except OSError:
+                return False
+            quarantined = self._matching_entry(quarantine, expected)
+            if quarantined is None:
+                try:
+                    os.stat(
+                        quarantine,
+                        dir_fd=self.parent_fd,
+                        follow_symlinks=False,
+                    )
+                    os.stat(name, dir_fd=self.parent_fd, follow_symlinks=False)
+                except FileNotFoundError:
+                    try:
+                        _rename_exclusive(self.parent_fd, quarantine, name)
+                    except OSError:
+                        pass
+                    return False
+                except OSError:
+                    return False
+                return False
+            try:
+                remaining = os.stat(name, dir_fd=self.parent_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                remaining = None
+            except OSError:
+                return False
+            if remaining is not None:
+                return False
+            retained = self._matching_entry(quarantine, expected)
+            return bool(
+                retained is not None
+                and stat.S_ISREG(retained.st_mode)
+                and retained.st_nlink == 1
+                and retained.st_size == 0
+            )
+        return False
+
+    def _restore_existing_target(
         self,
         temporary_name: str,
-        temporary_metadata: os.stat_result,
-    ) -> None:
-        """Retry exchange rollback, including a native call that raised after success."""
-        for _ in range(_ROLLBACK_ATTEMPTS):
-            if self._entry_matches(temporary_name, temporary_metadata):
-                break
-            if not self._entry_matches(self.name, temporary_metadata):
-                return
+        report: os.stat_result,
+        original: os.stat_result,
+        quarantine: str | None,
+    ) -> bool:
+        """Restore the exact preimage before its held inode has been scrubbed."""
+        if quarantine is not None and self._entry_matches(quarantine, original):
             try:
-                _exchange_names(self.parent_fd, temporary_name, self.name)
-            except BaseException:  # noqa: BLE001, S112 - preserve the control signal
-                continue
-        if not self._entry_matches(temporary_name, temporary_metadata):
-            return
+                _rename_exclusive(self.parent_fd, quarantine, temporary_name)
+            except OSError:
+                return False
+        if self._entry_matches(temporary_name, report) and self._entry_is_safe(
+            self.name,
+            original,
+        ):
+            return True
+        if not self._entry_matches(self.name, report) or not self._entry_matches(
+            temporary_name,
+            original,
+        ):
+            return False
         try:
+            _exchange_names(self.parent_fd, temporary_name, self.name)
             os.fsync(self.parent_fd)
-        except BaseException:  # noqa: BLE001, S110 - logical rollback is authenticated
-            pass
+        except OSError:
+            return False
+        return self._entry_matches(temporary_name, report) and self._entry_is_safe(
+            self.name,
+            original,
+        )
 
     def _install_verified_temporary(
         self,
         temporary_name: str,
-        temporary_metadata: os.stat_result,
+        report: os.stat_result,
         expected_target: os.stat_result | None,
+        report_descriptor: int,
+        displaced_descriptor: int,
+        state: _StrictWriteState,
     ) -> None:
-        """Install a prepared file only if the inspected target did not change."""
-        if expected_target is None:
-            try:
+        """Install a prepared report or prove rollback under named phase faults."""
+        failure: BaseException | None = None
+        quarantine: str | None = None
+        try:
+            if expected_target is None:
                 _rename_exclusive(self.parent_fd, temporary_name, self.name)
-                installed = os.stat(self.name, dir_fd=self.parent_fd, follow_symlinks=False)
-                installed_is_safe = (
-                    stat.S_ISREG(installed.st_mode)
-                    and installed.st_nlink == 1
-                    and _identity(installed) == _identity(temporary_metadata)
-                )
-                if not installed_is_safe:
+                self._strict_fault("new-installed")
+                if not self._entry_is_safe(self.name, report):
                     raise UnsafePathError()
                 os.fsync(self.parent_fd)
-                if not self._entry_is_safe(self.name, temporary_metadata):
+                self._strict_fault("new-durable")
+                if not self._terminal_report_snapshot(report, report_descriptor):
                     raise UnsafePathError()
-            except BaseException:
-                self._remove_installed_entry(temporary_metadata)
-                raise
-            return
+                state.committed = True
+                return
 
-        ready_to_commit = False
-        try:
             _exchange_names(self.parent_fd, temporary_name, self.name)
-            displaced = os.stat(
-                temporary_name,
-                dir_fd=self.parent_fd,
-                follow_symlinks=False,
-            )
-            installed = os.stat(self.name, dir_fd=self.parent_fd, follow_symlinks=False)
-            unchanged = (
-                stat.S_ISREG(displaced.st_mode)
-                and displaced.st_nlink == 1
-                and _identity(displaced) == _identity(expected_target)
-                and stat.S_ISREG(installed.st_mode)
-                and installed.st_nlink == 1
-                and _identity(installed) == _identity(temporary_metadata)
-            )
-            if not unchanged:
-                raise UnsafePathError()
-            os.fsync(self.parent_fd)
-            if not self._entry_is_safe(
+            self._strict_fault("existing-exchanged")
+            if not self._entry_is_safe(self.name, report) or not self._entry_is_safe(
                 temporary_name,
                 expected_target,
-            ) or not self._entry_is_safe(self.name, temporary_metadata):
+            ):
                 raise UnsafePathError()
-            ready_to_commit = True
-            os.unlink(temporary_name, dir_fd=self.parent_fd)
-        except BaseException:
-            if ready_to_commit and not self._entry_matches(temporary_name, expected_target):
-                return
-            self._restore_exchanged_entry(temporary_name, temporary_metadata)
-            raise
+            os.fsync(self.parent_fd)
+            self._strict_fault("existing-durable")
+            if not self._entry_is_safe(self.name, report) or not self._entry_is_safe(
+                temporary_name,
+                expected_target,
+            ):
+                raise UnsafePathError()
+            quarantine = f".{self.name}.{secrets.token_hex(16)}.rollback"
+            _rename_exclusive(self.parent_fd, temporary_name, quarantine)
+            self._strict_fault("original-quarantined")
+            if not self._entry_is_safe(quarantine, expected_target):
+                raise UnsafePathError()
+            state.displaced_touched = True
+            if not self._scrub_descriptor(
+                displaced_descriptor,
+                expected_target,
+                single_link=True,
+            ):
+                raise AtomicWriteRollbackError()
+            state.displaced_scrubbed = True
+            os.fsync(self.parent_fd)
+            self._strict_fault("original-scrubbed")
+            if not self._terminal_existing_snapshot(
+                quarantine,
+                expected_target,
+                displaced_descriptor,
+                report,
+                report_descriptor,
+            ):
+                raise AtomicWriteRollbackError()
+            state.committed = True
+            return
+        except BaseException as error:  # noqa: BLE001 - phase-aware result below
+            failure = error
 
-    def atomic_write(self, content: bytes, *, reject_target_races: bool = False) -> None:
+        if state.committed:
+            return
+        if expected_target is None:
+            target_cleaned = self._quarantine_owned_entry(
+                self.name,
+                report,
+                report_descriptor,
+            )
+            temporary_cleaned = self._quarantine_owned_entry(
+                temporary_name,
+                report,
+                report_descriptor,
+            )
+            state.cleaned = target_cleaned and temporary_cleaned
+            state.cleaned = state.cleaned and self._terminal_rollback_snapshot(
+                None,
+                displaced_descriptor,
+                report,
+                report_descriptor,
+            )
+        elif state.displaced_touched:
+            if (
+                quarantine is not None
+                and state.displaced_scrubbed
+                and self._terminal_existing_snapshot(
+                    quarantine,
+                    expected_target,
+                    displaced_descriptor,
+                    report,
+                    report_descriptor,
+                )
+            ):
+                state.committed = True
+                return
+        else:
+            restored = self._restore_existing_target(
+                temporary_name,
+                report,
+                expected_target,
+                quarantine,
+            )
+            state.cleaned = restored and self._quarantine_owned_entry(
+                temporary_name,
+                report,
+                report_descriptor,
+            )
+            state.cleaned = state.cleaned and self._terminal_rollback_snapshot(
+                expected_target,
+                displaced_descriptor,
+                report,
+                report_descriptor,
+            )
+        if not state.cleaned:
+            self._scrub_descriptor(report_descriptor, report, single_link=False)
+            state.indeterminate = True
+            failure = None
+            raise AtomicWriteRollbackError() from None
+        if failure is not None:
+            raise failure from None
+        raise AtomicWriteRollbackError() from None
+
+    def _atomic_write_unverified(self, content: bytes) -> None:
         temporary_name: str | None = None
         descriptor = -1
         temporary_metadata: os.stat_result | None = None
@@ -665,23 +916,15 @@ class SecureFile:
             os.fsync(descriptor)
             os.close(descriptor)
             descriptor = -1
-            expected_target = self._assert_safe_existing_target()
-            if reject_target_races:
-                self._install_verified_temporary(
-                    temporary_name,
-                    temporary_metadata,
-                    expected_target,
-                )
-            else:
-                os.replace(
-                    temporary_name,
-                    self.name,
-                    src_dir_fd=self.parent_fd,
-                    dst_dir_fd=self.parent_fd,
-                )
+            self._assert_safe_existing_target()
+            os.replace(
+                temporary_name,
+                self.name,
+                src_dir_fd=self.parent_fd,
+                dst_dir_fd=self.parent_fd,
+            )
             temporary_name = None
-            if not reject_target_races:
-                os.fsync(self.parent_fd)
+            os.fsync(self.parent_fd)
         except OSError as error:
             raise UnsafePathError() from error
         finally:
@@ -689,10 +932,114 @@ class SecureFile:
                 os.close(descriptor)
             if temporary_name is not None:
                 try:
-                    if temporary_metadata is not None:
-                        self._remove_owned_entry(temporary_name, temporary_metadata)
+                    if temporary_metadata is not None and self._entry_is_safe(
+                        temporary_name,
+                        temporary_metadata,
+                    ):
+                        os.unlink(temporary_name, dir_fd=self.parent_fd)
                 except BaseException:  # noqa: BLE001, S110 - preserve the primary failure
                     pass
+
+    def _atomic_write_strict(self, content: memoryview) -> None:
+        temporary_name: str | None = None
+        report_descriptor = -1
+        displaced_descriptor = -1
+        report: os.stat_result | None = None
+        state = _StrictWriteState()
+        failure: BaseException | None = None
+        view = content
+        content = memoryview(b"")
+        try:
+            for _ in range(_ROLLBACK_ATTEMPTS):
+                temporary_name = f".{self.name}.{secrets.token_hex(16)}.tmp"
+                try:
+                    report_descriptor = os.open(
+                        temporary_name,
+                        os.O_WRONLY | os.O_CREAT | os.O_EXCL | _NOFOLLOW | _CLOEXEC,
+                        0o644,
+                        dir_fd=self.parent_fd,
+                    )
+                except FileExistsError:
+                    temporary_name = None
+                    continue
+                break
+            if temporary_name is None or report_descriptor < 0:
+                raise UnsafePathError()
+            report = os.fstat(report_descriptor)
+            _require_regular(report)
+            while view:
+                written = os.write(report_descriptor, view)
+                view = view[written:]
+            os.fsync(report_descriptor)
+            report = os.fstat(report_descriptor)
+            _require_regular(report)
+            self._strict_fault("prepared")
+            expected_target = self._assert_safe_existing_target()
+            if expected_target is not None:
+                displaced_descriptor = os.open(
+                    self.name,
+                    os.O_WRONLY | _NOFOLLOW | _CLOEXEC,
+                    dir_fd=self.parent_fd,
+                )
+                displaced = os.fstat(displaced_descriptor)
+                _require_regular(displaced)
+                if _identity(displaced) != _identity(expected_target):
+                    raise UnsafePathError()
+            self._install_verified_temporary(
+                temporary_name,
+                report,
+                expected_target,
+                report_descriptor,
+                displaced_descriptor,
+                state,
+            )
+            if state.committed:
+                temporary_name = None
+        except BaseException as error:  # noqa: BLE001 - clear payload before dispatch
+            failure = error
+
+        if not state.committed and not state.cleaned and report is not None:
+            state.cleaned = bool(
+                temporary_name is not None
+                and self._quarantine_owned_entry(
+                    temporary_name,
+                    report,
+                    report_descriptor,
+                )
+            )
+            if not state.cleaned:
+                self._scrub_descriptor(report_descriptor, report, single_link=False)
+                failure = None
+
+        view.release()
+        view = memoryview(b"")
+        close_failed = False
+        for descriptor in (report_descriptor, displaced_descriptor):
+            if descriptor >= 0:
+                close_failed = not self._close_descriptor(descriptor) or close_failed
+
+        if state.committed and failure is None and not close_failed:
+            return
+        if close_failed or state.indeterminate or not state.cleaned or failure is None:
+            failure = None
+            raise AtomicWriteRollbackError() from None
+        if isinstance(failure, OSError):
+            os_failure = failure
+            failure = None
+            raise UnsafePathError() from os_failure
+        raise failure from None
+
+    def atomic_write(self, content: bytes, *, reject_target_races: bool = False) -> None:
+        if reject_target_races:
+            payload = memoryview(content)
+            content = b""
+            try:
+                self._atomic_write_strict(payload)
+            finally:
+                payload.release()
+                payload = memoryview(b"")
+            return
+        self._atomic_write_unverified(content)
 
     def append(self, content: bytes) -> None:
         try:

@@ -175,6 +175,8 @@ def test_every_evidence_derived_scalar_is_inert_and_sensitive_patterns_are_redac
         "/usr/local/share/intent",
         "/srv/intent/private",
         "/",
+        "//server/share/intent.md",
+        "provider //server/share/intent.md",
         r"\\server\share\intent.md",
         r"\\?\C:\private\intent.md",
         r"\\.\C:\private\intent.md",
