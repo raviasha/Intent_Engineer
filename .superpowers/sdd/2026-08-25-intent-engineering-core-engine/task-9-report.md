@@ -319,6 +319,37 @@ Final commands:
 Results: full pytest `219 passed in 10.89s`; Ruff clean; strict mypy clean
 across 9 modules; both help commands exited 0.
 
+### Fix round 4 final proof
+
+Proof commits: `6f322e710f5ca34e8112fd8d1507243ddb8438af`,
+`64bfcc1c5a887feaed5872996aa64ff6dd75e891`,
+`df673ffda19350cc4f3c2670d0e4009568a1dfe4`,
+`fa982ca800bf6cceafe6d07e0211281e4525d02a`, and
+`86dcaf842a78b952e65c56885af545c9b56eea9a`.
+
+Focused A--F command:
+
+```text
+.venv/bin/python -m pytest tests/e2e/test_cli_local.py::test_markdown_sync_produces_a_deterministic_reconciliation_case tests/unit/reconcile/test_local_resolution_recovery.py tests/e2e/test_cli_local.py::test_status_recovers_pending_resolution_journal_before_reading_state tests/unit/cli/test_runtime_metadata.py -q
+```
+
+Result: `11 passed in 1.58s`. This names the real preview/history deep equality
+and both terminal actions (A/B), commit and preview SystemExit recovery (C),
+non-resolution status startup recovery (D), and direct top-level/front-matter
+assertion plus detector ACL/current-reference validation (E/F).
+
+Named existing invariant command:
+
+```text
+.venv/bin/python -m pytest tests/integration/sync/test_idempotency.py::test_second_identical_sync_has_no_semantic_change tests/integration/capture/test_git_connector.py::test_git_connector_treats_an_unborn_head_as_empty_discovery tests/e2e/test_cli_local.py::test_acl_protected_evidence_is_indistinguishable_from_unknown tests/unit/render/test_renderers.py -q
+```
+
+Result: `17 passed in 0.65s` (second-sync no-op, unborn Git, ACL projection,
+and renderer canonical immutability/containment).
+
+Fresh final results: Ruff clean; strict mypy clean across 9 modules; full
+pytest `226 passed in 11.62s`; root and reconcile help commands exited 0.
+
 ## Fix round 4 — unified assertion validation and terminal review actions
 
 Product/tests: `5de14a89e24cd786aeb8136b7a37beaaff745f8c` and
