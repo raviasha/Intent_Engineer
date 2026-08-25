@@ -20,7 +20,7 @@ from tests.unit.reconcile.test_case_lifecycle import reconciliation_case
 NOW = datetime(2026, 8, 25, tzinfo=UTC)
 
 
-def _service(tmp_path: Path) -> LocalResolutionService:
+def _service(tmp_path: Path, *, needs_human: bool = True) -> LocalResolutionService:
     graph_store = YamlGraphStore(tmp_path / "graph.yaml", history_path=tmp_path / "history.jsonl")
     graph_store.initialize(graph())
     evidence_store = JsonlEvidenceStore(tmp_path / "evidence.jsonl")
@@ -35,10 +35,13 @@ def _service(tmp_path: Path) -> LocalResolutionService:
         )
     )
     case_store.put(opened)
-    case_store.put(transition_case(opened, ReconciliationStatus.PROPOSED, "tester", NOW))
-    case_store.put(
-        transition_case(case_store.get(opened.id), ReconciliationStatus.NEEDS_HUMAN, "tester", NOW)
-    )
+    if needs_human:
+        case_store.put(transition_case(opened, ReconciliationStatus.PROPOSED, "tester", NOW))
+        case_store.put(
+            transition_case(
+                case_store.get(opened.id), ReconciliationStatus.NEEDS_HUMAN, "tester", NOW
+            )
+        )
     return LocalResolutionService(graph_store, evidence_store, case_store, "tester")
 
 
@@ -82,7 +85,27 @@ def test_system_exit_after_each_durable_resolution_stage_recovers_exact_preimage
     )
     with pytest.raises(ResolutionUnavailable):
         fresh.resolve("case-1", ResolutionAction.UPDATE_IMPLEMENTATION)
+
+
+def test_system_exit_during_preview_case_append_recovers_exact_preimage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service = _service(tmp_path, needs_human=False)
+    paths = service._paths()
+    before = {path: path.read_bytes() if path.exists() else None for path in paths}
+    monkeypatch.setattr(service._case_store, "put", lambda _: (_ for _ in ()).throw(SystemExit()))
+    with pytest.raises(SystemExit):
+        service.resolve("case-1", ResolutionAction.UPDATE_IMPLEMENTATION)
+    assert service._journal_path().exists()
+    fresh = LocalResolutionService(
+        YamlGraphStore(tmp_path / "graph.yaml", history_path=tmp_path / "history.jsonl"),
+        JsonlEvidenceStore(tmp_path / "evidence.jsonl"),
+        JsonlCaseStore(tmp_path / "cases.jsonl"),
+        "tester",
+    )
+    fresh.recover()
     assert {path: path.read_bytes() if path.exists() else None for path in paths} == before
     assert not fresh._journal_path().exists()
-    with pytest.raises(ResolutionUnavailable):
-        fresh.resolve("case-1", ResolutionAction.UPDATE_IMPLEMENTATION)
+    fresh.recover()
+    assert {path: path.read_bytes() if path.exists() else None for path in paths} == before
+    assert not fresh._journal_path().exists()
