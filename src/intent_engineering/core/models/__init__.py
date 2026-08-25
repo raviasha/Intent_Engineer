@@ -27,19 +27,29 @@ from intent_engineering.core.models.evidence import (
 from intent_engineering.core.models.graph import Confidence, Edge, Graph, Node, TypeRegistry
 from intent_engineering.core.models.implementation import ImplementationClaim
 from intent_engineering.core.models.project import ProjectConfig, SyncCheckpoint
+from intent_engineering.core.models.reconciliation import (
+    ClassificationEvent,
+    DriftObservation,
+    EvidenceSide,
+    ReconciliationCase,
+    ReconciliationEvidenceSide,
+)
 
 __all__ = [
     "CandidateAssertion",
     "ChangeKind",
     "ChangeSet",
+    "ClassificationEvent",
     "Confidence",
     "ConfidenceChange",
+    "DriftObservation",
     "Edge",
     "EdgeUpdate",
     "EpistemicState",
     "EvidenceDelta",
     "EvidenceRecord",
     "EvidenceRef",
+    "EvidenceSide",
     "Graph",
     "ImplementationClaim",
     "ImplementationStatus",
@@ -49,7 +59,9 @@ __all__ = [
     "NodeType",
     "NodeUpdate",
     "ProjectConfig",
+    "ReconciliationCase",
     "ReconciliationCaseType",
+    "ReconciliationEvidenceSide",
     "ReconciliationStatus",
     "RelationType",
     "ResolutionAction",

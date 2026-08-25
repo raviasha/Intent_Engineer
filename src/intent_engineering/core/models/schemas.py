@@ -9,10 +9,12 @@ from pydantic import BaseModel
 
 from intent_engineering.core.models.evidence import EvidenceRecord
 from intent_engineering.core.models.graph import Graph
+from intent_engineering.core.models.reconciliation import ReconciliationCase
 
 _SCHEMA_MODELS: Mapping[str, type[BaseModel]] = {
     "Graph": Graph,
     "EvidenceRecord": EvidenceRecord,
+    "ReconciliationCase": ReconciliationCase,
 }
 
 

@@ -4,7 +4,14 @@ from collections.abc import Sequence
 from datetime import datetime
 from typing import Protocol
 
-from intent_engineering.core.models import ChangeSet, EvidenceRecord, Graph, SyncCheckpoint
+from intent_engineering.core.models import (
+    ChangeSet,
+    EvidenceRecord,
+    Graph,
+    ReconciliationCase,
+    ReconciliationStatus,
+    SyncCheckpoint,
+)
 
 
 class GraphStore(Protocol):
@@ -49,4 +56,20 @@ class CheckpointStore(Protocol):
         cursor: str | None,
         committed_at: datetime,
     ) -> SyncCheckpoint:
+        raise NotImplementedError
+
+
+class CaseStore(Protocol):
+    """Append-only reconciliation-case persistence with latest-version lookup."""
+
+    def put(self, case: ReconciliationCase) -> bool:
+        raise NotImplementedError
+
+    def get(self, case_id: str) -> ReconciliationCase:
+        raise NotImplementedError
+
+    def find_by_fingerprint(self, fingerprint: str) -> ReconciliationCase | None:
+        raise NotImplementedError
+
+    def list(self, status: ReconciliationStatus | None = None) -> Sequence[ReconciliationCase]:
         raise NotImplementedError

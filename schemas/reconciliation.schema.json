@@ -1,0 +1,251 @@
+{
+  "$defs": {
+    "ClassificationEvent": {
+      "description": "An immutable lifecycle event for a reconciliation case.",
+      "properties": {
+        "actor": {
+          "minLength": 1,
+          "title": "Actor",
+          "type": "string"
+        },
+        "at": {
+          "format": "date-time",
+          "title": "At",
+          "type": "string"
+        },
+        "new": {
+          "$ref": "#/$defs/ReconciliationStatus"
+        },
+        "prior": {
+          "$ref": "#/$defs/ReconciliationStatus"
+        }
+      },
+      "required": [
+        "actor",
+        "at",
+        "prior",
+        "new"
+      ],
+      "title": "ClassificationEvent",
+      "type": "object"
+    },
+    "EvidenceSide": {
+      "description": "One independently attributable position used to classify drift.",
+      "properties": {
+        "authors": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Authors",
+          "type": "array"
+        },
+        "claim": {
+          "title": "Claim",
+          "type": "string"
+        },
+        "confidence": {
+          "maximum": 1.0,
+          "minimum": 0.0,
+          "title": "Confidence",
+          "type": "number"
+        },
+        "current": {
+          "default": true,
+          "title": "Current",
+          "type": "boolean"
+        },
+        "evidence_refs": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Evidence Refs",
+          "type": "array"
+        },
+        "label": {
+          "title": "Label",
+          "type": "string"
+        },
+        "observed_at": {
+          "format": "date-time",
+          "title": "Observed At",
+          "type": "string"
+        },
+        "source_mode": {
+          "$ref": "#/$defs/SourceMode",
+          "default": "explicit"
+        }
+      },
+      "required": [
+        "label",
+        "claim",
+        "evidence_refs",
+        "observed_at",
+        "authors",
+        "confidence"
+      ],
+      "title": "EvidenceSide",
+      "type": "object"
+    },
+    "ReconciliationCaseType": {
+      "enum": [
+        "CODE_LAG",
+        "REQUIREMENT_LAG",
+        "INTENT_LAG",
+        "TEST_LAG",
+        "DOC_LAG",
+        "UNDOCUMENTED_CODE",
+        "ORPHAN_REQUIREMENT",
+        "CONFLICTING_SOURCES",
+        "AMBIGUOUS_DIVERGENCE",
+        "POSSIBLE_INTENT_CHANGE"
+      ],
+      "title": "ReconciliationCaseType",
+      "type": "string"
+    },
+    "ReconciliationStatus": {
+      "enum": [
+        "open",
+        "needs_human",
+        "proposed",
+        "resolved",
+        "deferred",
+        "false_positive"
+      ],
+      "title": "ReconciliationStatus",
+      "type": "string"
+    },
+    "ResolutionAction": {
+      "enum": [
+        "update_implementation",
+        "update_requirement",
+        "update_intent",
+        "update_tests",
+        "update_documentation",
+        "backfill_design_decision",
+        "supersede_requirement",
+        "merge_interpretations",
+        "preserve_disagreement",
+        "defer",
+        "mark_false_positive"
+      ],
+      "title": "ResolutionAction",
+      "type": "string"
+    },
+    "SourceMode": {
+      "enum": [
+        "explicit",
+        "inferred",
+        "derived"
+      ],
+      "title": "SourceMode",
+      "type": "string"
+    }
+  },
+  "description": "Durable case packet for a divergence requiring reconciliation.",
+  "properties": {
+    "affected_refs": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Affected Refs",
+      "type": "array"
+    },
+    "alternatives": {
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/ReconciliationCaseType"
+      },
+      "title": "Alternatives",
+      "type": "array"
+    },
+    "case_type": {
+      "$ref": "#/$defs/ReconciliationCaseType"
+    },
+    "created_at": {
+      "format": "date-time",
+      "title": "Created At",
+      "type": "string"
+    },
+    "detector_id": {
+      "title": "Detector Id",
+      "type": "string"
+    },
+    "evidence_sides": {
+      "items": {
+        "$ref": "#/$defs/EvidenceSide"
+      },
+      "title": "Evidence Sides",
+      "type": "array"
+    },
+    "fingerprint": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Fingerprint",
+      "type": "string"
+    },
+    "history": {
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/ClassificationEvent"
+      },
+      "title": "History",
+      "type": "array"
+    },
+    "id": {
+      "title": "Id",
+      "type": "string"
+    },
+    "impact": {
+      "default": "",
+      "title": "Impact",
+      "type": "string"
+    },
+    "requires_human": {
+      "default": true,
+      "title": "Requires Human",
+      "type": "boolean"
+    },
+    "resolution": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ResolutionAction"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "resolved_by_changeset": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Resolved By Changeset"
+    },
+    "status": {
+      "$ref": "#/$defs/ReconciliationStatus",
+      "default": "open"
+    },
+    "subject_ref": {
+      "title": "Subject Ref",
+      "type": "string"
+    }
+  },
+  "required": [
+    "id",
+    "subject_ref",
+    "case_type",
+    "affected_refs",
+    "evidence_sides",
+    "detector_id",
+    "fingerprint",
+    "created_at"
+  ],
+  "title": "ReconciliationCase",
+  "type": "object"
+}
