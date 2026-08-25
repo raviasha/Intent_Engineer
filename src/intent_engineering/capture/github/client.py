@@ -21,6 +21,8 @@ from intent_engineering.capture.github.errors import (
     GitHubRateLimitError,
     GitHubTransientError,
     endpoint_overlaps_secret,
+    provider_key_overlaps_secret,
+    provider_value_overlaps_secret,
     request_id_overlaps_secret,
     sanitize_endpoint,
     sanitize_request_id,
@@ -352,6 +354,29 @@ class GitHubClient:
             return "/redacted"
         return sanitize_endpoint(value)
 
+    def _provider_material_overlaps_credential(self, value: object) -> bool:
+        """Inspect detached provider scalars without retaining the credential in failures."""
+        authorization_secret = self._authorization_secret()
+        if authorization_secret is None:
+            return False
+        pending: list[tuple[object, bool]] = [(value, False)]
+        overlap = False
+        while pending and not overlap:
+            item, is_key = pending.pop()
+            if isinstance(item, Mapping):
+                pending.extend((key, True) for key in item)
+                pending.extend((nested, False) for nested in item.values())
+            elif isinstance(item, (list, tuple)):
+                pending.extend((nested, False) for nested in item)
+            elif item is not None and type(item) in {str, int, float, bool}:
+                overlap = (
+                    provider_key_overlaps_secret(str(item), authorization_secret)
+                    if is_key
+                    else provider_value_overlaps_secret(str(item), authorization_secret)
+                )
+        authorization_secret = None
+        return overlap
+
     async def _request_page(
         self,
         url: httpx.URL,
@@ -473,20 +498,23 @@ class GitHubClient:
         except (UnicodeError, ValueError):
             malformed = True
         rate_status = _repository_rate_status(response.headers)
-        authorization_secret = self._authorization_secret()
-        resource_overlaps_secret = bool(
-            rate_status is not None
-            and authorization_secret is not None
-            and request_id_overlaps_secret(rate_status[-1], authorization_secret)
+        reflected_provider_material = self._provider_material_overlaps_credential(
+            (
+                payload.get("full_name") if type(payload) is dict else None,
+                response.headers.get("X-RateLimit-Limit"),
+                response.headers.get("X-RateLimit-Remaining"),
+                response.headers.get("X-RateLimit-Used"),
+                response.headers.get("X-RateLimit-Reset"),
+                response.headers.get("X-RateLimit-Resource"),
+            )
         )
-        authorization_secret = None
         if (
             malformed
             or type(payload) is not dict
             or type(payload.get("full_name")) is not str
             or payload.get("full_name", "").casefold() != repository
             or rate_status is None
-            or resource_overlaps_secret
+            or reflected_provider_material
         ):
             malformed = True
         await response.aclose()
@@ -549,10 +577,8 @@ class GitHubClient:
             if not 200 <= response.status_code <= 299:
                 error = self._status_error(response, endpoint)
                 await response.aclose()
-                raise error
-
-            if page_number == 1:
-                first_etag = response.headers.get("ETag")
+                del response
+                raise error from None
 
             malformed_json = False
             try:
@@ -566,11 +592,40 @@ class GitHubClient:
                 or any(type(item) is not dict for item in payload)
             ):
                 await response.aclose()
-                raise GitHubProtocolError(endpoint)
+                del response
+                payload = None
+                raise GitHubProtocolError(endpoint) from None
+
+            reflected_provider_material = self._provider_material_overlaps_credential(
+                (
+                    response.headers.get("ETag"),
+                    response.headers.get("Link"),
+                    payload,
+                )
+            )
+            if reflected_provider_material:
+                await response.aclose()
+                del response
+                payload = None
+                first_etag = None
+                items.clear()
+                raise GitHubProtocolError(endpoint) from None
+
+            if page_number == 1:
+                first_etag = response.headers.get("ETag")
 
             items.extend(payload)
-            next_value = self._next_url(response, endpoint)
+            next_failed = False
+            try:
+                next_value = self._next_url(response, endpoint)
+            except GitHubProtocolError:
+                next_failed = True
+                next_value = None
             await response.aclose()
+            del response
+            payload = None
+            if next_failed:
+                raise GitHubProtocolError(endpoint) from None
             if next_value is None:
                 return PageResult(items=tuple(items), etag=first_etag)
             if page_number >= self._page_cap:

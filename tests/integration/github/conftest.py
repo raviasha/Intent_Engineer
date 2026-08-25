@@ -155,18 +155,39 @@ class FakeGitHubApi:
         }
         self.etags = {name: f'"{name.replace("/", "-")}-1"' for name in self.order}
         self.fail_endpoint: str | None = None
+        self.reflected_secret: str | None = None
+        self.doctor_response: tuple[int, bytes, dict[str, str]] | None = None
         self.requests: list[httpx.Request] = []
 
     def handler(self, request: httpx.Request) -> httpx.Response:
         self.requests.append(request)
         prefix = "/repos/acme/demo/"
+        if request.url.path == "/repos/acme/demo":
+            if self.doctor_response is not None:
+                status, content, headers = self.doctor_response
+                return httpx.Response(status, content=content, headers=headers)
+            return httpx.Response(
+                200,
+                json={"full_name": "acme/demo"},
+                headers={
+                    "X-RateLimit-Limit": "5000",
+                    "X-RateLimit-Remaining": "4999",
+                    "X-RateLimit-Used": "1",
+                    "X-RateLimit-Reset": "1787659200",
+                    "X-RateLimit-Resource": "core",
+                },
+            )
         assert request.url.path.startswith(prefix)
         endpoint = request.url.path.removeprefix(prefix)
         if endpoint == self.fail_endpoint:
+            reflected = self.reflected_secret or "PRIVATE_PROVIDER_BODY"
             return httpx.Response(
                 429,
-                content=b"PRIVATE_PROVIDER_BODY",
-                headers={"Retry-After": "60", "X-GitHub-Request-Id": "SAFE_TEST"},
+                content=("PRIVATE_PROVIDER_BODY:" + reflected).encode(),
+                headers={
+                    "Retry-After": "60",
+                    "X-GitHub-Request-Id": "request-" + reflected,
+                },
             )
         etag = self.etags[endpoint]
         if request.headers.get("If-None-Match") == etag:
@@ -218,7 +239,16 @@ class GitHubSyncHarness:
             clock=lambda: NOW,
         )
 
-    async def run(self, run_id: str = "github-run") -> SyncRunResult:
+    async def run(self, run_id: str = "github-run", *, token: str = TOKEN) -> SyncRunResult:
+        if token != TOKEN:
+            await self.client.aclose()
+            credentials = GitHubCredentials.resolve({"GH_TOKEN": token}, lambda _: "unused")
+            self.client = GitHubClient(
+                credentials,
+                transport=httpx.MockTransport(self.api.handler),
+                retry_policy=RetryPolicy(max_attempts=1),
+            )
+            self.connector = GitHubConnector(self.client, owner="acme", repository="demo")
         return await self.orchestrator.run(run_id, (self.connector,))
 
     async def close(self) -> None:

@@ -23,7 +23,7 @@ Requires Python 3.12 or newer.
 
 ```bash
 python -m pip install -e '.[dev]'
-intent init
+intent init --project .
 intent sync --sources markdown,git
 intent status
 intent context --task "add local export"
@@ -61,11 +61,14 @@ evidence ID.
 
 ## Local and cloud boundary
 
-This public-alpha core runs entirely on local files and local Git: no cloud
-account, network connector, model provider, or secret is required. Evidence ACLs
-are enforced fail-closed for the configured local actor. Hosted connectors,
-scheduling, managed model execution, and collaboration UI are roadmap items, not
-implicit fallbacks in this release.
+Local Markdown and Git workflows run entirely from local files and need neither
+a network connection nor a secret. GitHub ingestion is opt-in: it uses a local
+credential and an explicit, non-secret `GITHUB_REPOSITORY=owner/repository`
+scope. The repository-local GitHub Action provides manual/nightly scheduling; it
+is not a hosted Intent Engineering service. Evidence ACLs are enforced
+fail-closed for the configured local actor. Hosted OAuth, GitHub App
+installation, webhooks, collaboration UI, and external MCP writes are not
+shipped in this slice. See [the GitHub guide](docs/github.md).
 
 ## Development
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import re
 from collections.abc import Callable
 from datetime import datetime
@@ -29,6 +30,7 @@ _SAFE_ENDPOINT_CHARACTER = re.compile(r"[^A-Za-z0-9/._~%:@+-]")
 _SAFE_REQUEST_ID_CHARACTER = re.compile(r"[^A-Za-z0-9:_-]")
 _MAX_ENDPOINT_LENGTH = 160
 _MAX_REQUEST_ID_LENGTH = 64
+_MIN_CREDENTIAL_FRAGMENT_LENGTH = 12
 
 
 def sanitize_endpoint(value: str) -> str:
@@ -75,6 +77,26 @@ def endpoint_overlaps_secret(value: str, secret: str) -> bool:
     )
 
 
+def provider_value_overlaps_secret(value: str, secret: str) -> bool:
+    """Reject exact or conservatively long raw, sanitized, and encoded reflections."""
+    return _value_overlaps_secret(
+        value,
+        secret,
+        sanitizer=_sanitize_request_id_text,
+        max_length=None,
+    )
+
+
+def provider_key_overlaps_secret(value: str, secret: str) -> bool:
+    """Apply the same conservative rule to provider-controlled mapping keys."""
+    return _value_overlaps_secret(
+        value,
+        secret,
+        sanitizer=_sanitize_request_id_text,
+        max_length=None,
+    )
+
+
 def _public_prefix_overlaps_secret(
     value: str,
     secret: str,
@@ -82,19 +104,60 @@ def _public_prefix_overlaps_secret(
     sanitizer: Callable[[str], str],
     max_length: int,
 ) -> bool:
-    candidates = (value.strip(), sanitizer(value))
-    secrets = (secret, sanitizer(secret))
-    for candidate, normalized_secret in zip(candidates, secrets, strict=True):
-        if not normalized_secret:
-            continue
-        public_prefix = candidate[:max_length]
-        fragment_length = min(4, len(normalized_secret))
-        if any(
-            public_prefix[index : index + fragment_length] in normalized_secret
-            for index in range(max(0, len(public_prefix) - fragment_length + 1))
-        ):
-            return True
-    return False
+    return _value_overlaps_secret(
+        value,
+        secret,
+        sanitizer=sanitizer,
+        max_length=max_length,
+    )
+
+
+def _value_overlaps_secret(
+    value: str,
+    secret: str,
+    *,
+    sanitizer: Callable[[str], str],
+    max_length: int | None,
+) -> bool:
+    """Match full credentials or high-signal fragments without short-prefix collisions."""
+    full_candidates = (value.strip(), sanitizer(value))
+    secret_bytes = secret.encode("utf-8")
+    secret_variants = (
+        secret,
+        sanitizer(secret),
+        base64.b64encode(secret_bytes).decode("ascii"),
+        secret_bytes.hex(),
+    )
+    if any(
+        secret_variant in candidate
+        for candidate in full_candidates
+        for secret_variant in secret_variants
+        if candidate and secret_variant
+    ):
+        return True
+    candidates: tuple[str, ...] = full_candidates
+    if max_length is not None:
+        candidates = tuple(candidate[:max_length] for candidate in candidates)
+    return any(
+        _has_meaningful_overlap(candidate, secret_variant)
+        for candidate in candidates
+        for secret_variant in secret_variants
+        if candidate and secret_variant
+    )
+
+
+def _has_meaningful_overlap(candidate: str, secret_variant: str) -> bool:
+    if secret_variant in candidate:
+        return True
+    if (
+        len(candidate) < _MIN_CREDENTIAL_FRAGMENT_LENGTH
+        or len(secret_variant) < _MIN_CREDENTIAL_FRAGMENT_LENGTH
+    ):
+        return False
+    return any(
+        secret_variant[index : index + _MIN_CREDENTIAL_FRAGMENT_LENGTH] in candidate
+        for index in range(len(secret_variant) - _MIN_CREDENTIAL_FRAGMENT_LENGTH + 1)
+    )
 
 
 def _render_details(

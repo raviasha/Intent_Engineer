@@ -761,7 +761,7 @@ async def test_errors_requests_pytest_rendering_and_logs_never_expose_token(
 
 
 @pytest.mark.anyio
-@pytest.mark.parametrize("reflected_length", [94, 11])
+@pytest.mark.parametrize("reflected_length", [94, 12])
 async def test_long_token_prefix_reflected_in_request_id_is_fully_discarded(
     transport_factory: TransportFactory,
     reflected_length: int,
@@ -781,6 +781,25 @@ async def test_long_token_prefix_reflected_in_request_id_is_fully_discarded(
     assert caught.value.request_id is None
     assert "github_pat_" not in str(caught.value)
     assert token[:64] not in repr(caught.value)
+
+
+@pytest.mark.anyio
+async def test_public_fine_grained_token_prefix_in_request_id_is_not_a_secret_overlap(
+    transport_factory: TransportFactory,
+) -> None:
+    """The documented token-format marker alone is public, not credential material."""
+    token = "github" + "_pat_" + "A1b2C3d4E5f6G7h8J9k0L1m2N3p4Q5r6S7t8U9v0"
+    credentials = GitHubCredentials.resolve({"GH_TOKEN": token}, lambda _: "unused")
+
+    def handler(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(401, headers={"X-GitHub-Request-Id": "RID:github_pat_:safe"})
+
+    client = _client(credentials, handler, transport_factory)
+    with pytest.raises(GitHubPermissionError) as caught:
+        await client.get_pages("/items", {})
+    await client.aclose()
+
+    assert caught.value.request_id == "RID:github_pat_:safe"
 
 
 @pytest.mark.anyio

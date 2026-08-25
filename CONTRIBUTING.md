@@ -23,6 +23,15 @@ transaction recovery state), so it intentionally fails before initialization.
 .venv/bin/intent validate --project .
 ```
 
+## GitHub slice
+
+GitHub tests and release evidence are offline and use injected fake HTTP; never
+use a live token or `gh` login in the test suite. The local GitHub workflow and
+the repository Action are documented in [docs/github.md](docs/github.md). Keep
+the Action read-only, retain its clean-checkout initialization step, and do not
+claim hosted OAuth, GitHub Apps, webhooks, pull-request comments, external
+writes, or MCP write-back as shipped functionality.
+
 ## Test-driven changes
 
 Write a focused regression or feature test before production code. Run it and

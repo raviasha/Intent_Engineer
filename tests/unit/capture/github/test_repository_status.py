@@ -139,7 +139,7 @@ async def test_repository_status_malformed_input_is_fixed_and_forgets_rejected_v
     [
         TOKEN,
         TOKEN[:12],
-        f"safe_{TOKEN[4:12]}",
+        f"safe_{TOKEN[4:16]}",
     ],
 )
 async def test_repository_status_rejects_rate_resource_overlapping_credentials(
