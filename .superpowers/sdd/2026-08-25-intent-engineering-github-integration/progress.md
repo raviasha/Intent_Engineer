@@ -30,6 +30,12 @@
   scrub-through-links cleanup. Cost if wrong: applying owned cleanup to foreign state can alter an
   outside hardlink, while applying foreign-state refusal to owned output can retain private report
   bytes after rollback.
+- Ruling: Task 5 credential-reflection checks operate on raw provider-derived JSON keys/values and
+  ETag/Link fields before normalization. Exact raw/sanitized/base64/hex credentials are rejected at
+  any length; partial overlap requires at least 12 characters. Public token-format markers such as
+  `github_pat_` and locally constructed connector metadata are not credentials. Cost if wrong:
+  shorter coincidences are intentionally not classified as secret material, avoiding deterministic
+  rejection of valid fine-grained PATs and ordinary GitHub URLs.
 
 ## Preflight conflict and interface scan
 
@@ -56,12 +62,20 @@
 - Task 3 — completed after fix round 1; initial product `7b3a91e`, fix `8076f5e`, initial report
   `9a1aa6c`; final internal re-review clean after durable replay, association, lifecycle,
   exception-retention, and cancellation hardening.
-- Task 4 — implementation and independent-review fix rounds 1–3 complete; product `e725e8d`, fixes
+- Task 4 — independently approved after implementation and independent-review fix rounds 1–3;
+  product `e725e8d`, fixes
   `d230f42`, `e175ff1`, and `66de152`; final adversarial re-review clean after cancellation transaction,
   protected-path, secret-local, provider-scalar, UNC/device/forward-network path, Markdown escape,
   no-unlink tombstone, external-swap, close-exhaustion, traceback-local, and original pre-scrub
-  hardlink hardening; awaiting controller final review.
-- Task 5 — pending.
+  hardlink hardening.
+- Task 5 — completed; product/docs/tests `05d0acf`; final read-only pre-commit re-review clean with
+  no Critical, Important, or Minor findings. The unique-token
+  audit uses only injected fake HTTP and real resolver/client/connector/orchestrator/store/doctor/
+  report seams; the release proof uses a fresh real Git repository and one combined
+  `markdown,git,github` orchestrator run. Current verification: focused audit 24 passed, GitHub
+  audit plus docs contracts 27 passed, GitHub selection 233 passed, full suite and coverage run
+  644 passed, tracked Python Ruff passed, mypy passed,
+  and tracked-only coverage 89% without a configured threshold.
 
 ## Review findings
 
@@ -120,3 +134,23 @@
   `original-pre-scrub` phase, exact byte-preservation regression, and cancellation coverage. Focused
   verified-report tests **25 passed**; Task 4 selection **91 passed**, secure-focused selection
   **94 passed**, broader GitHub/local selection **174 passed**, and full offline suite **616 passed**.
+- Task 5 pre-commit review 1 found four required audit gaps: the project scanner had an
+  enumeration-to-path-read race; the combined release proof did not create semantic history or a
+  case; credential reflection probes omitted Link/endpoint, rate scalars, and source payloads; and
+  the guide did not distinguish GitHub-only failure exit 1 from mixed partial exit 3. The fix round
+  uses held recursive dirfds with authenticated no-follow opens, produces real ChangeSet/case state,
+  rejects full/fragment/sanitized/encoded provider reflections before persistence, and runs exact
+  injected-fake CLI exits. Initial RED was **2 failed, 3 passed**; JSON-key follow-up RED was
+  **2 failed, 6 passed**. The first fix round reached focused audit **21 passed**, audit plus docs
+  contracts **24 passed**, GitHub selection **229 passed**, and tracked-source coverage run
+  **640 passed at 89%**.
+- Task 5 pre-commit review 2 found one Critical false positive: arbitrary four-character overlap
+  windows and connector-constructed `github` metadata rejected valid fine-grained PATs and ordinary
+  GitHub Link URLs. Normal doctor/unpaginated/paginated RED was **2 failed, 1 passed**; the public
+  `github_pat_` request-ID marker also failed once. The fix scans only raw provider JSON keys/values
+  and ETag/Link in the real client, accepts public/short coincidences, and rejects exact credentials
+  plus raw/sanitized/base64/hex fragments of at least 12 characters. Current focused audit
+  **24 passed**, audit plus docs contracts **27 passed**, GitHub selection **233 passed**, and the
+  full/coverage suite **644 passed at 89%**. Final read-only re-review independently ran 107
+  focused tests plus adversarial ETag/traceback probes and found no Critical, Important, or Minor
+  findings.
