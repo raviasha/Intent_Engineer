@@ -5,8 +5,8 @@ from __future__ import annotations
 from collections.abc import Sequence
 from datetime import datetime
 
-from intent_engineering.capture.base import Connector, SourceObject
-from intent_engineering.core.models import SyncCheckpoint
+from intent_engineering.capture.base import Connector, ConnectorSyncLifecycle, SourceObject
+from intent_engineering.core.models import EvidenceRecord, SyncCheckpoint
 
 
 def checkpoint_after_discovery(
@@ -15,9 +15,15 @@ def checkpoint_after_discovery(
     committed_at: datetime,
     prior: SyncCheckpoint | None = None,
     consumed_evidence_ids: Sequence[str] = (),
+    consumed_evidence: Sequence[EvidenceRecord] = (),
 ) -> SyncCheckpoint:
     """Build a checkpoint, retaining the prior cursor for an empty successful batch."""
-    cursor = connector.next_checkpoint(discovered)
+    if isinstance(connector, ConnectorSyncLifecycle):
+        if tuple(record.id for record in consumed_evidence) != tuple(consumed_evidence_ids):
+            raise ValueError("checkpoint evidence inputs are inconsistent")
+        cursor = connector.finalize_checkpoint(discovered, consumed_evidence)
+    else:
+        cursor = connector.next_checkpoint(discovered)
     if not discovered and prior is not None and cursor is None:
         cursor = prior.cursor
     return SyncCheckpoint(

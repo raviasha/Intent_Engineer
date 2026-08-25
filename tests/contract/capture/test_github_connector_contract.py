@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Mapping
 from datetime import UTC, datetime
 
@@ -27,6 +28,37 @@ class StaticGitHubClient:
     ) -> PageResult:
         self.calls.append((path, dict(params), etag))
         return self.pages[path]
+
+
+class CancelOnceGitHubClient(StaticGitHubClient):
+    """Suspend only the first request so discovery cancellation can be deterministic."""
+
+    def __init__(self, pages: Mapping[str, PageResult]) -> None:
+        super().__init__(pages)
+        self.started = asyncio.Event()
+        self._cancelled_once = False
+
+    async def get_pages(
+        self,
+        path: str,
+        params: Mapping[str, str],
+        etag: str | None = None,
+    ) -> PageResult:
+        if not self._cancelled_once:
+            self._cancelled_once = True
+            self.started.set()
+            await asyncio.Event().wait()
+        return await super().get_pages(path, params, etag)
+
+
+def _traceback_locals(error: BaseException) -> str:
+    values: list[str] = []
+    traceback = error.__traceback__
+    while traceback is not None:
+        if "/src/intent_engineering/" in traceback.tb_frame.f_code.co_filename:
+            values.append(repr(traceback.tb_frame.f_locals))
+        traceback = traceback.tb_next
+    return "".join(values)
 
 
 def _user(login: str = "octocat") -> dict[str, object]:
@@ -401,9 +433,9 @@ async def test_newest_commit_sha_uses_provider_newest_first_order() -> None:
     older["sha"] = "e" * 40
     older["html_url"] = f"https://github.com/acme/demo/commit/{'e' * 40}"
     older["commit"] = {
-        "message": "Older commit",
-        "author": {"name": "Old", "date": "2026-08-24T09:00:00Z"},
-        "committer": {"name": "Old", "date": "2026-08-24T09:01:00Z"},
+        "message": "Provider second despite a later clock",
+        "author": {"name": "Skewed", "date": "2026-08-26T09:00:00Z"},
+        "committer": {"name": "Skewed", "date": "2026-08-26T09:01:00Z"},
     }
     pages = _pages()
     pages["/repos/acme/demo/commits"] = PageResult(items=(newer, older), etag='"commits-2"')
@@ -520,3 +552,162 @@ async def test_provider_repository_url_casing_normalizes_to_canonical_scope() ->
 
     assert record.external_object_id == "github:acme/demo:issue_comment:3001"
     assert record.source_locator == ("https://github.com/acme/demo/issues/42#issuecomment-3001")
+
+
+@pytest.mark.anyio
+async def test_pull_request_conversation_issue_comment_uses_pull_locator_and_issue_number() -> None:
+    comment = _issue_comment()
+    comment["issue_url"] = "https://api.github.com/repos/acme/demo/issues/7"
+    comment["html_url"] = "https://github.com/acme/demo/pull/7#issuecomment-3001"
+    pages = _pages()
+    pages["/repos/acme/demo/issues/comments"] = PageResult(
+        items=(comment,), etag='"pr-conversation"'
+    )
+    connector = GitHubConnector(StaticGitHubClient(pages), owner="acme", repository="demo")
+
+    source = next(
+        item
+        for item in await connector.discover(None)
+        if ":issue_comment:" in item.external_object_id
+    )
+    record = connector.normalize(
+        await connector.fetch(source.external_object_id, source.external_version)
+    )
+
+    assert record.source_locator == ("https://github.com/acme/demo/pull/7#issuecomment-3001")
+    assert record.model_dump(mode="json")["payload"]["issue_number"] == 7
+
+
+@pytest.mark.anyio
+async def test_overlapping_discovery_is_rejected_without_replacing_first_generation() -> None:
+    client = StaticGitHubClient(_pages())
+    connector = GitHubConnector(client, owner="acme", repository="demo")
+    first = await connector.discover(None)
+    first_raw = await connector.fetch(first[0].external_object_id, first[0].external_version)
+    calls_after_first = tuple(client.calls)
+
+    with pytest.raises(ConnectorError, match="GitHub discovery failed") as caught:
+        await connector.discover(None)
+
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+    assert tuple(client.calls) == calls_after_first
+    cursor = connector.next_checkpoint(first)
+    assert cursor is not None
+    checkpoint = GitHubCheckpoint.decode(cursor, expected_repository="acme/demo")
+    assert checkpoint.etags["issues"] == '"issues-1"'
+    with pytest.raises(ConnectorError, match="GitHub fetch failed"):
+        await connector.fetch(first[0].external_object_id, first[0].external_version)
+    with pytest.raises(ConnectorError, match="GitHub normalization failed"):
+        connector.normalize(first_raw)
+
+
+def test_checkpoint_decode_error_retains_no_nested_parser_context_or_input() -> None:
+    sentinel = "PRIVATE_CURSOR_INPUT"
+    with pytest.raises(ValueError, match="invalid GitHub checkpoint") as caught:
+        GitHubCheckpoint.decode(
+            '{"cursor_schema_version":1,"repository":"acme/demo","etags":{},'
+            f'"newest_updated_at":"{sentinel}","newest_commit_sha":null}}',
+            expected_repository="acme/demo",
+        )
+
+    error = caught.value
+    assert error.__cause__ is None
+    assert error.__context__ is None
+    assert sentinel not in str(error)
+    assert sentinel not in repr(error)
+    assert sentinel not in repr(error.__dict__)
+    assert sentinel not in _traceback_locals(error)
+
+
+def test_checkpoint_json_error_document_is_unreachable_from_exported_error() -> None:
+    sentinel = "PRIVATE_JSON_DOCUMENT"
+    with pytest.raises(ValueError, match="invalid GitHub checkpoint") as caught:
+        GitHubCheckpoint.decode(
+            f'{{"repository":"acme/demo","private":"{sentinel}"',
+            expected_repository="acme/demo",
+        )
+
+    error = caught.value
+    assert error.__cause__ is None
+    assert error.__context__ is None
+    assert sentinel not in repr(error)
+    assert sentinel not in repr(error.__dict__)
+    assert sentinel not in _traceback_locals(error)
+
+
+@pytest.mark.anyio
+async def test_discover_cursor_error_retains_no_nested_parser_context_or_input() -> None:
+    sentinel = "PRIVATE_DISCOVERY_CURSOR"
+    connector = GitHubConnector(StaticGitHubClient(_pages()), owner="acme", repository="demo")
+
+    with pytest.raises(ConnectorError, match="GitHub discovery failed") as caught:
+        await connector.discover(sentinel)
+
+    error = caught.value
+    assert error.__cause__ is None
+    assert error.__context__ is None
+    assert sentinel not in str(error)
+    assert sentinel not in repr(error)
+    assert sentinel not in repr(error.__dict__)
+    assert sentinel not in _traceback_locals(error)
+
+
+@pytest.mark.anyio
+async def test_checkpoint_foreign_consumed_record_retains_no_validation_context() -> None:
+    connector = GitHubConnector(StaticGitHubClient(_pages()), owner="acme", repository="demo")
+    discovered = await connector.discover(None)
+    source = discovered[0]
+    record = connector.normalize(
+        await connector.fetch(source.external_object_id, source.external_version)
+    )
+    foreign = record.model_copy(update={"connector_type": "git"})
+
+    with pytest.raises(ConnectorError, match="GitHub checkpoint failed") as caught:
+        connector.finalize_checkpoint(discovered, (foreign,))
+
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+
+
+@pytest.mark.anyio
+async def test_post_acquisition_discovery_exception_self_aborts_and_allows_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_encode = GitHubCheckpoint.encode
+    failed_once = False
+
+    def fail_once(checkpoint: GitHubCheckpoint) -> str:
+        nonlocal failed_once
+        if not failed_once:
+            failed_once = True
+            raise ValueError("private post-acquisition failure")
+        return original_encode(checkpoint)
+
+    monkeypatch.setattr(GitHubCheckpoint, "encode", fail_once)
+    connector = GitHubConnector(StaticGitHubClient(_pages()), owner="acme", repository="demo")
+
+    with pytest.raises(ConnectorError, match="GitHub discovery failed") as caught:
+        await connector.discover(None)
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+
+    discovered = await connector.discover(None)
+    assert discovered
+    assert connector.next_checkpoint(discovered) is not None
+
+
+@pytest.mark.anyio
+async def test_discovery_cancellation_cleans_owned_generation_and_is_re_raised() -> None:
+    client = CancelOnceGitHubClient(_pages())
+    connector = GitHubConnector(client, owner="acme", repository="demo")
+    cancelled_task = asyncio.create_task(connector.discover(None))
+    await client.started.wait()
+
+    cancelled_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await cancelled_task
+
+    discovered = await connector.discover(None)
+    assert discovered
+    assert connector.next_checkpoint(discovered) is not None

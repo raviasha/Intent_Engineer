@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from asyncio import CancelledError
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -11,7 +12,7 @@ from typing import Protocol
 
 import structlog
 
-from intent_engineering.capture.base import Connector, SourceObject
+from intent_engineering.capture.base import Connector, ConnectorSyncLifecycle, SourceObject
 from intent_engineering.capture.checkpoints import checkpoint_after_discovery
 from intent_engineering.core.models import (
     ChangeSet,
@@ -84,7 +85,8 @@ class SyncOrchestrator:
         checkpoint_store: CheckpointStore,
         case_store: CaseStore,
         reasoner: SemanticReasoner,
-        case_detector: CaseDetector | Callable[[EvidenceDelta, Graph], Sequence[DriftObservation]] = _no_cases,
+        case_detector: CaseDetector
+        | Callable[[EvidenceDelta, Graph], Sequence[DriftObservation]] = _no_cases,
         changeset_executor: LocalChangeSetExecutor | None = None,
         clock: Callable[[], datetime] = _utc_now,
     ) -> None:
@@ -113,8 +115,10 @@ class SyncOrchestrator:
         started = perf_counter()
         results: dict[str, ConnectorRunResult] = {}
         pending: list[_PendingConnector] = []
+        owned_generations: dict[int, Connector] = {}
         for connector in connectors:
             progress = _ConnectorProgress()
+            generation_acquired = False
             try:
                 prior = self._checkpoint_store.get(connector.connector_id)
                 connector_type = self._connector_type(connector)
@@ -133,9 +137,7 @@ class SyncOrchestrator:
                 ):
                     raise ValueError("checkpoint consumption association is invalid")
                 ingestions = [
-                    item
-                    for item in connector_ledger
-                    if item.evidence.id not in consumed_ids
+                    item for item in connector_ledger if item.evidence.id not in consumed_ids
                 ]
                 records = [item.evidence for item in ingestions]
                 record_ids = {record.id for record in records}
@@ -145,6 +147,9 @@ class SyncOrchestrator:
                     if item.predecessor_id is not None
                 }
                 discovered = await connector.discover(prior.cursor if prior is not None else None)
+                generation_acquired = True
+                if isinstance(connector, ConnectorSyncLifecycle):
+                    owned_generations[id(connector)] = connector
                 for source_object in discovered:
                     raw = await connector.fetch(
                         source_object.external_object_id,
@@ -184,7 +189,12 @@ class SyncOrchestrator:
                         progress=progress,
                     )
                 )
+            except CancelledError:
+                self._abort_owned_generations(owned_generations)
+                raise
             except Exception as error:  # noqa: BLE001 - boundary intentionally preserves BaseException
+                if generation_acquired:
+                    self._abort_owned_generation(owned_generations, connector)
                 results[connector.connector_id] = ConnectorRunResult.failed(
                     self._redact_error(error),
                     evidence_added=progress.evidence_added,
@@ -198,7 +208,11 @@ class SyncOrchestrator:
                 if pending_item.delta.added:
                     self._apply_reasoning(pending_item.delta, pending_item.progress)
                 semantic_successes.append(pending_item)
+            except CancelledError:
+                self._abort_owned_generations(owned_generations)
+                raise
             except Exception as error:  # noqa: BLE001 - connector isolation boundary
+                self._abort_owned_generation(owned_generations, pending_item.connector)
                 results[pending_item.connector.connector_id] = ConnectorRunResult.failed(
                     self._redact_error(error),
                     evidence_added=pending_item.progress.evidence_added,
@@ -213,6 +227,9 @@ class SyncOrchestrator:
                 if case_count:
                     semantic_successes[0].progress.cases_created += case_count
                     semantic_successes[0].progress.changes_applied += change_count
+            except CancelledError:
+                self._abort_owned_generations(owned_generations)
+                raise
             except Exception as error:  # noqa: BLE001 - shared detector transaction boundary
                 for successful_item in semantic_successes:
                     results[successful_item.connector.connector_id] = ConnectorRunResult.failed(
@@ -221,25 +238,39 @@ class SyncOrchestrator:
                         changes_applied=successful_item.progress.changes_applied,
                         cases_created=successful_item.progress.cases_created,
                     )
+                self._abort_owned_generations(owned_generations)
                 semantic_successes = []
 
         for successful_item in semantic_successes:
             try:
                 prior = successful_item.prior
+                consumed_evidence_ids = tuple(
+                    dict.fromkeys(
+                        (
+                            *(prior.consumed_evidence_ids if prior is not None else ()),
+                            *(record.id for record in successful_item.delta.added),
+                        )
+                    )
+                )
+                ledger_by_id = {
+                    item.evidence.id: item.evidence
+                    for item in self._evidence_store.ledger(
+                        successful_item.connector.connector_id,
+                        connector_type=self._connector_type(successful_item.connector),
+                    )
+                }
+                consumed_evidence = tuple(
+                    ledger_by_id[evidence_id] for evidence_id in consumed_evidence_ids
+                )
                 checkpoint = checkpoint_after_discovery(
                     successful_item.connector,
                     successful_item.discovered,
                     self._clock(),
                     prior=prior,
-                    consumed_evidence_ids=tuple(
-                        dict.fromkeys(
-                            (
-                                *(prior.consumed_evidence_ids if prior is not None else ()),
-                                *(record.id for record in successful_item.delta.added),
-                            )
-                        )
-                    ),
+                    consumed_evidence_ids=consumed_evidence_ids,
+                    consumed_evidence=consumed_evidence,
                 )
+                owned_generations.pop(id(successful_item.connector), None)
                 checkpoint_advanced = prior is None or (
                     checkpoint.cursor != prior.cursor
                     or checkpoint.consumed_evidence_ids != prior.consumed_evidence_ids
@@ -258,7 +289,11 @@ class SyncOrchestrator:
                     successful_item.progress.cases_created,
                     checkpoint_advanced,
                 )
+            except CancelledError:
+                self._abort_owned_generations(owned_generations)
+                raise
             except Exception as error:  # noqa: BLE001 - checkpoint is connector-local
+                self._abort_owned_generation(owned_generations, successful_item.connector)
                 results[successful_item.connector.connector_id] = ConnectorRunResult.failed(
                     self._redact_error(error),
                     evidence_added=successful_item.progress.evidence_added,
@@ -292,6 +327,35 @@ class SyncOrchestrator:
             progress.evidence_added += 1
 
     @staticmethod
+    def _abort_connector(connector: Connector) -> None:
+        """Best-effort invalidation of optional connector-local generation state."""
+        if not isinstance(connector, ConnectorSyncLifecycle):
+            return
+        try:
+            connector.abort_sync()
+        except Exception:  # noqa: BLE001 - preserve the original transaction failure
+            return
+
+    @classmethod
+    def _abort_owned_generation(
+        cls,
+        owned_generations: dict[int, Connector],
+        connector: Connector,
+    ) -> None:
+        """Abort one generation only when this run authenticated its ownership."""
+        owned = owned_generations.pop(id(connector), None)
+        if owned is not None:
+            cls._abort_connector(owned)
+
+    @classmethod
+    def _abort_owned_generations(cls, owned_generations: dict[int, Connector]) -> None:
+        """Abort every still-active generation authenticated to this run."""
+        owned = tuple(owned_generations.values())
+        owned_generations.clear()
+        for connector in owned:
+            cls._abort_connector(connector)
+
+    @staticmethod
     def _connector_type(connector: Connector) -> str:
         connector_type = getattr(connector, "connector_type", connector.connector_id)
         if not isinstance(connector_type, str) or not connector_type:
@@ -302,7 +366,9 @@ class SyncOrchestrator:
         """Reason and apply one connector's graph groups before combined detection."""
         graph = self._graph_store.load()
         assertions = self._reasoner.extract_assertions(delta)
-        changeset = ChangeSet.model_validate(self._reasoner.map_to_graph(assertions, graph).model_dump())
+        changeset = ChangeSet.model_validate(
+            self._reasoner.map_to_graph(assertions, graph).model_dump()
+        )
         if changeset.reconciliation_cases_created or changeset.reconciliation_cases_resolved:
             raise ValueError("reasoner cannot supply reconciliation payloads")
         if not changeset.is_semantic:
@@ -332,7 +398,9 @@ class SyncOrchestrator:
             return 0, 0
         graph = self._graph_store.load()
         cases: list[ReconciliationCase] = []
-        for observation in sorted(self._case_detector(delta, graph), key=lambda item: item.fingerprint):
+        for observation in sorted(
+            self._case_detector(delta, graph), key=lambda item: item.fingerprint
+        ):
             if self._case_store.find_by_fingerprint(observation.fingerprint) is not None:
                 continue
             cases.append(

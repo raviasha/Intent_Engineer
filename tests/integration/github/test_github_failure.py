@@ -4,7 +4,26 @@ from __future__ import annotations
 
 import pytest
 
+from intent_engineering.capture.github.connector import GitHubCheckpoint
 from intent_engineering.sync.models import SyncRunStatus
+from intent_engineering.validation.service import _checkpoint_diagnostics
+
+
+def _checkpoint_codes(github_sync_harness) -> tuple[str, ...]:  # type: ignore[no-untyped-def]
+    checkpoint = github_sync_harness.checkpoint_store.get("github:acme/demo")
+    ledger = github_sync_harness.evidence_store.ledger(
+        "github:acme/demo",
+        connector_type="github",
+    )
+    return tuple(
+        diagnostic.code
+        for diagnostic in _checkpoint_diagnostics(
+            {"github:acme/demo": checkpoint} if checkpoint is not None else {},
+            tuple(item.evidence for item in ledger),
+            tuple(ledger),
+            (),
+        )
+    )
 
 
 @pytest.mark.anyio
@@ -89,4 +108,71 @@ async def test_later_endpoint_failure_leaves_existing_checkpoint_exact_bytes_unc
         len(github_sync_harness.evidence_store.ledger("github:acme/demo", connector_type="github"))
         == 6
     )
+    await github_sync_harness.close()
+
+
+@pytest.mark.anyio
+async def test_new_connector_retry_cursors_deleted_newer_mutable_durable_evidence(
+    github_sync_harness,  # type: ignore[no-untyped-def]
+) -> None:
+    baseline = await github_sync_harness.run("baseline")
+    assert baseline.status is SyncRunStatus.SUCCESS
+
+    github_sync_harness.api.payloads["issues"] = [
+        {
+            **github_sync_harness.api.payloads["issues"][0],
+            "title": "Durable but deleted before retry",
+            "updated_at": "2026-08-26T11:00:00Z",
+        }
+    ]
+    github_sync_harness.api.etags["issues"] = '"issues-2"'
+    github_sync_harness.api.fail_endpoint = "pulls"
+    failed = await github_sync_harness.run("partial-newer-mutable")
+
+    assert failed.status is SyncRunStatus.FAILED
+    assert failed.evidence_added == 1
+    await github_sync_harness.close()
+    github_sync_harness.api.fail_endpoint = None
+    github_sync_harness.api.payloads["issues"] = []
+    github_sync_harness.api.etags["issues"] = '"issues-3"'
+    github_sync_harness.restart_connector()
+
+    recovered = await github_sync_harness.run("new-process-retry")
+    checkpoint = github_sync_harness.checkpoint_store.get("github:acme/demo")
+
+    assert recovered.status is SyncRunStatus.SUCCESS
+    assert checkpoint is not None and checkpoint.cursor is not None
+    cursor = GitHubCheckpoint.decode(checkpoint.cursor, expected_repository="acme/demo")
+    assert cursor.newest_updated_at.isoformat() == "2026-08-26T11:00:00+00:00"
+    assert _checkpoint_codes(github_sync_harness) == ()
+    await github_sync_harness.close()
+
+
+@pytest.mark.anyio
+async def test_new_connector_retry_cursors_deleted_first_commit_durable_evidence(
+    github_sync_harness,  # type: ignore[no-untyped-def]
+) -> None:
+    github_sync_harness.api.payloads["issues"] = []
+    github_sync_harness.api.payloads["pulls"] = []
+    github_sync_harness.api.fail_endpoint = "issues/comments"
+    failed = await github_sync_harness.run("partial-first-commit")
+
+    assert failed.status is SyncRunStatus.FAILED
+    assert failed.evidence_added == 1
+    await github_sync_harness.close()
+    github_sync_harness.api.fail_endpoint = None
+    github_sync_harness.api.payloads["commits"] = []
+    github_sync_harness.api.payloads["issues/comments"] = []
+    github_sync_harness.api.payloads["pulls/comments"] = []
+    github_sync_harness.api.etags["commits"] = '"commits-2"'
+    github_sync_harness.restart_connector()
+
+    recovered = await github_sync_harness.run("new-process-retry")
+    checkpoint = github_sync_harness.checkpoint_store.get("github:acme/demo")
+
+    assert recovered.status is SyncRunStatus.SUCCESS
+    assert checkpoint is not None and checkpoint.cursor is not None
+    cursor = GitHubCheckpoint.decode(checkpoint.cursor, expected_repository="acme/demo")
+    assert cursor.newest_commit_sha == "d" * 40
+    assert _checkpoint_codes(github_sync_harness) == ()
     await github_sync_harness.close()

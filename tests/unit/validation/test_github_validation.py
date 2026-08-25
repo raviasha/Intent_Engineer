@@ -115,6 +115,37 @@ def _seed_association(
     return record.id
 
 
+def _seed_uncheckpointed_association(
+    root: Path,
+    *,
+    connector_id: str,
+    connector_type: str,
+    external_object_id: str,
+    payload: dict[str, JsonValue],
+) -> None:
+    initialize_project(root)
+    runtime = load_runtime(root)
+    observed_at = datetime(2026, 8, 25, 10, tzinfo=UTC)
+    encoded = (
+        __import__("json")
+        .dumps(payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+        .encode("utf-8")
+    )
+    record = normalize_raw_source(
+        RawSourceObject(
+            connector_type=connector_type,
+            external_object_id=external_object_id,
+            external_version="2026-08-25T10:00:00Z",
+            author=None,
+            observed_at=observed_at,
+            source_locator="https://github.com/acme/demo/issues/42",
+            content_hash=f"sha256:{sha256(encoded).hexdigest()}",
+            payload=payload,
+        )
+    )
+    runtime.evidence_store.associate(connector_id, record)
+
+
 def test_valid_github_ledger_and_checkpoint_pass_deep_validation(tmp_path: Path) -> None:
     root = tmp_path / "project"
     root.mkdir()
@@ -286,6 +317,54 @@ def test_github_checkpoint_rejects_missing_or_foreign_newest_commit_sha(
     assert expected_code in _codes(root)
 
 
+def test_github_checkpoint_accepts_provider_head_even_when_an_older_commit_has_later_clock(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "project"
+    root.mkdir()
+    initialize_project(root)
+    runtime = load_runtime(root)
+    records = []
+    for sha, observed_at in (
+        ("a" * 40, datetime(2026, 8, 25, 9, tzinfo=UTC)),
+        ("b" * 40, datetime(2026, 8, 25, 11, tzinfo=UTC)),
+    ):
+        payload: dict[str, JsonValue] = {
+            "kind": "commit",
+            "repository": "acme/demo",
+            "sha": sha,
+        }
+        encoded = (
+            __import__("json")
+            .dumps(payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+            .encode("utf-8")
+        )
+        record = normalize_raw_source(
+            RawSourceObject(
+                connector_type="github",
+                external_object_id=f"github:acme/demo:commit:{sha}",
+                external_version=sha,
+                author=None,
+                observed_at=observed_at,
+                source_locator=f"https://github.com/acme/demo/commit/{sha}",
+                content_hash=f"sha256:{sha256(encoded).hexdigest()}",
+                payload=payload,
+            )
+        )
+        runtime.evidence_store.associate("github:acme/demo", record)
+        records.append(record)
+    cursor = GitHubCheckpoint(repository="acme/demo", newest_commit_sha="a" * 40).encode()
+    runtime.checkpoint_store.compare_and_set(
+        "github:acme/demo",
+        expected=None,
+        cursor=cursor,
+        committed_at=NOW,
+        consumed_evidence_ids=tuple(record.id for record in records),
+    )
+
+    assert validate_project(root).valid is True
+
+
 def test_github_checkpoint_rejects_malformed_scoped_external_identity(tmp_path: Path) -> None:
     root = tmp_path / "project"
     root.mkdir()
@@ -301,3 +380,46 @@ def test_github_checkpoint_rejects_malformed_scoped_external_identity(tmp_path: 
     )
 
     assert "checkpoint.consumed_evidence_foreign" in _codes(root)
+
+
+def test_valid_uncheckpointed_github_partial_ledger_is_accepted(tmp_path: Path) -> None:
+    root = tmp_path / "project"
+    root.mkdir()
+    _seed_uncheckpointed_association(
+        root,
+        connector_id="github:acme/demo",
+        connector_type="github",
+        external_object_id="github:acme/demo:issue:42",
+        payload=_issue_payload("acme/demo", "2026-08-25T10:00:00Z"),
+    )
+
+    assert validate_project(root).valid is True
+
+
+@pytest.mark.parametrize(
+    ("connector_id", "connector_type", "external_object_id", "repository"),
+    [
+        ("github:acme/demo", "git", "commit:bad-scope", "acme/demo"),
+        ("github:acme/demo", "github", "github:acme/other:issue:42", "acme/other"),
+        ("github:bad/../repo", "github", "github:bad/../repo:issue:42", "bad/../repo"),
+        ("unknown:connector", "github", "github:acme/demo:issue:42", "acme/demo"),
+    ],
+)
+def test_uncheckpointed_github_association_scope_is_deeply_validated(
+    tmp_path: Path,
+    connector_id: str,
+    connector_type: str,
+    external_object_id: str,
+    repository: str,
+) -> None:
+    root = tmp_path / "project"
+    root.mkdir()
+    _seed_uncheckpointed_association(
+        root,
+        connector_id=connector_id,
+        connector_type=connector_type,
+        external_object_id=external_object_id,
+        payload=_issue_payload(repository, "2026-08-25T10:00:00Z"),
+    )
+
+    assert "evidence.github_association_invalid" in _codes(root)

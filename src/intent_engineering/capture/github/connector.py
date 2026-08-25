@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+from asyncio import CancelledError
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
 from hashlib import sha256
@@ -152,6 +153,8 @@ class GitHubCheckpoint(StrictModel):
 
     @classmethod
     def decode(cls, value: str, *, expected_repository: str) -> GitHubCheckpoint:
+        checkpoint: GitHubCheckpoint | None = None
+        payload: object = None
         try:
             if type(value) is not str or len(value.encode("utf-8")) > _CURSOR_MAX_BYTES:
                 raise ValueError
@@ -161,9 +164,13 @@ class GitHubCheckpoint(StrictModel):
             checkpoint = cls.model_validate(payload)
             if checkpoint.repository != expected_repository or checkpoint.encode() != value:
                 raise ValueError
-            return checkpoint
         except (UnicodeError, TypeError, ValidationError, ValueError):
-            raise GitHubCheckpointError() from None
+            checkpoint = None
+        if checkpoint is None:
+            payload = None
+            del value
+            raise GitHubCheckpointError()
+        return checkpoint
 
 
 def _split_provider_fields(
@@ -305,11 +312,20 @@ def _semantic_hash(payload: Mapping[str, JsonValue]) -> str:
 
 def _validated_html_locator(
     value: str,
-    expected_path: str,
+    expected_path: str | tuple[str, ...],
     *,
     expected_fragment: str = "",
 ) -> str:
     parsed = urlsplit(value)
+    expected_paths = (expected_path,) if isinstance(expected_path, str) else expected_path
+    canonical_path = next(
+        (
+            candidate
+            for candidate in expected_paths
+            if parsed.path.casefold() == candidate.casefold()
+        ),
+        None,
+    )
     if (
         parsed.scheme != "https"
         or parsed.hostname != "github.com"
@@ -317,12 +333,12 @@ def _validated_html_locator(
         or parsed.username is not None
         or parsed.password is not None
         or parsed.query
-        or parsed.path.casefold() != expected_path.casefold()
+        or canonical_path is None
         or parsed.fragment != expected_fragment
     ):
         raise ValueError("invalid GitHub locator")
     fragment = f"#{expected_fragment}" if expected_fragment else ""
-    return f"https://github.com{expected_path}{fragment}"
+    return f"https://github.com{canonical_path}{fragment}"
 
 
 def _linked_number(value: str, expected_prefix: str) -> int:
@@ -396,11 +412,14 @@ class GitHubConnector:
 
     async def discover(self, cursor: str | None) -> Sequence[SourceObject]:
         """Return a deterministic partial batch and defer any later failure to checkpointing."""
+        if self._checkpoint_pending:
+            raise ConnectorError("GitHub discovery failed")
         self._cache = {}
         self._last_discovered = ()
         self._next_cursor = None
         self._checkpoint_pending = False
         self._discovery_failed = False
+        prior: GitHubCheckpoint | None = None
         try:
             prior = (
                 GitHubCheckpoint(repository=self.repository)
@@ -408,7 +427,34 @@ class GitHubConnector:
                 else GitHubCheckpoint.decode(cursor, expected_repository=self.repository)
             )
         except (TypeError, ValueError):
-            raise ConnectorError("GitHub discovery failed") from None
+            prior = None
+        if prior is None:
+            cursor = None
+            raise ConnectorError("GitHub discovery failed")
+        self._checkpoint_pending = True
+        discovered: tuple[SourceObject, ...] | None = None
+        try:
+            discovered = await self._discover_generation(prior, cursor)
+        except CancelledError:
+            prior = None
+            cursor = None
+            self.abort_sync()
+            raise
+        except Exception:  # noqa: BLE001 - fixed provider boundary raised below
+            discovered = None
+        if discovered is None:
+            prior = None
+            cursor = None
+            self.abort_sync()
+            raise ConnectorError("GitHub discovery failed")
+        return discovered
+
+    async def _discover_generation(
+        self,
+        prior: GitHubCheckpoint,
+        cursor: str | None,
+    ) -> tuple[SourceObject, ...]:
+        """Populate one already-acquired generation, allowing partial endpoint durability."""
 
         etags = dict(prior.etags)
         newest_updated_at = prior.newest_updated_at
@@ -462,7 +508,6 @@ class GitHubConnector:
         )
         self._next_cursor = next_state.encode() if discovered else cursor
         self._last_discovered = discovered
-        self._checkpoint_pending = True
         return discovered
 
     def _decode_page(
@@ -637,7 +682,10 @@ class GitHubConnector:
             observed_at=item.updated_at,
             locator=_validated_html_locator(
                 item.html_url,
-                f"/{self.owner}/{self.repository_name}/issues/{number}",
+                (
+                    f"/{self.owner}/{self.repository_name}/issues/{number}",
+                    f"/{self.owner}/{self.repository_name}/pull/{number}",
+                ),
                 expected_fragment=f"issuecomment-{item.id}",
             ),
             payload=payload,
@@ -688,13 +736,122 @@ class GitHubConnector:
 
     def next_checkpoint(self, discovered: Sequence[SourceObject]) -> str | None:
         """Consume only the immediately preceding successful discovery checkpoint."""
+        consumed_evidence = tuple(normalize_raw_source(raw) for raw in self._cache.values())
+        return self.finalize_checkpoint(discovered, consumed_evidence)
+
+    def finalize_checkpoint(
+        self,
+        discovered: Sequence[SourceObject],
+        consumed_evidence: Sequence[EvidenceRecord],
+    ) -> str | None:
+        """Finalize the active generation against its exact durable consumed ledger."""
         supplied = tuple(discovered)
         if (
             not self._checkpoint_pending
             or supplied != self._last_discovered
             or self._discovery_failed
         ):
-            self._checkpoint_pending = False
+            self.abort_sync()
             raise ConnectorError("GitHub checkpoint failed")
+        if not consumed_evidence:
+            empty_cursor = self._next_cursor
+            self.abort_sync()
+            return empty_cursor
+        cursor: str | None = None
+        failed = False
+        record: EvidenceRecord | None = None
+        kind: str | None = None
+        state: GitHubCheckpoint | None = None
+        mutable_records: list[EvidenceRecord] = []
+        commit_records: list[EvidenceRecord] = []
+        try:
+            state = (
+                GitHubCheckpoint(repository=self.repository)
+                if self._next_cursor is None
+                else GitHubCheckpoint.decode(
+                    self._next_cursor,
+                    expected_repository=self.repository,
+                )
+            )
+            for record in consumed_evidence:
+                kind = self._scoped_record_kind(record)
+                if kind is None:
+                    raise ValueError("foreign GitHub evidence")
+                if kind == "commit":
+                    commit_records.append(record)
+                else:
+                    mutable_records.append(record)
+            newest_updated_at = (
+                max(record.observed_at for record in mutable_records) if mutable_records else None
+            )
+            newest_commit_sha = state.newest_commit_sha
+            consumed_commit_shas = {record.external_version for record in commit_records}
+            if consumed_commit_shas:
+                if newest_commit_sha is None:
+                    newest_commit_sha = min(consumed_commit_shas)
+                elif newest_commit_sha not in consumed_commit_shas:
+                    raise ValueError("GitHub head is not durable")
+            elif newest_commit_sha is not None:
+                raise ValueError("GitHub head evidence is missing")
+            cursor = GitHubCheckpoint(
+                repository=self.repository,
+                etags=state.etags,
+                newest_updated_at=newest_updated_at,
+                newest_commit_sha=newest_commit_sha,
+            ).encode()
+        except (TypeError, ValidationError, ValueError):
+            failed = True
+        if failed:
+            consumed_evidence = ()
+            mutable_records = []
+            commit_records = []
+            record = None
+            kind = None
+            state = None
+            self.abort_sync()
+            raise ConnectorError("GitHub checkpoint failed")
+        self.abort_sync()
+        return cursor
+
+    def abort_sync(self) -> None:
+        """Invalidate every object and cursor tied to the current generation."""
+        self._cache = {}
+        self._last_discovered = ()
+        self._next_cursor = None
         self._checkpoint_pending = False
-        return self._next_cursor
+        self._discovery_failed = False
+
+    def _scoped_record_kind(self, record: EvidenceRecord) -> str | None:
+        if record.connector_type != self.connector_type:
+            return None
+        prefix = f"github:{self.repository}:"
+        if not record.external_object_id.startswith(prefix):
+            return None
+        suffix = record.external_object_id.removeprefix(prefix)
+        kind, separator, identity = suffix.partition(":")
+        if not separator:
+            return None
+        payload = record.model_dump(mode="json")["payload"]
+        if payload.get("repository") != self.repository or payload.get("kind") != kind:
+            return None
+        if kind == "commit":
+            if (
+                _SHA.fullmatch(identity) is None
+                or record.external_version != identity
+                or payload.get("sha") != identity
+            ):
+                return None
+            return kind
+        if kind not in {"issue", "pull_request", "issue_comment", "review_comment"}:
+            return None
+        if not identity.isascii() or not identity.isdecimal() or identity.startswith("0"):
+            return None
+        identity_field = "number" if kind in {"issue", "pull_request"} else "provider_id"
+        canonical_observed_at = _format_datetime(record.observed_at)
+        if (
+            payload.get(identity_field) != int(identity)
+            or record.external_version != canonical_observed_at
+            or payload.get("updated_at") != canonical_observed_at
+        ):
+            return None
+        return kind

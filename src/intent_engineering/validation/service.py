@@ -540,6 +540,28 @@ def _github_scoped_record_kind(record: EvidenceRecord, repository: str) -> str |
     return kind
 
 
+def _github_association_diagnostics(
+    ingestions: Sequence[EvidenceIngestion],
+) -> list[ValidationDiagnostic]:
+    """Validate every GitHub ingestion association, including partial uncheckpointed ledgers."""
+    diagnostics: list[ValidationDiagnostic] = []
+    for ingestion in ingestions:
+        connector_id = ingestion.connector_id
+        record = ingestion.evidence
+        if connector_id.startswith(_GITHUB_CONNECTOR_PREFIX):
+            repository = connector_id.removeprefix(_GITHUB_CONNECTOR_PREFIX)
+            try:
+                GitHubCheckpoint(repository=repository)
+            except (TypeError, ValidationError, ValueError):
+                diagnostics.append(_diagnostic("evidence.github_association_invalid", "evidence"))
+                continue
+            if _github_scoped_record_kind(record, repository) is None:
+                diagnostics.append(_diagnostic("evidence.github_association_invalid", "evidence"))
+        elif record.connector_type == "github":
+            diagnostics.append(_diagnostic("evidence.github_association_invalid", "evidence"))
+    return diagnostics
+
+
 def _checkpoint_diagnostics(
     checkpoints: Mapping[str, SyncCheckpoint],
     evidence: Sequence[EvidenceRecord],
@@ -646,18 +668,13 @@ def _checkpoint_diagnostics(
                 record for record in consumed_records if kinds_by_evidence_id[record.id] == "commit"
             )
             if commit_records:
-                newest_commit_records = tuple(
-                    record
-                    for record in commit_records
-                    if record.observed_at == max(item.observed_at for item in commit_records)
-                )
                 if github_cursor.newest_commit_sha is None:
                     diagnostics.append(_diagnostic("checkpoint.cursor_invalid", "checkpoints"))
                 elif not any(
                     record.external_object_id
                     == f"github:{github_repository}:commit:{github_cursor.newest_commit_sha}"
                     and record.external_version == github_cursor.newest_commit_sha
-                    for record in newest_commit_records
+                    for record in commit_records
                 ):
                     diagnostics.append(_diagnostic("checkpoint.evidence_missing", "checkpoints"))
             elif github_cursor.newest_commit_sha is not None:
@@ -835,6 +852,8 @@ class WorkspaceValidationService:
 
         if evidence is not None:
             diagnostics.extend(_evidence_diagnostics(evidence, legacy_ids))
+            if ingestions is not None:
+                diagnostics.extend(_github_association_diagnostics(ingestions))
         if graph is not None and evidence is not None:
             evidence_by_id = {record.id: record for record in evidence}
             diagnostics.extend(_graph_diagnostics(graph, evidence_by_id))

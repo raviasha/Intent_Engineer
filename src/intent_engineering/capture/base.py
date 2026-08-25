@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from datetime import datetime
 from hashlib import sha256
-from typing import Protocol
+from typing import Protocol, runtime_checkable
 
 from pydantic import ConfigDict, field_validator
 
@@ -65,6 +65,23 @@ class Connector(Protocol):
         raise NotImplementedError
 
     def next_checkpoint(self, discovered: Sequence[SourceObject]) -> str | None:
+        raise NotImplementedError
+
+
+@runtime_checkable
+class ConnectorSyncLifecycle(Protocol):
+    """Optional transaction lifecycle for stateful connector generations."""
+
+    def finalize_checkpoint(
+        self,
+        discovered: Sequence[SourceObject],
+        consumed_evidence: Sequence[EvidenceRecord],
+    ) -> str | None:
+        """Finalize the exact generation against its complete durable evidence prefix."""
+        raise NotImplementedError
+
+    def abort_sync(self) -> None:
+        """Invalidate connector-local generation state after a failed sync attempt."""
         raise NotImplementedError
 
 

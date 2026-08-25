@@ -27,6 +27,13 @@ async def test_success_persists_all_five_kinds_and_exact_consumed_prefix(
         "issue_comment",
         "review_comment",
     }
+    issue_comment = next(
+        item.evidence
+        for item in ledger
+        if item.evidence.model_dump(mode="json")["payload"]["kind"] == "issue_comment"
+    )
+    assert issue_comment.source_locator == ("https://github.com/acme/demo/pull/7#issuecomment-3001")
+    assert issue_comment.model_dump(mode="json")["payload"]["issue_number"] == 7
     assert (
         GitHubCheckpoint.decode(checkpoint.cursor, expected_repository="acme/demo").repository
         == "acme/demo"

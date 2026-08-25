@@ -85,8 +85,8 @@ def issue_comment() -> dict[str, object]:
         "body": "Issue comment",
         "user": user("commenter"),
         "updated_at": "2026-08-25T10:10:00Z",
-        "html_url": "https://github.com/acme/demo/issues/42#issuecomment-3001",
-        "issue_url": "https://api.github.com/repos/acme/demo/issues/42",
+        "html_url": "https://github.com/acme/demo/pull/7#issuecomment-3001",
+        "issue_url": "https://api.github.com/repos/acme/demo/issues/7",
     }
 
 
@@ -223,6 +223,16 @@ class GitHubSyncHarness:
 
     async def close(self) -> None:
         await self.client.aclose()
+
+    def restart_connector(self) -> None:
+        """Replace connector-local state while retaining only durable stores and fake API."""
+        credentials = GitHubCredentials.resolve({"GH_TOKEN": TOKEN}, lambda _: "unused")
+        self.client = GitHubClient(
+            credentials,
+            transport=httpx.MockTransport(self.api.handler),
+            retry_policy=RetryPolicy(max_attempts=1),
+        )
+        self.connector = GitHubConnector(self.client, owner="acme", repository="demo")
 
     def build_repository_connector(
         self,
