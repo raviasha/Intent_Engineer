@@ -4,12 +4,19 @@ from __future__ import annotations
 
 import os
 import stat
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any, cast
 
 import yaml  # type: ignore[import-untyped]
 
-from intent_engineering.core.models import EvidenceRecord, Graph, ProjectConfig, ReconciliationCase
+from intent_engineering.core.models import (
+    EvidenceRecord,
+    Graph,
+    ProjectConfig,
+    ReconciliationCase,
+    SyncCheckpoint,
+)
 from intent_engineering.core.models.changeset import ChangeSet
 
 
@@ -41,6 +48,19 @@ def _validate_jsonl(
     for line in content.splitlines():
         if line:
             model.model_validate_json(line)
+
+
+def _validate_checkpoints(path: Path) -> None:
+    loaded = yaml.safe_load(_read_regular(path).decode("utf-8"))
+    if not isinstance(loaded, dict) or set(loaded) != {"checkpoints"}:
+        raise ValueError("invalid checkpoints")
+    records = loaded["checkpoints"]
+    if not isinstance(records, dict):
+        raise TypeError("invalid checkpoints")
+    for connector_id, record in records.items():
+        checkpoint = SyncCheckpoint.model_validate(record)
+        if checkpoint.connector_id != connector_id:
+            raise ValueError("invalid checkpoints")
 
 
 def inspect_workspace(root: Path) -> tuple[bool, tuple[str, ...]]:
@@ -82,7 +102,7 @@ def inspect_workspace(root: Path) -> tuple[bool, tuple[str, ...]]:
         if name in present_state and not _kind(path, stat.S_IFREG)
     }
     diagnostics.extend(sorted(invalid_state))
-    checks = (
+    checks: tuple[tuple[str, Callable[[], None]], ...] = (
         (
             "evidence",
             lambda: _validate_jsonl(workspace / "evidence" / "evidence.jsonl", EvidenceRecord),
@@ -96,9 +116,7 @@ def inspect_workspace(root: Path) -> tuple[bool, tuple[str, ...]]:
         ("history", lambda: _validate_jsonl(workspace / "history" / "changesets.jsonl", ChangeSet)),
         (
             "checkpoints",
-            lambda: yaml.safe_load(
-                _read_regular(workspace / "cache" / "checkpoints.yaml").decode("utf-8")
-            ),
+            lambda: _validate_checkpoints(workspace / "cache" / "checkpoints.yaml"),
         ),
     )
     for name, check in checks:
