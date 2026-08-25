@@ -175,3 +175,38 @@ Follow-up redaction boundary: `b5c534199b5f32e42427a97d53d65efd09fe85f5`.
 Fresh final verification after that commit: focused E2E `28 passed in 8.94s`,
 Ruff clean, strict mypy clean across 12 modules, full pytest `213 passed in
 10.04s`, and both help commands exited 0.
+
+## Fix round 2 — recovery, projections, and metadata
+
+Product/tests: `e4fa45c3e79cb671307efcc5305d83d4195ef178`.
+
+- Source selections are now validated before runtime construction.
+- Status and rendering use an authorized graph/case projection.
+- Markdown front matter projects both detector input and intent assertions into
+  the existing application boundaries; detector fixture evidence is constrained
+  to the current durable record.
+- Resolution persists a preimage journal, replays it before the next locked
+  resolution operation, and rejects defer/false-positive actions from the
+  resolved transition path.
+
+RED:
+
+```text
+.venv/bin/python -m pytest tests/e2e/test_cli_local.py::test_invalid_sources_are_usage_errors_before_project_loading -v
+```
+
+Result: failed because an uninitialized project returned exit 1 before source
+validation. GREEN: same target passed after validation was moved before runtime
+loading.
+
+Final commands:
+
+```text
+.venv/bin/ruff check src/intent_engineering/cli src/intent_engineering/reconcile tests/e2e/test_cli_local.py
+.venv/bin/mypy --strict src/intent_engineering/cli src/intent_engineering/reconcile
+.venv/bin/python -m pytest tests/e2e/test_cli_local.py -v
+.venv/bin/python -m pytest
+```
+
+Results: Ruff clean; strict mypy clean across 8 modules; focused E2E `29
+passed in 9.08s`; full pytest `214 passed in 10.12s`.
