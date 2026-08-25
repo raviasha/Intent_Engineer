@@ -31,11 +31,14 @@
   outside hardlink, while applying foreign-state refusal to owned output can retain private report
   bytes after rollback.
 - Ruling: Task 5 credential-reflection checks operate on raw provider-derived JSON keys/values and
-  ETag/Link fields before normalization. Exact raw/sanitized/base64/hex credentials are rejected at
-  any length; partial overlap requires at least 12 characters. Public token-format markers such as
-  `github_pat_` and locally constructed connector metadata are not credentials. Cost if wrong:
-  shorter coincidences are intentionally not classified as secret material, avoiding deterministic
-  rejection of valid fine-grained PATs and ordinary GitHub URLs.
+  ETag/Link fields before normalization. Exact raw/sanitized/standard-base64/hex credentials are
+  rejected at any length; partial overlap requires at least 12 characters. Hexadecimal comparisons
+  alone are case-insensitive and search qualifying even-length credential windows inside contiguous
+  hex runs regardless of unrelated prefix/suffix nibble parity. Public token-format markers such as
+  `github_pat_` and locally constructed connector metadata are not credentials. URL-safe base64 is
+  not claimed by this reviewed contract. Cost if wrong: shorter coincidences are intentionally not
+  classified as secret material, avoiding deterministic rejection of valid fine-grained PATs and
+  ordinary GitHub URLs.
 
 ## Preflight conflict and interface scan
 
@@ -68,13 +71,13 @@
   protected-path, secret-local, provider-scalar, UNC/device/forward-network path, Markdown escape,
   no-unlink tombstone, external-swap, close-exhaustion, traceback-local, and original pre-scrub
   hardlink hardening.
-- Task 5 — completed; product/docs/tests `05d0acf`; final read-only pre-commit re-review clean with
-  no Critical, Important, or Minor findings. The unique-token
+- Task 5 — completed; product/docs/tests `05d0acf`, case-varied hex fix `ba719a7`; final external
+  re-review clean with no Critical, Important, or Minor findings. The unique-token
   audit uses only injected fake HTTP and real resolver/client/connector/orchestrator/store/doctor/
   report seams; the release proof uses a fresh real Git repository and one combined
-  `markdown,git,github` orchestrator run. Current verification: focused audit 24 passed, GitHub
-  audit plus docs contracts 27 passed, GitHub selection 233 passed, full suite and coverage run
-  644 passed, tracked Python Ruff passed, mypy passed,
+  `markdown,git,github` orchestrator run. Current verification: focused audit 48 passed, GitHub
+  audit plus docs contracts 51 passed, GitHub selection 257 passed, full suite and coverage run
+  668 passed, tracked Python Ruff passed, mypy passed,
   and tracked-only coverage 89% without a configured threshold.
 
 ## Review findings
@@ -154,3 +157,14 @@
   full/coverage suite **644 passed at 89%**. Final read-only re-review independently ran 107
   focused tests plus adversarial ETag/traceback probes and found no Critical, Important, or Minor
   findings.
+- Task 5 external final review found one Important persistence bypass: uppercase hexadecimal
+  credential material was not recognized by the lowercase-only production matcher or audit oracle.
+  Independently derived upper/mixed JSON value/key and ETag/Link RED was **8 failed**; JSON sync
+  persisted five EvidenceRecords and Link followed the reflected endpoint. The first fix review
+  found one further Important: a single hex nibble before or after the encoding made the enclosing
+  run odd, so the matcher skipped it. Prefix/suffix JSON value/key and ETag/Link RED was
+  **16 failed, 4 passed**. The final implementation case-folds only contiguous hex runs and searches
+  exact or even 12-character credential windows regardless of enclosing parity. Normal PAT paths
+  remain green. Final focused audit **48 passed**, audit plus docs **51 passed**, GitHub selection
+  **257 passed**, and full/coverage suite **668 passed at 89%**. External final re-review found no
+  Critical, Important, or Minor findings; product/test fix `ba719a7`.

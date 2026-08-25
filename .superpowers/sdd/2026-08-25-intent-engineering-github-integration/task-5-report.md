@@ -4,8 +4,10 @@
 
 - Base: `327467122f706e22889287624caefbc68c5f84a7` on `feat/public-alpha`.
 - Product/docs/tests commit: `05d0acf9f7af8bd8f10198edc4a2a58629da29ac`.
-- The final read-only pre-commit re-review approved the complete Task 5 diff with no Critical,
-  Important, or Minor findings. This report and ledger are committed separately.
+- Initial report/ledger commit: `34c43b264f2c339200f39dd95abdcd32304d10d6`.
+- Case-insensitive hexadecimal reflection fix: `ba719a789dddb78ce9897ad4e1f495f27e716aef`.
+- The final external re-review approved the amended Task 5 product/test diff with no Critical,
+  Important, or Minor findings. This amended report and ledger are committed separately.
 - No live GitHub API, real credential, `gh` login, GUI/browser, raw Git object access, MCP work,
   hosted OAuth, GitHub App flow, webhook, PR write, or external write was used.
 
@@ -58,6 +60,30 @@ normalization; constructed connector metadata is not treated as provider provena
 normal-plus-malicious matrix is `17 passed, 7 deselected in 0.08s`, and the full focused audit is
 `24 passed in 0.44s`.
 
+After the initial Task 5 report, external final review found one Important persistence bypass:
+uppercase hexadecimal encoding of the credential was not recognized by the lowercase-only
+production matcher or audit oracle. The independently derived upper/mixed JSON value/key and
+ETag/Link RED was:
+
+```text
+8 failed, 24 deselected in 0.40s
+```
+
+The JSON cases completed a real GitHub sync and persisted five EvidenceRecords, ETag returned
+normally, and Link was followed. A first case-insensitive hex-run fix made those eight cases green.
+Read-only review then found that skipping an odd-length enclosing hex run still permitted one
+provider hex nibble before or after a full encoding. The persisted prefix/suffix matrix RED was:
+
+```text
+16 failed, 4 passed, 28 deselected in 0.49s
+```
+
+The final matcher searches each contiguous hexadecimal run case-insensitively for the exact
+even-length credential encoding or a meaningful even 12-character credential fragment, regardless
+of unrelated enclosing nibble parity. It does not case-fold ordinary raw, sanitized, or standard
+base64 material. The parity selector is now `20 passed, 28 deselected in 0.41s`; the complete audit
+is `48 passed`, and valid fine-grained PAT doctor/unpaginated/paginated paths remain successful.
+
 ## Delivered behavior
 
 - `README.md`, `CONTRIBUTING.md`, and new `docs/github.md` document Python 3.12, clean-checkout
@@ -82,9 +108,10 @@ normal-plus-malicious matrix is `17 passed, 7 deselected in 0.08s`, and the full
   public error repr/args/cause/context/repository traceback locals, and owned-client closure on
   every exercised path. Provider probes cover pagination Link/next endpoint, ETag-adjacent state,
   resource and all numeric rate scalars, source values, and provider-controlled keys using exact
-  full values plus 12-or-longer raw, sanitized, base64, and hex fragments. The scanner oracle
-  independently derives the same meaningful raw/sanitized/encoded fragments in memory. No sentinel
-  leak was observed.
+  full values plus 12-or-longer raw, sanitized, standard-base64, and hex fragments. Hex probes cover
+  lower, upper, and deterministic mixed case, including one-nibble prefix/suffix enclosure. The
+  scanner oracle derives those representations and every meaningful fragment independently in
+  memory without calling the production overlap helper. No sentinel leak was observed.
 - A separate fresh real Git repository release proof performs init → validate → injected-fake
   doctor → one combined `markdown,git,github` run through the shared orchestrator → validate →
   byte-identical no-op → Markdown drift output. Its explicit front-matter fixture produces exactly
@@ -114,7 +141,7 @@ git ls-files -z -- '*.py' | xargs -0 .venv/bin/ruff check
   tests/integration/github/test_github_docs.py
 .venv/bin/mypy src/intent_engineering
 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 .venv/bin/python -m pytest -p anyio.pytest_plugin -q -W error
-COVERAGE_FILE=/private/tmp/intent-engineering-task5-final-coverage \
+COVERAGE_FILE=/private/tmp/intent-engineering-task5-hex-parity-coverage \
   PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 .venv/bin/python -m pytest \
   -p anyio.pytest_plugin -p pytest_cov.plugin --cov=intent_engineering \
   --cov-config=/private/tmp/intent-engineering-task5-coveragerc \
@@ -126,15 +153,15 @@ git diff --check
 ```
 
 ```text
-Focused persistence audit: 24 passed in 0.44s
-Focused audit + docs contracts: 27 passed in 1.47s
-GitHub unit/contract/integration/CLI selection: 233 passed in 4.60s
+Focused persistence audit: 48 passed in 0.62s
+Focused audit + docs contracts: 51 passed in 1.26s
+GitHub unit/contract/integration/CLI selection: 257 passed in 4.66s
 Tracked Python Ruff: All checks passed
 New Python files Ruff: All checks passed
 Mypy: Success, no issues found in 74 source files
-Full offline suite: 644 passed in 22.48s
-Full offline suite with tracked-source coverage: 644 passed in 23.93s
-Tracked-only coverage: 89% (6,006 statements; 681 missed)
+Full offline suite: 668 passed in 22.76s
+Full offline suite with tracked-source coverage: 668 passed in 24.40s
+Tracked-only coverage: 89% (6,015 statements; 680 missed)
 ```
 
 Coverage used isolated data outside the workspace, tracked source
@@ -168,10 +195,14 @@ These commands also exited successfully: `.venv/bin/intent doctor github --help`
   regular files created in the temporary project, including report rollback tombstones.
 - Credential-overlap validation is fail-closed only at material public/persistence boundaries:
   doctor fields that are actually returned and raw sync JSON keys/values plus Link/ETag state.
-  Dropped doctor extras retain prior behavior. Exact full raw/sanitized/base64/hex credentials are
-  rejected at any length; partial overlap requires at least 12 characters. The public
+  Dropped doctor extras retain prior behavior. Exact full raw/sanitized/standard-base64/hex
+  credentials are rejected at any length; partial overlap requires at least 12 characters.
+  Hex comparisons alone are case-insensitive and recognize qualifying credential windows even
+  inside an odd-length enclosing hex run. The public
   `github_pat_` format marker, normal GitHub URLs, and locally constructed connector/repository/kind
   fields therefore do not create short-fragment false positives.
+- The encoded audit and production contract names standard RFC 4648 base64 only. No URL-safe
+  base64 behavior is claimed or added in this proven hexadecimal-bypass fix.
 - Documentation and workflow describe read-only GitHub evidence ingestion only. Hosted OAuth,
   GitHub Apps, webhooks, PR comments/annotations, external writes, MCP write-back, and Slack,
   Notion, Jira, and Confluence completion are explicit non-goals.
@@ -211,3 +242,10 @@ The final reviewer found no Critical, Important, or Minor issues, independently 
 tests, and probed ETag handling to confirm full and 12-character reflections are rejected without
 traceback retention while the public `github_pat_` marker is accepted. Product/docs/tests were
 committed as `05d0acf9f7af8bd8f10198edc4a2a58629da29ac` only after that approval.
+
+External final review after that commit found the uppercase-hex Important described above. The
+first narrow fix passed all requested gates, but its read-only review found the odd-enclosing-run
+Important before commit. Prefix/suffix affix regressions reproduced it across JSON values, JSON
+keys, ETag, and Link. The amended matcher and independently derived oracle were then re-reviewed;
+the external final verdict was zero Critical, Important, or Minor findings. The two-file product/
+test fix was committed as `ba719a789dddb78ce9897ad4e1f495f27e716aef` only after that verdict.
