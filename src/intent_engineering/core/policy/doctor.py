@@ -41,11 +41,27 @@ def inspect_workspace(root: Path) -> tuple[bool, tuple[str, ...]]:
         return False, tuple(diagnostics)
     try:
         config_data = yaml.safe_load(config.read_text(encoding="utf-8"))
-        graph_data = yaml.safe_load(graph.read_text(encoding="utf-8"))
         ProjectConfig.model_validate(cast(dict[str, Any], config_data))
+    except Exception:  # noqa: BLE001 - health diagnostics intentionally redact parser detail
+        diagnostics.append("config")
+    try:
+        graph_data = yaml.safe_load(graph.read_text(encoding="utf-8"))
         Graph.model_validate(cast(dict[str, Any], graph_data))
     except Exception:  # noqa: BLE001 - health diagnostics intentionally redact parser detail
-        diagnostics.extend(("config", "graph"))
+        diagnostics.append("graph")
+    state_paths = (
+        ("evidence", workspace / "evidence" / "evidence.jsonl"),
+        ("cases", workspace / "reconciliation" / "cases.jsonl"),
+        ("history", workspace / "history" / "changesets.jsonl"),
+        ("checkpoints", workspace / "cache" / "checkpoints.yaml"),
+    )
+    invalid_state = {
+        name
+        for name, path in state_paths
+        if path.exists() or path.is_symlink()
+        if not _kind(path, stat.S_IFREG)
+    }
+    diagnostics.extend(sorted(invalid_state))
     checks = (
         ("evidence", lambda: JsonlEvidenceStore(workspace / "evidence" / "evidence.jsonl")),
         ("cases", lambda: JsonlCaseStore(workspace / "reconciliation" / "cases.jsonl")),
@@ -56,6 +72,8 @@ def inspect_workspace(root: Path) -> tuple[bool, tuple[str, ...]]:
         ),
     )
     for name, check in checks:
+        if name in invalid_state:
+            continue
         try:
             check()
         except Exception:  # noqa: BLE001 - health diagnostics intentionally redact parser detail

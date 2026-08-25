@@ -122,6 +122,22 @@ def test_doctor_reports_redacted_structured_diagnostics_for_corrupt_evidence(
     assert result.json() == {"diagnostics": ["evidence"], "healthy": False, "version": "1"}
 
 
+def test_doctor_rejects_symlinked_state_without_reading_its_target(tmp_path: Path) -> None:
+    """State files are canonical workspace entries, never indirections."""
+    repo = init_git_repo(tmp_path)
+    assert run_intent(repo, "init").returncode == 0
+    target = tmp_path / "external-evidence.jsonl"
+    target.write_text("", encoding="utf-8")
+    evidence = repo / ".intent/evidence/evidence.jsonl"
+    evidence.symlink_to(target)
+
+    result = run_intent(repo, "doctor", "--format", "json")
+
+    assert result.returncode == 1
+    assert result.stderr == ""
+    assert result.json() == {"diagnostics": ["evidence"], "healthy": False, "version": "1"}
+
+
 @pytest.mark.parametrize(
     ("args", "marker"),
     [
