@@ -46,6 +46,17 @@ def test_uninitialized_project_is_a_redacted_runtime_failure(tmp_path: Path) -> 
     assert str(repo) not in result.stderr
 
 
+def test_corrupt_graph_is_a_redacted_runtime_failure(tmp_path: Path) -> None:
+    """Catch command-level graph loads that leak parser errors or local paths."""
+    repo = init_git_repo(tmp_path)
+    assert run_intent(repo, "init").returncode == 0
+    (repo / ".intent/graph.yaml").write_text("not: [valid", encoding="utf-8")
+    result = run_intent(repo, "status", "--format", "json")
+    assert result.returncode == 1
+    assert result.stdout == ""
+    assert result.stderr == "intent error: local operation failed\n"
+
+
 @pytest.mark.parametrize(
     ("args", "marker"),
     [

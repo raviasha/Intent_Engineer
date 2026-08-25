@@ -14,8 +14,12 @@ import typer
 
 from intent_engineering.cli.output import OutputFormat, emit
 from intent_engineering.cli.runtime import Runtime, load_runtime, new_run_id, resolve_connectors
+from intent_engineering.context import ContextProvider
 from intent_engineering.core.models import (
     ChangeSet,
+    EvidenceRecord,
+    Graph,
+    ReconciliationCase,
     ReconciliationStatus,
     ResolutionAction,
     is_nonterminal_case_status,
@@ -51,7 +55,7 @@ def _runtime(project: Path) -> Runtime:
         return load_runtime(project)
     except ProjectNotInitialized as error:
         raise typer.Exit(code=_runtime_error(error)) from error
-    except (OSError, TypeError, ValueError) as error:
+    except Exception as error:
         raise typer.Exit(code=_runtime_error(error)) from error
 
 
@@ -65,6 +69,33 @@ def _runtime_error(error: Exception) -> int:
         message = "local operation failed"
     typer.echo(f"intent error: {message}", err=True)
     return 1
+
+
+def _graph(runtime: Runtime) -> Graph:
+    """Load canonical graph state while preserving the CLI's redacted error contract."""
+    try:
+        return runtime.graph_store.load()
+    except Exception as error:
+        _runtime_error(error)
+        raise typer.Exit(1) from error
+
+
+def _cases(runtime: Runtime) -> tuple[ReconciliationCase, ...]:
+    """Read durable cases while preserving the CLI's redacted error contract."""
+    try:
+        return runtime.cases()
+    except (OSError, TypeError, ValueError) as error:
+        _runtime_error(error)
+        raise typer.Exit(1) from error
+
+
+def _evidence(runtime: Runtime) -> tuple[EvidenceRecord, ...]:
+    """Read persisted evidence while preserving the CLI's redacted error contract."""
+    try:
+        return runtime.evidence()
+    except (OSError, TypeError, ValueError) as error:
+        _runtime_error(error)
+        raise typer.Exit(1) from error
 
 
 def _invoke_sync(runtime: Runtime, sources: str) -> SyncRunResult:
@@ -104,11 +135,7 @@ def validate_command(
 ) -> None:
     """Validate the canonical graph and local configuration."""
     runtime = _runtime(project)
-    try:
-        graph = runtime.graph_store.load()
-    except (OSError, ValueError) as error:
-        _runtime_error(error)
-        raise typer.Exit(1) from error
+    graph = _graph(runtime)
     emit({"valid": True, "graph_id": graph.id, "graph_version": graph.version}, output_format)
 
 
@@ -153,7 +180,7 @@ def drift_command(
 ) -> None:
     """Report open and proposed reconciliation cases requiring attention."""
     cases = tuple(
-        case for case in _runtime(project).cases() if is_nonterminal_case_status(case.status)
+        case for case in _cases(_runtime(project)) if is_nonterminal_case_status(case.status)
     )
     emit({"cases": cases, "review_required": bool(cases) or require_review}, output_format)
     _exit_for_review(bool(cases) or require_review)
@@ -166,15 +193,15 @@ def status_command(
 ) -> None:
     """Summarize durable graph, evidence, and reconciliation state."""
     runtime = _runtime(project)
-    graph = runtime.graph_store.load()
-    cases = runtime.cases()
+    graph = _graph(runtime)
+    cases = _cases(runtime)
     emit(
         {
             "project_id": runtime.config.project_id,
             "graph_version": graph.version,
             "node_count": len(graph.nodes),
             "edge_count": len(graph.edges),
-            "evidence_count": len(runtime.evidence()),
+            "evidence_count": len(_evidence(runtime)),
             "open_case_count": sum(is_nonterminal_case_status(case.status) for case in cases),
         },
         output_format,
@@ -189,12 +216,12 @@ def explain_command(
 ) -> None:
     """Explain the local graph node, evidence object, or reconciliation case by reference."""
     runtime = _runtime(project)
-    graph = runtime.graph_store.load()
+    graph = _graph(runtime)
     matching_nodes = tuple(node for node in graph.nodes if node.id == reference)
-    matching_cases = tuple(case for case in runtime.cases() if case.id == reference)
+    matching_cases = tuple(case for case in _cases(runtime) if case.id == reference)
     matching_evidence = tuple(
         record
-        for record in runtime.evidence()
+        for record in _evidence(runtime)
         if reference in {record.id, record.external_object_id, record.source_locator}
     )
     if not (matching_nodes or matching_cases or matching_evidence):
@@ -219,7 +246,8 @@ def context_command(
     output_format: OutputFormat = typer.Option(OutputFormat.TEXT, "--format"),
 ) -> None:
     """Build a conservative, bounded context pack for a task or exact symbol."""
-    provider = _runtime(project).context()
+    runtime = _runtime(project)
+    provider = ContextProvider(_graph(runtime), _cases(runtime), runtime.config, _evidence(runtime))
     pack = provider.for_symbol(symbol) if symbol is not None else provider.for_task(task)
     emit(pack, output_format)
 
@@ -231,7 +259,10 @@ def reconcile_list_command(
     output_format: OutputFormat = typer.Option(OutputFormat.TEXT, "--format"),
 ) -> None:
     """List durable reconciliation cases in stable ID order."""
-    emit({"cases": _runtime(project).case_store.list(status)}, output_format)
+    cases = _cases(_runtime(project))
+    if status is not None:
+        cases = tuple(case for case in cases if case.status is status)
+    emit({"cases": cases}, output_format)
 
 
 @reconcile_app.command("show")
