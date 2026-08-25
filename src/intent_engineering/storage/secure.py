@@ -18,6 +18,7 @@ _READ_FLAGS = os.O_RDONLY | _NOFOLLOW | _CLOEXEC
 _RENAME_NOREPLACE = 1
 _RENAME_EXCHANGE = 2
 _RENAME_EXCL = 4
+_ROLLBACK_ATTEMPTS = 32
 
 type FileIdentity = tuple[int, int]
 
@@ -492,6 +493,90 @@ class SecureFile:
         _require_regular(metadata)
         return metadata
 
+    def _entry_matches(self, name: str, expected: os.stat_result) -> bool:
+        return self._matching_entry(name, expected) is not None
+
+    def _matching_entry(
+        self,
+        name: str,
+        expected: os.stat_result,
+    ) -> os.stat_result | None:
+        try:
+            observed = os.stat(name, dir_fd=self.parent_fd, follow_symlinks=False)
+        except OSError:
+            return None
+        return observed if _identity(observed) == _identity(expected) else None
+
+    def _entry_is_safe(self, name: str, expected: os.stat_result) -> bool:
+        observed = self._matching_entry(name, expected)
+        return bool(
+            observed is not None and stat.S_ISREG(observed.st_mode) and observed.st_nlink == 1
+        )
+
+    def _scrub_linked_owned_entry(self, name: str, expected: os.stat_result) -> None:
+        """Remove report bytes from every raced hardlink before rollback unlink."""
+        descriptor = os.open(
+            name,
+            os.O_WRONLY | _NOFOLLOW | _CLOEXEC,
+            dir_fd=self.parent_fd,
+        )
+        try:
+            observed = os.fstat(descriptor)
+            if _identity(observed) != _identity(expected) or not stat.S_ISREG(observed.st_mode):
+                return
+            os.ftruncate(descriptor, 0)
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+
+    def _remove_installed_entry(self, expected: os.stat_result) -> None:
+        """Rollback a newly installed entry without unlinking a raced value."""
+        self._remove_owned_entry(self.name, expected)
+        try:
+            os.fsync(self.parent_fd)
+        except BaseException:  # noqa: BLE001, S110 - logical rollback is authenticated
+            pass
+
+    def _remove_owned_entry(self, name: str, expected: os.stat_result) -> None:
+        """Retry an authenticated unlink if interruption lands before the native operation."""
+        for _ in range(_ROLLBACK_ATTEMPTS):
+            observed = self._matching_entry(name, expected)
+            if observed is None:
+                return
+            if observed.st_nlink != 1:
+                try:
+                    self._scrub_linked_owned_entry(name, expected)
+                except BaseException:  # noqa: BLE001, S112 - preserve the control signal
+                    continue
+            try:
+                os.unlink(name, dir_fd=self.parent_fd)
+            except BaseException:  # noqa: BLE001, S112 - preserve the control signal
+                continue
+        if self._entry_matches(name, expected):
+            return
+
+    def _restore_exchanged_entry(
+        self,
+        temporary_name: str,
+        temporary_metadata: os.stat_result,
+    ) -> None:
+        """Retry exchange rollback, including a native call that raised after success."""
+        for _ in range(_ROLLBACK_ATTEMPTS):
+            if self._entry_matches(temporary_name, temporary_metadata):
+                break
+            if not self._entry_matches(self.name, temporary_metadata):
+                return
+            try:
+                _exchange_names(self.parent_fd, temporary_name, self.name)
+            except BaseException:  # noqa: BLE001, S112 - preserve the control signal
+                continue
+        if not self._entry_matches(temporary_name, temporary_metadata):
+            return
+        try:
+            os.fsync(self.parent_fd)
+        except BaseException:  # noqa: BLE001, S110 - logical rollback is authenticated
+            pass
+
     def _install_verified_temporary(
         self,
         temporary_name: str,
@@ -500,24 +585,27 @@ class SecureFile:
     ) -> None:
         """Install a prepared file only if the inspected target did not change."""
         if expected_target is None:
-            _rename_exclusive(self.parent_fd, temporary_name, self.name)
-            installed = os.stat(self.name, dir_fd=self.parent_fd, follow_symlinks=False)
-            installed_is_safe = (
-                stat.S_ISREG(installed.st_mode)
-                and installed.st_nlink == 1
-                and _identity(installed) == _identity(temporary_metadata)
-            )
-            if not installed_is_safe:
-                try:
-                    os.unlink(self.name, dir_fd=self.parent_fd)
-                except OSError as error:
-                    raise UnsafePathError() from error
-                raise UnsafePathError()
-            os.fsync(self.parent_fd)
+            try:
+                _rename_exclusive(self.parent_fd, temporary_name, self.name)
+                installed = os.stat(self.name, dir_fd=self.parent_fd, follow_symlinks=False)
+                installed_is_safe = (
+                    stat.S_ISREG(installed.st_mode)
+                    and installed.st_nlink == 1
+                    and _identity(installed) == _identity(temporary_metadata)
+                )
+                if not installed_is_safe:
+                    raise UnsafePathError()
+                os.fsync(self.parent_fd)
+                if not self._entry_is_safe(self.name, temporary_metadata):
+                    raise UnsafePathError()
+            except BaseException:
+                self._remove_installed_entry(temporary_metadata)
+                raise
             return
 
-        _exchange_names(self.parent_fd, temporary_name, self.name)
+        ready_to_commit = False
         try:
+            _exchange_names(self.parent_fd, temporary_name, self.name)
             displaced = os.stat(
                 temporary_name,
                 dir_fd=self.parent_fd,
@@ -532,16 +620,21 @@ class SecureFile:
                 and installed.st_nlink == 1
                 and _identity(installed) == _identity(temporary_metadata)
             )
-        except OSError:
-            unchanged = False
-        if not unchanged:
-            try:
-                _exchange_names(self.parent_fd, temporary_name, self.name)
-            except OSError as error:
-                raise UnsafePathError() from error
-            raise UnsafePathError()
-        os.unlink(temporary_name, dir_fd=self.parent_fd)
-        os.fsync(self.parent_fd)
+            if not unchanged:
+                raise UnsafePathError()
+            os.fsync(self.parent_fd)
+            if not self._entry_is_safe(
+                temporary_name,
+                expected_target,
+            ) or not self._entry_is_safe(self.name, temporary_metadata):
+                raise UnsafePathError()
+            ready_to_commit = True
+            os.unlink(temporary_name, dir_fd=self.parent_fd)
+        except BaseException:
+            if ready_to_commit and not self._entry_matches(temporary_name, expected_target):
+                return
+            self._restore_exchanged_entry(temporary_name, temporary_metadata)
+            raise
 
     def atomic_write(self, content: bytes, *, reject_target_races: bool = False) -> None:
         temporary_name: str | None = None
@@ -587,7 +680,8 @@ class SecureFile:
                     dst_dir_fd=self.parent_fd,
                 )
             temporary_name = None
-            os.fsync(self.parent_fd)
+            if not reject_target_races:
+                os.fsync(self.parent_fd)
         except OSError as error:
             raise UnsafePathError() from error
         finally:
@@ -595,8 +689,9 @@ class SecureFile:
                 os.close(descriptor)
             if temporary_name is not None:
                 try:
-                    os.unlink(temporary_name, dir_fd=self.parent_fd)
-                except FileNotFoundError:
+                    if temporary_metadata is not None:
+                        self._remove_owned_entry(temporary_name, temporary_metadata)
+                except BaseException:  # noqa: BLE001, S110 - preserve the primary failure
                     pass
 
     def append(self, content: bytes) -> None:

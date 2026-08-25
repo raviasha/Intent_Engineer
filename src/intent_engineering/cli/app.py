@@ -255,6 +255,14 @@ def _validate_github_scope(sources: str) -> None:
         ) from error
 
 
+def _validate_report_output(output: Path) -> None:
+    protected = {".git", ".intent"}
+    if output.suffix.casefold() != ".md" or any(
+        part.casefold() in protected for part in output.parts
+    ):
+        raise ValueError("unsafe report target")
+
+
 @app.command("drift")
 def drift_command(
     project: Path = typer.Option(Path("."), "--project"),
@@ -274,8 +282,7 @@ def drift_command(
         if output is not None:
             target = None
             try:
-                if output.suffix.casefold() != ".md" or output.parts[0] in {".git", ".intent"}:
-                    raise ValueError("unsafe report target")
+                _validate_report_output(output)
                 target = runtime.project_directory.file(output)
                 target.atomic_write(report.encode("utf-8"), reject_target_races=True)
             except (OSError, TypeError, ValueError) as error:

@@ -131,3 +131,40 @@ async def test_repository_status_malformed_input_is_fixed_and_forgets_rejected_v
     assert "provider_secret" not in rendered
     assert caught.value.__cause__ is None
     assert caught.value.__context__ is None
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "resource",
+    [
+        TOKEN,
+        TOKEN[:12],
+        f"safe_{TOKEN[4:12]}",
+    ],
+)
+async def test_repository_status_rejects_rate_resource_overlapping_credentials(
+    resource: str,
+) -> None:
+    def handler(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={"full_name": "acme/demo"},
+            headers={
+                "X-RateLimit-Limit": "5000",
+                "X-RateLimit-Remaining": "4999",
+                "X-RateLimit-Used": "1",
+                "X-RateLimit-Reset": "1787659200",
+                "X-RateLimit-Resource": resource,
+            },
+        )
+
+    client = _client(handler)
+    with pytest.raises(GitHubProtocolError) as caught:
+        await client.get_repository_status("acme/demo")
+    await client.aclose()
+
+    rendered = _repository_traceback_locals(caught.value)
+    assert TOKEN not in rendered
+    assert resource not in rendered
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None

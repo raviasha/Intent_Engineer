@@ -71,6 +71,16 @@ class _RecordingSync:
         )
 
 
+def _source_traceback_locals(error: BaseException) -> str:
+    values: list[str] = []
+    traceback = error.__traceback__
+    while traceback is not None:
+        if "/src/intent_engineering/" in traceback.tb_frame.f_code.co_filename:
+            values.append(repr(traceback.tb_frame.f_locals))
+        traceback = traceback.tb_next
+    return "".join(values)
+
+
 def _runtime(tmp_path: Path, sync: _RecordingSync) -> Runtime:
     project = tmp_path / "project"
     project.mkdir()
@@ -267,6 +277,7 @@ async def test_github_cancellation_propagates_after_cleanup_even_when_cleanup_fa
 ) -> None:
     """Cancellation is a BaseException control signal and must remain the visible outcome."""
     cancellation = CancelledError()
+    secret = "gh" + "p_sync-cancellation-local-secret"
     sync = _RecordingSync(failure=cancellation)
     runtime = _runtime(tmp_path, sync)
     client = _RecordingClient(close_failure=KeyboardInterrupt("discarded close failure"))
@@ -276,7 +287,7 @@ async def test_github_cancellation_propagates_after_cleanup_even_when_cleanup_fa
             runtime,
             "github",
             "run:cancelled",
-            env={"GH_TOKEN": "offline-token", "GITHUB_REPOSITORY": "acme/demo"},
+            env={"GH_TOKEN": secret, "GITHUB_REPOSITORY": "acme/demo"},
             token_runner=lambda _: "unused",
             client_factory=lambda _: cast(GitHubClient, client),
         )
@@ -284,6 +295,7 @@ async def test_github_cancellation_propagates_after_cleanup_even_when_cleanup_fa
     assert caught.value is cancellation
     assert caught.value.__cause__ is None
     assert caught.value.__context__ is None
+    assert secret not in _source_traceback_locals(caught.value)
     assert client.closed is True
 
 
@@ -492,6 +504,7 @@ async def test_github_doctor_reports_fixed_close_failure_without_retaining_it(
 async def test_github_doctor_cancellation_propagates_after_cleanup(tmp_path: Path) -> None:
     runtime = _runtime(tmp_path, _RecordingSync())
     cancellation = CancelledError()
+    secret = "gh" + "p_doctor-cancellation-local-secret"
     client = _DoctorLifecycleClient(
         probe_failure=cancellation,
         close_failure=RuntimeError("discarded cleanup"),
@@ -500,7 +513,7 @@ async def test_github_doctor_cancellation_propagates_after_cleanup(tmp_path: Pat
     with pytest.raises(CancelledError) as caught:
         await check_github(
             runtime,
-            env={"GH_TOKEN": "offline-token", "GITHUB_REPOSITORY": "acme/demo"},
+            env={"GH_TOKEN": secret, "GITHUB_REPOSITORY": "acme/demo"},
             token_runner=lambda _: "unused",
             client_factory=lambda _: cast(GitHubClient, client),
         )
@@ -508,6 +521,7 @@ async def test_github_doctor_cancellation_propagates_after_cleanup(tmp_path: Pat
     assert caught.value is cancellation
     assert caught.value.__cause__ is None
     assert caught.value.__context__ is None
+    assert secret not in _source_traceback_locals(caught.value)
     assert client.closed is True
 
 
@@ -742,6 +756,35 @@ def test_markdown_drift_refuses_unsafe_output_without_touching_targets(
         assert (project / "intent-drift.md").read_text(encoding="utf-8") == "unchanged"
 
 
+@pytest.mark.parametrize(
+    "target",
+    [
+        ".GIT/report.md",
+        ".Intent/report.md",
+        "reports/.git/report.md",
+        "reports/.INTENT/report.md",
+    ],
+)
+def test_markdown_drift_rejects_protected_components_anywhere_case_insensitively(
+    tmp_path: Path,
+    target: str,
+) -> None:
+    project = tmp_path / "protected-output"
+    project.mkdir()
+    initialize_project(project)
+    _seed_cli_case(project)
+    destination = project.joinpath(*Path(target).parts)
+    if not destination.parent.exists():
+        destination.parent.mkdir(parents=True)
+    if not destination.exists():
+        destination.write_text("unchanged", encoding="utf-8")
+
+    result = run_intent(project, "drift", "--format", "markdown", "--output", target)
+
+    assert result.returncode != 0
+    assert destination.read_text(encoding="utf-8") == "unchanged"
+
+
 def test_markdown_drift_rejects_a_final_target_swapped_after_validation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -821,6 +864,372 @@ def test_verified_report_write_rejects_a_hardlink_added_at_installation(
 
     assert linked is True
     assert not target.exists()
+
+
+@pytest.mark.parametrize("existing", [False, True])
+@pytest.mark.parametrize("failure_stage", ["rename", "parent_fsync"])
+def test_verified_report_write_rolls_back_cancellation_at_each_install_phase(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    existing: bool,
+    failure_stage: str,
+) -> None:
+    target = tmp_path / "intent-drift.md"
+    original = b"original report\n"
+    if existing:
+        target.write_bytes(original)
+        original_identity = (target.stat().st_dev, target.stat().st_ino)
+    else:
+        original_identity = None
+    secure_file = SecureFile.from_path(target)
+    parent_fd = secure_file.parent_fd
+    cancellation = CancelledError()
+    installed = False
+    injected = False
+
+    if existing:
+        original_rename = secure_storage._exchange_names
+
+        def cancel_after_rename(parent_fd: int, left: str, right: str) -> None:
+            nonlocal injected, installed
+            original_rename(parent_fd, left, right)
+            installed = True
+            if failure_stage == "rename" and not injected:
+                injected = True
+                raise cancellation
+
+        monkeypatch.setattr(secure_storage, "_exchange_names", cancel_after_rename)
+    else:
+        original_rename = secure_storage._rename_exclusive
+
+        def cancel_after_rename(parent_fd: int, left: str, right: str) -> None:
+            nonlocal injected, installed
+            original_rename(parent_fd, left, right)
+            installed = True
+            if failure_stage == "rename" and not injected:
+                injected = True
+                raise cancellation
+
+        monkeypatch.setattr(secure_storage, "_rename_exclusive", cancel_after_rename)
+
+    original_fsync = secure_storage.os.fsync
+
+    def cancel_parent_fsync(descriptor: int) -> None:
+        nonlocal injected
+        if (
+            failure_stage == "parent_fsync"
+            and installed
+            and descriptor == parent_fd
+            and not injected
+        ):
+            injected = True
+            raise cancellation
+        original_fsync(descriptor)
+
+    monkeypatch.setattr(secure_storage.os, "fsync", cancel_parent_fsync)
+    try:
+        with pytest.raises(CancelledError) as caught:
+            secure_file.atomic_write(b"replacement report\n", reject_target_races=True)
+    finally:
+        secure_file.close()
+
+    assert caught.value is cancellation
+    if existing:
+        assert target.read_bytes() == original
+        assert (target.stat().st_dev, target.stat().st_ino) == original_identity
+    else:
+        assert not target.exists()
+    assert not tuple(tmp_path.glob(".intent-drift.md.*.tmp"))
+
+    retry = SecureFile.from_path(target)
+    try:
+        retry.atomic_write(b"replacement report\n", reject_target_races=True)
+    finally:
+        retry.close()
+    assert target.read_bytes() == b"replacement report\n"
+    assert not tuple(tmp_path.glob(".intent-drift.md.*.tmp"))
+
+
+@pytest.mark.parametrize("existing", [False, True])
+def test_verified_report_write_recovers_when_rollback_is_itself_interrupted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    existing: bool,
+) -> None:
+    target = tmp_path / "intent-drift.md"
+    original = b"original report\n"
+    if existing:
+        target.write_bytes(original)
+        original_identity = (target.stat().st_dev, target.stat().st_ino)
+    else:
+        original_identity = None
+    secure_file = SecureFile.from_path(target)
+    cancellation = CancelledError()
+
+    if existing:
+        original_exchange = secure_storage._exchange_names
+        exchange_calls = 0
+
+        def interrupt_install_and_first_rollback(
+            parent_fd: int,
+            left: str,
+            right: str,
+        ) -> None:
+            nonlocal exchange_calls
+            exchange_calls += 1
+            if exchange_calls == 1:
+                original_exchange(parent_fd, left, right)
+                raise cancellation
+            if exchange_calls == 2:
+                raise KeyboardInterrupt("rollback interrupted")
+            original_exchange(parent_fd, left, right)
+
+        monkeypatch.setattr(
+            secure_storage,
+            "_exchange_names",
+            interrupt_install_and_first_rollback,
+        )
+    else:
+        original_rename = secure_storage._rename_exclusive
+
+        def cancel_after_install(parent_fd: int, left: str, right: str) -> None:
+            original_rename(parent_fd, left, right)
+            raise cancellation
+
+        monkeypatch.setattr(secure_storage, "_rename_exclusive", cancel_after_install)
+        original_unlink = secure_storage.os.unlink
+        unlink_interrupted = False
+
+        def interrupt_first_target_unlink(
+            path: os.PathLike[str] | str,
+            *args: object,
+            **kwargs: object,
+        ) -> None:
+            nonlocal unlink_interrupted
+            if path == target.name and not unlink_interrupted:
+                unlink_interrupted = True
+                raise KeyboardInterrupt("rollback interrupted")
+            original_unlink(path, *args, **kwargs)
+
+        monkeypatch.setattr(secure_storage.os, "unlink", interrupt_first_target_unlink)
+
+    try:
+        with pytest.raises(CancelledError) as caught:
+            secure_file.atomic_write(b"replacement report\n", reject_target_races=True)
+    finally:
+        secure_file.close()
+
+    assert caught.value is cancellation
+    if existing:
+        assert target.read_bytes() == original
+        assert (target.stat().st_dev, target.stat().st_ino) == original_identity
+    else:
+        assert not target.exists()
+    assert not tuple(tmp_path.glob(".intent-drift.md.*.tmp"))
+
+
+@pytest.mark.parametrize("existing", [False, True])
+def test_verified_report_rollback_scrubs_a_raced_external_hardlink(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    existing: bool,
+) -> None:
+    target = tmp_path / "intent-drift.md"
+    outside = tmp_path / "external-copy.md"
+    original = b"original report\n"
+    replacement = b"private replacement report\n"
+    if existing:
+        target.write_bytes(original)
+        original_identity = (target.stat().st_dev, target.stat().st_ino)
+    else:
+        original_identity = None
+    secure_file = SecureFile.from_path(target)
+    cancellation = CancelledError()
+    installed = False
+
+    if existing:
+        original_exchange = secure_storage._exchange_names
+
+        def link_then_cancel(parent_fd: int, left: str, right: str) -> None:
+            nonlocal installed
+            original_exchange(parent_fd, left, right)
+            if not installed:
+                installed = True
+                os.link(target, outside)
+                raise cancellation
+
+        monkeypatch.setattr(secure_storage, "_exchange_names", link_then_cancel)
+    else:
+        original_rename = secure_storage._rename_exclusive
+
+        def link_then_cancel(parent_fd: int, left: str, right: str) -> None:
+            original_rename(parent_fd, left, right)
+            os.link(target, outside)
+            raise cancellation
+
+        monkeypatch.setattr(secure_storage, "_rename_exclusive", link_then_cancel)
+
+    try:
+        with pytest.raises(CancelledError) as caught:
+            secure_file.atomic_write(replacement, reject_target_races=True)
+    finally:
+        secure_file.close()
+
+    assert caught.value is cancellation
+    if existing:
+        assert target.read_bytes() == original
+        assert (target.stat().st_dev, target.stat().st_ino) == original_identity
+    else:
+        assert not target.exists()
+    assert outside.read_bytes() == b""
+    assert not tuple(tmp_path.glob(".intent-drift.md.*.tmp"))
+
+
+@pytest.mark.parametrize("existing", [False, True])
+def test_verified_report_write_reauthenticates_after_parent_fsync(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    existing: bool,
+) -> None:
+    target = tmp_path / "intent-drift.md"
+    outside = tmp_path / "post-fsync-copy.md"
+    original = b"original report\n"
+    replacement = b"private replacement report\n"
+    if existing:
+        target.write_bytes(original)
+        original_identity = (target.stat().st_dev, target.stat().st_ino)
+    else:
+        original_identity = None
+    secure_file = SecureFile.from_path(target)
+    parent_fd = secure_file.parent_fd
+    installed = False
+
+    if existing:
+        original_exchange = secure_storage._exchange_names
+
+        def record_install(parent: int, left: str, right: str) -> None:
+            nonlocal installed
+            original_exchange(parent, left, right)
+            installed = True
+
+        monkeypatch.setattr(secure_storage, "_exchange_names", record_install)
+    else:
+        original_rename = secure_storage._rename_exclusive
+
+        def record_install(parent: int, left: str, right: str) -> None:
+            nonlocal installed
+            original_rename(parent, left, right)
+            installed = True
+
+        monkeypatch.setattr(secure_storage, "_rename_exclusive", record_install)
+
+    original_fsync = secure_storage.os.fsync
+    linked = False
+
+    def link_during_parent_fsync(descriptor: int) -> None:
+        nonlocal linked
+        if installed and descriptor == parent_fd and not linked:
+            os.link(target, outside)
+            linked = True
+        original_fsync(descriptor)
+
+    monkeypatch.setattr(secure_storage.os, "fsync", link_during_parent_fsync)
+    try:
+        with pytest.raises(UnsafePathError):
+            secure_file.atomic_write(replacement, reject_target_races=True)
+    finally:
+        secure_file.close()
+
+    assert linked is True
+    if existing:
+        assert target.read_bytes() == original
+        assert (target.stat().st_dev, target.stat().st_ino) == original_identity
+    else:
+        assert not target.exists()
+    assert outside.read_bytes() == b""
+    assert not tuple(tmp_path.glob(".intent-drift.md.*.tmp"))
+
+
+def test_verified_report_write_rolls_back_cancellation_before_displaced_unlink(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = tmp_path / "intent-drift.md"
+    original = b"original report\n"
+    replacement = b"replacement report\n"
+    target.write_bytes(original)
+    original_identity = (target.stat().st_dev, target.stat().st_ino)
+    secure_file = SecureFile.from_path(target)
+    cancellation = CancelledError()
+    original_unlink = secure_storage.os.unlink
+    interrupted = False
+
+    def cancel_before_displaced_unlink(
+        path: os.PathLike[str] | str,
+        *args: object,
+        **kwargs: object,
+    ) -> None:
+        nonlocal interrupted
+        if isinstance(path, str) and path.endswith(".tmp") and not interrupted:
+            interrupted = True
+            raise cancellation
+        original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(secure_storage.os, "unlink", cancel_before_displaced_unlink)
+    try:
+        with pytest.raises(CancelledError) as caught:
+            secure_file.atomic_write(replacement, reject_target_races=True)
+    finally:
+        secure_file.close()
+
+    assert interrupted is True
+    assert caught.value is cancellation
+    assert target.read_bytes() == original
+    assert (target.stat().st_dev, target.stat().st_ino) == original_identity
+    assert not tuple(tmp_path.glob(".intent-drift.md.*.tmp"))
+
+    retry = SecureFile.from_path(target)
+    try:
+        retry.atomic_write(replacement, reject_target_races=True)
+    finally:
+        retry.close()
+    assert target.read_bytes() == replacement
+    assert not tuple(tmp_path.glob(".intent-drift.md.*.tmp"))
+
+
+def test_verified_report_write_commit_wins_after_displaced_unlink_completed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = tmp_path / "intent-drift.md"
+    original = b"original report\n"
+    replacement = b"replacement report\n"
+    target.write_bytes(original)
+    secure_file = SecureFile.from_path(target)
+    cancellation = CancelledError()
+    original_unlink = secure_storage.os.unlink
+    interrupted = False
+
+    def cancel_after_displaced_unlink(
+        path: os.PathLike[str] | str,
+        *args: object,
+        **kwargs: object,
+    ) -> None:
+        nonlocal interrupted
+        original_unlink(path, *args, **kwargs)
+        if isinstance(path, str) and path.endswith(".tmp") and not interrupted:
+            interrupted = True
+            raise cancellation
+
+    monkeypatch.setattr(secure_storage.os, "unlink", cancel_after_displaced_unlink)
+    try:
+        secure_file.atomic_write(replacement, reject_target_races=True)
+    finally:
+        secure_file.close()
+
+    assert interrupted is True
+    assert target.read_bytes() == replacement
+    assert not tuple(tmp_path.glob(".intent-drift.md.*.tmp"))
 
 
 def test_drift_json_contract_remains_versioned_and_output_is_markdown_only(tmp_path: Path) -> None:

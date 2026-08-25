@@ -109,6 +109,7 @@ async def check_github(
     try:
         credentials = GitHubCredentials.resolve(env, token_runner)
     except GitHubAuthError as error:
+        env = {}
         return GitHubDoctorResult.failed(
             repository=repository,
             diagnostic=GitHubDoctorDiagnostic(
@@ -116,6 +117,7 @@ async def check_github(
                 message=str(error),
             ),
         )
+    env = {}
 
     cancelled_class = anyio.get_cancelled_exc_class()
     client: GitHubClient | None = None

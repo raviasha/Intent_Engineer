@@ -175,19 +175,41 @@ def test_every_evidence_derived_scalar_is_inert_and_sensitive_patterns_are_redac
         "/usr/local/share/intent",
         "/srv/intent/private",
         "/",
+        r"\\server\share\intent.md",
+        r"\\?\C:\private\intent.md",
+        r"\\.\C:\private\intent.md",
     ],
 )
 def test_report_redacts_any_absolute_local_path(local_path: str) -> None:
     case = _case(
         ReconciliationCaseType.CODE_LAG,
-        "case:absolute-path",
+        local_path,
+        label=local_path,
         claim=f"provider returned {local_path}",
-    )
+        authors=(local_path,),
+        evidence_refs=(local_path,),
+        affected_refs=(local_path,),
+        impact=local_path,
+    ).model_copy(update={"subject_ref": local_path})
 
     report = render_drift_report((case,))
 
     assert local_path not in report
     assert "[redacted-local-path]" in report
+
+
+def test_report_escapes_underscore_and_tilde_markdown_delimiters() -> None:
+    malicious = "__emphasis__ ~~strikethrough~~"
+    case = _case(
+        ReconciliationCaseType.CODE_LAG,
+        "case:markdown-delimiters",
+        claim=malicious,
+    )
+
+    report = render_drift_report((case,))
+
+    assert r"\_\_emphasis\_\_" in report
+    assert r"\~\~strikethrough\~\~" in report
 
 
 def test_report_preserves_a_nonlocal_https_provenance_url() -> None:

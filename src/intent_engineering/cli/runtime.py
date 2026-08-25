@@ -323,6 +323,8 @@ async def run_selected_sync(
     environment: Mapping[str, object] = os.environ if env is None else env
     repository = github_repository_scope(environment)
     credentials = GitHubCredentials.resolve(environment, token_runner)
+    environment = {}
+    env = None
     client = client_factory(credentials)
     operation_failed = False
     try:

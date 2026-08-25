@@ -473,18 +473,27 @@ class GitHubClient:
         except (UnicodeError, ValueError):
             malformed = True
         rate_status = _repository_rate_status(response.headers)
+        authorization_secret = self._authorization_secret()
+        resource_overlaps_secret = bool(
+            rate_status is not None
+            and authorization_secret is not None
+            and request_id_overlaps_secret(rate_status[-1], authorization_secret)
+        )
+        authorization_secret = None
         if (
             malformed
             or type(payload) is not dict
             or type(payload.get("full_name")) is not str
             or payload.get("full_name", "").casefold() != repository
             or rate_status is None
+            or resource_overlaps_secret
         ):
             malformed = True
         await response.aclose()
         del response
         payload = None
         if malformed or rate_status is None:
+            rate_status = None
             repository = ""
             raise GitHubProtocolError(endpoint) from None
         limit, remaining, used, reset_at, resource = rate_status
