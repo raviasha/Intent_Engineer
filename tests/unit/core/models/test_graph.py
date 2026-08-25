@@ -66,6 +66,14 @@ def test_edge_to_missing_node_is_rejected() -> None:
         Graph(id="g", version=0, nodes=[node("req-1")], edges=[edge("e-1", to_id="test-missing")])
 
 
+def test_unknown_relation_is_rejected() -> None:
+    payload = edge("e-1").model_dump()
+    payload["relation"] = "UNKNOWN_RELATION"
+
+    with pytest.raises(ValidationError):
+        Edge.model_validate(payload)
+
+
 def test_external_edge_can_target_an_external_node() -> None:
     graph = Graph(
         id="g",

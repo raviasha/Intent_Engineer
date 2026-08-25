@@ -6,7 +6,7 @@ from typing import Annotated
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from intent_engineering.core.models.enums import NodeType, SourceMode
+from intent_engineering.core.models.enums import NodeType, RelationType, SourceMode
 
 Confidence = Annotated[float, Field(ge=0.0, le=1.0)]
 
@@ -73,7 +73,7 @@ class Edge(BaseModel):
 
     id: str
     from_id: str = Field(alias="from")
-    relation: str
+    relation: RelationType
     to_id: str = Field(alias="to")
     status: str
     created_by: str
