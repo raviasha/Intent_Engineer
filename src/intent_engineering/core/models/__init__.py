@@ -34,6 +34,7 @@ from intent_engineering.core.models.reconciliation import (
     EvidenceSide,
     ReconciliationCase,
     ReconciliationEvidenceSide,
+    is_nonterminal_case_status,
 )
 
 __all__ = [
@@ -71,4 +72,5 @@ __all__ = [
     "SourceMode",
     "SyncCheckpoint",
     "TypeRegistry",
+    "is_nonterminal_case_status",
 ]

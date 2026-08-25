@@ -6,7 +6,15 @@ from pathlib import Path
 
 import pytest
 
-from intent_engineering.core.models import Edge, Graph, Node, NodeType
+from intent_engineering.core.models import (
+    Edge,
+    EvidenceSide,
+    Graph,
+    Node,
+    NodeType,
+    ReconciliationCase,
+    ReconciliationCaseType,
+)
 from intent_engineering.render.renderer import GraphRenderer
 from intent_engineering.storage.yaml.graph_store import YamlGraphStore
 
@@ -32,6 +40,7 @@ class RenderFixture:
     output_dir: Path
     renderer: GraphRenderer
     graph: Graph
+    cases: tuple[ReconciliationCase, ...]
 
 
 @pytest.fixture
@@ -62,9 +71,29 @@ def render_fixture(tmp_path: Path) -> RenderFixture:
     graph_path = tmp_path / "graph.yaml"
     store = YamlGraphStore(graph_path)
     store.initialize(graph)
+    case = ReconciliationCase(
+        id="case-render",
+        subject_ref="req-a",
+        case_type=ReconciliationCaseType.TEST_LAG,
+        affected_refs=("req-a",),
+        evidence_sides=(
+            EvidenceSide(
+                label="test",
+                claim="A renderer test case",
+                evidence_refs=("ev-render",),
+                observed_at=NOW,
+                authors=("fixture@example.test",),
+                confidence=0.8,
+            ),
+        ),
+        detector_id="fixture",
+        fingerprint="a" * 64,
+        created_at=NOW,
+    )
     return RenderFixture(
         graph_path=graph_path,
         output_dir=tmp_path / "generated",
-        renderer=GraphRenderer(store),
+        renderer=GraphRenderer(store, (case,)),
         graph=graph,
+        cases=(case,),
     )

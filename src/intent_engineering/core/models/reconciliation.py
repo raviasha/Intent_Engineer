@@ -29,6 +29,19 @@ ALLOWED_CASE_TRANSITIONS: dict[ReconciliationStatus, frozenset[ReconciliationSta
     ReconciliationStatus.FALSE_POSITIVE: frozenset(),
 }
 
+NONTERMINAL_CASE_STATUSES = frozenset(
+    {
+        ReconciliationStatus.OPEN,
+        ReconciliationStatus.PROPOSED,
+        ReconciliationStatus.NEEDS_HUMAN,
+    }
+)
+
+
+def is_nonterminal_case_status(status: ReconciliationStatus) -> bool:
+    """Return whether a reconciliation case remains actionable by a reviewer."""
+    return status in NONTERMINAL_CASE_STATUSES
+
 
 class EvidenceSide(BaseModel):
     """One independently attributable position used to classify drift."""

@@ -17,6 +17,7 @@ _DEFAULT_CONTEXT_LIMITS = {
     "code_refs": 20,
     "test_refs": 20,
     "open_reconciliation_cases": 10,
+    "evidence_refs": 20,
 }
 
 

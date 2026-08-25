@@ -1,13 +1,14 @@
 """Deterministic Markdown projection of an immutable graph."""
 
 from collections.abc import Sequence
+from unicodedata import category
 
 from intent_engineering.core.models import (
     Graph,
     Node,
     NodeType,
     ReconciliationCase,
-    ReconciliationStatus,
+    is_nonterminal_case_status,
 )
 
 SEMANTIC_GROUPS: tuple[tuple[str, frozenset[NodeType]], ...] = (
@@ -44,6 +45,10 @@ SEMANTIC_GROUPS: tuple[tuple[str, frozenset[NodeType]], ...] = (
 
 
 def _escape_markdown(value: str) -> str:
+    value = "".join(
+        " " if character in "\r\n\u2028\u2029" or category(character).startswith("C") else character
+        for character in value
+    )
     return "".join(
         f"\\{character}" if character in r'\\`*_{}[]<>#|"' else character for character in value
     )
@@ -67,7 +72,7 @@ def _render_node_group(group: tuple[str, frozenset[NodeType]], nodes: Sequence[N
 
 def _render_cases(cases: Sequence[ReconciliationCase]) -> str:
     open_cases = sorted(
-        (case for case in cases if case.status is ReconciliationStatus.OPEN),
+        (case for case in cases if is_nonterminal_case_status(case.status)),
         key=lambda case: case.id,
     )
     if not open_cases:

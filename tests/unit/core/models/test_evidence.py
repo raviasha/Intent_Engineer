@@ -76,6 +76,7 @@ def test_project_config_has_immutable_independent_context_limits() -> None:
         "code_refs": 20,
         "test_refs": 20,
         "open_reconciliation_cases": 10,
+        "evidence_refs": 20,
     }
     assert first.context_limits is not second.context_limits
     with pytest.raises(TypeError):

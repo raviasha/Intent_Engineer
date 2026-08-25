@@ -16,7 +16,7 @@ from intent_engineering.core.models import (
     NodeType,
     ProjectConfig,
     ReconciliationCase,
-    ReconciliationStatus,
+    is_nonterminal_case_status,
 )
 
 _WORD = re.compile(r"\w+", re.UNICODE)
@@ -82,9 +82,21 @@ class ContextProvider:
 
     def for_symbol(self, symbol_ref: str, actor: str | None = None) -> ContextPack:
         """Return bounded context for a symbol identifier or label."""
-        return self._build(query=symbol_ref, repository_scope=None, actor=actor)
+        return self._build(
+            query=symbol_ref,
+            repository_scope=None,
+            actor=actor,
+            exact_seed_id=symbol_ref or None,
+        )
 
-    def _build(self, *, query: str, repository_scope: str | None, actor: str | None) -> ContextPack:
+    def _build(
+        self,
+        *,
+        query: str,
+        repository_scope: str | None,
+        actor: str | None,
+        exact_seed_id: str | None = None,
+    ) -> ContextPack:
         query_tokens = _tokens(query)
         active_nodes = {
             node.id: node
@@ -95,9 +107,14 @@ class ContextProvider:
             node_id: len(query_tokens & _tokens(node.label))
             for node_id, node in active_nodes.items()
         }
-        selected_ids = self._expand(
-            {node_id for node_id, score in scores.items() if score > 0}, active_nodes
+        seed_ids = (
+            {exact_seed_id}
+            if exact_seed_id is not None and exact_seed_id in active_nodes
+            else set()
         )
+        if exact_seed_id is None:
+            seed_ids = {node_id for node_id, score in scores.items() if score > 0}
+        selected_ids = self._expand(seed_ids, active_nodes)
         selected_nodes = tuple(active_nodes[node_id] for node_id in selected_ids)
         selected_cases = self._selected_cases(selected_ids, repository_scope, actor)
 
@@ -177,7 +194,7 @@ class ContextProvider:
         return tuple(
             case
             for case in self._cases
-            if case.status is ReconciliationStatus.OPEN
+            if is_nonterminal_case_status(case.status)
             and (case.subject_ref in selected_ids or bool(set(case.affected_refs) & selected_ids))
             and self._refs_allowed(case.all_evidence_refs, repository_scope, actor)
         )
@@ -188,10 +205,11 @@ class ContextProvider:
     def _refs_allowed(
         self, evidence_refs: Sequence[str], repository_scope: str | None, actor: str | None
     ) -> bool:
-        return all(
-            self._evidence_allowed(self._evidence[ref], repository_scope, actor)
-            for ref in evidence_refs
-            if ref in self._evidence
+        records = tuple(self._evidence.get(reference) for reference in evidence_refs)
+        return all(record is not None for record in records) and all(
+            self._evidence_allowed(record, repository_scope, actor)
+            for record in records
+            if record is not None
         )
 
     @staticmethod
@@ -205,7 +223,7 @@ class ContextProvider:
         if record.acl and (actor is None or actor not in record.acl):
             return False
         scope = self._scope(record)
-        return repository_scope is None or scope is None or scope == repository_scope
+        return repository_scope is None or scope == repository_scope
 
     def _cap(self, category: str, values: Sequence[_Item]) -> tuple[_Item, ...]:
         limit = self._config.context_limits.get(category, len(values))

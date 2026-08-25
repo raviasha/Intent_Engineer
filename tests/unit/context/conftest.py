@@ -61,7 +61,9 @@ def _edge(edge_id: str, from_id: str, to_id: str, *, status: str = "active") -> 
     )
 
 
-def _evidence(evidence_id: str, *, repository_scope: str, acl: tuple[str, ...]) -> EvidenceRecord:
+def _evidence(
+    evidence_id: str, *, repository_scope: str | None, acl: tuple[str, ...]
+) -> EvidenceRecord:
     return EvidenceRecord(
         id=evidence_id,
         connector_type="fixture",
@@ -71,7 +73,7 @@ def _evidence(evidence_id: str, *, repository_scope: str, acl: tuple[str, ...]) 
         observed_at=NOW,
         source_locator=f"fixture://{evidence_id}",
         content_hash=sha256(evidence_id.encode()).hexdigest(),
-        payload={"repository_scope": repository_scope},
+        payload={} if repository_scope is None else {"repository_scope": repository_scope},
         acl=acl,
     )
 
@@ -80,6 +82,8 @@ def _evidence(evidence_id: str, *, repository_scope: str, acl: tuple[str, ...]) 
 class ContextFixture:
     graph: Graph
     cases: tuple[ReconciliationCase, ...]
+    config: ProjectConfig
+    evidence: tuple[EvidenceRecord, ...]
     provider: ContextProvider
 
 
@@ -147,14 +151,17 @@ def context_fixture() -> ContextFixture:
             "evidence_refs": 2,
         },
     )
+    evidence = (
+        _evidence("ev-export", repository_scope="repo-a", acl=("alice@example.test",)),
+        _evidence("ev-case", repository_scope="repo-a", acl=("alice@example.test",)),
+        _evidence("ev-unrelated", repository_scope="repo-b", acl=("bob@example.test",)),
+    )
     provider = ContextProvider(
         graph,
         (case,),
         config,
-        (
-            _evidence("ev-export", repository_scope="repo-a", acl=("alice@example.test",)),
-            _evidence("ev-case", repository_scope="repo-a", acl=("alice@example.test",)),
-            _evidence("ev-unrelated", repository_scope="repo-b", acl=("bob@example.test",)),
-        ),
+        evidence,
     )
-    return ContextFixture(graph=graph, cases=(case,), provider=provider)
+    return ContextFixture(
+        graph=graph, cases=(case,), config=config, evidence=evidence, provider=provider
+    )
