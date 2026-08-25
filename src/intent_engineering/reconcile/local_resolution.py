@@ -43,7 +43,12 @@ class LocalResolutionService:
         self._actor = actor
 
     def resolve(
-        self, case_id: str, action: ResolutionAction, *, approve: str | None = None, at: datetime | None = None
+        self,
+        case_id: str,
+        action: ResolutionAction,
+        *,
+        approve: str | None = None,
+        at: datetime | None = None,
     ) -> tuple[ReconciliationCase, ChangeSet | None, str | None]:
         """Prevalidate all state, then commit graph/history/case or restore exact bytes."""
         paths = self._paths()
@@ -65,21 +70,40 @@ class LocalResolutionService:
                     ResolutionAction.DEFER,
                     ResolutionAction.MARK_FALSE_POSITIVE,
                 }:
-                    target = (ReconciliationStatus.DEFERRED if action is ResolutionAction.DEFER else ReconciliationStatus.FALSE_POSITIVE)
+                    target = (
+                        ReconciliationStatus.DEFERRED
+                        if action is ResolutionAction.DEFER
+                        else ReconciliationStatus.FALSE_POSITIVE
+                    )
                     updated = transition_case(case, target, self._actor, timestamp)
                     self._case_store.put(updated)
                     return updated, None, None
                 if case.status is ReconciliationStatus.OPEN:
-                    proposed = transition_case(case, ReconciliationStatus.PROPOSED, self._actor, timestamp)
-                    reviewed = transition_case(proposed, ReconciliationStatus.NEEDS_HUMAN, self._actor, timestamp)
+                    proposed = transition_case(
+                        case, ReconciliationStatus.PROPOSED, self._actor, timestamp
+                    )
+                    reviewed = transition_case(
+                        proposed, ReconciliationStatus.NEEDS_HUMAN, self._actor, timestamp
+                    )
                     self._case_store.put(proposed)
                     self._case_store.put(reviewed)
-                    changeset = self._changeset(reviewed, graph.version, action, reviewed.created_at)
-                    return reviewed, changeset, self._approval_hash(reviewed, graph.version, action, changeset)
+                    changeset = self._changeset(
+                        reviewed, graph.version, action, reviewed.created_at
+                    )
+                    return (
+                        reviewed,
+                        changeset,
+                        self._approval_hash(reviewed, graph.version, action, changeset),
+                    )
                 if case.status is not ReconciliationStatus.NEEDS_HUMAN or approve is None:
                     raise ResolutionUnavailable("resolution unavailable")
                 changeset = self._changeset(case, graph.version, action, timestamp)
-                expected = self._approval_hash(case, graph.version, action, self._changeset(case, graph.version, action, case.created_at))
+                expected = self._approval_hash(
+                    case,
+                    graph.version,
+                    action,
+                    self._changeset(case, graph.version, action, case.created_at),
+                )
                 if approve != expected:
                     raise ResolutionUnavailable("resolution unavailable")
                 resolved = transition_case(
@@ -103,9 +127,18 @@ class LocalResolutionService:
                 raise ResolutionUnavailable("resolution unavailable") from error
 
     @staticmethod
-    def _approval_hash(case: ReconciliationCase, graph_version: int, action: ResolutionAction, changeset: ChangeSet) -> str:
-        payload = {"action": action.value, "case": case.model_dump(mode="json"), "changeset": changeset.model_dump(mode="json"), "graph_version": graph_version}
-        return sha256(json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")).hexdigest()
+    def _approval_hash(
+        case: ReconciliationCase, graph_version: int, action: ResolutionAction, changeset: ChangeSet
+    ) -> str:
+        payload = {
+            "action": action.value,
+            "case": case.model_dump(mode="json"),
+            "changeset": changeset.model_dump(mode="json"),
+            "graph_version": graph_version,
+        }
+        return sha256(
+            json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+        ).hexdigest()
 
     def _paths(self) -> tuple[Path, ...]:
         return (
