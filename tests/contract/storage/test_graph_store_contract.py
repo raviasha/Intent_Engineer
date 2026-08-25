@@ -1,0 +1,139 @@
+"""Reusable contract tests for canonical graph storage."""
+
+from __future__ import annotations
+
+from datetime import UTC, datetime
+from pathlib import Path
+
+import pytest
+
+from intent_engineering.core.graph.applier import UnknownIdentity
+from intent_engineering.core.models import (
+    ChangeSet,
+    Edge,
+    Graph,
+    Node,
+    NodeType,
+    RelationType,
+    SourceMode,
+)
+from intent_engineering.storage.interfaces import GraphStore
+from intent_engineering.storage.yaml.graph_store import YamlGraphStore
+
+NOW = datetime(2026, 8, 25, tzinfo=UTC)
+
+
+def node(node_id: str) -> Node:
+    return Node(
+        id=node_id,
+        type=NodeType.REQUIREMENT,
+        label="Export is local-first",
+        status="active",
+        created_by="tester",
+        created_at=NOW,
+        last_modified_by="tester",
+        last_modified_at=NOW,
+        source_mode=SourceMode.EXPLICIT,
+        evidence_refs=("ev-1",),
+    )
+
+
+def edge(edge_id: str, *, to_id: str = "req-2") -> Edge:
+    return Edge(
+        id=edge_id,
+        from_id="req-1",
+        relation=RelationType.VERIFIED_BY,
+        to_id=to_id,
+        status="active",
+        created_by="tester",
+        created_at=NOW,
+        last_modified_by="tester",
+        last_modified_at=NOW,
+    )
+
+
+def graph() -> Graph:
+    return Graph(id="graph-1", version=4, nodes=(node("req-1"), node("req-2")), edges=(edge("edge-1"),))
+
+
+def changeset(**changes: object) -> ChangeSet:
+    payload: dict[str, object] = {
+        "id": "cs-1",
+        "actor": "tester",
+        "timestamp": NOW,
+        "baseline_graph_version": 4,
+        "evidence_refs": ("ev-1",),
+        "nodes_added": (),
+        "nodes_updated": (),
+        "nodes_superseded": (),
+        "edges_added": (),
+        "edges_updated": (),
+        "edges_superseded": (),
+        "confidence_changes": (),
+        "implementation_status_changes": (),
+        "reconciliation_cases_created": (),
+        "reconciliation_cases_resolved": (),
+        "validation_status": "approved",
+    }
+    payload.update(changes)
+    return ChangeSet(**payload)
+
+
+def assert_graph_store_round_trip(store: GraphStore, initial: Graph) -> None:
+    store.initialize(initial)
+    assert store.load() == initial
+
+
+def test_yaml_graph_store_satisfies_round_trip_contract(tmp_path: Path) -> None:
+    assert_graph_store_round_trip(YamlGraphStore(tmp_path / "graph.yaml"), graph())
+
+
+def test_yaml_graph_store_uses_edge_aliases_and_iso_datetimes(tmp_path: Path) -> None:
+    path = tmp_path / "graph.yaml"
+    store = YamlGraphStore(path)
+    store.initialize(graph())
+
+    text = path.read_text()
+
+    assert "from: req-1" in text
+    assert "to: req-2" in text
+    assert "from_id:" not in text
+    assert "created_at: '2026-08-25T00:00:00Z'" in text
+
+
+def test_graph_apply_replaces_graph_before_appending_history(tmp_path: Path) -> None:
+    store = YamlGraphStore(tmp_path / "graph.yaml", history_path=tmp_path / "history.jsonl")
+    store.initialize(graph())
+    mutation = changeset(nodes_added=(node("req-3"),))
+
+    result = store.apply(mutation)
+
+    assert result.version == 5
+    assert tuple(item.id for item in result.nodes) == ("req-1", "req-2", "req-3")
+    assert store.history("req-3") == (mutation,)
+
+
+def test_failed_apply_preserves_canonical_bytes_and_does_not_append_history(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "graph.yaml"
+    history_path = tmp_path / "history.jsonl"
+    store = YamlGraphStore(path, history_path=history_path)
+    store.initialize(graph())
+    before = path.read_bytes()
+    invalid = changeset(edges_added=(edge("edge-invalid", to_id="missing-node"),))
+
+    with pytest.raises(ValueError, match="missing node: missing-node"):
+        store.apply(invalid)
+
+    assert path.read_bytes() == before
+    assert store.history("missing-node") == ()
+    assert history_path.exists() is False
+
+
+def test_graph_store_rejects_unknown_mutation_identity(tmp_path: Path) -> None:
+    store = YamlGraphStore(tmp_path / "graph.yaml")
+    store.initialize(graph())
+
+    with pytest.raises(UnknownIdentity, match="missing-node"):
+        store.apply(changeset(nodes_superseded=("missing-node",)))
