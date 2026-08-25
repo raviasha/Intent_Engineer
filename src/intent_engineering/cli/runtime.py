@@ -102,8 +102,22 @@ class _FrontMatterReasoner(DeterministicReasoner):
     """Expose approved Markdown fixture metadata at the existing reasoner boundary."""
 
     def extract_assertions(self, delta: EvidenceDelta) -> Sequence[CandidateAssertion]:
-        normalized = tuple(self._normalized(record) for record in delta.added)
+        normalized = tuple(self._validated(record) for record in delta.added)
         return super().extract_assertions(delta.model_copy(update={"added": normalized}))
+
+    def _validated(self, record: EvidenceRecord) -> EvidenceRecord:
+        """Remove typed-invalid fixture assertions before the shared reasoner sees them."""
+        normalized = self._normalized(record)
+        assertion = normalized.payload.get("intent_assertion")
+        if assertion is None:
+            return normalized
+        try:
+            CandidateAssertion.model_validate(assertion)
+        except (ValidationError, ValueError):
+            payload = dict(normalized.payload)
+            payload.pop("intent_assertion", None)
+            return normalized.model_copy(update={"payload": payload})
+        return normalized
 
     def _normalized(self, record: EvidenceRecord) -> EvidenceRecord:
         content = record.payload.get("content")
@@ -113,8 +127,8 @@ class _FrontMatterReasoner(DeterministicReasoner):
             for key in ("intent_assertion", "detection_input"):
                 if key not in payload and key in metadata:
                     payload[key] = metadata[key]
-        assertion = payload.get("intent_assertion")
-        if assertion is not None:
+        if "intent_assertion" in payload:
+            assertion = payload["intent_assertion"]
             if not isinstance(assertion, Mapping):
                 payload.pop("intent_assertion", None)
                 return record.model_copy(update={"payload": payload})

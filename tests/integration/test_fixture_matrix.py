@@ -2,6 +2,7 @@
 
 import pytest
 
+from intent_engineering.sync.models import SyncRunStatus
 from tests.helpers.fixtures import FIXTURES, run_fixture, run_fixture_twice
 
 
@@ -21,7 +22,13 @@ def test_fixture_classification(fixture_name: str, expected: set[str]) -> None:
     """Each fixture exercises exactly one intentional classification outcome."""
     result = run_fixture(FIXTURES / fixture_name)
 
+    assert result.sync.status is SyncRunStatus.SUCCESS
+    assert result.sync.connectors["markdown"].status is SyncRunStatus.SUCCESS
+    assert result.sync.connectors["git"].status is SyncRunStatus.SUCCESS
+    assert {record.connector_type for record in result.evidence} == {"markdown", "git"}
     assert {item.case_type.value for item in result.cases} == expected
+    if fixture_name == "cross_author_conflict":
+        assert {node.id for node in result.graph.nodes} >= {"requirement:first", "decision:second"}
 
 
 def test_second_sync_is_a_zero_mutation_noop() -> None:

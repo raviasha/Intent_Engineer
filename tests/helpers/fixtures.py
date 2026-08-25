@@ -16,7 +16,7 @@ import anyio
 import yaml  # type: ignore[import-untyped]
 
 from intent_engineering.cli.runtime import load_runtime, resolve_connectors
-from intent_engineering.core.models import Graph, ReconciliationCase
+from intent_engineering.core.models import EvidenceRecord, Graph, ReconciliationCase
 from intent_engineering.core.policy.project import initialize_project
 from intent_engineering.sync.models import SyncRunResult
 
@@ -32,6 +32,7 @@ class FixtureRun:
     sync: SyncRunResult
     cases: tuple[ReconciliationCase, ...]
     graph: Graph
+    evidence: tuple[EvidenceRecord, ...]
 
 
 def _side(label: str, claim: str, author: str = "fixture") -> dict[str, Any]:
@@ -191,26 +192,32 @@ def materialize_fixture_repository(path: Path, destination: Path) -> Path:
 
 def _run(
     path: Path, *, second: bool
-) -> tuple[SyncRunResult, SyncRunResult | None, tuple[ReconciliationCase, ...], Graph]:
+) -> tuple[
+    SyncRunResult,
+    SyncRunResult | None,
+    tuple[ReconciliationCase, ...],
+    Graph,
+    tuple[EvidenceRecord, ...],
+]:
     with tempfile.TemporaryDirectory(prefix="intent-fixture-") as temporary:
         project = materialize_fixture_repository(path, Path(temporary))
         runtime = load_runtime(project)
         connectors = resolve_connectors(runtime, "markdown,git")
         first = anyio.run(runtime.sync.run, "fixture-run", connectors)
         second_result = anyio.run(runtime.sync.run, "fixture-run-2", connectors) if second else None
-        return first, second_result, runtime.cases(), runtime.graph_store.load()
+        return first, second_result, runtime.cases(), runtime.graph_store.load(), runtime.evidence()
 
 
 def run_fixture(path: Path) -> FixtureRun:
     """Execute a fresh materialized fixture through the production local runtime."""
-    sync, _, cases, graph = _run(path, second=False)
-    return FixtureRun(sync=sync, cases=cases, graph=graph)
+    sync, _, cases, graph, evidence = _run(path, second=False)
+    return FixtureRun(sync=sync, cases=cases, graph=graph, evidence=evidence)
 
 
 def run_fixture_twice(
     path: Path,
 ) -> tuple[SyncRunResult, SyncRunResult, tuple[ReconciliationCase, ...]]:
     """Run the same materialized repository twice to prove checkpoint idempotency."""
-    first, second, cases, _ = _run(path, second=True)
+    first, second, cases, _, _ = _run(path, second=True)
     assert second is not None
     return first, second, cases

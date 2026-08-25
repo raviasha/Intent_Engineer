@@ -10,9 +10,11 @@ from intent_engineering.cli.runtime import _detect_cases, _FrontMatterReasoner
 from intent_engineering.core.models import EvidenceDelta, EvidenceRecord, Graph
 
 
-def _record(payload: dict[str, object], acl: tuple[str, ...] = ()) -> EvidenceRecord:
+def _record(
+    payload: dict[str, object], acl: tuple[str, ...] = (), *, record_id: str = "evidence:one"
+) -> EvidenceRecord:
     return EvidenceRecord(
-        id="evidence:one",
+        id=record_id,
         connector_type="markdown",
         external_object_id="one",
         external_version="1",
@@ -87,6 +89,45 @@ def test_top_level_assertion_takes_precedence_over_front_matter() -> None:
     )
 
     assert len(assertions) == 1
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"intent_assertion": None},
+        {"intent_assertion": {"id": "missing-fields", "evidence_refs": ["$self"]}},
+        {"intent_assertion": {**_assertion("$self"), "change_kind": "wrong"}},
+        {"intent_assertion": {**_assertion("$self"), "confidence": "high"}},
+        {
+            "content": "---\nintent_engineering:\n  intent_assertion:\n    id: incomplete\n    evidence_refs: ['$self']\n---\n"
+        },
+        {
+            "content": "---\nintent_engineering:\n  intent_assertion:\n    id: wrong-enum\n    subject_id: requirement:one\n    change_kind: wrong\n    node_type: requirement\n    label: one\n    source_mode: explicit\n    evidence_refs: ['$self']\n    confidence: 0.9\n---\n"
+        },
+    ],
+)
+def test_malformed_assertion_mappings_fail_closed(payload: dict[str, object]) -> None:
+    """Typed CandidateAssertion failures cannot escape or create a semantic proposal."""
+    reasoner = _FrontMatterReasoner(actor="local")
+    delta = EvidenceDelta(added=(_record(payload),), prior_versions={})
+
+    assert reasoner.extract_assertions(delta) == ()
+    assert reasoner.map_to_graph((), Graph(id="g", version=0, nodes=(), edges=())).is_empty
+
+
+def test_malformed_assertion_does_not_poison_a_valid_peer() -> None:
+    """Per-record validation preserves a valid neighboring assertion in the same sync delta."""
+    valid = _record({"intent_assertion": _assertion("$self")}, record_id="evidence:valid")
+    invalid = _record({"intent_assertion": {"id": "incomplete"}}, record_id="evidence:invalid")
+    reasoner = _FrontMatterReasoner(actor="local")
+
+    assertions = reasoner.extract_assertions(
+        EvidenceDelta(added=(valid, invalid), prior_versions={})
+    )
+    changeset = reasoner.map_to_graph(assertions, Graph(id="g", version=0, nodes=(), edges=()))
+
+    assert tuple(assertion.subject_id for assertion in assertions) == ("requirement:one",)
+    assert tuple(node.id for node in changeset.nodes_added) == ("requirement:one",)
 
 
 def test_detector_rejects_unreadable_and_noncurrent_references() -> None:
