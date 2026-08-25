@@ -6,12 +6,45 @@ from intent_engineering.capture.github.auth import (
     GitHubTokenRunner,
     run_gh_token,
 )
-from intent_engineering.capture.github.errors import GitHubAuthError
+from intent_engineering.capture.github.client import GitHubClient, RetryPolicy
+from intent_engineering.capture.github.errors import (
+    GitHubApiError,
+    GitHubAuthError,
+    GitHubNotFound,
+    GitHubPermissionError,
+    GitHubProtocolError,
+    GitHubRateLimitError,
+    GitHubTransientError,
+)
+from intent_engineering.capture.github.models import (
+    GitHubCommit,
+    GitHubIssue,
+    GitHubIssueComment,
+    GitHubPullRequest,
+    GitHubReviewComment,
+    GitHubUser,
+    PageResult,
+)
 
 __all__ = [
     "CredentialSource",
+    "GitHubApiError",
     "GitHubAuthError",
+    "GitHubClient",
+    "GitHubCommit",
     "GitHubCredentials",
+    "GitHubIssue",
+    "GitHubIssueComment",
+    "GitHubNotFound",
+    "GitHubPermissionError",
+    "GitHubProtocolError",
+    "GitHubPullRequest",
+    "GitHubRateLimitError",
+    "GitHubReviewComment",
     "GitHubTokenRunner",
+    "GitHubTransientError",
+    "GitHubUser",
+    "PageResult",
+    "RetryPolicy",
     "run_gh_token",
 ]
