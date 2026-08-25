@@ -542,7 +542,11 @@ class SecureFile:
     ) -> bool:
         try:
             observed = os.fstat(descriptor)
-            if _identity(observed) != _identity(expected) or not stat.S_ISREG(observed.st_mode):
+            if (
+                _identity(observed) != _identity(expected)
+                or not stat.S_ISREG(observed.st_mode)
+                or (single_link and observed.st_nlink != 1)
+            ):
                 return False
             os.ftruncate(descriptor, 0)
             os.fsync(descriptor)
@@ -803,6 +807,7 @@ class SecureFile:
             self._strict_fault("original-quarantined")
             if not self._entry_is_safe(quarantine, expected_target):
                 raise UnsafePathError()
+            self._strict_fault("original-pre-scrub")
             state.displaced_touched = True
             if not self._scrub_descriptor(
                 displaced_descriptor,

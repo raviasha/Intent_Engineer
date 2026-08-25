@@ -904,6 +904,7 @@ def test_verified_report_strict_path_never_uses_pathname_unlink(
         (True, "existing-exchanged"),
         (True, "existing-durable"),
         (True, "original-quarantined"),
+        (True, "original-pre-scrub"),
     ],
 )
 def test_verified_report_named_cancellation_phases_restore_exact_preimage(
@@ -1175,9 +1176,7 @@ def test_verified_report_terminal_rollback_reauth_detects_external_target_swap(
     assert swapped is True
     assert type(caught.value).__name__ == "AtomicWriteRollbackError"
     surviving = [
-        item.read_bytes()
-        for item in tmp_path.iterdir()
-        if item.is_file() and not item.is_symlink()
+        item.read_bytes() for item in tmp_path.iterdir() if item.is_file() and not item.is_symlink()
     ]
     assert foreign in surviving
     assert original in surviving
@@ -1334,6 +1333,50 @@ def test_verified_report_write_rolls_back_cancellation_before_original_scrub(
         retry.close()
     assert target.read_bytes() == replacement
     assert not tuple(tmp_path.glob(".intent-drift.md.*.tmp"))
+
+
+def test_verified_report_rejects_a_hardlinked_original_before_scrub_without_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = tmp_path / "intent-drift.md"
+    outside = tmp_path / "external-original.md"
+    original = b"original report must remain exact\n"
+    replacement = b"replacement report\n"
+    target.write_bytes(original)
+    original_identity = (target.stat().st_dev, target.stat().st_ino)
+    secure_file = SecureFile.from_path(target)
+    linked = False
+
+    def link_original_before_scrub(owned: SecureFile, stage: str) -> None:
+        nonlocal linked
+        if stage == "original-pre-scrub" and not linked:
+            quarantined = next(tmp_path.glob(".intent-drift.md.*.rollback"))
+            assert (quarantined.stat().st_dev, quarantined.stat().st_ino) == original_identity
+            os.link(quarantined, outside)
+            linked = True
+
+    monkeypatch.setattr(SecureFile, "_strict_fault", link_original_before_scrub)
+    try:
+        with pytest.raises(BaseException) as caught:
+            secure_file.atomic_write(replacement, reject_target_races=True)
+    finally:
+        secure_file.close()
+
+    assert linked is True
+    assert type(caught.value).__name__ == "AtomicWriteRollbackError"
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+    assert outside.read_bytes() == original
+    original_entries = [
+        item
+        for item in tmp_path.iterdir()
+        if item.is_file()
+        and not item.is_symlink()
+        and (item.stat().st_dev, item.stat().st_ino) == original_identity
+    ]
+    assert len(original_entries) == 2
+    assert all(item.read_bytes() == original for item in original_entries)
 
 
 def test_verified_report_write_commit_wins_after_original_scrub_completed(
