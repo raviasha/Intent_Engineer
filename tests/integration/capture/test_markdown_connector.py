@@ -110,3 +110,21 @@ async def test_markdown_connector_wraps_operational_discovery_and_fetch_failures
     with pytest.raises(ConnectorError, match="Markdown fetch failed") as fetch_error:
         await connector.fetch("path:missing.md", "sha256:missing")
     assert "missing.md" not in str(fetch_error.value)
+
+
+@pytest.mark.anyio
+async def test_markdown_connector_wraps_content_version_mismatch(tmp_path: Path) -> None:
+    """A file changed after discovery is a safe connector-boundary failure."""
+    path = tmp_path / "intent.md"
+    path.write_text("# Initial\n", encoding="utf-8")
+    connector = MarkdownConnector(
+        tmp_path,
+        ProjectConfig(project_id="capture-test", local_actor="tester"),
+    )
+    source = (await connector.discover(cursor=None))[0]
+    path.write_text("# Changed\n", encoding="utf-8")
+
+    with pytest.raises(ConnectorError, match="Markdown fetch failed") as error:
+        await connector.fetch(source.external_object_id, source.external_version)
+
+    assert "intent.md" not in str(error.value)

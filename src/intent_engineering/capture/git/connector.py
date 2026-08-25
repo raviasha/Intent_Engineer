@@ -91,7 +91,7 @@ class GitConnector:
         """Fetch commit data, deduplicating per-parent merge paths in sorted order."""
         sha = _sha_from_object_id(object_id)
         if version != sha:
-            raise ValueError(f"Git object version must equal its commit SHA: {object_id}")
+            raise ConnectorError("Git fetch failed")
         try:
             metadata = await anyio.to_thread.run_sync(
                 run_git,

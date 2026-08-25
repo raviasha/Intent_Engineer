@@ -101,7 +101,7 @@ class MarkdownConnector:
             return await anyio.to_thread.run_sync(self._fetch_sync, object_id, version)
         except ConnectorError:
             raise
-        except (OSError, UnicodeError) as error:
+        except (OSError, UnicodeError, ValueError) as error:
             raise ConnectorError("Markdown fetch failed") from error
 
     def normalize(self, raw: RawSourceObject) -> EvidenceRecord:

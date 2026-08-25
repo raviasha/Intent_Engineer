@@ -147,3 +147,17 @@ async def test_git_connector_wraps_operational_discovery_and_fetch_failures(tmp_
     with pytest.raises(ConnectorError, match="Git fetch failed") as fetch_error:
         await GitConnector(repo).fetch("commit:deadbeef", "deadbeef")
     assert "fatal:" not in str(fetch_error.value)
+
+
+@pytest.mark.anyio
+async def test_git_connector_wraps_object_version_mismatch(tmp_path: Path) -> None:
+    """A caller-supplied version that differs from the commit SHA is safe to isolate."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    git(repo, "init")
+    sha = commit(repo, "README.md", "# Intent\n", "Add intent", "First body")
+
+    with pytest.raises(ConnectorError, match="Git fetch failed") as error:
+        await GitConnector(repo).fetch(f"commit:{sha}", "other-version")
+
+    assert sha not in str(error.value)
