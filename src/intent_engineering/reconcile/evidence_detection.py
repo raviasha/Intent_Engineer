@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Literal, cast
 
@@ -18,7 +19,11 @@ from intent_engineering.core.models import (
 )
 from intent_engineering.core.models._base import StrictModel
 from intent_engineering.core.policy.access import refs_allowed
-from intent_engineering.reconcile.detectors import DetectionInput, detect_drift
+from intent_engineering.reconcile.detectors import (
+    DetectionInput,
+    EvidenceOrder,
+    detect_drift,
+)
 
 
 class _SideDeclaration(StrictModel):
@@ -57,6 +62,14 @@ class _DetectionDeclaration(StrictModel):
     requirement_active: bool = True
     has_mapped_semantics: bool = True
     material_code_change: bool = False
+
+
+@dataclass(frozen=True)
+class _ResolvedSide:
+    """A public evidence side plus the immutable records used to derive it."""
+
+    side: EvidenceSide
+    records: tuple[EvidenceRecord, ...]
 
 
 def _front_matter(content: str) -> Mapping[str, Any] | None:
@@ -141,7 +154,7 @@ def _resolve_side(
     declaring_record: EvidenceRecord,
     records: Sequence[EvidenceRecord],
     actor: str,
-) -> EvidenceSide | None:
+) -> _ResolvedSide | None:
     if not side.evidence_refs or len(side.evidence_refs) != len(set(side.evidence_refs)):
         return None
     resolved: list[EvidenceRecord] = []
@@ -160,16 +173,63 @@ def _resolve_side(
     authors = tuple(sorted({record.author for record in resolved if record.author}))
     if not authors:
         return None
-    return EvidenceSide(
-        label=side.label,
-        claim=side.claim,
-        evidence_refs=evidence_ids,
-        observed_at=max(record.observed_at for record in resolved),
-        authors=authors,
-        confidence=side.confidence,
-        source_mode=side.source_mode,
-        current=side.current,
+    return _ResolvedSide(
+        side=EvidenceSide(
+            label=side.label,
+            claim=side.claim,
+            evidence_refs=evidence_ids,
+            observed_at=max(record.observed_at for record in resolved),
+            authors=authors,
+            confidence=side.confidence,
+            source_mode=side.source_mode,
+            current=side.current,
+        ),
+        records=tuple(resolved),
     )
+
+
+def _record_order(
+    left: EvidenceRecord,
+    right: EvidenceRecord,
+    append_positions: Mapping[str, int],
+) -> EvidenceOrder:
+    if (
+        left.connector_type == right.connector_type
+        and left.external_object_id == right.external_object_id
+    ):
+        left_position = append_positions[left.id]
+        right_position = append_positions[right.id]
+        if left_position < right_position:
+            return EvidenceOrder.BEFORE
+        if left_position > right_position:
+            return EvidenceOrder.AFTER
+        return EvidenceOrder.TIED
+    if left.observed_at < right.observed_at:
+        return EvidenceOrder.BEFORE
+    if left.observed_at > right.observed_at:
+        return EvidenceOrder.AFTER
+    return EvidenceOrder.TIED
+
+
+def _side_order(
+    left: _ResolvedSide,
+    right: _ResolvedSide,
+    append_positions: Mapping[str, int],
+) -> EvidenceOrder:
+    orders = {
+        _record_order(left_record, right_record, append_positions)
+        for left_record in left.records
+        for right_record in right.records
+    }
+    return next(iter(orders)) if len(orders) == 1 else EvidenceOrder.UNKNOWN
+
+
+def _declared_order(left: int, right: int) -> EvidenceOrder:
+    if left < right:
+        return EvidenceOrder.BEFORE
+    if left > right:
+        return EvidenceOrder.AFTER
+    return EvidenceOrder.TIED
 
 
 def _input_from_record(
@@ -190,7 +250,7 @@ def _input_from_record(
         reference not in graph_ids for reference in declaration.affected_refs
     ):
         return None
-    resolved_sides: dict[str, EvidenceSide | None] = {}
+    resolved_sides: dict[str, _ResolvedSide | None] = {}
     side_evidence: list[set[str]] = []
     for name in ("requirement", "implementation", "test", "decision"):
         declared_side = getattr(declaration, name)
@@ -200,15 +260,55 @@ def _input_from_record(
         resolved = _resolve_side(declared_side, declaring_record, records, actor)
         if resolved is None:
             return None
-        current_refs = set(resolved.evidence_refs)
+        current_refs = set(resolved.side.evidence_refs)
         if any(current_refs & previous for previous in side_evidence):
             return None
         side_evidence.append(current_refs)
         resolved_sides[name] = resolved
+    append_positions = {record.id: index for index, record in enumerate(records)}
+    comparisons = {
+        "requirement_implementation_order": ("requirement", "implementation"),
+        "decision_requirement_order": ("decision", "requirement"),
+        "implementation_decision_order": ("implementation", "decision"),
+        "test_decision_order": ("test", "decision"),
+        "implementation_test_order": ("implementation", "test"),
+    }
+    chronology: dict[str, EvidenceOrder] = {}
+    for field, (left_name, right_name) in comparisons.items():
+        left = resolved_sides[left_name]
+        right = resolved_sides[right_name]
+        if left is None or right is None:
+            continue
+        derived = _side_order(left, right, append_positions)
+        left_version = getattr(declaration, f"{left_name}_version")
+        right_version = getattr(declaration, f"{right_name}_version")
+        if (
+            left_version is not None
+            and right_version is not None
+            and _declared_order(left_version, right_version) is not derived
+        ):
+            return None
+        chronology[field] = derived
     payload = declaration.model_dump(
-        exclude={"schema_version", "requirement", "implementation", "test", "decision"}
+        exclude={
+            "schema_version",
+            "requirement",
+            "implementation",
+            "test",
+            "decision",
+            "requirement_version",
+            "implementation_version",
+            "test_version",
+            "decision_version",
+        }
     )
-    payload.update(resolved_sides)
+    payload.update(
+        {
+            name: resolved.side if resolved is not None else None
+            for name, resolved in resolved_sides.items()
+        }
+    )
+    payload.update(chronology)
     try:
         return DetectionInput.model_validate(payload)
     except ValidationError:
@@ -237,9 +337,9 @@ def detect_evidence_drift(
         if previous is not None and previous != record:
             return ()
         by_id[record.id] = record
-    stable_records = tuple(sorted(by_id.values(), key=lambda item: item.id))
+    stable_records = tuple(by_id.values())
     candidates: list[DriftObservation] = []
-    for record in stable_records:
+    for record in sorted(stable_records, key=lambda item: item.id):
         detection_input = _input_from_record(record, stable_records, graph, actor)
         if detection_input is not None:
             candidates.extend(detect_drift(detection_input))

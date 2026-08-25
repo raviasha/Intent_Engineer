@@ -18,6 +18,7 @@ from intent_engineering.sync.models import SyncRunStatus
 from sync.conftest import SyncHarness
 
 NOW = datetime(2026, 8, 25, tzinfo=UTC)
+IMPLEMENTATION_AT = datetime(2026, 8, 24, tzinfo=UTC)
 
 
 class DeclarationConnector:
@@ -57,8 +58,6 @@ class DeclarationConnector:
                     "subject_ref": "requirement:export",
                     "affected_refs": ["requirement:export"],
                     "compatibility": "aligns",
-                    "requirement_version": 2,
-                    "implementation_version": 1,
                     "requirement": {
                         "label": "requirement",
                         "claim": "Export locally",
@@ -103,7 +102,7 @@ class ImplementationConnector:
             external_object_id=object_id,
             external_version=version,
             author="engineer@example.test",
-            observed_at=NOW,
+            observed_at=IMPLEMENTATION_AT,
             source_locator="git:commit:implementation-v1",
             content_hash="sha256:implementation-v1",
             payload={"changed_paths": ["src/export.py"]},

@@ -8,7 +8,7 @@ import subprocess
 import tempfile
 from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import datetime
 from pathlib import Path
 from typing import Any, cast
 
@@ -21,8 +21,33 @@ from intent_engineering.core.policy.project import initialize_project
 from intent_engineering.sync.models import SyncRunResult
 
 FIXTURES = Path(__file__).parents[1] / "fixtures"
-_TIMESTAMP = datetime(2026, 8, 25, tzinfo=UTC)
-_GIT_DATE = "2026-08-25T00:00:00+00:00"
+_FIXTURE_DATES = {
+    "aligned": {
+        "requirement": "2026-08-21T00:00:00+00:00",
+        "implementation": "2026-08-22T00:00:00+00:00",
+        "test": "2026-08-23T00:00:00+00:00",
+        "decision": "2026-08-24T00:00:00+00:00",
+    },
+    "code_lag": {
+        "requirement": "2026-08-25T00:00:00+00:00",
+        "implementation": "2026-08-22T00:00:00+00:00",
+        "test": "2026-08-23T00:00:00+00:00",
+        "decision": "2026-08-24T00:00:00+00:00",
+    },
+    "requirement_lag": {
+        "requirement": "2026-08-20T00:00:00+00:00",
+        "decision": "2026-08-23T00:00:00+00:00",
+        "implementation": "2026-08-24T00:00:00+00:00",
+        "test": "2026-08-25T00:00:00+00:00",
+    },
+    "test_lag": {
+        "requirement": "2026-08-21T00:00:00+00:00",
+        "implementation": "2026-08-24T00:00:00+00:00",
+        "test": "2026-08-23T00:00:00+00:00",
+        "decision": "2026-08-22T00:00:00+00:00",
+    },
+}
+_DEFAULT_DATES = _FIXTURE_DATES["aligned"]
 
 
 @dataclass(frozen=True)
@@ -59,22 +84,9 @@ def _detection_input(kind: str, subject: str) -> dict[str, Any]:
         "subject_ref": subject,
         "affected_refs": [subject],
     }
-    if kind == "aligned":
+    if kind in {"aligned", "code_lag"}:
         payload.update(
             compatibility="aligns",
-            requirement_version=1,
-            implementation_version=1,
-            test_version=1,
-            requirement=requirement,
-            implementation=implementation,
-            test=test,
-        )
-    elif kind == "code_lag":
-        payload.update(
-            compatibility="aligns",
-            requirement_version=2,
-            implementation_version=1,
-            test_version=1,
             requirement=requirement,
             implementation=implementation,
             test=test,
@@ -82,10 +94,6 @@ def _detection_input(kind: str, subject: str) -> dict[str, Any]:
     elif kind == "requirement_lag":
         payload.update(
             compatibility="aligns",
-            requirement_version=1,
-            decision_version=2,
-            implementation_version=2,
-            test_version=2,
             requirement=requirement,
             decision=decision,
             implementation=implementation,
@@ -94,9 +102,6 @@ def _detection_input(kind: str, subject: str) -> dict[str, Any]:
     elif kind == "test_lag":
         payload.update(
             compatibility="aligns",
-            requirement_version=2,
-            implementation_version=2,
-            test_version=1,
             requirement=requirement,
             implementation=implementation,
             test=test,
@@ -140,10 +145,15 @@ def _assertion(subject: str, label: str) -> dict[str, Any]:
     }
 
 
-def _write_markdown(path: Path, metadata: Mapping[str, Any], title: str) -> None:
+def _write_markdown(
+    path: Path,
+    metadata: Mapping[str, Any],
+    title: str,
+    observed_at: datetime,
+) -> None:
     front_matter = yaml.safe_dump({"intent_engineering": dict(metadata)}, sort_keys=True)
     path.write_text(f"---\n{front_matter}---\n# {title}\n", encoding="utf-8")
-    timestamp = _TIMESTAMP.timestamp()
+    timestamp = observed_at.timestamp()
     os.utime(path, (timestamp, timestamp))
 
 
@@ -194,8 +204,9 @@ def _commit_path(
     _git(project, "commit", "--quiet", "-m", message, environment=identity)
 
 
-def _commit_fixture_repository(project: Path) -> None:
+def _commit_fixture_repository(project: Path, kind: str) -> None:
     """Create independent code, test, decision, and Markdown evidence revisions."""
+    dates = _FIXTURE_DATES.get(kind, _DEFAULT_DATES)
     _git(project, "init", "--quiet")
     (project / "src").mkdir()
     (project / "src" / "implementation.py").write_text(
@@ -208,7 +219,7 @@ def _commit_fixture_repository(project: Path) -> None:
         "implement export",
         author_name="Implementation Author",
         author_email="implementation@example.test",
-        date="2026-08-22T00:00:00+00:00",
+        date=dates["implementation"],
     )
     (project / "tests").mkdir()
     (project / "tests" / "test_implementation.py").write_text(
@@ -221,7 +232,7 @@ def _commit_fixture_repository(project: Path) -> None:
         "verify export",
         author_name="Test Author",
         author_email="tests@example.test",
-        date="2026-08-23T00:00:00+00:00",
+        date=dates["test"],
     )
     (project / "docs").mkdir()
     (project / "docs" / "decision.txt").write_text(
@@ -234,7 +245,7 @@ def _commit_fixture_repository(project: Path) -> None:
         "record decision",
         author_name="Decision Author",
         author_email="decision@example.test",
-        date="2026-08-24T00:00:00+00:00",
+        date=dates["decision"],
     )
     _commit_path(
         project,
@@ -242,7 +253,7 @@ def _commit_fixture_repository(project: Path) -> None:
         "revise requirement",
         author_name="Product Author",
         author_email="product@example.test",
-        date=_GIT_DATE,
+        date=dates["requirement"],
     )
 
 
@@ -259,8 +270,14 @@ def materialize_fixture_repository(path: Path, destination: Path) -> Path:
         "intent_assertion": _assertion(subject, f"{path.name} assertion"),
         "detection_input": _detection_input(kind, subject),
     }
-    _write_markdown(project / "fixture.md", metadata, path.name)
-    _commit_fixture_repository(project)
+    dates = _FIXTURE_DATES.get(kind, _DEFAULT_DATES)
+    _write_markdown(
+        project / "fixture.md",
+        metadata,
+        path.name,
+        datetime.fromisoformat(dates["requirement"]),
+    )
+    _commit_fixture_repository(project, kind)
     return project
 
 

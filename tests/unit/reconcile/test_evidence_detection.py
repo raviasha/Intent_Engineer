@@ -152,3 +152,149 @@ def test_disconnected_subject_or_affected_reference_creates_no_case() -> None:
         )
         == ()
     )
+
+
+def test_changing_consistent_declared_version_integers_cannot_flip_classification() -> None:
+    graph = _graph("requirement:export")
+    original = _declaration()
+    renumbered = original.model_copy(
+        update={
+            "payload": {
+                "detection_input": {
+                    **original.payload["detection_input"],  # type: ignore[dict-item]
+                    "requirement_version": 200,
+                    "implementation_version": 100,
+                }
+            }
+        }
+    )
+
+    first = detect_evidence_drift(
+        (original, _git()), graph, "local@example.test"
+    )
+    second = detect_evidence_drift((renumbered, _git()), graph, "local@example.test")
+
+    assert [item.case_type.value for item in first] == ["CODE_LAG"]
+    assert second == first
+
+
+def test_inconsistent_declared_chronology_creates_no_case() -> None:
+    graph = _graph("requirement:export")
+    original = _declaration()
+    inverted = original.model_copy(
+        update={
+            "payload": {
+                "detection_input": {
+                    **original.payload["detection_input"],  # type: ignore[dict-item]
+                    "requirement_version": 1,
+                    "implementation_version": 99,
+                }
+            }
+        }
+    )
+
+    assert detect_evidence_drift((inverted, _git()), graph, "local@example.test") == ()
+
+
+def test_tied_or_non_current_required_chronology_fails_closed() -> None:
+    tied_git = _git().model_copy(update={"observed_at": MARKDOWN_AT})
+    non_current = _declaration().model_copy(
+        update={
+            "payload": {
+                "detection_input": {
+                    **_declaration().payload["detection_input"],  # type: ignore[dict-item]
+                    "requirement": {
+                        **_declaration().payload["detection_input"]["requirement"],  # type: ignore[index]
+                        "current": False,
+                    },
+                }
+            }
+        }
+    )
+
+    assert detect_evidence_drift(
+        (_declaration(), tied_git), _graph("requirement:export"), "local@example.test"
+    ) == ()
+    assert detect_evidence_drift(
+        (non_current, _git()), _graph("requirement:export"), "local@example.test"
+    ) == ()
+
+
+def test_same_object_version_chain_orders_equal_timestamp_evidence_deterministically() -> None:
+    earlier = _git("evidence:git-v1").model_copy(
+        update={
+            "external_object_id": "commit:shared",
+            "external_version": "v1",
+            "observed_at": GIT_AT,
+        }
+    )
+    later = _git("evidence:git-v2").model_copy(
+        update={
+            "external_object_id": "commit:shared",
+            "external_version": "v2",
+            "observed_at": GIT_AT,
+        }
+    )
+    declaration = _declaration().model_copy(
+        update={
+            "payload": {
+                "detection_input": {
+                    **_declaration().payload["detection_input"],  # type: ignore[dict-item]
+                    "requirement_version": 2,
+                    "implementation_version": 1,
+                    "requirement": {
+                        "label": "requirement",
+                        "claim": "new behavior",
+                        "evidence_refs": [later.id],
+                        "confidence": 0.9,
+                    },
+                    "implementation": {
+                        "label": "implementation",
+                        "claim": "old behavior",
+                        "evidence_refs": [earlier.id],
+                        "confidence": 0.8,
+                    },
+                }
+            }
+        }
+    )
+
+    observations = detect_evidence_drift(
+        (earlier, later, declaration),
+        _graph("requirement:export"),
+        "local@example.test",
+    )
+
+    assert [item.case_type.value for item in observations] == ["CODE_LAG"]
+
+
+def test_mixed_record_chronology_within_one_side_fails_closed() -> None:
+    early = _git("evidence:git-early").model_copy(
+        update={"observed_at": datetime(2026, 8, 23, tzinfo=UTC)}
+    )
+    late = _git("evidence:git-late").model_copy(
+        update={"observed_at": datetime(2026, 8, 26, tzinfo=UTC)}
+    )
+    declaration = _declaration().model_copy(
+        update={
+            "payload": {
+                "detection_input": {
+                    **_declaration().payload["detection_input"],  # type: ignore[dict-item]
+                    "requirement_version": None,
+                    "implementation_version": None,
+                    "implementation": {
+                        "label": "implementation",
+                        "claim": "mixed provenance",
+                        "evidence_refs": [early.id, late.id],
+                        "confidence": 0.8,
+                    },
+                }
+            }
+        }
+    )
+
+    assert detect_evidence_drift(
+        (declaration, early, late),
+        _graph("requirement:export"),
+        "local@example.test",
+    ) == ()

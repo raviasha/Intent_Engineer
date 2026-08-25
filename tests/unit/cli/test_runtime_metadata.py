@@ -179,15 +179,17 @@ def test_detector_rejects_unreadable_and_noncurrent_references() -> None:
 def test_detector_requires_independent_authorized_evidence_and_connected_graph() -> None:
     """Every declared side resolves independently to authorized evidence and graph state."""
     implementation = _record({}, record_id="evidence:implementation").model_copy(
-        update={"connector_type": "git", "author": "engineer@example.test"}
+        update={
+            "connector_type": "git",
+            "author": "engineer@example.test",
+            "observed_at": datetime(2026, 8, 24, tzinfo=UTC),
+        }
     )
     payload = {
         "detection_input": {
             "subject_ref": "r",
             "affected_refs": ["r"],
             "compatibility": "aligns",
-            "requirement_version": 2,
-            "implementation_version": 1,
             "requirement": _side_payload("$self"),
             "implementation": _side_payload(implementation.id),
         }

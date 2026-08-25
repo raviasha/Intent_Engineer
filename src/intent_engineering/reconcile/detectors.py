@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Callable, Sequence
+from enum import StrEnum
 from typing import Literal
 
 from pydantic import ConfigDict
@@ -20,6 +21,15 @@ from intent_engineering.core.models._base import StrictModel
 SemanticCompatibility = Literal["aligns", "contradicts", "unknown"]
 
 
+class EvidenceOrder(StrEnum):
+    """Deterministic relative chronology between two resolved evidence sides."""
+
+    BEFORE = "before"
+    AFTER = "after"
+    TIED = "tied"
+    UNKNOWN = "unknown"
+
+
 class DetectionInput(StrictModel):
     """Versioned, evidence-backed facts for a single deterministic comparison."""
 
@@ -31,14 +41,34 @@ class DetectionInput(StrictModel):
     implementation: EvidenceSide | None = None
     test: EvidenceSide | None = None
     decision: EvidenceSide | None = None
-    requirement_version: int | None = None
-    implementation_version: int | None = None
-    test_version: int | None = None
-    decision_version: int | None = None
+    requirement_implementation_order: EvidenceOrder | None = None
+    decision_requirement_order: EvidenceOrder | None = None
+    implementation_decision_order: EvidenceOrder | None = None
+    test_decision_order: EvidenceOrder | None = None
+    implementation_test_order: EvidenceOrder | None = None
     compatibility: SemanticCompatibility
     requirement_active: bool = True
     has_mapped_semantics: bool = True
     material_code_change: bool = False
+
+
+def _order(
+    declared: EvidenceOrder | None,
+    left: EvidenceSide,
+    right: EvidenceSide,
+) -> EvidenceOrder:
+    """Use immutable-record chronology when supplied, otherwise side timestamps."""
+    if declared is not None:
+        return declared
+    if left.observed_at < right.observed_at:
+        return EvidenceOrder.BEFORE
+    if left.observed_at > right.observed_at:
+        return EvidenceOrder.AFTER
+    return EvidenceOrder.TIED
+
+
+def _all_current(*sides: EvidenceSide) -> bool:
+    return all(side.current for side in sides)
 
 
 def _fingerprint(
@@ -106,16 +136,28 @@ def detect_requirement_lag(input: DetectionInput) -> DriftObservation | None:
         or input.implementation is None
         or input.test is None
         or input.decision is None
-        or input.requirement_version is None
-        or input.implementation_version is None
-        or input.test_version is None
-        or input.decision_version is None
         or input.compatibility != "aligns"
         or input.decision.source_mode is not SourceMode.EXPLICIT
-        or not input.decision.current
-        or input.decision_version <= input.requirement_version
-        or input.implementation_version < input.decision_version
-        or input.test_version < input.decision_version
+        or not _all_current(
+            input.requirement,
+            input.decision,
+            input.implementation,
+            input.test,
+        )
+        or _order(
+            input.decision_requirement_order,
+            input.decision,
+            input.requirement,
+        )
+        is not EvidenceOrder.AFTER
+        or _order(
+            input.implementation_decision_order,
+            input.implementation,
+            input.decision,
+        )
+        is not EvidenceOrder.AFTER
+        or _order(input.test_decision_order, input.test, input.decision)
+        is not EvidenceOrder.AFTER
     ):
         return None
     return _observation(
@@ -134,10 +176,14 @@ def detect_code_lag(input: DetectionInput) -> DriftObservation | None:
     if (
         input.requirement is None
         or input.implementation is None
-        or input.requirement_version is None
-        or input.implementation_version is None
         or not input.requirement_active
-        or input.requirement_version <= input.implementation_version
+        or not _all_current(input.requirement, input.implementation)
+        or _order(
+            input.requirement_implementation_order,
+            input.requirement,
+            input.implementation,
+        )
+        is not EvidenceOrder.AFTER
     ):
         return None
     return _observation(
@@ -156,10 +202,14 @@ def detect_test_lag(input: DetectionInput) -> DriftObservation | None:
         input.requirement is None
         or input.implementation is None
         or input.test is None
-        or input.implementation_version is None
-        or input.test_version is None
         or not input.requirement_active
-        or input.implementation_version <= input.test_version
+        or not _all_current(input.requirement, input.implementation, input.test)
+        or _order(
+            input.implementation_test_order,
+            input.implementation,
+            input.test,
+        )
+        is not EvidenceOrder.AFTER
     ):
         return None
     return _observation(
