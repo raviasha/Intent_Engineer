@@ -149,3 +149,58 @@ $ .venv/bin/pytest -v
 ### Fix commit
 
 - Product and regression tests: `8cf437572f79a9e6e5531cc3406cf4b915d3a33e`
+
+## Fix round 2 — Markdown manifest cursors
+
+### Root cause and design
+
+Task 6 Markdown discovery always returned its full current snapshot and its checkpoint
+was a single file-content hash. The Task 7 recovery correctly treats records beyond a
+committed checkpoint as pending, but that made an identical Markdown scan re-enter
+reasoning and case detection. The cursor could not represent every included document.
+
+Markdown now encodes a canonical `markdown:v1:` JSON manifest of sorted POSIX
+path/content-version pairs. Discovery scans under the existing AnyIO thread boundary,
+retains that complete snapshot for `next_checkpoint()`, and compares it to a valid
+prior manifest to return only new or changed documents. Legacy hash (and malformed)
+cursors intentionally do one safe full rescan, then migrate to the manifest. Empty
+incremental Markdown scans return a manifest rather than `None`, while Git continues
+to return `None`; the shared checkpoint helper therefore preserves Git cursors but
+commits Markdown deletion/no-op snapshots correctly. Sync skips the semantic boundary
+entirely when a connector's delta has no records.
+
+### RED
+
+```console
+$ .venv/bin/python -m pytest tests/integration/capture/test_markdown_connector.py tests/integration/sync -v
+4 failed, 18 passed in 0.14s
+```
+
+The failures showed that Markdown still returned a single hash, ignored a prior cursor,
+re-invoked custom reasoners on an identical snapshot, and did not migrate a legacy
+checkpoint. The direct pytest executable reproduces the carried environment-only
+`ModuleNotFoundError: No module named 'tests'` for the isolated capture target, so the
+module invocation was used for the focused capture-plus-sync command.
+
+### GREEN and verification
+
+```console
+$ .venv/bin/python -m pytest tests/integration/capture/test_markdown_connector.py tests/integration/sync -v
+22 passed in 0.16s
+
+$ .venv/bin/pytest tests/unit tests/contract tests/integration -v
+149 passed in 1.48s
+
+$ .venv/bin/ruff check src/intent_engineering/capture/markdown/connector.py src/intent_engineering/capture/checkpoints.py src/intent_engineering/sync/orchestrator.py tests/integration/capture/test_markdown_connector.py tests/integration/sync
+All checks passed!
+
+$ .venv/bin/mypy --strict src/intent_engineering/capture/markdown/connector.py src/intent_engineering/capture/checkpoints.py src/intent_engineering/sync/orchestrator.py
+Success: no issues found in 3 source files
+
+$ .venv/bin/pytest -v
+149 passed in 1.36s
+```
+
+### Fix commit
+
+- Product and regression tests: `f0d2e779ca8a0b9564893b522eba018b1838ff7f`
