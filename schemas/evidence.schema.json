@@ -1,0 +1,118 @@
+{
+  "$defs": {
+    "JsonValue": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "integer"
+        },
+        {
+          "type": "number"
+        },
+        {
+          "type": "boolean"
+        },
+        {
+          "items": {
+            "$ref": "#/$defs/JsonValue"
+          },
+          "type": "array"
+        },
+        {
+          "additionalProperties": {
+            "$ref": "#/$defs/JsonValue"
+          },
+          "type": "object"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    }
+  },
+  "description": "A normalized, version-addressed record captured from a source.",
+  "properties": {
+    "acl": {
+      "default": [],
+      "items": {
+        "type": "string"
+      },
+      "title": "Acl",
+      "type": "array"
+    },
+    "author": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Author"
+    },
+    "connector_type": {
+      "title": "Connector Type",
+      "type": "string"
+    },
+    "content_hash": {
+      "title": "Content Hash",
+      "type": "string"
+    },
+    "external_object_id": {
+      "title": "External Object Id",
+      "type": "string"
+    },
+    "external_version": {
+      "title": "External Version",
+      "type": "string"
+    },
+    "id": {
+      "title": "Id",
+      "type": "string"
+    },
+    "observed_at": {
+      "format": "date-time",
+      "title": "Observed At",
+      "type": "string"
+    },
+    "parent_ref": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Parent Ref"
+    },
+    "payload": {
+      "additionalProperties": {
+        "$ref": "#/$defs/JsonValue"
+      },
+      "title": "Payload",
+      "type": "object"
+    },
+    "source_locator": {
+      "title": "Source Locator",
+      "type": "string"
+    }
+  },
+  "required": [
+    "id",
+    "connector_type",
+    "external_object_id",
+    "external_version",
+    "author",
+    "observed_at",
+    "source_locator",
+    "content_hash",
+    "payload"
+  ],
+  "title": "EvidenceRecord",
+  "type": "object"
+}
