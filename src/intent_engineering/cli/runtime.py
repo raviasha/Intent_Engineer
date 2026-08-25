@@ -22,6 +22,7 @@ from intent_engineering.core.models import (
     ProjectConfig,
     ReconciliationCase,
 )
+from intent_engineering.core.policy.access import refs_allowed
 from intent_engineering.core.policy.project import ProjectNotInitialized, workspace_path
 from intent_engineering.extract.deterministic import DeterministicReasoner
 from intent_engineering.reconcile import DetectionInput, LocalResolutionService, detect_drift
@@ -64,7 +65,7 @@ def _detection_input(record: EvidenceRecord) -> DetectionInput | None:
         references = copied_side.get("evidence_refs")
         if isinstance(references, Sequence) and not isinstance(references, str):
             if any(item != "$self" for item in references):
-                raise ValueError("fixture detection evidence must reference current record")
+                return None
             copied_side["evidence_refs"] = [
                 record.id if item == "$self" else item for item in references
             ]
@@ -72,11 +73,13 @@ def _detection_input(record: EvidenceRecord) -> DetectionInput | None:
     return DetectionInput.model_validate(payload)
 
 
-def _detect_cases(delta: EvidenceDelta, graph: Graph) -> Sequence[DriftObservation]:
+def _detect_cases(delta: EvidenceDelta, graph: Graph, actor: str) -> Sequence[DriftObservation]:
     """Project fixture evidence into deterministic Task 5 observations without graph mutation."""
     del graph
     observations: list[DriftObservation] = []
     for record in delta.added:
+        if not refs_allowed((record.id,), (record,), actor):
+            continue
         detection_input = _detection_input(record)
         if detection_input is not None:
             observations.extend(detect_drift(detection_input))
@@ -90,8 +93,7 @@ class _FrontMatterReasoner(DeterministicReasoner):
         normalized = tuple(self._normalized(record) for record in delta.added)
         return super().extract_assertions(delta.model_copy(update={"added": normalized}))
 
-    @staticmethod
-    def _normalized(record: EvidenceRecord) -> EvidenceRecord:
+    def _normalized(self, record: EvidenceRecord) -> EvidenceRecord:
         content = record.payload.get("content")
         metadata = _front_matter(content) if isinstance(content, str) else None
         if metadata is None:
@@ -105,6 +107,9 @@ class _FrontMatterReasoner(DeterministicReasoner):
             copied = dict(assertion)
             references = copied.get("evidence_refs")
             if isinstance(references, Sequence) and not isinstance(references, str):
+                if any(reference != "$self" for reference in references):
+                    payload.pop("intent_assertion", None)
+                    return record.model_copy(update={"payload": payload})
                 copied["evidence_refs"] = [
                     record.id if item == "$self" else item for item in references
                 ]
@@ -173,9 +178,10 @@ def load_runtime(root: Path) -> Runtime:
         checkpoint_store=checkpoint_store,
         case_store=case_store,
         reasoner=_FrontMatterReasoner(actor=config.local_actor),
-        case_detector=_detect_cases,
+        case_detector=lambda delta, graph: _detect_cases(delta, graph, config.local_actor),
     )
     resolution = LocalResolutionService(graph_store, evidence_store, case_store, config.local_actor)
+    resolution.recover()
     return Runtime(
         root=root,
         workspace=workspace,

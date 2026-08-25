@@ -51,8 +51,8 @@ def test_system_exit_after_each_durable_resolution_stage_recovers_exact_preimage
     before = {path: path.read_bytes() if path.exists() else None for path in paths}
     case = service._case_store.get("case-1")
     graph_version = service._graph_store.load().version
-    canonical = service._changeset(
-        case, graph_version, ResolutionAction.UPDATE_IMPLEMENTATION, case.created_at
+    canonical = service._canonical_changeset(
+        case, graph_version, ResolutionAction.UPDATE_IMPLEMENTATION
     )
     approval = service._approval_hash(
         case, graph_version, ResolutionAction.UPDATE_IMPLEMENTATION, canonical

@@ -85,24 +85,26 @@ class LocalResolutionService:
                     reviewed = transition_case(
                         proposed, ReconciliationStatus.NEEDS_HUMAN, self._actor, timestamp
                     )
+                    self._write_journal(snapshots)
                     self._case_store.put(proposed)
                     self._case_store.put(reviewed)
-                    changeset = self._changeset(
-                        reviewed, graph.version, action, reviewed.created_at
-                    )
+                    changeset = self._canonical_changeset(reviewed, graph.version, action)
+                    self._journal_path().unlink(missing_ok=True)
                     return (
                         reviewed,
                         changeset,
                         self._approval_hash(reviewed, graph.version, action, changeset),
                     )
+                if action in {ResolutionAction.DEFER, ResolutionAction.MARK_FALSE_POSITIVE}:
+                    raise ResolutionUnavailable("resolution unavailable")
                 if case.status is not ReconciliationStatus.NEEDS_HUMAN or approve is None:
                     raise ResolutionUnavailable("resolution unavailable")
-                changeset = self._changeset(case, graph.version, action, timestamp)
+                changeset = self._canonical_changeset(case, graph.version, action)
                 expected = self._approval_hash(
                     case,
                     graph.version,
                     action,
-                    self._changeset(case, graph.version, action, case.created_at),
+                    changeset,
                 )
                 if approve != expected:
                     raise ResolutionUnavailable("resolution unavailable")
@@ -139,6 +141,18 @@ class LocalResolutionService:
         return sha256(
             json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
         ).hexdigest()
+
+    def _canonical_changeset(
+        self, case: ReconciliationCase, graph_version: int, action: ResolutionAction
+    ) -> ChangeSet:
+        return self._changeset(case, graph_version, action, case.history[-1].at)
+
+    def recover(self) -> None:
+        """Replay any interrupted transaction before exposing runtime stores."""
+        with ExitStack() as locks:
+            for path in sorted(self._paths(), key=str):
+                locks.enter_context(same_path_lock(path))
+            self._recover()
 
     def _paths(self) -> tuple[Path, ...]:
         return (
