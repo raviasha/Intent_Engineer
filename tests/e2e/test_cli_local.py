@@ -138,7 +138,9 @@ def test_doctor_rejects_symlinked_state_without_reading_its_target(tmp_path: Pat
     assert result.json() == {"diagnostics": ["evidence"], "healthy": False, "version": "1"}
 
 
-def test_doctor_holds_original_directory_after_parent_swap(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_doctor_holds_original_directory_after_parent_swap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """A post-open replacement cannot redirect doctor into an external directory."""
     from intent_engineering.core.policy import doctor
 
@@ -259,27 +261,48 @@ intent_engineering:
     assert preview_payload["case"]["status"] == "needs_human"
     graph_before = (repo / ".intent/graph.yaml").read_bytes()
     cases_before = (repo / ".intent/reconciliation/cases.jsonl").read_bytes()
-    terminal = run_intent(
+    for terminal_action in ("defer", "mark_false_positive"):
+        history_before = (
+            (repo / ".intent/history/changesets.jsonl").read_bytes()
+            if (repo / ".intent/history/changesets.jsonl").exists()
+            else None
+        )
+        terminal = run_intent(
+            repo,
+            "reconcile",
+            "resolve",
+            cases[0]["id"],
+            "--action",
+            terminal_action,
+            "--approve",
+            preview_payload["approval"],
+            "--format",
+            "json",
+        )
+        assert terminal.returncode == 1
+        assert (repo / ".intent/graph.yaml").read_bytes() == graph_before
+        assert (repo / ".intent/reconciliation/cases.jsonl").read_bytes() == cases_before
+        history_path = repo / ".intent/history/changesets.jsonl"
+        assert (history_path.read_bytes() if history_path.exists() else None) == history_before
+    refused = run_intent(
+        repo, "reconcile", "resolve", cases[0]["id"], "--approve", "wrong", "--format", "json"
+    )
+    assert refused.returncode == 1
+    assert (repo / ".intent/graph.yaml").read_bytes() == graph_before
+    resolved = run_intent(
         repo,
         "reconcile",
         "resolve",
         cases[0]["id"],
-        "--action",
-        "defer",
         "--approve",
         preview_payload["approval"],
         "--format",
         "json",
     )
-    assert terminal.returncode == 1
-    assert (repo / ".intent/graph.yaml").read_bytes() == graph_before
-    assert (repo / ".intent/reconciliation/cases.jsonl").read_bytes() == cases_before
-    refused = run_intent(repo, "reconcile", "resolve", cases[0]["id"], "--approve", "wrong", "--format", "json")
-    assert refused.returncode == 1
-    assert (repo / ".intent/graph.yaml").read_bytes() == graph_before
-    resolved = run_intent(repo, "reconcile", "resolve", cases[0]["id"], "--approve", preview_payload["approval"], "--format", "json")
     assert resolved.returncode == 0
     assert resolved.json()["case"]["status"] == "resolved"
+    history = (repo / ".intent/history/changesets.jsonl").read_text(encoding="utf-8").splitlines()
+    assert json.loads(history[-1]) == preview_payload["changeset"]
 
 
 def test_acl_protected_evidence_is_indistinguishable_from_unknown(tmp_path: Path) -> None:
