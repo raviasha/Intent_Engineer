@@ -165,6 +165,7 @@ class GitHubCommitData(GitHubProviderModel):
 
     message: str
     author: GitHubCommitAuthor | None
+    committer: GitHubCommitAuthor | None = None
 
 
 class GitHubCommit(GitHubProviderModel):
@@ -174,6 +175,7 @@ class GitHubCommit(GitHubProviderModel):
     html_url: str
     commit: GitHubCommitData
     author: GitHubUser | None
+    committer: GitHubUser | None = None
 
 
 class GitHubIssueComment(GitHubProviderModel):

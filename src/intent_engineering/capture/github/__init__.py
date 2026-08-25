@@ -7,9 +7,11 @@ from intent_engineering.capture.github.auth import (
     run_gh_token,
 )
 from intent_engineering.capture.github.client import GitHubClient, RetryPolicy
+from intent_engineering.capture.github.connector import GitHubCheckpoint, GitHubConnector
 from intent_engineering.capture.github.errors import (
     GitHubApiError,
     GitHubAuthError,
+    GitHubCheckpointError,
     GitHubNotFound,
     GitHubPermissionError,
     GitHubProtocolError,
@@ -30,8 +32,11 @@ __all__ = [
     "CredentialSource",
     "GitHubApiError",
     "GitHubAuthError",
+    "GitHubCheckpoint",
+    "GitHubCheckpointError",
     "GitHubClient",
     "GitHubCommit",
+    "GitHubConnector",
     "GitHubCredentials",
     "GitHubIssue",
     "GitHubIssueComment",

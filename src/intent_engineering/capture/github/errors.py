@@ -18,6 +18,13 @@ class GitHubAuthError(RuntimeError):
         super().__init__(GITHUB_AUTH_ERROR_MESSAGE)
 
 
+class GitHubCheckpointError(ValueError):
+    """A fixed public failure for malformed or foreign GitHub cursors."""
+
+    def __init__(self) -> None:
+        super().__init__("invalid GitHub checkpoint")
+
+
 _SAFE_ENDPOINT_CHARACTER = re.compile(r"[^A-Za-z0-9/._~%:@+-]")
 _SAFE_REQUEST_ID_CHARACTER = re.compile(r"[^A-Za-z0-9:_-]")
 _MAX_ENDPOINT_LENGTH = 160

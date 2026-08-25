@@ -7,6 +7,7 @@ import re
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from datetime import UTC
 from enum import StrEnum
 from hashlib import sha256
 from pathlib import Path
@@ -15,6 +16,7 @@ from typing import Any, Literal, cast
 import yaml  # type: ignore[import-untyped]
 from pydantic import ConfigDict, Field, ValidationError
 
+from intent_engineering.capture.github.connector import GitHubCheckpoint
 from intent_engineering.core.graph.applier import apply_changeset_with_case_effects
 from intent_engineering.core.models import (
     ChangeSet,
@@ -51,6 +53,8 @@ _CODE = re.compile(r"^[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)+$")
 _SHA256 = re.compile(r"^sha256:[0-9a-f]{64}$")
 _GIT_CURSOR = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
 _MARKDOWN_CURSOR_PREFIX = "markdown:v1:"
+_GITHUB_CONNECTOR_PREFIX = "github:"
+_GITHUB_SHA = re.compile(r"^[0-9a-f]{40}$")
 
 
 class DiagnosticSeverity(StrEnum):
@@ -109,10 +113,7 @@ def _report(
     diagnostics: Sequence[ValidationDiagnostic],
     graph: Graph | None = None,
 ) -> ValidationReport:
-    unique = {
-        (item.code, item.scope, item.severity.value): item
-        for item in diagnostics
-    }
+    unique = {(item.code, item.scope, item.severity.value): item for item in diagnostics}
     ordered = tuple(
         unique[key]
         for key in sorted(
@@ -201,8 +202,7 @@ def _parse_evidence(
 
 def _parse_history(content: bytes | None) -> tuple[ChangeSet, ...]:
     return tuple(
-        ChangeSet.model_validate(value)
-        for value in _load_json_lines(content, allow_blank=True)
+        ChangeSet.model_validate(value) for value in _load_json_lines(content, allow_blank=True)
     )
 
 
@@ -252,9 +252,7 @@ def _evidence_diagnostics(
     positions: dict[str, int] = {}
     for position, record in enumerate(records):
         if record.id in legacy_ids and record.connector_type not in {"markdown", "git"}:
-            diagnostics.append(
-                _diagnostic("evidence.legacy_association_ambiguous", "evidence")
-            )
+            diagnostics.append(_diagnostic("evidence.legacy_association_ambiguous", "evidence"))
         previous_id = by_id.get(record.id)
         if previous_id is not None:
             diagnostics.append(
@@ -287,7 +285,7 @@ def _evidence_diagnostics(
                 f"sha256:{sha256(content.encode('utf-8')).hexdigest()}"
             ):
                 diagnostics.append(_diagnostic("evidence.content_hash_mismatch", "evidence"))
-        elif record.connector_type == "git":
+        elif record.connector_type in {"git", "github"}:
             encoded = json.dumps(
                 payload,
                 ensure_ascii=False,
@@ -353,9 +351,7 @@ def _case_diagnostics(
             previous_at = event.at
 
     created_by_changeset = {
-        case_id
-        for changeset in history
-        for case_id in changeset.reconciliation_cases_created
+        case_id for changeset in history for case_id in changeset.reconciliation_cases_created
     }
     resolved_by_changeset = {
         (case_id, changeset.id)
@@ -456,9 +452,7 @@ def _graph_diagnostics(
     evidence_by_id: Mapping[str, EvidenceRecord],
 ) -> list[ValidationDiagnostic]:
     if any(
-        reference not in evidence_by_id
-        for node in graph.nodes
-        for reference in node.evidence_refs
+        reference not in evidence_by_id for node in graph.nodes for reference in node.evidence_refs
     ):
         return [_diagnostic("graph.evidence_ref_missing", "graph")]
     return []
@@ -504,6 +498,48 @@ def _parse_markdown_cursor(cursor: str) -> dict[str, str]:
     return result
 
 
+def _github_scoped_record_kind(record: EvidenceRecord, repository: str) -> str | None:
+    """Return one deeply valid GitHub kind scoped to the checkpoint repository."""
+    if record.connector_type != "github":
+        return None
+    prefix = f"github:{repository}:"
+    if not record.external_object_id.startswith(prefix):
+        return None
+    suffix = record.external_object_id.removeprefix(prefix)
+    kind, separator, provider_identity = suffix.partition(":")
+    if not separator:
+        return None
+    payload = record.model_dump(mode="json")["payload"]
+    if payload.get("repository") != repository or payload.get("kind") != kind:
+        return None
+    if kind == "commit":
+        if (
+            _GITHUB_SHA.fullmatch(provider_identity) is None
+            or record.external_version != provider_identity
+            or payload.get("sha") != provider_identity
+        ):
+            return None
+        return kind
+    if kind not in {"issue", "pull_request", "issue_comment", "review_comment"}:
+        return None
+    if (
+        not provider_identity.isascii()
+        or not provider_identity.isdecimal()
+        or provider_identity.startswith("0")
+    ):
+        return None
+    identity_field = "number" if kind in {"issue", "pull_request"} else "provider_id"
+    if payload.get(identity_field) != int(provider_identity):
+        return None
+    canonical_observed_at = record.observed_at.astimezone(UTC).isoformat().replace("+00:00", "Z")
+    if (
+        record.external_version != canonical_observed_at
+        or payload.get("updated_at") != canonical_observed_at
+    ):
+        return None
+    return kind
+
+
 def _checkpoint_diagnostics(
     checkpoints: Mapping[str, SyncCheckpoint],
     evidence: Sequence[EvidenceRecord],
@@ -534,7 +570,15 @@ def _checkpoint_diagnostics(
             ledger_ids_by_connector[record.connector_type].append(record.id)
     for connector_id in sorted(checkpoints):
         checkpoint = checkpoints[connector_id]
-        if connector_id not in {"markdown", "git"}:
+        github_repository: str | None = None
+        if connector_id.startswith(_GITHUB_CONNECTOR_PREFIX):
+            github_repository = connector_id.removeprefix(_GITHUB_CONNECTOR_PREFIX)
+            try:
+                GitHubCheckpoint(repository=github_repository)
+            except (TypeError, ValidationError, ValueError):
+                diagnostics.append(_diagnostic("checkpoint.connector_unknown", "checkpoints"))
+                continue
+        elif connector_id not in {"markdown", "git"}:
             diagnostics.append(_diagnostic("checkpoint.connector_unknown", "checkpoints"))
             continue
         for evidence_id in checkpoint.consumed_evidence_ids:
@@ -555,6 +599,74 @@ def _checkpoint_diagnostics(
             )
         cursor = checkpoint.cursor
         if cursor is None:
+            if github_repository is not None and checkpoint.consumed_evidence_ids:
+                diagnostics.append(_diagnostic("checkpoint.cursor_invalid", "checkpoints"))
+            continue
+        if github_repository is not None:
+            try:
+                github_cursor = GitHubCheckpoint.decode(
+                    cursor,
+                    expected_repository=github_repository,
+                )
+            except (TypeError, ValueError):
+                diagnostics.append(_diagnostic("checkpoint.cursor_invalid", "checkpoints"))
+                continue
+            associated_consumed_records = tuple(
+                record
+                for record in evidence
+                if record.id in checkpoint.consumed_evidence_ids
+                and (connector_id, record.id) in associations
+            )
+            kinds_by_evidence_id = {
+                record.id: _github_scoped_record_kind(record, github_repository)
+                for record in associated_consumed_records
+            }
+            invalid_association = any(
+                kinds_by_evidence_id[record.id] is None for record in associated_consumed_records
+            )
+            if invalid_association:
+                diagnostics.append(
+                    _diagnostic("checkpoint.consumed_evidence_foreign", "checkpoints")
+                )
+            consumed_records = tuple(
+                record
+                for record in associated_consumed_records
+                if kinds_by_evidence_id[record.id] is not None
+            )
+            mutable_records = tuple(
+                record for record in consumed_records if kinds_by_evidence_id[record.id] != "commit"
+            )
+            if mutable_records:
+                expected_updated_at = max(record.observed_at for record in mutable_records)
+                if github_cursor.newest_updated_at != expected_updated_at:
+                    diagnostics.append(_diagnostic("checkpoint.cursor_invalid", "checkpoints"))
+            elif github_cursor.newest_updated_at is not None:
+                diagnostics.append(_diagnostic("checkpoint.evidence_missing", "checkpoints"))
+            commit_records = tuple(
+                record for record in consumed_records if kinds_by_evidence_id[record.id] == "commit"
+            )
+            if commit_records:
+                newest_commit_records = tuple(
+                    record
+                    for record in commit_records
+                    if record.observed_at == max(item.observed_at for item in commit_records)
+                )
+                if github_cursor.newest_commit_sha is None:
+                    diagnostics.append(_diagnostic("checkpoint.cursor_invalid", "checkpoints"))
+                elif not any(
+                    record.external_object_id
+                    == f"github:{github_repository}:commit:{github_cursor.newest_commit_sha}"
+                    and record.external_version == github_cursor.newest_commit_sha
+                    for record in newest_commit_records
+                ):
+                    diagnostics.append(_diagnostic("checkpoint.evidence_missing", "checkpoints"))
+            elif github_cursor.newest_commit_sha is not None:
+                diagnostics.append(_diagnostic("checkpoint.evidence_missing", "checkpoints"))
+            if not consumed_records and (
+                github_cursor.newest_updated_at is not None
+                or github_cursor.newest_commit_sha is not None
+            ):
+                diagnostics.append(_diagnostic("checkpoint.cursor_invalid", "checkpoints"))
             continue
         if connector_id == "git":
             if _GIT_CURSOR.fullmatch(cursor) is None:
@@ -727,7 +839,9 @@ class WorkspaceValidationService:
             evidence_by_id = {record.id: record for record in evidence}
             diagnostics.extend(_graph_diagnostics(graph, evidence_by_id))
             if history is not None:
-                diagnostics.extend(_history_diagnostics(history, graph, evidence_by_id, cases or ()))
+                diagnostics.extend(
+                    _history_diagnostics(history, graph, evidence_by_id, cases or ())
+                )
             if cases is not None and history is not None:
                 diagnostics.extend(_case_diagnostics(cases, graph, evidence_by_id, history))
         if checkpoints is not None and evidence is not None and ingestions is not None:
