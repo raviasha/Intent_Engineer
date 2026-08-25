@@ -53,7 +53,18 @@ GREEN command:
 .venv/bin/python -m pytest tests/e2e/test_cli_local.py -v
 ```
 
-Result: `20 passed in 6.47s` using the installed `intent` subprocess.
+Result: final focused run: `21 passed in 6.61s` using the installed `intent`
+subprocess.
+
+Follow-up RED command:
+
+```text
+.venv/bin/python -m pytest tests/e2e/test_cli_local.py::test_corrupt_graph_is_a_redacted_runtime_failure -v
+```
+
+Result: failed as intended because `status` leaked the YAML parser traceback.
+After routing command-level graph reads through the CLI redaction boundary, the
+same command passed (`1 passed in 0.56s`).
 
 ## Verification
 
@@ -76,11 +87,13 @@ found in 6 source files`.
 .venv/bin/python -m pytest
 ```
 
-Result: `205 passed in 7.37s`.
+Result: final run: `206 passed in 7.64s`.
 
 ## Commit
 
 Product and tests: `4983a6a7502e4da7ff282af2c65540d570add6c8`
+
+Follow-up redaction regression: `a9a2b21b59ca047ead01955b3e0ca5dc51d16f09`.
 
 ## Risks and deviations
 
