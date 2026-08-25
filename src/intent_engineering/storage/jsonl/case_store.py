@@ -6,6 +6,8 @@ import json
 from collections.abc import Sequence
 from pathlib import Path
 
+from pydantic import ValidationError
+
 from intent_engineering.core.models import ReconciliationCase, ReconciliationStatus
 from intent_engineering.storage._atomic import append_durable_line, same_path_lock
 
@@ -92,6 +94,10 @@ class JsonlCaseStore:
 
     def put(self, case: ReconciliationCase) -> bool:
         """Append a new case or lifecycle version, returning false for an exact duplicate."""
+        try:
+            case = ReconciliationCase.model_validate(case.model_dump())
+        except ValidationError as error:
+            raise CaseStoreError("invalid reconciliation case") from error
         serialized = json.dumps(
             case.model_dump(mode="json"),
             ensure_ascii=False,

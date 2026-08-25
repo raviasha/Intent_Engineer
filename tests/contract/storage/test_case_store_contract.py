@@ -57,6 +57,14 @@ def test_case_store_rejects_changed_identity_and_reused_fingerprint(tmp_path: Pa
         store.put(case.model_copy(update={"id": "case-2"}))
 
 
+def test_case_store_rejects_model_copy_that_bypasses_lifecycle_validation(tmp_path: Path) -> None:
+    store = JsonlCaseStore(tmp_path / "cases.jsonl")
+    invalid = reconciliation_case().model_copy(update={"status": ReconciliationStatus.NEEDS_HUMAN})
+
+    with pytest.raises(CaseStoreError, match="invalid reconciliation case"):
+        store.put(invalid)
+
+
 def test_case_store_rejects_blank_or_corrupt_lines(tmp_path: Path) -> None:
     path = tmp_path / "cases.jsonl"
     path.write_text(" \n", encoding="utf-8")

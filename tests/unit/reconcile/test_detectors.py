@@ -1,6 +1,8 @@
 """Tests for deterministic evidence-backed drift classification."""
 
-from intent_engineering.core.models import ReconciliationCaseType
+import pytest
+
+from intent_engineering.core.models import ReconciliationCaseType, SourceMode
 from intent_engineering.reconcile.detectors import detect_drift
 from tests.unit.reconcile import builders
 
@@ -59,3 +61,28 @@ def test_fingerprint_is_stable_over_equivalent_input() -> None:
 
     assert first.fingerprint == second.fingerprint
     assert len(first.fingerprint) == 64
+
+
+@pytest.mark.parametrize(
+    ("source_mode", "current"),
+    [(SourceMode.INFERRED, True), (SourceMode.DERIVED, True), (SourceMode.EXPLICIT, False)],
+)
+def test_requirement_lag_requires_current_explicit_decision_evidence(
+    source_mode: SourceMode, current: bool
+) -> None:
+    input = builders.requirement_lag_input()
+    assert input.decision is not None
+    decision = input.decision.model_copy(update={"source_mode": source_mode, "current": current})
+
+    assert detect_drift(input.model_copy(update={"decision": decision})) == ()
+
+
+def test_fingerprint_uses_the_same_canonical_affected_refs_as_observation() -> None:
+    original = detect_drift(builders.code_lag_input())[0]
+    repeated_refs = builders.code_lag_input().model_copy(
+        update={"affected_refs": ("symbol-export", "req-export", "req-export")}
+    )
+    canonical = detect_drift(repeated_refs)[0]
+
+    assert canonical.affected_refs == ("req-export", "symbol-export")
+    assert canonical.fingerprint == original.fingerprint

@@ -8,6 +8,7 @@ from pydantic import ValidationError
 
 from intent_engineering.core.models import (
     ClassificationEvent,
+    EvidenceSide,
     ReconciliationCase,
     ReconciliationCaseType,
     ReconciliationStatus,
@@ -57,6 +58,41 @@ def test_case_evidence_refs_are_an_ordered_union_across_sides() -> None:
 def test_case_requires_evidence_references() -> None:
     with pytest.raises(ValidationError, match="reconciliation case requires evidence"):
         reconciliation_case(evidence_sides=())
+
+
+@pytest.mark.parametrize("field", ["authors", "evidence_refs"])
+def test_evidence_side_requires_each_side_to_have_authorship_and_evidence(field: str) -> None:
+    payload = side("requirement", version=2).model_dump()
+    payload[field] = ()
+
+    with pytest.raises(ValidationError, match=f"{field} must not be empty"):
+        EvidenceSide(**payload)
+
+
+def test_case_rejects_initial_non_open_status() -> None:
+    with pytest.raises(ValidationError, match="case status must match lifecycle history"):
+        reconciliation_case(status=ReconciliationStatus.NEEDS_HUMAN)
+
+
+def test_case_rejects_history_with_forbidden_transition() -> None:
+    event = ClassificationEvent(
+        actor="reviewer",
+        at=NOW,
+        prior=ReconciliationStatus.OPEN,
+        new=ReconciliationStatus.NEEDS_HUMAN,
+    )
+
+    with pytest.raises(ValidationError, match="invalid reconciliation transition"):
+        reconciliation_case(status=ReconciliationStatus.NEEDS_HUMAN, history=(event,))
+
+
+def test_resolved_case_requires_a_corresponding_resolution_history_event() -> None:
+    with pytest.raises(ValidationError, match="case status must match lifecycle history"):
+        reconciliation_case(
+            status=ReconciliationStatus.RESOLVED,
+            resolution=ResolutionAction.UPDATE_IMPLEMENTATION,
+            resolved_by_changeset="cs-1",
+        )
 
 
 def test_lifecycle_allows_only_approved_non_terminal_path() -> None:
@@ -122,7 +158,7 @@ def test_only_open_cases_can_take_terminal_alternatives(
             changeset_id="cs-1",
         )
     else:
-        case = reconciliation_case(status=source)
+        case = transition_case(reconciliation_case(), source, "reviewer", NOW)
 
     with pytest.raises(InvalidCaseTransition):
         transition_case(case, target, "reviewer", NOW)
@@ -141,7 +177,9 @@ def test_only_open_cases_can_take_terminal_alternatives(
 def test_lifecycle_rejects_forbidden_or_terminal_transitions(
     source: ReconciliationStatus, target: ReconciliationStatus
 ) -> None:
-    case = reconciliation_case(status=source)
+    case = reconciliation_case()
+    if source is not ReconciliationStatus.OPEN:
+        case = transition_case(case, source, "reviewer", NOW)
 
     with pytest.raises(InvalidCaseTransition):
         transition_case(case, target, "reviewer", NOW)
@@ -192,7 +230,7 @@ def test_case_history_is_immutable() -> None:
         prior=ReconciliationStatus.OPEN,
         new=ReconciliationStatus.PROPOSED,
     )
-    case = reconciliation_case(history=[event])
+    case = reconciliation_case(status=ReconciliationStatus.PROPOSED, history=[event])
 
     assert case.history == (event,)
     with pytest.raises(ValidationError):

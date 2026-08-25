@@ -54,6 +54,11 @@ def _fingerprint(
     ).hexdigest()
 
 
+def _canonical_affected_refs(affected_refs: Sequence[str]) -> tuple[str, ...]:
+    """Return the sole affected-reference representation used by observations and hashes."""
+    return tuple(sorted(set(affected_refs)))
+
+
 def _observation(
     input: DetectionInput,
     case_type: ReconciliationCaseType,
@@ -61,13 +66,14 @@ def _observation(
     *sides: EvidenceSide | None,
 ) -> DriftObservation:
     evidence_sides = tuple(side for side in sides if side is not None)
+    affected_refs = _canonical_affected_refs(input.affected_refs)
     return DriftObservation(
         subject_ref=input.subject_ref,
         case_type=case_type,
-        affected_refs=tuple(sorted(set(input.affected_refs))),
+        affected_refs=affected_refs,
         evidence_sides=evidence_sides,
         detector_id=detector_id,
-        fingerprint=_fingerprint(detector_id, input.subject_ref, input.affected_refs, evidence_sides),
+        fingerprint=_fingerprint(detector_id, input.subject_ref, affected_refs, evidence_sides),
     )
 
 
@@ -101,6 +107,8 @@ def detect_requirement_lag(input: DetectionInput) -> DriftObservation | None:
         or input.test_version is None
         or input.decision_version is None
         or input.compatibility != "aligns"
+        or input.decision.source_mode is not SourceMode.EXPLICIT
+        or not input.decision.current
         or input.decision_version <= input.requirement_version
         or input.implementation_version < input.decision_version
         or input.test_version < input.decision_version

@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
-from collections.abc import Set as AbstractSet
 from datetime import datetime
 
 from intent_engineering.core.models import (
@@ -12,19 +10,9 @@ from intent_engineering.core.models import (
     ReconciliationStatus,
     ResolutionAction,
 )
+from intent_engineering.core.models.reconciliation import ALLOWED_CASE_TRANSITIONS
 
-ALLOWED_TRANSITIONS: Mapping[ReconciliationStatus, AbstractSet[ReconciliationStatus]] = {
-    ReconciliationStatus.OPEN: {
-        ReconciliationStatus.PROPOSED,
-        ReconciliationStatus.DEFERRED,
-        ReconciliationStatus.FALSE_POSITIVE,
-    },
-    ReconciliationStatus.PROPOSED: {ReconciliationStatus.NEEDS_HUMAN},
-    ReconciliationStatus.NEEDS_HUMAN: {ReconciliationStatus.RESOLVED},
-    ReconciliationStatus.RESOLVED: set(),
-    ReconciliationStatus.DEFERRED: set(),
-    ReconciliationStatus.FALSE_POSITIVE: set(),
-}
+ALLOWED_TRANSITIONS = ALLOWED_CASE_TRANSITIONS
 
 
 class InvalidCaseTransition(ValueError):
@@ -59,7 +47,7 @@ def transition_case(
     if not actor or at is None:
         raise MissingResolutionEvidence(case.id)
     event = ClassificationEvent(actor=actor, at=at, prior=case.status, new=target)
-    return case.model_copy(
+    updated = case.model_copy(
         update={
             "status": target,
             "resolution": resolution if target is ReconciliationStatus.RESOLVED else None,
@@ -67,3 +55,4 @@ def transition_case(
             "history": case.history + (event,),
         }
     )
+    return ReconciliationCase.model_validate(updated.model_dump())

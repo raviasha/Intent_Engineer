@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from intent_engineering.core.models.enums import (
     ReconciliationCaseType,
@@ -13,6 +13,21 @@ from intent_engineering.core.models.enums import (
     SourceMode,
 )
 from intent_engineering.core.models.graph import Confidence
+
+ALLOWED_CASE_TRANSITIONS: dict[ReconciliationStatus, frozenset[ReconciliationStatus]] = {
+    ReconciliationStatus.OPEN: frozenset(
+        {
+            ReconciliationStatus.PROPOSED,
+            ReconciliationStatus.DEFERRED,
+            ReconciliationStatus.FALSE_POSITIVE,
+        }
+    ),
+    ReconciliationStatus.PROPOSED: frozenset({ReconciliationStatus.NEEDS_HUMAN}),
+    ReconciliationStatus.NEEDS_HUMAN: frozenset({ReconciliationStatus.RESOLVED}),
+    ReconciliationStatus.RESOLVED: frozenset(),
+    ReconciliationStatus.DEFERRED: frozenset(),
+    ReconciliationStatus.FALSE_POSITIVE: frozenset(),
+}
 
 
 class EvidenceSide(BaseModel):
@@ -28,6 +43,20 @@ class EvidenceSide(BaseModel):
     confidence: Confidence
     source_mode: SourceMode = SourceMode.EXPLICIT
     current: bool = True
+
+    @field_validator("evidence_refs")
+    @classmethod
+    def require_evidence_refs(cls, evidence_refs: tuple[str, ...]) -> tuple[str, ...]:
+        if not evidence_refs or any(not reference.strip() for reference in evidence_refs):
+            raise ValueError("evidence_refs must not be empty")
+        return evidence_refs
+
+    @field_validator("authors")
+    @classmethod
+    def require_authors(cls, authors: tuple[str, ...]) -> tuple[str, ...]:
+        if not authors or any(not author.strip() for author in authors):
+            raise ValueError("authors must not be empty")
+        return authors
 
 
 ReconciliationEvidenceSide = EvidenceSide
@@ -94,6 +123,15 @@ class ReconciliationCase(BaseModel):
     def require_resolution_for_resolved_case(self) -> ReconciliationCase:
         if not self.all_evidence_refs:
             raise ValueError("reconciliation case requires evidence")
+        expected_status = ReconciliationStatus.OPEN
+        for event in self.history:
+            if event.prior is not expected_status:
+                raise ValueError("case history must be contiguous")
+            if event.new not in ALLOWED_CASE_TRANSITIONS[event.prior]:
+                raise ValueError(f"invalid reconciliation transition: {event.prior} -> {event.new}")
+            expected_status = event.new
+        if self.status is not expected_status:
+            raise ValueError("case status must match lifecycle history")
         if self.status is ReconciliationStatus.RESOLVED and (
             self.resolution is None or self.resolved_by_changeset is None
         ):
