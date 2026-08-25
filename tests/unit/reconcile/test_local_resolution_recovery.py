@@ -50,8 +50,6 @@ def test_system_exit_after_each_durable_resolution_stage_recovers_exact_preimage
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stage: str
 ) -> None:
     service = _service(tmp_path)
-    paths = service._paths()
-    before = {path: path.read_bytes() if path.exists() else None for path in paths}
     case = service._case_store.get("case-1")
     graph_version = service._graph_store.load().version
     canonical = service._canonical_changeset(

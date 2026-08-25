@@ -6,7 +6,7 @@ from datetime import UTC, datetime
 
 import pytest
 
-from intent_engineering.cli.runtime import _FrontMatterReasoner, _detect_cases
+from intent_engineering.cli.runtime import _detect_cases, _FrontMatterReasoner
 from intent_engineering.core.models import EvidenceDelta, EvidenceRecord, Graph
 
 
