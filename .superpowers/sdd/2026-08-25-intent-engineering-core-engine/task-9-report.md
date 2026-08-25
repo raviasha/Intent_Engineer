@@ -237,3 +237,44 @@ GREEN/static:
 ```
 
 Results: focused E2E `30 passed in 9.48s`; Ruff clean; strict mypy clean.
+
+### Fix round 2 final — approved resolution and crash recovery
+
+Product/tests: `adcc26146ad6cab574943c0f1d3efba6a9eb742c`,
+`fa8599b9e5e7f689562b8ef74834e28ca8c50bf0`, and
+`dc2b3ca5db17e8b89dc28709712d9ff056a71c41`.
+
+The documented resolve command is now two phase: an OPEN detector case creates
+the durable PROPOSED then NEEDS_HUMAN review record and exits 4 with a
+deterministic approval hash. Exact `--approve` is required for the graph/history
+commit; missing, stale, or wrong approval is non-mutating. DEFER and
+MARK_FALSE_POSITIVE take their terminal lifecycle transitions without graph or
+history mutation. Doctor reads canonical files through O_NOFOLLOW descriptors
+and does not construct stores or lock files while inspecting state.
+
+RED:
+
+```text
+.venv/bin/python -m pytest tests/unit/reconcile/test_local_resolution_recovery.py -q
+```
+
+Initial matrix setup failed until the approval was calculated from the canonical
+NEEDS_HUMAN snapshot, confirming resolution rejects an arbitrary approval before
+durable mutation. GREEN: graph replacement, history append, and case append
+each raise SystemExit unmasked; a fresh service restores exact graph/history/case
+preimages, removes the journal, and a second recovery attempt remains safe.
+
+Final commands:
+
+```text
+.venv/bin/ruff check src/intent_engineering/reconcile/local_resolution.py src/intent_engineering/core/policy/doctor.py tests/unit/reconcile/test_local_resolution_recovery.py
+.venv/bin/mypy --strict src/intent_engineering/reconcile/local_resolution.py src/intent_engineering/core/policy/doctor.py
+.venv/bin/python -m pytest tests/unit/reconcile/test_local_resolution_recovery.py tests/e2e/test_cli_local.py -q
+.venv/bin/python -m pytest
+.venv/bin/intent --help
+.venv/bin/intent reconcile --help
+```
+
+Results: Ruff clean; strict mypy clean across 2 modules; focused recovery/E2E
+`33 passed in 10.02s`; full pytest `218 passed in 10.96s`; both help commands
+exited 0.
