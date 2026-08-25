@@ -3,10 +3,11 @@
 ## Commits
 
 - Base commit: `6d13a9ea06de84d32da69015812f5062eb224969`
-- Final implementation commit: `314bd99bb869bbab113f84d280896fd87c19fbff`
+- Final implementation commit: `f871681c34bcfd053a1ba1be4cbcac99b6ec74b1`
 - Implementation commits:
   - `1a15e95` — `fix(sync): replay durable evidence past checkpoints`
   - `314bd99` — `fix(reconcile): derive lag chronology from evidence`
+  - `f871681` — `fix(evidence): authenticate connector ingestion chains`
 - This report is committed separately after the implementation commits.
 
 ## RED evidence
@@ -126,3 +127,100 @@ Result: `Success: no issues found in 65 source files`.
 - The cumulative consumed-ID tuple gives an explicit, migration-safe alpha contract but grows linearly with connector evidence history and rewrites the checkpoint YAML when the boundary advances. A future storage migration can replace it with an evidence-ledger sequence/watermark once the store exposes a stable per-connector append offset; that change should preserve versioned checkpoint decoding and the one-safe-rescan fallback.
 - Legacy fallback can identify rows only when the historical `connector_type` equals the connector ID. Existing Markdown and Git rows satisfy this. Any pre-contract custom connector that used a different instance ID needs an explicit migration rather than a guessed association.
 - The exact whole-tree Ruff gate remains intentionally obstructed by the preserved untracked `dogfood 2.py` Desktop artifact; tracked Python files pass.
+
+## Fix round 1: authenticated ingestion chains and currentness
+
+The independent review found that the first implementation still trusted caller tuple order for same-object chronology, copied declaration `current`, and stored one connector owner on the immutable evidence record. Commit `f871681c34bcfd053a1ba1be4cbcac99b6ec74b1` closes those findings. The earlier `ingested_by` and caller-order decisions above are superseded by this section.
+
+### Fix-round RED evidence
+
+Evidence detection:
+
+```bash
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 .venv/bin/python -m pytest -p anyio.pytest_plugin tests/unit/reconcile/test_evidence_detection.py -q
+```
+
+Result before production changes: `2 failed, 8 passed`. Reversing the same immutable v1/v2 records changed the result from CODE_LAG to no case, and an old exact v1 reference declared current still emitted CODE_LAG despite durable v2.
+
+Ingestion ledger contracts:
+
+```bash
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 .venv/bin/python -m pytest -p anyio.pytest_plugin tests/contract/storage/test_evidence_store_contract.py -q
+```
+
+Result before production changes: `3 failed, 5 passed`. There was no connector-association ledger, connector-scoped predecessor chain, or explicit custom legacy migration failure.
+
+Checkpoint association validation:
+
+```bash
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 .venv/bin/python -m pytest -p anyio.pytest_plugin tests/unit/validation/test_service.py::test_checkpoint_consumption_boundary_rejects_missing_or_foreign_associations -q
+```
+
+Result before production changes: `1 failed`. A missing consumed evidence ID produced no diagnostic.
+
+Custom legacy validation was separately observed RED: `1 failed, 2 passed`; only `evidence.id_mismatch` appeared before the explicit `evidence.legacy_association_ambiguous` diagnostic was added.
+
+### Fix-round GREEN and static verification
+
+Expanded focused gate:
+
+```bash
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 .venv/bin/python -m pytest -p anyio.pytest_plugin \
+  tests/integration/sync \
+  tests/contract/storage/test_evidence_store_contract.py \
+  tests/unit/reconcile/test_evidence_detection.py \
+  tests/unit/reconcile/test_detectors.py \
+  tests/unit/validation/test_service.py \
+  tests/integration/test_fixture_matrix.py -q
+```
+
+Result: `83 passed in 2.88s`.
+
+Full suite:
+
+```bash
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 .venv/bin/python -m pytest -p anyio.pytest_plugin -q
+```
+
+Result: `348 passed in 17.00s`.
+
+Tracked static checks:
+
+```bash
+git ls-files -z -- '*.py' | xargs -0 .venv/bin/ruff check
+.venv/bin/mypy src/intent_engineering
+```
+
+Results: `All checks passed!` and `Success: no issues found in 65 source files`.
+
+The exact whole-tree Ruff command still reports only `N999` for the preserved untracked `src/intent_engineering/core/policy/dogfood 2.py` artifact.
+
+### Fix-round architecture and migration semantics
+
+- `EvidenceRecord` is provider-neutral again; `ingested_by` was removed from the model and generated public schema.
+- The evidence JSONL store now accepts a strict versioned union: legacy raw `EvidenceRecord` rows and atomic `EvidenceIngestion` envelopes. Each envelope embeds the immutable record and binds it to a connector ID, per-connector sequence, and connector-scoped immediate predecessor in one durable append.
+- Distinct connector IDs may associate independently with the exact same immutable evidence. Only the first global evidence identity increments `evidence_added`; each connector still gets its own ledger entry, semantic replay, checkpoint boundary, and predecessor chain.
+- Built-in raw Markdown/Git rows are migrated by appending explicit envelopes before replay. Custom connector/type legacy ownership is never guessed: the store raises an actionable explicit-association error and deep validation emits `evidence.legacy_association_ambiguous`.
+- `EvidenceDelta` carries the authenticated ingestion envelopes into combined detection. Same-object order comes only from shared connector sequences, so permuting the record tuple cannot affect results.
+- Side currentness is derived from the authenticated connector/provider/object chain. Declaration `current` is optional legacy consistency metadata; a stale exact reference claiming current fails closed.
+- Checkpoint consumed IDs are checked at runtime and by deep validation. Missing and foreign associations fail rather than suppressing replay. Corrupt, non-contiguous, duplicate, or predecessor-invalid envelopes produce redacted `evidence.invalid` diagnostics.
+- The cumulative consumed-ID checkpoint tuple remains an alpha tradeoff. It grows linearly and rewrites YAML; the authenticated per-connector ledger now provides the stable sequence needed for a future watermark migration without changing evidence identity.
+
+### Fix-round changed files
+
+- `schemas/evidence.schema.json`
+- `src/intent_engineering/cli/runtime.py`
+- `src/intent_engineering/core/models/__init__.py`
+- `src/intent_engineering/core/models/evidence.py`
+- `src/intent_engineering/reconcile/evidence_detection.py`
+- `src/intent_engineering/storage/interfaces.py`
+- `src/intent_engineering/storage/jsonl/evidence_store.py`
+- `src/intent_engineering/sync/orchestrator.py`
+- `src/intent_engineering/validation/service.py`
+- `tests/contract/storage/test_evidence_store_contract.py`
+- `tests/e2e/test_cli_local.py`
+- `tests/integration/sync/test_combined_detection.py`
+- `tests/integration/sync/test_recovery.py`
+- `tests/unit/cli/test_runtime_metadata.py`
+- `tests/unit/reconcile/test_evidence_detection.py`
+- `tests/unit/validation/test_service.py`
