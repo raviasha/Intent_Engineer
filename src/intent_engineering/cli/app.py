@@ -4,8 +4,6 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
-from hashlib import sha256
 from pathlib import Path
 
 import anyio
@@ -13,10 +11,15 @@ import structlog
 import typer
 
 from intent_engineering.cli.output import OutputFormat, emit
-from intent_engineering.cli.runtime import Runtime, load_runtime, new_run_id, resolve_connectors
+from intent_engineering.cli.runtime import (
+    Runtime,
+    load_runtime,
+    new_run_id,
+    parse_sources,
+    resolve_connectors,
+)
 from intent_engineering.context import ContextProvider
 from intent_engineering.core.models import (
-    ChangeSet,
     EvidenceRecord,
     Graph,
     ReconciliationCase,
@@ -27,9 +30,12 @@ from intent_engineering.core.models import (
 from intent_engineering.core.policy import (
     ProjectAlreadyInitialized,
     ProjectNotInitialized,
+    evidence_allowed,
     initialize_project,
+    inspect_workspace,
+    refs_allowed,
 )
-from intent_engineering.reconcile import transition_case
+from intent_engineering.reconcile import ResolutionUnavailable
 from intent_engineering.render import GraphRenderer
 from intent_engineering.sync.models import SyncRunResult, SyncRunStatus
 
@@ -98,6 +104,25 @@ def _evidence(runtime: Runtime) -> tuple[EvidenceRecord, ...]:
         raise typer.Exit(1) from error
 
 
+def _authorized_evidence(runtime: Runtime) -> tuple[EvidenceRecord, ...]:
+    """Project only evidence that the configured local actor may read."""
+    return tuple(
+        record
+        for record in _evidence(runtime)
+        if evidence_allowed(record, runtime.config.local_actor)
+    )
+
+
+def _authorized_cases(runtime: Runtime) -> tuple[ReconciliationCase, ...]:
+    """Project only cases whose full evidence packet is locally readable."""
+    records = _evidence(runtime)
+    return tuple(
+        case
+        for case in _cases(runtime)
+        if refs_allowed(case.all_evidence_refs, records, runtime.config.local_actor)
+    )
+
+
 def _invoke_sync(runtime: Runtime, sources: str) -> SyncRunResult:
     """Cross exactly one AnyIO boundary for one CLI sync-like command."""
     return anyio.run(runtime.sync.run, new_run_id(), resolve_connectors(runtime, sources))
@@ -141,6 +166,10 @@ def validate_command(
 
 def _sync_command(runtime: Runtime, sources: str, output_format: OutputFormat) -> None:
     try:
+        parse_sources(sources)
+    except ValueError as error:
+        raise typer.BadParameter("invalid source selection", param_hint="--sources") from error
+    try:
         result = _invoke_sync(runtime, sources)
     except (OSError, ValueError) as error:
         _runtime_error(error)
@@ -180,7 +209,9 @@ def drift_command(
 ) -> None:
     """Report open and proposed reconciliation cases requiring attention."""
     cases = tuple(
-        case for case in _cases(_runtime(project)) if is_nonterminal_case_status(case.status)
+        case
+        for case in _authorized_cases(_runtime(project))
+        if is_nonterminal_case_status(case.status)
     )
     emit({"cases": cases, "review_required": bool(cases) or require_review}, output_format)
     _exit_for_review(bool(cases) or require_review)
@@ -194,14 +225,20 @@ def status_command(
     """Summarize durable graph, evidence, and reconciliation state."""
     runtime = _runtime(project)
     graph = _graph(runtime)
-    cases = _cases(runtime)
+    records = _evidence(runtime)
+    cases = _authorized_cases(runtime)
+    nodes = tuple(
+        node
+        for node in graph.nodes
+        if refs_allowed(node.evidence_refs, records, runtime.config.local_actor)
+    )
     emit(
         {
             "project_id": runtime.config.project_id,
             "graph_version": graph.version,
-            "node_count": len(graph.nodes),
+            "node_count": len(nodes),
             "edge_count": len(graph.edges),
-            "evidence_count": len(_evidence(runtime)),
+            "evidence_count": len(_authorized_evidence(runtime)),
             "open_case_count": sum(is_nonterminal_case_status(case.status) for case in cases),
         },
         output_format,
@@ -217,11 +254,17 @@ def explain_command(
     """Explain the local graph node, evidence object, or reconciliation case by reference."""
     runtime = _runtime(project)
     graph = _graph(runtime)
-    matching_nodes = tuple(node for node in graph.nodes if node.id == reference)
-    matching_cases = tuple(case for case in _cases(runtime) if case.id == reference)
+    records = _evidence(runtime)
+    matching_nodes = tuple(
+        node
+        for node in graph.nodes
+        if node.id == reference
+        and refs_allowed(node.evidence_refs, records, runtime.config.local_actor)
+    )
+    matching_cases = tuple(case for case in _authorized_cases(runtime) if case.id == reference)
     matching_evidence = tuple(
         record
-        for record in _evidence(runtime)
+        for record in _authorized_evidence(runtime)
         if reference in {record.id, record.external_object_id, record.source_locator}
     )
     if not (matching_nodes or matching_cases or matching_evidence):
@@ -247,8 +290,14 @@ def context_command(
 ) -> None:
     """Build a conservative, bounded context pack for a task or exact symbol."""
     runtime = _runtime(project)
-    provider = ContextProvider(_graph(runtime), _cases(runtime), runtime.config, _evidence(runtime))
-    pack = provider.for_symbol(symbol) if symbol is not None else provider.for_task(task)
+    provider = ContextProvider(
+        _graph(runtime), _authorized_cases(runtime), runtime.config, _authorized_evidence(runtime)
+    )
+    pack = (
+        provider.for_symbol(symbol, actor=runtime.config.local_actor)
+        if symbol is not None
+        else provider.for_task(task, actor=runtime.config.local_actor)
+    )
     emit(pack, output_format)
 
 
@@ -259,7 +308,7 @@ def reconcile_list_command(
     output_format: OutputFormat = typer.Option(OutputFormat.TEXT, "--format"),
 ) -> None:
     """List durable reconciliation cases in stable ID order."""
-    cases = _cases(_runtime(project))
+    cases = _authorized_cases(_runtime(project))
     if status is not None:
         cases = tuple(case for case in cases if case.status is status)
     emit({"cases": cases}, output_format)
@@ -275,36 +324,12 @@ def reconcile_show_command(
     runtime = _runtime(project)
     try:
         case = runtime.case_store.get(case_id)
+        if not refs_allowed(case.all_evidence_refs, _evidence(runtime), runtime.config.local_actor):
+            raise KeyError(case_id)
     except KeyError as error:
         typer.echo("intent error: reconciliation case was not found", err=True)
         raise typer.Exit(1) from error
     emit({"case": case}, output_format)
-
-
-def _resolution_changeset(runtime: Runtime, case_id: str, action: ResolutionAction) -> ChangeSet:
-    graph = runtime.graph_store.load()
-    case = runtime.case_store.get(case_id)
-    material = f"{case.id}\x00{graph.version}\x00{action.value}\x00" + "\x00".join(
-        case.all_evidence_refs
-    )
-    return ChangeSet(
-        id=f"changeset:resolve:{sha256(material.encode('utf-8')).hexdigest()}",
-        actor=runtime.config.local_actor,
-        timestamp=datetime.now(UTC),
-        baseline_graph_version=graph.version,
-        evidence_refs=case.all_evidence_refs,
-        nodes_added=(),
-        nodes_updated=(),
-        nodes_superseded=(),
-        edges_added=(),
-        edges_updated=(),
-        edges_superseded=(),
-        confidence_changes=(),
-        implementation_status_changes=(),
-        reconciliation_cases_created=(),
-        reconciliation_cases_resolved=(case.id,),
-        validation_status="validated",
-    )
 
 
 @reconcile_app.command("resolve")
@@ -317,19 +342,8 @@ def reconcile_resolve_command(
     """Apply a validated ChangeSet, then persist the audited case transition."""
     runtime = _runtime(project)
     try:
-        case = runtime.case_store.get(case_id)
-        changeset = _resolution_changeset(runtime, case_id, action)
-        runtime.graph_store.apply(changeset)
-        resolved = transition_case(
-            case,
-            ReconciliationStatus.RESOLVED,
-            runtime.config.local_actor,
-            changeset.timestamp,
-            action,
-            changeset.id,
-        )
-        runtime.case_store.put(resolved)
-    except (KeyError, ValueError) as error:
+        resolved, changeset = runtime.resolution.resolve(case_id, action)
+    except ResolutionUnavailable as error:
         _runtime_error(error)
         raise typer.Exit(1) from error
     emit({"case": resolved, "changeset": changeset}, output_format)
@@ -360,24 +374,9 @@ def doctor_command(
     output_format: OutputFormat = typer.Option(OutputFormat.TEXT, "--format"),
 ) -> None:
     """Check local workspace structure and canonical graph readability."""
-    runtime = _runtime(project)
-    expected = (
-        "config.yaml",
-        "graph.yaml",
-        "evidence",
-        "reconciliation",
-        "history",
-        "approvals",
-        "cache",
-    )
-    missing = tuple(name for name in expected if not (runtime.workspace / name).exists())
-    try:
-        runtime.graph_store.load()
-    except (OSError, ValueError) as error:
-        _runtime_error(error)
-        raise typer.Exit(1) from error
-    emit({"healthy": not missing, "missing": missing}, output_format)
-    if missing:
+    healthy, diagnostics = inspect_workspace(project)
+    emit({"healthy": healthy, "diagnostics": diagnostics}, output_format)
+    if not healthy:
         raise typer.Exit(1)
 
 

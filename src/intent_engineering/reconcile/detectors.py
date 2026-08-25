@@ -41,7 +41,10 @@ class DetectionInput(BaseModel):
 
 
 def _fingerprint(
-    detector_id: str, subject_ref: str, affected_refs: Sequence[str], evidence_sides: Sequence[EvidenceSide]
+    detector_id: str,
+    subject_ref: str,
+    affected_refs: Sequence[str],
+    evidence_sides: Sequence[EvidenceSide],
 ) -> str:
     payload = {
         "detector_id": detector_id,

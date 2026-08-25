@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import os
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -50,13 +49,7 @@ def init_git_repo(path: Path) -> Path:
 
 def run_intent(repo: Path, *args: str) -> CliResult:
     """Run the installed package with a deterministic, scrubbed environment."""
-    environment = {
-        "LANG": "C.UTF-8",
-        "LC_ALL": "C.UTF-8",
-        "PATH": os.environ.get("PATH", ""),
-        "PYTHONPATH": os.environ.get("PYTHONPATH", ""),
-        "VIRTUAL_ENV": os.environ.get("VIRTUAL_ENV", ""),
-    }
+    environment = {"LANG": "C.UTF-8", "LC_ALL": "C.UTF-8", "PATH": "/usr/bin:/bin"}
     completed = subprocess.run(
         [str(Path(sys.executable).with_name("intent")), *args],
         cwd=repo,

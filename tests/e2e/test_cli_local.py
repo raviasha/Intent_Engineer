@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -37,6 +38,48 @@ def test_init_preserves_existing_files_without_force_and_scopes_force(tmp_path: 
     assert run_intent(repo, "validate", "--format", "json").json()["valid"] is True
 
 
+def test_complete_init_is_idempotent_and_byte_preserving(tmp_path: Path) -> None:
+    """Catch a second init that treats a valid workspace as an overwrite conflict."""
+    repo = init_git_repo(tmp_path)
+    assert run_intent(repo, "init").returncode == 0
+    before = {
+        path: path.read_bytes()
+        for path in (repo / ".intent").rglob("*")
+        if path.is_file() and not path.name.endswith(".lock")
+    }
+    assert run_intent(repo, "init").returncode == 0
+    after = {
+        path: path.read_bytes()
+        for path in (repo / ".intent").rglob("*")
+        if path.is_file() and not path.name.endswith(".lock")
+    }
+    assert after == before
+
+
+def test_init_refuses_a_symlinked_workspace_without_touching_the_target(tmp_path: Path) -> None:
+    """Catch path-based init following .intent outside the selected project."""
+    repo = init_git_repo(tmp_path)
+    target = tmp_path / "outside"
+    target.mkdir()
+    sentinel = target / "sentinel"
+    sentinel.write_text("keep", encoding="utf-8")
+    (repo / ".intent").symlink_to(target, target_is_directory=True)
+    assert run_intent(repo, "init", "--force").returncode == 1
+    assert sentinel.read_text(encoding="utf-8") == "keep"
+    assert not (target / "config.yaml").exists()
+
+
+def test_invalid_source_selection_is_usage_error_without_writes(tmp_path: Path) -> None:
+    """Catch invalid connector names being executed as partial runtime syncs."""
+    repo = init_git_repo(tmp_path)
+    assert run_intent(repo, "init").returncode == 0
+    before = (repo / ".intent/graph.yaml").read_bytes()
+    result = run_intent(repo, "sync", "--sources", "markdown,markdown", "--format", "json")
+    assert result.returncode == 2
+    assert result.stdout == ""
+    assert (repo / ".intent/graph.yaml").read_bytes() == before
+
+
 def test_uninitialized_project_is_a_redacted_runtime_failure(tmp_path: Path) -> None:
     """Catch commands that bypass the typed local-project boundary."""
     repo = init_git_repo(tmp_path)
@@ -55,6 +98,20 @@ def test_corrupt_graph_is_a_redacted_runtime_failure(tmp_path: Path) -> None:
     assert result.returncode == 1
     assert result.stdout == ""
     assert result.stderr == "intent error: local operation failed\n"
+
+
+def test_doctor_reports_redacted_structured_diagnostics_for_corrupt_evidence(
+    tmp_path: Path,
+) -> None:
+    """Catch doctor delegating corrupt JSONL to a traceback-producing runtime loader."""
+    repo = init_git_repo(tmp_path)
+    assert run_intent(repo, "init").returncode == 0
+    evidence = repo / ".intent/evidence/evidence.jsonl"
+    evidence.write_text("not-json\n", encoding="utf-8")
+    result = run_intent(repo, "doctor", "--format", "json")
+    assert result.returncode == 1
+    assert result.stderr == ""
+    assert result.json() == {"diagnostics": ["evidence"], "healthy": False, "version": "1"}
 
 
 @pytest.mark.parametrize(
@@ -107,17 +164,78 @@ def test_sync_partial_and_review_exit_codes_are_distinct(tmp_path: Path) -> None
     """Catch exit-code collapse between recoverable sync and human-review outcomes."""
     repo = init_git_repo(tmp_path)
     assert run_intent(repo, "init").returncode == 0
-    assert run_intent(repo, "sync", "--sources", "markdown,missing").returncode == 3
+    (repo / ".git").rename(repo / ".git-hidden")
+    assert run_intent(repo, "sync", "--sources", "markdown,git").returncode == 3
     assert run_intent(repo, "drift", "--require-review").returncode == 4
+
+
+def test_markdown_sync_produces_a_deterministic_reconciliation_case(tmp_path: Path) -> None:
+    """Catch a runtime that persists evidence but never wires Task 5 case detection."""
+    repo = init_git_repo(tmp_path)
+    (repo / "drift.md").write_text(
+        """---
+intent_engineering:
+  detection_input:
+    subject_ref: requirement:export
+    affected_refs: [requirement:export]
+    compatibility: aligns
+    requirement_version: 2
+    implementation_version: 1
+    requirement:
+      label: requirement
+      claim: local export
+      evidence_refs: ["$self"]
+      observed_at: "2026-08-25T00:00:00Z"
+      authors: [local]
+      confidence: 0.9
+    implementation:
+      label: implementation
+      claim: old export
+      evidence_refs: ["$self"]
+      observed_at: "2026-08-24T00:00:00Z"
+      authors: [local]
+      confidence: 0.9
+---
+# Drift fixture
+""",
+        encoding="utf-8",
+    )
+    assert run_intent(repo, "init").returncode == 0
+    assert run_intent(repo, "sync", "--sources", "markdown").returncode == 0
+    cases = run_intent(repo, "reconcile", "list", "--format", "json").json()["cases"]
+    assert len(cases) == 1
+    assert cases[0]["case_type"] == "CODE_LAG"
+    assert cases[0]["evidence_sides"][0]["evidence_refs"][0].startswith("evidence:sha256:")
+
+
+def test_acl_protected_evidence_is_indistinguishable_from_unknown(tmp_path: Path) -> None:
+    """Catch local CLI read paths that disclose ACL-protected evidence or its count."""
+    repo = init_git_repo(tmp_path)
+    assert run_intent(repo, "init").returncode == 0
+    assert run_intent(repo, "ingest").returncode == 0
+    evidence_path = repo / ".intent/evidence/evidence.jsonl"
+    record = json.loads(evidence_path.read_text(encoding="utf-8"))
+    record["acl"] = ["other"]
+    evidence_path.write_text(json.dumps(record) + "\n", encoding="utf-8")
+    result = run_intent(repo, "explain", record["id"], "--format", "json")
+    assert result.returncode == 1
+    assert result.stderr == "intent error: local reference was not found\n"
+    assert run_intent(repo, "status", "--format", "json").json()["evidence_count"] == 0
 
 
 def test_reconcile_resolve_records_a_changeset_before_case_transition(tmp_path: Path) -> None:
     """Catch direct YAML edits that resolve a case without a graph ChangeSet audit."""
     repo = init_git_repo(tmp_path)
     assert run_intent(repo, "init").returncode == 0
+    assert run_intent(repo, "ingest").returncode == 0
+    evidence_id = json.loads(
+        (repo / ".intent/evidence/evidence.jsonl").read_text(encoding="utf-8")
+    )["id"]
     case_file = repo / ".intent/reconciliation/cases.jsonl"
     case_file.write_text(
-        """{\"affected_refs\":[],\"alternatives\":[],\"case_type\":\"CODE_LAG\",\"created_at\":\"2026-08-25T00:00:00Z\",\"detector_id\":\"test\",\"evidence_sides\":[{\"authors\":[\"tester\"],\"claim\":\"old\",\"confidence\":0.9,\"current\":true,\"evidence_refs\":[\"ev-1\"],\"label\":\"requirement\",\"observed_at\":\"2026-08-25T00:00:00Z\",\"source_mode\":\"explicit\"}],\"fingerprint\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"history\":[{\"actor\":\"tester\",\"at\":\"2026-08-25T00:00:00Z\",\"new\":\"proposed\",\"prior\":\"open\"},{\"actor\":\"tester\",\"at\":\"2026-08-25T00:00:00Z\",\"new\":\"needs_human\",\"prior\":\"proposed\"}],\"id\":\"case:test\",\"impact\":\"\",\"requires_human\":true,\"resolution\":null,\"resolved_by_changeset\":null,\"status\":\"needs_human\",\"subject_ref\":\"subject:test\"}\n""",
+        """{\"affected_refs\":[],\"alternatives\":[],\"case_type\":\"CODE_LAG\",\"created_at\":\"2026-08-25T00:00:00Z\",\"detector_id\":\"test\",\"evidence_sides\":[{\"authors\":[\"tester\"],\"claim\":\"old\",\"confidence\":0.9,\"current\":true,\"evidence_refs\":[\"ev-1\"],\"label\":\"requirement\",\"observed_at\":\"2026-08-25T00:00:00Z\",\"source_mode\":\"explicit\"}],\"fingerprint\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"history\":[{\"actor\":\"tester\",\"at\":\"2026-08-25T00:00:00Z\",\"new\":\"proposed\",\"prior\":\"open\"},{\"actor\":\"tester\",\"at\":\"2026-08-25T00:00:00Z\",\"new\":\"needs_human\",\"prior\":\"proposed\"}],\"id\":\"case:test\",\"impact\":\"\",\"requires_human\":true,\"resolution\":null,\"resolved_by_changeset\":null,\"status\":\"needs_human\",\"subject_ref\":\"subject:test\"}\n""".replace(
+            "ev-1", evidence_id
+        ),
         encoding="utf-8",
     )
     graph_before = (repo / ".intent/graph.yaml").read_text(encoding="utf-8")
@@ -127,3 +245,21 @@ def test_reconcile_resolve_records_a_changeset_before_case_transition(tmp_path: 
     assert payload["case"]["resolved_by_changeset"].startswith("changeset:")
     assert (repo / ".intent/graph.yaml").read_text(encoding="utf-8") != graph_before
     assert "case:test" in (repo / ".intent/history/changesets.jsonl").read_text(encoding="utf-8")
+
+
+def test_reconcile_resolve_refuses_missing_case_evidence_without_graph_mutation(
+    tmp_path: Path,
+) -> None:
+    """Catch resolution that applies a graph audit record before evidence prevalidation."""
+    repo = init_git_repo(tmp_path)
+    assert run_intent(repo, "init").returncode == 0
+    case_file = repo / ".intent/reconciliation/cases.jsonl"
+    case_file.write_text(
+        """{\"affected_refs\":[],\"alternatives\":[],\"case_type\":\"CODE_LAG\",\"created_at\":\"2026-08-25T00:00:00Z\",\"detector_id\":\"test\",\"evidence_sides\":[{\"authors\":[\"tester\"],\"claim\":\"old\",\"confidence\":0.9,\"current\":true,\"evidence_refs\":[\"missing\"],\"label\":\"requirement\",\"observed_at\":\"2026-08-25T00:00:00Z\",\"source_mode\":\"explicit\"}],\"fingerprint\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"history\":[{\"actor\":\"tester\",\"at\":\"2026-08-25T00:00:00Z\",\"new\":\"proposed\",\"prior\":\"open\"},{\"actor\":\"tester\",\"at\":\"2026-08-25T00:00:00Z\",\"new\":\"needs_human\",\"prior\":\"proposed\"}],\"id\":\"case:missing\",\"impact\":\"\",\"requires_human\":true,\"resolution\":null,\"resolved_by_changeset\":null,\"status\":\"needs_human\",\"subject_ref\":\"subject:test\"}\n""",
+        encoding="utf-8",
+    )
+    graph_before = (repo / ".intent/graph.yaml").read_bytes()
+    result = run_intent(repo, "reconcile", "resolve", "case:missing", "--format", "json")
+    assert result.returncode == 1
+    assert (repo / ".intent/graph.yaml").read_bytes() == graph_before
+    assert not (repo / ".intent/history/changesets.jsonl").exists()

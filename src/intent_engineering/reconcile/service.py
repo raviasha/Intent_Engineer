@@ -51,7 +51,9 @@ def transition_case(
         update={
             "status": target,
             "resolution": resolution if target is ReconciliationStatus.RESOLVED else None,
-            "resolved_by_changeset": changeset_id if target is ReconciliationStatus.RESOLVED else None,
+            "resolved_by_changeset": changeset_id
+            if target is ReconciliationStatus.RESOLVED
+            else None,
             "history": case.history + (event,),
         }
     )

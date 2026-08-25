@@ -2,25 +2,82 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
 
 import yaml  # type: ignore[import-untyped]
 
-from intent_engineering.capture.base import Connector, ConnectorError, RawSourceObject, SourceObject
+from intent_engineering.capture.base import Connector
 from intent_engineering.capture.git.connector import GitConnector
 from intent_engineering.capture.markdown.connector import MarkdownConnector
 from intent_engineering.context import ContextProvider
-from intent_engineering.core.models import EvidenceRecord, ProjectConfig, ReconciliationCase
+from intent_engineering.core.models import (
+    DriftObservation,
+    EvidenceDelta,
+    EvidenceRecord,
+    Graph,
+    ProjectConfig,
+    ReconciliationCase,
+)
 from intent_engineering.core.policy.project import ProjectNotInitialized, workspace_path
 from intent_engineering.extract.deterministic import DeterministicReasoner
+from intent_engineering.reconcile import DetectionInput, LocalResolutionService, detect_drift
 from intent_engineering.storage.jsonl.case_store import JsonlCaseStore
 from intent_engineering.storage.jsonl.evidence_store import JsonlEvidenceStore
 from intent_engineering.storage.yaml.checkpoint_store import YamlCheckpointStore
 from intent_engineering.storage.yaml.graph_store import YamlGraphStore
 from intent_engineering.sync import SyncOrchestrator
+
+
+def _front_matter(content: str) -> Mapping[str, Any] | None:
+    """Read strict YAML metadata owned by the local fixture convention."""
+    if not content.startswith("---\n"):
+        return None
+    closing = content.find("\n---\n", 4)
+    if closing < 0:
+        return None
+    loaded = yaml.safe_load(content[4:closing])
+    if not isinstance(loaded, Mapping):
+        return None
+    metadata = loaded.get("intent_engineering")
+    return cast(Mapping[str, Any], metadata) if isinstance(metadata, Mapping) else None
+
+
+def _detection_input(record: EvidenceRecord) -> DetectionInput | None:
+    """Validate one top-level or front-matter detector fixture against the Task 5 model."""
+    raw = record.payload.get("detection_input")
+    if raw is None:
+        content = record.payload.get("content")
+        metadata = _front_matter(content) if isinstance(content, str) else None
+        raw = metadata.get("detection_input") if metadata is not None else None
+    if not isinstance(raw, Mapping):
+        return None
+    payload = dict(cast(Mapping[str, Any], raw))
+    for side_name in ("requirement", "implementation", "test", "decision"):
+        side = payload.get(side_name)
+        if not isinstance(side, Mapping):
+            continue
+        copied_side = dict(cast(Mapping[str, Any], side))
+        references = copied_side.get("evidence_refs")
+        if isinstance(references, Sequence) and not isinstance(references, str):
+            copied_side["evidence_refs"] = [
+                record.id if item == "$self" else item for item in references
+            ]
+        payload[side_name] = copied_side
+    return DetectionInput.model_validate(payload)
+
+
+def _detect_cases(delta: EvidenceDelta, graph: Graph) -> Sequence[DriftObservation]:
+    """Project fixture evidence into deterministic Task 5 observations without graph mutation."""
+    del graph
+    observations: list[DriftObservation] = []
+    for record in delta.added:
+        detection_input = _detection_input(record)
+        if detection_input is not None:
+            observations.extend(detect_drift(detection_input))
+    return tuple(observations)
 
 
 @dataclass(frozen=True)
@@ -35,6 +92,7 @@ class Runtime:
     case_store: JsonlCaseStore
     checkpoint_store: YamlCheckpointStore
     sync: SyncOrchestrator
+    resolution: LocalResolutionService
 
     def evidence(self) -> tuple[EvidenceRecord, ...]:
         """Load persisted evidence in append order for read-only CLI projections."""
@@ -83,7 +141,9 @@ def load_runtime(root: Path) -> Runtime:
         checkpoint_store=checkpoint_store,
         case_store=case_store,
         reasoner=DeterministicReasoner(actor=config.local_actor),
+        case_detector=_detect_cases,
     )
+    resolution = LocalResolutionService(graph_store, evidence_store, case_store, config.local_actor)
     return Runtime(
         root=root,
         workspace=workspace,
@@ -93,46 +153,35 @@ def load_runtime(root: Path) -> Runtime:
         case_store=case_store,
         checkpoint_store=checkpoint_store,
         sync=sync,
+        resolution=resolution,
     )
 
 
 def resolve_connectors(runtime: Runtime, sources: str) -> tuple[Connector, ...]:
     """Resolve a stable comma-delimited local connector list without provider fallbacks."""
-    requested = tuple(item.strip() for item in sources.split(",") if item.strip())
+    requested = parse_sources(sources)
     connectors: list[Connector] = []
     for source in requested:
         if source == "markdown":
             connectors.append(MarkdownConnector(runtime.root, runtime.config))
         elif source == "git":
             connectors.append(GitConnector(runtime.root))
-        else:
-            connectors.append(_UnavailableConnector(source))
-    if not connectors:
-        raise ValueError("at least one source is required")
+        else:  # pragma: no cover - parse_sources establishes this boundary
+            raise AssertionError(source)
     return tuple(connectors)
 
 
-class _UnavailableConnector:
-    """Represent an unavailable requested connector as an isolated sync failure."""
-
-    def __init__(self, connector_id: str) -> None:
-        self.connector_id = connector_id
-
-    async def discover(self, cursor: str | None) -> Sequence[SourceObject]:
-        del cursor
-        raise ConnectorError("requested connector is unavailable")
-
-    async def fetch(self, object_id: str, version: str) -> RawSourceObject:
-        del object_id, version
-        raise ConnectorError("requested connector is unavailable")
-
-    def normalize(self, raw: RawSourceObject) -> EvidenceRecord:
-        del raw
-        raise ConnectorError("requested connector is unavailable")
-
-    def next_checkpoint(self, discovered: Sequence[SourceObject]) -> str | None:
-        del discovered
-        return None
+def parse_sources(sources: str) -> tuple[str, ...]:
+    """Validate a connector selection before the command crosses into AnyIO."""
+    requested = tuple(item.strip() for item in sources.split(","))
+    if not requested or any(not item for item in requested):
+        raise ValueError("sources must name one or more connectors")
+    if len(requested) != len(set(requested)):
+        raise ValueError("sources must not contain duplicates")
+    unknown = tuple(item for item in requested if item not in {"markdown", "git"})
+    if unknown:
+        raise ValueError("sources must be markdown and/or git")
+    return requested
 
 
 def new_run_id() -> str:
