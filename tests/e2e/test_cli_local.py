@@ -138,6 +138,29 @@ def test_doctor_rejects_symlinked_state_without_reading_its_target(tmp_path: Pat
     assert result.json() == {"diagnostics": ["evidence"], "healthy": False, "version": "1"}
 
 
+def test_doctor_holds_original_directory_after_parent_swap(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A post-open replacement cannot redirect doctor into an external directory."""
+    from intent_engineering.core.policy import doctor
+
+    repo = init_git_repo(tmp_path)
+    assert run_intent(repo, "init").returncode == 0
+    original = doctor._open_directory
+    outside = tmp_path / "outside"
+    outside.mkdir()
+
+    def swap(parent_fd: int, name: str) -> int:
+        descriptor = original(parent_fd, name)
+        if name == "evidence":
+            evidence = repo / ".intent/evidence"
+            evidence.rename(repo / ".intent/evidence-held")
+            evidence.symlink_to(outside, target_is_directory=True)
+        return descriptor
+
+    monkeypatch.setattr(doctor, "_open_directory", swap)
+    assert doctor.inspect_workspace(repo) == (True, ())
+    assert not list(outside.glob(".*.lock"))
+
+
 @pytest.mark.parametrize(
     ("args", "marker"),
     [
