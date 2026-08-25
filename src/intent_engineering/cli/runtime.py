@@ -96,18 +96,19 @@ class _FrontMatterReasoner(DeterministicReasoner):
     def _normalized(self, record: EvidenceRecord) -> EvidenceRecord:
         content = record.payload.get("content")
         metadata = _front_matter(content) if isinstance(content, str) else None
-        if metadata is None:
-            return record
         payload = dict(record.payload)
-        for key in ("intent_assertion", "detection_input"):
-            if key not in payload and key in metadata:
-                payload[key] = metadata[key]
+        if metadata is not None:
+            for key in ("intent_assertion", "detection_input"):
+                if key not in payload and key in metadata:
+                    payload[key] = metadata[key]
         assertion = payload.get("intent_assertion")
         if isinstance(assertion, Mapping):
             copied = dict(assertion)
             references = copied.get("evidence_refs")
             if isinstance(references, Sequence) and not isinstance(references, str):
-                if any(reference != "$self" for reference in references):
+                if any(reference not in {"$self", record.id} for reference in references) or not refs_allowed(
+                    (record.id,), (record,), self._actor
+                ):
                     payload.pop("intent_assertion", None)
                     return record.model_copy(update={"payload": payload})
                 copied["evidence_refs"] = [
