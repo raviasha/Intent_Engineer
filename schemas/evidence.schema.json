@@ -32,6 +32,7 @@
       ]
     }
   },
+  "additionalProperties": false,
   "description": "A normalized, version-addressed record captured from a source.",
   "properties": {
     "acl": {

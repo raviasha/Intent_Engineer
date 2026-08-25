@@ -205,6 +205,7 @@ class SyncOrchestrator:
                 detector_id=observation.detector_id,
                 fingerprint=observation.fingerprint,
                 created_at=self._clock(),
+                created_by=f"detector:{observation.detector_id}",
                 requires_human=observation.requires_human,
             )
             progress.cases_created += int(self._case_store.put(case))

@@ -134,6 +134,7 @@ def context_fixture() -> ContextFixture:
         detector_id="fixture",
         fingerprint=sha256(b"case-export-tests").hexdigest(),
         created_at=NOW,
+        created_by="detector:fixture",
         status=ReconciliationStatus.OPEN,
     )
     config = ProjectConfig(

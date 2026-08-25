@@ -4,8 +4,9 @@ import re
 from datetime import datetime
 from typing import Annotated
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import ConfigDict, Field, field_validator
 
+from intent_engineering.core.models._base import StrictModel
 from intent_engineering.core.models.enums import NodeType, RelationType, SourceMode
 
 Confidence = Annotated[float, Field(ge=0.0, le=1.0)]
@@ -13,7 +14,7 @@ Confidence = Annotated[float, Field(ge=0.0, le=1.0)]
 _NAMESPACED_TYPE = re.compile(r"^[^\s:]+:[^\s:]+$")
 
 
-class TypeRegistry(BaseModel):
+class TypeRegistry(StrictModel):
     """Project-approved namespaced node-type extensions."""
 
     model_config = ConfigDict(frozen=True)
@@ -39,7 +40,7 @@ class TypeRegistry(BaseModel):
             raise ValueError(f"unregistered node type: {value}")
 
 
-class Node(BaseModel):
+class Node(StrictModel):
     """A typed assertion in the canonical intent graph."""
 
     model_config = ConfigDict(frozen=True)
@@ -66,7 +67,7 @@ class Node(BaseModel):
         return node_type
 
 
-class Edge(BaseModel):
+class Edge(StrictModel):
     """A directed relationship between graph nodes."""
 
     model_config = ConfigDict(frozen=True, populate_by_name=True)
@@ -83,7 +84,7 @@ class Edge(BaseModel):
     external: bool = False
 
 
-class Graph(BaseModel):
+class Graph(StrictModel):
     """Canonical graph state, validated whenever it is constructed."""
 
     model_config = ConfigDict(frozen=True)

@@ -444,6 +444,7 @@ def test_acl_filtered_status_and_render_exclude_protected_topology(tmp_path: Pat
             detector_id="fixture",
             fingerprint="a" * 64,
             created_at=now,
+            created_by="detector:fixture",
         )
     )
     evidence_path = repo / ".intent/evidence/evidence.jsonl"

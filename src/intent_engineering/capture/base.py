@@ -7,9 +7,10 @@ from datetime import datetime
 from hashlib import sha256
 from typing import Protocol
 
-from pydantic import BaseModel, ConfigDict, field_validator
+from pydantic import ConfigDict, field_validator
 
 from intent_engineering.core.models import EvidenceRecord, JsonValue
+from intent_engineering.core.models._base import StrictModel
 from intent_engineering.core.models.evidence import freeze_json
 
 
@@ -17,7 +18,7 @@ class ConnectorError(RuntimeError):
     """Raised when a connector cannot discover or fetch source evidence."""
 
 
-class SourceObject(BaseModel):
+class SourceObject(StrictModel):
     """A discovered version-addressed object that can be fetched by a connector."""
 
     model_config = ConfigDict(frozen=True)
@@ -27,7 +28,7 @@ class SourceObject(BaseModel):
     locator: str
 
 
-class RawSourceObject(BaseModel):
+class RawSourceObject(StrictModel):
     """Connector-neutral raw data ready to normalize into immutable evidence."""
 
     model_config = ConfigDict(frozen=True)

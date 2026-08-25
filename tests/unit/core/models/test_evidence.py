@@ -43,6 +43,37 @@ def test_evidence_identity_includes_version_and_hash() -> None:
     assert record.model_copy(update={"payload": {"message": "changed"}}).id == "ev-git-1"
 
 
+def test_misspelled_acl_is_rejected_instead_of_being_dropped() -> None:
+    payload = evidence_record().model_dump()
+    payload["acll"] = ["developers"]
+
+    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+        EvidenceRecord.model_validate(payload)
+
+
+@pytest.mark.parametrize(
+    ("model", "payload", "unknown_field"),
+    [
+        (ProjectConfig, {"project_id": "project", "local_actor": "tester"}, "graph_pat"),
+        (
+            SyncCheckpoint,
+            {"connector_id": "git", "cursor": None, "committed_at": NOW},
+            "commited_at",
+        ),
+    ],
+)
+def test_public_project_models_reject_unknown_fields(
+    model: type[ProjectConfig | SyncCheckpoint],
+    payload: dict[str, object],
+    unknown_field: str,
+) -> None:
+    raw = dict(payload)
+    raw[unknown_field] = "unexpected"
+
+    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+        model.model_validate(raw)
+
+
 def test_evidence_payload_is_deeply_immutable_and_detached_from_input() -> None:
     payload = {"message": "Add local export", "files": ["README.md"]}
     record = evidence_record(payload=payload, acl=["developers"])

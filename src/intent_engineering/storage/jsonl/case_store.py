@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from collections.abc import Sequence
 from pathlib import Path
+from typing import Any, cast
 
 from pydantic import ValidationError
 
@@ -38,6 +39,28 @@ def _immutable_identity(case: ReconciliationCase) -> dict[str, object]:
         mode="json",
         exclude={"status", "resolution", "resolved_by_changeset", "history"},
     )
+
+
+def _migrate_legacy_case_payload(payload: object) -> dict[str, Any]:
+    """Add only the one explicit legacy field before strict public validation."""
+    if not isinstance(payload, dict):
+        raise TypeError("case record must be a mapping")
+    migrated = cast(dict[str, Any], dict(payload))
+    if "created_by" in migrated:
+        return migrated
+    history = migrated.get("history")
+    if isinstance(history, list) and history:
+        earliest = history[0]
+        if isinstance(earliest, dict) and isinstance(earliest.get("actor"), str):
+            actor = earliest["actor"].strip()
+            if actor:
+                migrated["created_by"] = actor
+                return migrated
+    detector_id = migrated.get("detector_id")
+    if not isinstance(detector_id, str) or not detector_id.strip():
+        raise ValueError("legacy case has no detector provenance")
+    migrated["created_by"] = f"detector:{detector_id}"
+    return migrated
 
 
 class JsonlCaseStore:
@@ -83,7 +106,9 @@ class JsonlCaseStore:
                 if not line.strip():
                     raise CaseStoreError(f"blank case record at line {line_number} in {self.path}")
                 try:
-                    case = ReconciliationCase.model_validate_json(line)
+                    case = ReconciliationCase.model_validate(
+                        _migrate_legacy_case_payload(json.loads(line))
+                    )
                     self._record_version_unlocked(case)
                 except CaseStoreError:
                     raise

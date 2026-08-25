@@ -6,7 +6,6 @@ from collections.abc import Mapping
 from datetime import datetime
 
 from pydantic import (
-    BaseModel,
     ConfigDict,
     Field,
     field_serializer,
@@ -14,6 +13,7 @@ from pydantic import (
     model_validator,
 )
 
+from intent_engineering.core.models._base import StrictModel
 from intent_engineering.core.models.enums import (
     ChangeKind,
     ImplementationStatus,
@@ -25,7 +25,7 @@ from intent_engineering.core.models.evidence import JsonValue, freeze_json, thaw
 from intent_engineering.core.models.graph import Confidence, Edge, Node
 
 
-class NodeUpdate(BaseModel):
+class NodeUpdate(StrictModel):
     """Replace a graph node while retaining its stable identity."""
 
     model_config = ConfigDict(frozen=True, validate_default=True)
@@ -40,7 +40,7 @@ class NodeUpdate(BaseModel):
         return self
 
 
-class EdgeUpdate(BaseModel):
+class EdgeUpdate(StrictModel):
     """Replace a graph edge while retaining its stable identity."""
 
     model_config = ConfigDict(frozen=True, validate_default=True)
@@ -55,7 +55,7 @@ class EdgeUpdate(BaseModel):
         return self
 
 
-class ImplementationStatusChange(BaseModel):
+class ImplementationStatusChange(StrictModel):
     """An evidence-backed transition of a separately versioned implementation claim."""
 
     model_config = ConfigDict(frozen=True, validate_default=True)
@@ -66,7 +66,7 @@ class ImplementationStatusChange(BaseModel):
     evidence_refs: tuple[str, ...]
 
 
-class CandidateAssertion(BaseModel):
+class CandidateAssertion(StrictModel):
     """A deterministic reasoner's typed, evidence-backed proposal boundary."""
 
     model_config = ConfigDict(frozen=True, validate_default=True)
@@ -91,7 +91,7 @@ class CandidateAssertion(BaseModel):
         return thaw_json(attributes)
 
 
-class ChangeSet(BaseModel):
+class ChangeSet(StrictModel):
     """The complete, evidence-backed set of changes proposed for one graph baseline."""
 
     model_config = ConfigDict(frozen=True)

@@ -2,12 +2,13 @@
 
 from datetime import datetime
 
-from pydantic import BaseModel, ConfigDict, model_validator
+from pydantic import ConfigDict, model_validator
 
+from intent_engineering.core.models._base import StrictModel
 from intent_engineering.core.models.enums import ImplementationStatus
 
 
-class ImplementationClaim(BaseModel):
+class ImplementationClaim(StrictModel):
     """A separately-versioned claim about how a requirement behaves in code."""
 
     model_config = ConfigDict(frozen=True)

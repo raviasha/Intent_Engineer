@@ -1,6 +1,7 @@
 {
   "$defs": {
     "ClassificationEvent": {
+      "additionalProperties": false,
       "description": "An immutable lifecycle event for a reconciliation case.",
       "properties": {
         "actor": {
@@ -30,6 +31,7 @@
       "type": "object"
     },
     "EvidenceSide": {
+      "additionalProperties": false,
       "description": "One independently attributable position used to classify drift.",
       "properties": {
         "authors": {
@@ -141,6 +143,7 @@
       "type": "string"
     }
   },
+  "additionalProperties": false,
   "description": "Durable case packet for a divergence requiring reconciliation.",
   "properties": {
     "affected_refs": {
@@ -164,6 +167,11 @@
     "created_at": {
       "format": "date-time",
       "title": "Created At",
+      "type": "string"
+    },
+    "created_by": {
+      "minLength": 1,
+      "title": "Created By",
       "type": "string"
     },
     "detector_id": {
@@ -244,7 +252,8 @@
     "evidence_sides",
     "detector_id",
     "fingerprint",
-    "created_at"
+    "created_at",
+    "created_by"
   ],
   "title": "ReconciliationCase",
   "type": "object"

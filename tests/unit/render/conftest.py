@@ -89,6 +89,7 @@ def render_fixture(tmp_path: Path) -> RenderFixture:
         detector_id="fixture",
         fingerprint="a" * 64,
         created_at=NOW,
+        created_by="detector:fixture",
     )
     return RenderFixture(
         graph_path=graph_path,

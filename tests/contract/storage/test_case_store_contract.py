@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import multiprocessing
 from pathlib import Path
 
@@ -70,6 +71,45 @@ def test_case_store_rejects_blank_or_corrupt_lines(tmp_path: Path) -> None:
     path.write_text(" \n", encoding="utf-8")
 
     with pytest.raises(CaseStoreError, match="blank case record at line 1"):
+        JsonlCaseStore(path)
+
+
+def test_case_store_migrates_legacy_created_by_from_earliest_history_actor(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "cases.jsonl"
+    opened = reconciliation_case()
+    proposed = transition_case(opened, ReconciliationStatus.PROPOSED, "first-reviewer", NOW)
+    payload = proposed.model_dump(mode="json")
+    payload.pop("created_by", None)
+    path.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
+
+    migrated = JsonlCaseStore(path).get(opened.id)
+
+    assert migrated.created_by == "first-reviewer"
+
+
+def test_case_store_migrates_historyless_legacy_created_by_from_detector(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "cases.jsonl"
+    payload = reconciliation_case().model_dump(mode="json")
+    payload.pop("created_by", None)
+    path.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
+
+    migrated = JsonlCaseStore(path).get("case-1")
+
+    assert migrated.created_by == "detector:code_lag"
+
+
+def test_case_store_legacy_migration_does_not_hide_unknown_fields(tmp_path: Path) -> None:
+    path = tmp_path / "cases.jsonl"
+    payload = reconciliation_case().model_dump(mode="json")
+    payload.pop("created_by", None)
+    payload["created_byy"] = "attacker"
+    path.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
+
+    with pytest.raises(CaseStoreError, match="invalid reconciliation case record"):
         JsonlCaseStore(path)
 
 

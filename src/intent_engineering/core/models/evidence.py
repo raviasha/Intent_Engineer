@@ -7,7 +7,9 @@ from datetime import datetime
 from types import MappingProxyType
 from typing import cast
 
-from pydantic import BaseModel, ConfigDict, field_serializer, field_validator
+from pydantic import ConfigDict, field_serializer, field_validator
+
+from intent_engineering.core.models._base import StrictModel
 
 type JsonValue = str | int | float | bool | None | list[JsonValue] | dict[str, JsonValue]
 
@@ -30,7 +32,7 @@ def thaw_json(value: object) -> JsonValue:
     return cast(JsonValue, value)
 
 
-class EvidenceRef(BaseModel):
+class EvidenceRef(StrictModel):
     """A stable reference to immutable evidence."""
 
     model_config = ConfigDict(frozen=True)
@@ -39,7 +41,7 @@ class EvidenceRef(BaseModel):
     locator: str | None = None
 
 
-class EvidenceRecord(BaseModel):
+class EvidenceRecord(StrictModel):
     """A normalized, version-addressed record captured from a source."""
 
     model_config = ConfigDict(frozen=True)
@@ -74,7 +76,7 @@ class EvidenceRecord(BaseModel):
         )
 
 
-class EvidenceDelta(BaseModel):
+class EvidenceDelta(StrictModel):
     """Evidence newly durable for a source plus prior version links."""
 
     model_config = ConfigDict(frozen=True)

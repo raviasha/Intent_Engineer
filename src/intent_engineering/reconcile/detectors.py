@@ -7,7 +7,7 @@ import json
 from collections.abc import Callable, Sequence
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import ConfigDict
 
 from intent_engineering.core.models import (
     DriftObservation,
@@ -15,11 +15,12 @@ from intent_engineering.core.models import (
     ReconciliationCaseType,
     SourceMode,
 )
+from intent_engineering.core.models._base import StrictModel
 
 SemanticCompatibility = Literal["aligns", "contradicts", "unknown"]
 
 
-class DetectionInput(BaseModel):
+class DetectionInput(StrictModel):
     """Versioned, evidence-backed facts for a single deterministic comparison."""
 
     model_config = ConfigDict(frozen=True)

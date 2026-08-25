@@ -3,12 +3,13 @@
 from collections.abc import Sequence
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, field_validator
+from pydantic import ConfigDict, field_validator
 
+from intent_engineering.core.models._base import StrictModel
 from intent_engineering.core.models.graph import Confidence
 
 
-class ContextItem(BaseModel):
+class ContextItem(StrictModel):
     """A concise, display-safe projection of a semantic graph item."""
 
     model_config = ConfigDict(frozen=True)
@@ -25,7 +26,7 @@ class ContextItem(BaseModel):
         return tuple(evidence_refs)
 
 
-class ContextPack(BaseModel):
+class ContextPack(StrictModel):
     """Deterministic context selected for a task or symbol query."""
 
     model_config = ConfigDict(frozen=True)

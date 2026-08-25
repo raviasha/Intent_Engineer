@@ -35,12 +35,29 @@ def reconciliation_case(**changes: object) -> ReconciliationCase:
         "detector_id": "code_lag",
         "fingerprint": "f" * 64,
         "created_at": NOW,
+        "created_by": "detector:code_lag",
         "status": ReconciliationStatus.OPEN,
         "requires_human": True,
         "history": (),
     }
     payload.update(changes)
     return ReconciliationCase(**payload)
+
+
+def test_case_requires_explicit_creation_provenance() -> None:
+    payload = reconciliation_case().model_dump()
+    payload.pop("created_by", None)
+
+    with pytest.raises(ValidationError, match="created_by"):
+        ReconciliationCase.model_validate(payload)
+
+
+def test_case_rejects_unknown_canonical_fields() -> None:
+    payload = reconciliation_case().model_dump()
+    payload["created_byy"] = "detector:code_lag"
+
+    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+        ReconciliationCase.model_validate(payload)
 
 
 def test_case_evidence_refs_are_an_ordered_union_across_sides() -> None:

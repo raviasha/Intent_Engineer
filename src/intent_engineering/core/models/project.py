@@ -6,7 +6,9 @@ from collections.abc import Mapping
 from datetime import datetime
 from types import MappingProxyType
 
-from pydantic import BaseModel, ConfigDict, Field, field_serializer, field_validator
+from pydantic import ConfigDict, Field, field_serializer, field_validator
+
+from intent_engineering.core.models._base import StrictModel
 
 _DEFAULT_CONTEXT_LIMITS = {
     "relevant_intent": 10,
@@ -21,7 +23,7 @@ _DEFAULT_CONTEXT_LIMITS = {
 }
 
 
-class SyncCheckpoint(BaseModel):
+class SyncCheckpoint(StrictModel):
     """The durable cursor reached by one connector."""
 
     model_config = ConfigDict(frozen=True, validate_default=True)
@@ -31,7 +33,7 @@ class SyncCheckpoint(BaseModel):
     committed_at: datetime
 
 
-class ProjectConfig(BaseModel):
+class ProjectConfig(StrictModel):
     """Local project settings that affect deterministic application behavior."""
 
     model_config = ConfigDict(frozen=True, validate_default=True)

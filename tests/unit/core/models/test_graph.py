@@ -46,6 +46,33 @@ def test_confidence_range_is_validated() -> None:
         Node.model_validate(payload)
 
 
+@pytest.mark.parametrize(
+    ("model", "payload", "unknown_field"),
+    [
+        (Node, lambda: node("req-1").model_dump(), "labell"),
+        (Edge, lambda: edge("e-1", external=True).model_dump(by_alias=True), "externall"),
+        (
+            Graph,
+            lambda: Graph(id="g", version=0, nodes=(), edges=()).model_dump(),
+            "nodez",
+        ),
+        (TypeRegistry, lambda: TypeRegistry().model_dump(), "extensionz"),
+    ],
+)
+def test_public_graph_models_reject_unknown_fields(
+    model: type[Node | Edge | Graph | TypeRegistry],
+    payload: object,
+    unknown_field: str,
+) -> None:
+    """A misspelled canonical field must fail rather than vanish on rewrite."""
+    raw = payload()
+    assert isinstance(raw, dict)
+    raw[unknown_field] = "unexpected"
+
+    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+        model.model_validate(raw)
+
+
 def test_duplicate_node_ids_are_rejected() -> None:
     with pytest.raises(ValueError, match="duplicate node id: req-1"):
         Graph(id="g", version=0, nodes=[node("req-1"), node("req-1")], edges=[])

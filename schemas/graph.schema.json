@@ -1,6 +1,7 @@
 {
   "$defs": {
     "Edge": {
+      "additionalProperties": false,
       "description": "A directed relationship between graph nodes.",
       "properties": {
         "created_at": {
@@ -61,6 +62,7 @@
       "type": "object"
     },
     "Node": {
+      "additionalProperties": false,
       "description": "A typed assertion in the canonical intent graph.",
       "properties": {
         "confidence_basis": {
@@ -278,6 +280,7 @@
       "type": "string"
     },
     "TypeRegistry": {
+      "additionalProperties": false,
       "description": "Project-approved namespaced node-type extensions.",
       "properties": {
         "extensions": {
@@ -293,6 +296,7 @@
       "type": "object"
     }
   },
+  "additionalProperties": false,
   "description": "Canonical graph state, validated whenever it is constructed.",
   "properties": {
     "edges": {

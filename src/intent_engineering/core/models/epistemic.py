@@ -2,13 +2,14 @@
 
 from datetime import datetime
 
-from pydantic import BaseModel, ConfigDict, model_validator
+from pydantic import ConfigDict, model_validator
 
+from intent_engineering.core.models._base import StrictModel
 from intent_engineering.core.models.enums import ChangeKind
 from intent_engineering.core.models.graph import Confidence
 
 
-class EpistemicState(BaseModel):
+class EpistemicState(StrictModel):
     """Confidence about intent fidelity, independent of implementation status."""
 
     model_config = ConfigDict(frozen=True)
@@ -25,7 +26,7 @@ class EpistemicState(BaseModel):
         return self
 
 
-class ConfidenceChange(BaseModel):
+class ConfidenceChange(StrictModel):
     """An auditable, evidence-backed change to epistemic confidence."""
 
     model_config = ConfigDict(frozen=True)

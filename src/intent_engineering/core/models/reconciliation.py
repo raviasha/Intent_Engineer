@@ -4,8 +4,9 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import ConfigDict, Field, field_validator, model_validator
 
+from intent_engineering.core.models._base import StrictModel
 from intent_engineering.core.models.enums import (
     ReconciliationCaseType,
     ReconciliationStatus,
@@ -43,7 +44,7 @@ def is_nonterminal_case_status(status: ReconciliationStatus) -> bool:
     return status in NONTERMINAL_CASE_STATUSES
 
 
-class EvidenceSide(BaseModel):
+class EvidenceSide(StrictModel):
     """One independently attributable position used to classify drift."""
 
     model_config = ConfigDict(frozen=True)
@@ -75,7 +76,7 @@ class EvidenceSide(BaseModel):
 ReconciliationEvidenceSide = EvidenceSide
 
 
-class DriftObservation(BaseModel):
+class DriftObservation(StrictModel):
     """A deterministic detector result before durable case creation."""
 
     model_config = ConfigDict(frozen=True)
@@ -95,7 +96,7 @@ class DriftObservation(BaseModel):
         return self
 
 
-class ClassificationEvent(BaseModel):
+class ClassificationEvent(StrictModel):
     """An immutable lifecycle event for a reconciliation case."""
 
     model_config = ConfigDict(frozen=True)
@@ -106,7 +107,7 @@ class ClassificationEvent(BaseModel):
     new: ReconciliationStatus
 
 
-class ReconciliationCase(BaseModel):
+class ReconciliationCase(StrictModel):
     """Durable case packet for a divergence requiring reconciliation."""
 
     model_config = ConfigDict(frozen=True)
@@ -119,6 +120,7 @@ class ReconciliationCase(BaseModel):
     detector_id: str
     fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
     created_at: datetime
+    created_by: str = Field(min_length=1)
     status: ReconciliationStatus = ReconciliationStatus.OPEN
     requires_human: bool = True
     alternatives: tuple[ReconciliationCaseType, ...] = ()

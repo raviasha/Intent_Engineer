@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from enum import StrEnum
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import ConfigDict
+
+from intent_engineering.core.models._base import StrictModel
 
 
 class SyncRunStatus(StrEnum):
@@ -15,7 +17,7 @@ class SyncRunStatus(StrEnum):
     FAILED = "failed"
 
 
-class ConnectorRunResult(BaseModel):
+class ConnectorRunResult(StrictModel):
     """The durable outcome for one connector within a run."""
 
     model_config = ConfigDict(frozen=True)
@@ -64,7 +66,7 @@ class ConnectorRunResult(BaseModel):
         )
 
 
-class SyncRunResult(BaseModel):
+class SyncRunResult(StrictModel):
     """A deterministic aggregate over the connector results in one run."""
 
     model_config = ConfigDict(frozen=True)
