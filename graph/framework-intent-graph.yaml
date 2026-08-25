@@ -1,0 +1,351 @@
+graph:
+  id: intent-engineering-framework
+  version: 0.1.0
+  name: Intent Engineering Framework Graph
+  purpose: Dogfood graph describing the framework's own intent and design.
+  created_at: '2026-08-25'
+  source_spec: INTENT_ENGINEERING.md
+nodes:
+- id: ctx-fragmented-intent
+  type: CONTEXT
+  label: Software intent is fragmented across documents, conversations, tickets, code, and tests
+  status: active
+  created_by: founding-spec
+  created_at: '2026-08-25'
+  last_modified_by: founding-spec
+  last_modified_at: '2026-08-25'
+  source_mode: explicit
+  intent_fidelity_confidence: 0.99
+  confidence_basis: Foundational problem statement
+  evidence_refs:
+  - spec:2
+- id: need-living-intent
+  type: NEED
+  label: Maintain a living, provenance-backed representation of current product and engineering intent
+  status: active
+  created_by: founding-spec
+  created_at: '2026-08-25'
+  last_modified_by: founding-spec
+  last_modified_at: '2026-08-25'
+  source_mode: explicit
+  intent_fidelity_confidence: 0.99
+  confidence_basis: Explicit framework objective
+  evidence_refs:
+  - spec:1
+  - spec:3
+- id: intent-preserve-fidelity
+  type: PRODUCT_INTENT
+  label: Preserve intent fidelity as human sources, requirements, code, and tests evolve
+  status: active
+  created_by: founding-spec
+  created_at: '2026-08-25'
+  last_modified_by: founding-spec
+  last_modified_at: '2026-08-25'
+  source_mode: explicit
+  intent_fidelity_confidence: 0.99
+  confidence_basis: Core product thesis
+  evidence_refs:
+  - spec:1
+  - spec:3
+- id: outcome-alignment-visible
+  type: DESIRED_OUTCOME
+  label: Teams and coding agents can see why software exists, what should be true, what is implemented, and where those disagree
+  status: active
+  created_by: founding-spec
+  created_at: '2026-08-25'
+  last_modified_by: founding-spec
+  last_modified_at: '2026-08-25'
+  source_mode: explicit
+  intent_fidelity_confidence: 0.98
+  confidence_basis: Foundational invariant
+  evidence_refs:
+  - spec:36
+- id: principle-provenance-first
+  type: PRINCIPLE
+  label: Every material assertion must be traceable to evidence
+  status: active
+  created_by: founding-spec
+  created_at: '2026-08-25'
+  last_modified_by: founding-spec
+  last_modified_at: '2026-08-25'
+  source_mode: explicit
+  intent_fidelity_confidence: 0.99
+  confidence_basis: Design principle
+  evidence_refs:
+  - spec:4
+- id: principle-no-requirement-truth-assumption
+  type: PRINCIPLE
+  label: A mismatch must not assume the requirement is correct and the code is wrong
+  status: active
+  created_by: founding-spec
+  created_at: '2026-08-25'
+  last_modified_by: founding-spec
+  last_modified_at: '2026-08-25'
+  source_mode: explicit
+  intent_fidelity_confidence: 1.0
+  confidence_basis: Explicit foundational decision
+  evidence_refs:
+  - spec:2
+  - spec:13
+- id: cap-capture
+  type: CAPABILITY
+  label: Capture evidence from heterogeneous product and engineering sources
+  status: active
+  created_by: founding-spec
+  created_at: '2026-08-25'
+  last_modified_by: founding-spec
+  last_modified_at: '2026-08-25'
+  source_mode: explicit
+  intent_fidelity_confidence: 0.99
+  confidence_basis: Core capability
+  evidence_refs:
+  - spec:3
+- id: cap-manage
+  type: CAPABILITY
+  label: Manage typed intent, requirement, provenance, confidence, history, and conflict state
+  status: active
+  created_by: founding-spec
+  created_at: '2026-08-25'
+  last_modified_by: founding-spec
+  last_modified_at: '2026-08-25'
+  source_mode: explicit
+  intent_fidelity_confidence: 0.99
+  confidence_basis: Core capability
+  evidence_refs:
+  - spec:3
+  - spec:11
+- id: cap-sync
+  type: CAPABILITY
+  label: Continuously compare design-time graph state with code, tests, and source changes
+  status: active
+  created_by: founding-spec
+  created_at: '2026-08-25'
+  last_modified_by: founding-spec
+  last_modified_at: '2026-08-25'
+  source_mode: explicit
+  intent_fidelity_confidence: 0.99
+  confidence_basis: Core capability
+  evidence_refs:
+  - spec:3
+  - spec:12
+- id: cap-reconcile
+  type: CAPABILITY
+  label: Classify and reconcile divergence without presuming which artifact is stale
+  status: active
+  created_by: founding-spec
+  created_at: '2026-08-25'
+  last_modified_by: founding-spec
+  last_modified_at: '2026-08-25'
+  source_mode: explicit
+  intent_fidelity_confidence: 1.0
+  confidence_basis: Core differentiator
+  evidence_refs:
+  - spec:13
+- id: decision-local-first-oss
+  type: DECISION
+  label: Open-source core must be useful locally without a managed cloud account
+  status: active
+  created_by: founding-spec
+  created_at: '2026-08-25'
+  last_modified_by: founding-spec
+  last_modified_at: '2026-08-25'
+  source_mode: explicit
+  intent_fidelity_confidence: 0.99
+  confidence_basis: Open-source product decision
+  evidence_refs:
+  - spec:4
+  - spec:25
+- id: decision-yaml-mvp
+  type: DECISION
+  label: Use YAML as canonical machine-readable graph storage for MVP behind a storage interface
+  status: active
+  created_by: founding-spec
+  created_at: '2026-08-25'
+  last_modified_by: founding-spec
+  last_modified_at: '2026-08-25'
+  source_mode: explicit
+  intent_fidelity_confidence: 0.95
+  confidence_basis: MVP architecture decision; adapter allows later graph databases
+  evidence_refs:
+  - spec:6
+  - spec:20
+- id: decision-agent-agnostic
+  type: DECISION
+  label: Expose intent context through CLI and MCP before proprietary IDE integrations
+  status: active
+  created_by: founding-spec
+  created_at: '2026-08-25'
+  last_modified_by: founding-spec
+  last_modified_at: '2026-08-25'
+  source_mode: explicit
+  intent_fidelity_confidence: 0.97
+  confidence_basis: Agent-agnostic adoption strategy
+  evidence_refs:
+  - spec:17
+- id: arch-deterministic-core-agentic-edges
+  type: ARCHITECTURE
+  label: Deterministic scheduler, stores, validators, and appliers invoke LLM reasoning only for semantic interpretation
+  status: active
+  created_by: founding-spec
+  created_at: '2026-08-25'
+  last_modified_by: founding-spec
+  last_modified_at: '2026-08-25'
+  source_mode: explicit
+  intent_fidelity_confidence: 0.98
+  confidence_basis: Core architecture principle
+  evidence_refs:
+  - spec:4
+  - spec:10
+  - spec:23
+- id: req-mvp-nightly-sync
+  type: REQUIREMENT
+  label: MVP supports manual and nightly repository sync
+  status: active
+  created_by: founding-spec
+  created_at: '2026-08-25'
+  last_modified_by: founding-spec
+  last_modified_at: '2026-08-25'
+  source_mode: explicit
+  intent_fidelity_confidence: 0.96
+  confidence_basis: MVP scope
+  evidence_refs:
+  - spec:9
+  - spec:12
+  - spec:30
+- id: req-mvp-context-pack
+  type: REQUIREMENT
+  label: MVP returns compact task-specific context for coding agents
+  status: active
+  created_by: founding-spec
+  created_at: '2026-08-25'
+  last_modified_by: founding-spec
+  last_modified_at: '2026-08-25'
+  source_mode: explicit
+  intent_fidelity_confidence: 0.97
+  confidence_basis: MVP requirement
+  evidence_refs:
+  - spec:17
+  - spec:30
+- id: req-cloud-not-required
+  type: REQUIREMENT
+  label: Core workflows function without cloud-hosted services
+  status: active
+  created_by: founding-spec
+  created_at: '2026-08-25'
+  last_modified_by: founding-spec
+  last_modified_at: '2026-08-25'
+  source_mode: explicit
+  intent_fidelity_confidence: 0.99
+  confidence_basis: Local-first open-source boundary
+  evidence_refs:
+  - spec:25
+  - spec:31
+edges:
+- id: e1
+  from: ctx-fragmented-intent
+  relation: CREATES_NEED
+  to: need-living-intent
+  status: active
+  created_by: founding-spec
+  created_at: '2026-08-25'
+  last_modified_by: founding-spec
+  last_modified_at: '2026-08-25'
+- id: e2
+  from: need-living-intent
+  relation: MOTIVATES
+  to: intent-preserve-fidelity
+  status: active
+  created_by: founding-spec
+  created_at: '2026-08-25'
+  last_modified_by: founding-spec
+  last_modified_at: '2026-08-25'
+- id: e3
+  from: intent-preserve-fidelity
+  relation: SEEKS_OUTCOME
+  to: outcome-alignment-visible
+  status: active
+  created_by: founding-spec
+  created_at: '2026-08-25'
+  last_modified_by: founding-spec
+  last_modified_at: '2026-08-25'
+- id: e4
+  from: intent-preserve-fidelity
+  relation: REALIZED_BY
+  to: cap-capture
+  status: active
+  created_by: founding-spec
+  created_at: '2026-08-25'
+  last_modified_by: founding-spec
+  last_modified_at: '2026-08-25'
+- id: e5
+  from: intent-preserve-fidelity
+  relation: REALIZED_BY
+  to: cap-manage
+  status: active
+  created_by: founding-spec
+  created_at: '2026-08-25'
+  last_modified_by: founding-spec
+  last_modified_at: '2026-08-25'
+- id: e6
+  from: intent-preserve-fidelity
+  relation: REALIZED_BY
+  to: cap-sync
+  status: active
+  created_by: founding-spec
+  created_at: '2026-08-25'
+  last_modified_by: founding-spec
+  last_modified_at: '2026-08-25'
+- id: e7
+  from: intent-preserve-fidelity
+  relation: REALIZED_BY
+  to: cap-reconcile
+  status: active
+  created_by: founding-spec
+  created_at: '2026-08-25'
+  last_modified_by: founding-spec
+  last_modified_at: '2026-08-25'
+- id: e8
+  from: principle-no-requirement-truth-assumption
+  relation: JUSTIFIES
+  to: cap-reconcile
+  status: active
+  created_by: founding-spec
+  created_at: '2026-08-25'
+  last_modified_by: founding-spec
+  last_modified_at: '2026-08-25'
+- id: e9
+  from: decision-agent-agnostic
+  relation: JUSTIFIES
+  to: req-mvp-context-pack
+  status: active
+  created_by: founding-spec
+  created_at: '2026-08-25'
+  last_modified_by: founding-spec
+  last_modified_at: '2026-08-25'
+- id: e10
+  from: decision-local-first-oss
+  relation: JUSTIFIES
+  to: req-cloud-not-required
+  status: active
+  created_by: founding-spec
+  created_at: '2026-08-25'
+  last_modified_by: founding-spec
+  last_modified_at: '2026-08-25'
+- id: e11
+  from: arch-deterministic-core-agentic-edges
+  relation: REALIZED_BY
+  to: req-mvp-nightly-sync
+  status: active
+  created_by: founding-spec
+  created_at: '2026-08-25'
+  last_modified_by: founding-spec
+  last_modified_at: '2026-08-25'
+- id: e12
+  from: decision-yaml-mvp
+  relation: IMPLEMENTS_CAPABILITY
+  to: cap-manage
+  status: active
+  created_by: founding-spec
+  created_at: '2026-08-25'
+  last_modified_by: founding-spec
+  last_modified_at: '2026-08-25'
