@@ -24,13 +24,22 @@ _DEFAULT_CONTEXT_LIMITS = {
 
 
 class SyncCheckpoint(StrictModel):
-    """The durable cursor reached by one connector."""
+    """The durable source cursor and semantic-consumption boundary for one connector."""
 
     model_config = ConfigDict(frozen=True, validate_default=True)
 
     connector_id: str
     cursor: str | None
     committed_at: datetime
+    consumption_schema_version: int = Field(default=1, ge=1, le=1)
+    consumed_evidence_ids: tuple[str, ...] = ()
+
+    @field_validator("consumed_evidence_ids")
+    @classmethod
+    def validate_consumed_evidence_ids(cls, evidence_ids: tuple[str, ...]) -> tuple[str, ...]:
+        if len(evidence_ids) != len(set(evidence_ids)):
+            raise ValueError("consumed evidence ids must be unique")
+        return evidence_ids
 
 
 class ProjectConfig(StrictModel):

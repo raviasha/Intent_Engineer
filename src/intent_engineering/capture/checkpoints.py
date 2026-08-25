@@ -14,6 +14,7 @@ def checkpoint_after_discovery(
     discovered: Sequence[SourceObject],
     committed_at: datetime,
     prior: SyncCheckpoint | None = None,
+    consumed_evidence_ids: Sequence[str] = (),
 ) -> SyncCheckpoint:
     """Build a checkpoint, retaining the prior cursor for an empty successful batch."""
     cursor = connector.next_checkpoint(discovered)
@@ -23,4 +24,5 @@ def checkpoint_after_discovery(
         connector_id=connector.connector_id,
         cursor=cursor,
         committed_at=committed_at,
+        consumed_evidence_ids=tuple(consumed_evidence_ids),
     )

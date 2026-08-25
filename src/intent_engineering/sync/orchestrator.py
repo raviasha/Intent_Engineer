@@ -116,19 +116,38 @@ class SyncOrchestrator:
             progress = _ConnectorProgress()
             try:
                 prior = self._checkpoint_store.get(connector.connector_id)
-                discovered = await connector.discover(prior.cursor if prior is not None else None)
-                records: list[EvidenceRecord] = []
+                consumed_ids = set(prior.consumed_evidence_ids if prior is not None else ())
+                records = [
+                    record
+                    for record in self._evidence_store.for_connector(connector.connector_id)
+                    if record.id not in consumed_ids
+                ]
+                record_ids = {record.id for record in records}
                 prior_versions: dict[str, str] = {}
+                for record in records:
+                    predecessor = self._predecessor(
+                        record,
+                        self._evidence_store.versions(record.external_object_id),
+                    )
+                    if predecessor is not None:
+                        prior_versions[record.external_object_id] = predecessor.id
+                discovered = await connector.discover(prior.cursor if prior is not None else None)
                 for source_object in discovered:
                     raw = await connector.fetch(
                         source_object.external_object_id,
                         source_object.external_version,
                     )
                     record = connector.normalize(raw)
+                    if record.ingested_by not in (None, connector.connector_id):
+                        raise ValueError("evidence ingestion boundary mismatch")
+                    if record.ingested_by is None:
+                        record = record.model_copy(update={"ingested_by": connector.connector_id})
                     predecessor = self._persist_evidence(record, progress)
                     if predecessor is not None:
                         prior_versions[record.external_object_id] = predecessor.id
-                    records.append(record)
+                    if record.id not in record_ids:
+                        records.append(record)
+                        record_ids.add(record.id)
                 delta = EvidenceDelta(
                     added=tuple(records),
                     prior_versions=prior_versions,
@@ -189,14 +208,26 @@ class SyncOrchestrator:
                     successful_item.discovered,
                     self._clock(),
                     prior=prior,
+                    consumed_evidence_ids=tuple(
+                        dict.fromkeys(
+                            (
+                                *(prior.consumed_evidence_ids if prior is not None else ()),
+                                *(record.id for record in successful_item.delta.added),
+                            )
+                        )
+                    ),
                 )
-                checkpoint_advanced = prior is None or checkpoint.cursor != prior.cursor
+                checkpoint_advanced = prior is None or (
+                    checkpoint.cursor != prior.cursor
+                    or checkpoint.consumed_evidence_ids != prior.consumed_evidence_ids
+                )
                 if checkpoint_advanced:
                     self._checkpoint_store.compare_and_set(
                         successful_item.connector.connector_id,
                         expected=prior,
                         cursor=checkpoint.cursor,
                         committed_at=checkpoint.committed_at,
+                        consumed_evidence_ids=checkpoint.consumed_evidence_ids,
                     )
                 results[successful_item.connector.connector_id] = ConnectorRunResult.succeeded(
                     successful_item.progress.evidence_added,

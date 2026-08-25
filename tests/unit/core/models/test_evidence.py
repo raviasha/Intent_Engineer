@@ -122,6 +122,25 @@ def test_checkpoint_is_immutable() -> None:
         checkpoint.cursor = "abc"  # type: ignore[misc]
 
 
+def test_checkpoint_consumption_boundary_is_versioned_and_unique() -> None:
+    checkpoint = SyncCheckpoint(
+        connector_id="git",
+        cursor="abc",
+        committed_at=NOW,
+        consumed_evidence_ids=("evidence:one", "evidence:two"),
+    )
+
+    assert checkpoint.consumption_schema_version == 1
+    assert checkpoint.consumed_evidence_ids == ("evidence:one", "evidence:two")
+    with pytest.raises(ValidationError):
+        SyncCheckpoint(
+            connector_id="git",
+            cursor="abc",
+            committed_at=NOW,
+            consumed_evidence_ids=("evidence:one", "evidence:one"),
+        )
+
+
 @pytest.mark.parametrize(("name", "model"), [("graph", "Graph"), ("evidence", "EvidenceRecord")])
 def test_checked_in_schemas_match_deterministic_regeneration(name: str, model: str) -> None:
     assert (SCHEMA_DIRECTORY / f"{name}.schema.json").read_bytes() == schema_bytes(model)

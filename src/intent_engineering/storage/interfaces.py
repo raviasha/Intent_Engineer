@@ -42,6 +42,9 @@ class EvidenceStore(Protocol):
     def versions(self, external_object_id: str) -> Sequence[EvidenceRecord]:
         raise NotImplementedError
 
+    def for_connector(self, connector_id: str) -> Sequence[EvidenceRecord]:
+        raise NotImplementedError
+
 
 class CheckpointStore(Protocol):
     """Optimistic connector-cursor persistence."""
@@ -55,6 +58,7 @@ class CheckpointStore(Protocol):
         expected: SyncCheckpoint | None,
         cursor: str | None,
         committed_at: datetime,
+        consumed_evidence_ids: Sequence[str] = (),
     ) -> SyncCheckpoint:
         raise NotImplementedError
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from datetime import datetime
 from pathlib import Path
 from typing import Any, cast
@@ -71,6 +72,7 @@ class YamlCheckpointStore:
         expected: SyncCheckpoint | None,
         cursor: str | None,
         committed_at: datetime,
+        consumed_evidence_ids: Sequence[str] = (),
     ) -> SyncCheckpoint:
         """Atomically persist a new cursor only when the expected value still matches."""
         with same_path_lock(self._file):
@@ -81,6 +83,7 @@ class YamlCheckpointStore:
                 connector_id=connector_id,
                 cursor=cursor,
                 committed_at=committed_at,
+                consumed_evidence_ids=tuple(consumed_evidence_ids),
             )
             checkpoints[connector_id] = checkpoint
             self._write_all(checkpoints)

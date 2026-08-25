@@ -48,6 +48,7 @@ class EvidenceRecord(StrictModel):
 
     id: str
     connector_type: str
+    ingested_by: str | None = None
     external_object_id: str
     external_version: str
     author: str | None

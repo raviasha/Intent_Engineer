@@ -75,7 +75,12 @@ class JsonlEvidenceStore:
             self._rebuild_index_unlocked()
             existing = self._by_id.get(record.id)
             if existing is not None:
-                if existing != record:
+                legacy_equivalent = (
+                    existing.ingested_by is None
+                    and record.ingested_by is not None
+                    and existing == record.model_copy(update={"ingested_by": None})
+                )
+                if existing != record and not legacy_equivalent:
                     raise ConflictingEvidenceId(record.id)
                 return False
             append_durable_line(self._file, serialized)
@@ -100,3 +105,14 @@ class JsonlEvidenceStore:
         with same_path_lock(self._file):
             self._rebuild_index_unlocked()
             return tuple(self._by_id.values())
+
+    def for_connector(self, connector_id: str) -> Sequence[EvidenceRecord]:
+        """Return records in append order for their provider-neutral ingestion boundary."""
+        with same_path_lock(self._file):
+            self._rebuild_index_unlocked()
+            return tuple(
+                record
+                for record in self._by_id.values()
+                if record.ingested_by == connector_id
+                or (record.ingested_by is None and record.connector_type == connector_id)
+            )

@@ -167,7 +167,7 @@ class MultiObjectFailOnceConnector:
             payload={
                 "intent_assertion": {
                     "id": f"assertion:{name}",
-                    "subject_id": f"requirement:{name}",
+                    "subject_id": f"requirement:{name}:{version}",
                     "change_kind": "initialize",
                     "node_type": "REQUIREMENT",
                     "label": f"Requirement {name}",
@@ -185,6 +185,66 @@ class MultiObjectFailOnceConnector:
 
     def next_checkpoint(self, discovered: Sequence[SourceObject]) -> str | None:
         return "batch-v1" if self.batch else "baseline-v1"
+
+
+class MutablePendingConnector:
+    """Expose source deletion/change after one record is durable and a later fetch fails."""
+
+    connector_id = "mutable"
+
+    def __init__(self) -> None:
+        self.visible: tuple[tuple[str, str], ...] = (("baseline", "v1"),)
+        self.fail_object: str | None = None
+        self._failed = False
+
+    async def discover(self, cursor: str | None) -> tuple[SourceObject, ...]:
+        return tuple(
+            SourceObject(
+                external_object_id=f"fixture:{name}",
+                external_version=version,
+                locator=f"{name}.md",
+            )
+            for name, version in self.visible
+        )
+
+    async def fetch(self, object_id: str, version: str) -> RawSourceObject:
+        if object_id == self.fail_object and not self._failed:
+            self._failed = True
+            raise RuntimeError("private later-object failure")
+        name = object_id.removeprefix("fixture:")
+        return RawSourceObject(
+            connector_type=self.connector_id,
+            external_object_id=object_id,
+            external_version=version,
+            author="fixture@example.test",
+            observed_at=datetime(2026, 8, 25, tzinfo=UTC),
+            source_locator=f"{name}.md",
+            content_hash=f"sha256:{name}:{version}",
+            payload={
+                "intent_assertion": {
+                    "id": f"assertion:{name}:{version}",
+                    "subject_id": f"requirement:{name}:{version}",
+                    "change_kind": "initialize",
+                    "node_type": "REQUIREMENT",
+                    "label": f"Requirement {name} {version}",
+                    "source_mode": "explicit",
+                    "evidence_refs": (
+                        f"evidence:{self.connector_id}:{object_id}:{version}",
+                    ),
+                    "confidence": 0.9,
+                }
+            },
+        )
+
+    def normalize(self, raw: RawSourceObject):  # type: ignore[no-untyped-def]
+        from intent_engineering.capture.base import normalize_raw_source
+
+        return normalize_raw_source(raw)
+
+    def next_checkpoint(self, discovered: Sequence[SourceObject]) -> str | None:
+        if not discovered:
+            return None
+        return ",".join(f"{item.external_object_id}@{item.external_version}" for item in discovered)
 
 
 class SelectiveBrokenCheckpointStore:
@@ -372,6 +432,88 @@ async def test_multi_object_fetch_failure_keeps_prior_records_and_retries_full_p
         "fixture:three",
     }
     assert harness.checkpoint_path.read_bytes() != checkpoint_before
+
+
+@pytest.mark.anyio
+async def test_deleted_source_record_is_replayed_from_durable_evidence_before_completion(
+    tmp_path: Path,
+) -> None:
+    """Removing a source cannot erase evidence persisted beyond the retained checkpoint."""
+    connector = MutablePendingConnector()
+    reasoner = RecordingReasoner()
+    harness = SyncHarness(tmp_path, (connector,), reasoner=reasoner)
+    await harness.run()
+    connector.visible = (("one", "v1"), ("two", "v1"))
+    connector.fail_object = "fixture:two"
+
+    failed = await harness.run()
+    connector.visible = ()
+    recovered = await harness.run()
+
+    assert failed.status is SyncRunStatus.FAILED
+    assert failed.evidence_added == 1
+    assert recovered.status is SyncRunStatus.SUCCESS
+    assert recovered.evidence_added == 0
+    assert recovered.changes_applied == 1
+    assert recovered.connectors["mutable"].checkpoint_advanced is True
+    assert [record.external_object_id for record in reasoner.deltas[-1].added] == ["fixture:one"]
+
+    repeated = await harness.run()
+    assert (repeated.evidence_added, repeated.changes_applied, repeated.cases_created) == (0, 0, 0)
+    assert repeated.connectors["mutable"].checkpoint_advanced is False
+    assert len(reasoner.deltas) == 2
+
+
+@pytest.mark.anyio
+async def test_changed_source_replays_pending_then_new_version_in_durable_order(tmp_path: Path) -> None:
+    """A changed object cannot replace its already-durable pending semantic version."""
+    connector = MutablePendingConnector()
+    reasoner = RecordingReasoner()
+    harness = SyncHarness(tmp_path, (connector,), reasoner=reasoner)
+    await harness.run()
+    connector.visible = (("one", "v1"), ("two", "v1"))
+    connector.fail_object = "fixture:two"
+    await harness.run()
+    connector.visible = (("one", "v2"), ("two", "v1"))
+
+    recovered = await harness.run()
+    replay = reasoner.deltas[-1]
+
+    assert recovered.status is SyncRunStatus.SUCCESS
+    assert recovered.evidence_added == 2
+    assert [
+        (record.external_object_id, record.external_version) for record in replay.added
+    ] == [("fixture:one", "v1"), ("fixture:one", "v2"), ("fixture:two", "v1")]
+    assert replay.prior_versions["fixture:one"] == replay.added[0].id
+
+
+@pytest.mark.anyio
+async def test_legacy_evidence_and_checkpoint_migrate_with_one_semantic_replay(tmp_path: Path) -> None:
+    """A pre-boundary row is enriched without conflicting and an empty boundary rescans once."""
+    connector = MutablePendingConnector()
+    reasoner = RecordingReasoner()
+    harness = SyncHarness(tmp_path, (connector,), reasoner=reasoner)
+    source = (await connector.discover(None))[0]
+    legacy = connector.normalize(await connector.fetch(source.external_object_id, source.external_version))
+    assert legacy.ingested_by is None
+    assert harness.evidence_store.put(legacy) is True
+    harness.checkpoint_store.compare_and_set(
+        connector.connector_id,
+        None,
+        "legacy-cursor",
+        datetime(2026, 8, 24, tzinfo=UTC),
+    )
+
+    migrated = await harness.run()
+    repeated = await harness.run()
+
+    assert migrated.status is SyncRunStatus.SUCCESS
+    assert (migrated.evidence_added, migrated.changes_applied) == (0, 1)
+    assert migrated.connectors["mutable"].checkpoint_advanced is True
+    assert reasoner.deltas[0].added == (legacy,)
+    assert harness.evidence_store.get(legacy.id) == legacy
+    assert harness.checkpoint_store.get("mutable").consumed_evidence_ids == (legacy.id,)  # type: ignore[union-attr]
+    assert (repeated.evidence_added, repeated.changes_applied, repeated.cases_created) == (0, 0, 0)
 
 
 @pytest.mark.anyio
