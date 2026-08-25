@@ -171,7 +171,7 @@ def _sync_command(runtime: Runtime, sources: str, output_format: OutputFormat) -
         raise typer.BadParameter("invalid source selection", param_hint="--sources") from error
     try:
         result = _invoke_sync(runtime, sources)
-    except (OSError, ValueError) as error:
+    except Exception as error:
         _runtime_error(error)
         raise typer.Exit(1) from error
     emit(result, output_format)
@@ -362,7 +362,7 @@ def render_command(
         markdown, mermaid = GraphRenderer(runtime.graph_store, runtime.cases()).render_all(
             output_dir
         )
-    except (OSError, ValueError) as error:
+    except Exception as error:
         _runtime_error(error)
         raise typer.Exit(1) from error
     emit({"markdown": str(markdown), "mermaid": str(mermaid)}, output_format)
