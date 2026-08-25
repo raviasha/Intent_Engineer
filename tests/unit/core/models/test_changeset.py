@@ -105,6 +105,20 @@ def test_semantic_changeset_requires_evidence() -> None:
 
 
 @pytest.mark.parametrize(
+    ("update_type", "identifier", "replacement"),
+    [
+        (NodeUpdate, "req-1", node("req-2")),
+        (EdgeUpdate, "edge-1", edge("edge-2")),
+    ],
+)
+def test_update_replacement_must_keep_its_stable_id(
+    update_type: type[NodeUpdate | EdgeUpdate], identifier: str, replacement: Node | Edge
+) -> None:
+    with pytest.raises(ValidationError, match="replacement id must match"):
+        update_type(**{"node_id" if update_type is NodeUpdate else "edge_id": identifier, "replacement": replacement})
+
+
+@pytest.mark.parametrize(
     ("group", "value"),
     [
         ("nodes_added", (node("req-1"), node("req-1"))),
@@ -149,6 +163,57 @@ def test_changeset_rejects_subjects_updated_and_superseded(
 ) -> None:
     with pytest.raises(ValidationError, match="cannot both update and supersede"):
         changeset(**{update_group: update_value, supersede_group: supersede_value})
+
+
+@pytest.mark.parametrize(
+    ("first_group", "second_group", "first_value", "second_value", "message"),
+    [
+        (
+            "nodes_added",
+            "nodes_updated",
+            (node("req-1"),),
+            (NodeUpdate(node_id="req-1", replacement=node("req-1")),),
+            "cannot both add and update node",
+        ),
+        (
+            "nodes_added",
+            "nodes_superseded",
+            (node("req-1"),),
+            ("req-1",),
+            "cannot both add and supersede node",
+        ),
+        (
+            "edges_added",
+            "edges_updated",
+            (edge("edge-1"),),
+            (EdgeUpdate(edge_id="edge-1", replacement=edge("edge-1")),),
+            "cannot both add and update edge",
+        ),
+        (
+            "edges_added",
+            "edges_superseded",
+            (edge("edge-1"),),
+            ("edge-1",),
+            "cannot both add and supersede edge",
+        ),
+        (
+            "reconciliation_cases_created",
+            "reconciliation_cases_resolved",
+            ("case-1",),
+            ("case-1",),
+            "cannot both create and resolve reconciliation case",
+        ),
+    ],
+)
+def test_changeset_rejects_incompatible_subject_overlaps(
+    first_group: str,
+    second_group: str,
+    first_value: object,
+    second_value: object,
+    message: str,
+) -> None:
+    with pytest.raises(ValidationError, match=message):
+        changeset(**{first_group: first_value, second_group: second_value})
 
 
 def test_changeset_normalizes_all_mutation_groups_to_tuples() -> None:

@@ -33,6 +33,12 @@ class NodeUpdate(BaseModel):
     node_id: str
     replacement: Node
 
+    @model_validator(mode="after")
+    def require_matching_replacement_id(self) -> NodeUpdate:
+        if self.replacement.id != self.node_id:
+            raise ValueError("node replacement id must match node_id")
+        return self
+
 
 class EdgeUpdate(BaseModel):
     """Replace a graph edge while retaining its stable identity."""
@@ -41,6 +47,12 @@ class EdgeUpdate(BaseModel):
 
     edge_id: str
     replacement: Edge
+
+    @model_validator(mode="after")
+    def require_matching_replacement_id(self) -> EdgeUpdate:
+        if self.replacement.id != self.edge_id:
+            raise ValueError("edge replacement id must match edge_id")
+        return self
 
 
 class ImplementationStatusChange(BaseModel):
@@ -144,9 +156,26 @@ class ChangeSet(BaseModel):
             if len(subjects) != len(set(subjects)):
                 raise ValueError(f"duplicate subject in {group}")
 
-        if {item.node_id for item in self.nodes_updated} & set(self.nodes_superseded):
+        node_additions = set(mutation_subjects["nodes_added"])
+        node_updates = set(mutation_subjects["nodes_updated"])
+        node_supersessions = set(mutation_subjects["nodes_superseded"])
+        edge_additions = set(mutation_subjects["edges_added"])
+        edge_updates = set(mutation_subjects["edges_updated"])
+        edge_supersessions = set(mutation_subjects["edges_superseded"])
+
+        if node_additions & node_updates:
+            raise ValueError("cannot both add and update node")
+        if node_additions & node_supersessions:
+            raise ValueError("cannot both add and supersede node")
+        if edge_additions & edge_updates:
+            raise ValueError("cannot both add and update edge")
+        if edge_additions & edge_supersessions:
+            raise ValueError("cannot both add and supersede edge")
+        if set(self.reconciliation_cases_created) & set(self.reconciliation_cases_resolved):
+            raise ValueError("cannot both create and resolve reconciliation case")
+        if node_updates & node_supersessions:
             raise ValueError("cannot both update and supersede node")
-        if {item.edge_id for item in self.edges_updated} & set(self.edges_superseded):
+        if edge_updates & edge_supersessions:
             raise ValueError("cannot both update and supersede edge")
         if self.is_semantic and not self.evidence_refs:
             raise ValueError("semantic ChangeSet requires evidence")
