@@ -2,17 +2,15 @@
 
 from __future__ import annotations
 
+import os
 import stat
 from pathlib import Path
 from typing import Any, cast
 
 import yaml  # type: ignore[import-untyped]
 
-from intent_engineering.core.models import Graph, ProjectConfig
-from intent_engineering.storage.jsonl.case_store import JsonlCaseStore
-from intent_engineering.storage.jsonl.evidence_store import JsonlEvidenceStore
-from intent_engineering.storage.jsonl.history_store import JsonlHistoryStore
-from intent_engineering.storage.yaml.checkpoint_store import YamlCheckpointStore
+from intent_engineering.core.models import EvidenceRecord, Graph, ProjectConfig, ReconciliationCase
+from intent_engineering.core.models.changeset import ChangeSet
 
 
 def _kind(path: Path, expected: int) -> bool:
@@ -21,6 +19,28 @@ def _kind(path: Path, expected: int) -> bool:
     except OSError:
         return False
     return not stat.S_ISLNK(metadata.st_mode) and stat.S_IFMT(metadata.st_mode) == expected
+
+
+def _read_regular(path: Path) -> bytes:
+    """Read one canonical file through a no-follow descriptor, never a store lock."""
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise ValueError("not a regular file")
+        with os.fdopen(descriptor, "rb", closefd=False) as source:
+            return source.read()
+    finally:
+        os.close(descriptor)
+
+
+def _validate_jsonl(
+    path: Path, model: type[EvidenceRecord | ReconciliationCase | ChangeSet]
+) -> None:
+    content = _read_regular(path)
+    for line in content.splitlines():
+        if line:
+            model.model_validate_json(line)
 
 
 def inspect_workspace(root: Path) -> tuple[bool, tuple[str, ...]]:
@@ -40,12 +60,12 @@ def inspect_workspace(root: Path) -> tuple[bool, tuple[str, ...]]:
     if diagnostics:
         return False, tuple(diagnostics)
     try:
-        config_data = yaml.safe_load(config.read_text(encoding="utf-8"))
+        config_data = yaml.safe_load(_read_regular(config).decode("utf-8"))
         ProjectConfig.model_validate(cast(dict[str, Any], config_data))
     except Exception:  # noqa: BLE001 - health diagnostics intentionally redact parser detail
         diagnostics.append("config")
     try:
-        graph_data = yaml.safe_load(graph.read_text(encoding="utf-8"))
+        graph_data = yaml.safe_load(_read_regular(graph).decode("utf-8"))
         Graph.model_validate(cast(dict[str, Any], graph_data))
     except Exception:  # noqa: BLE001 - health diagnostics intentionally redact parser detail
         diagnostics.append("graph")
@@ -55,24 +75,34 @@ def inspect_workspace(root: Path) -> tuple[bool, tuple[str, ...]]:
         ("history", workspace / "history" / "changesets.jsonl"),
         ("checkpoints", workspace / "cache" / "checkpoints.yaml"),
     )
+    present_state = {name for name, path in state_paths if path.exists() or path.is_symlink()}
     invalid_state = {
         name
         for name, path in state_paths
-        if path.exists() or path.is_symlink()
-        if not _kind(path, stat.S_IFREG)
+        if name in present_state and not _kind(path, stat.S_IFREG)
     }
     diagnostics.extend(sorted(invalid_state))
     checks = (
-        ("evidence", lambda: JsonlEvidenceStore(workspace / "evidence" / "evidence.jsonl")),
-        ("cases", lambda: JsonlCaseStore(workspace / "reconciliation" / "cases.jsonl")),
-        ("history", lambda: JsonlHistoryStore(workspace / "history" / "changesets.jsonl")),
+        (
+            "evidence",
+            lambda: _validate_jsonl(workspace / "evidence" / "evidence.jsonl", EvidenceRecord),
+        ),
+        (
+            "cases",
+            lambda: _validate_jsonl(
+                workspace / "reconciliation" / "cases.jsonl", ReconciliationCase
+            ),
+        ),
+        ("history", lambda: _validate_jsonl(workspace / "history" / "changesets.jsonl", ChangeSet)),
         (
             "checkpoints",
-            lambda: YamlCheckpointStore(workspace / "cache" / "checkpoints.yaml").get("doctor"),
+            lambda: yaml.safe_load(
+                _read_regular(workspace / "cache" / "checkpoints.yaml").decode("utf-8")
+            ),
         ),
     )
     for name, check in checks:
-        if name in invalid_state:
+        if name not in present_state or name in invalid_state:
             continue
         try:
             check()
