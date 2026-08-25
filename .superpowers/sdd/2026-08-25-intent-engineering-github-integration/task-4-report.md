@@ -225,3 +225,80 @@ direct regressions then became GREEN at **24 passed**.
 
 No live GitHub request, real credential, GUI/browser action, Task 5 work, MCP work, or raw Git
 object read occurred. The five protected untracked artifacts remain untouched and uncommitted.
+
+## Independent review fix round 2
+
+The second independent review reopened the verified report-output boundary. The final product/test
+fix is commit `e175ff1` and changes only:
+
+- `src/intent_engineering/storage/secure.py`;
+- `src/intent_engineering/render/drift_report.py`;
+- `tests/e2e/test_cli_github.py`; and
+- `tests/unit/render/test_drift_report.py`.
+
+### Controller threat-boundary ruling
+
+- In scope: real POSIX syscall results, external name/inode/hardlink races, ordinary failures, and
+  cancellation/KeyboardInterrupt delivered at named public transaction stages and AnyIO
+  boundaries.
+- Out of scope: hostile code already executing in-process, monkeypatched libc/OS wrappers that
+  perform a syscall and then raise before returning, and a second `sys.settrace` exception injected
+  inside the recovery/error-wins handler itself. Those probes cannot define a finite pure-Python
+  recovery boundary and were removed in favor of explicit named fault stages.
+- A strict transaction ends at its final descriptor-rooted validation bundle. The bundle validates
+  the target, retained tombstone/quarantine, and held report/original descriptors twice after the
+  final hook and name mutation. A mutation after that terminal snapshot/return is a new local
+  operation, not part of the completed transaction.
+
+### Transaction and privacy behavior
+
+- Strict report output uses standard descriptor-rooted `os.open` plus native atomic no-replace and
+  exchange renames. It performs no destructive pathname unlink. Rollback first truncates and
+  fsyncs the held owned report inode, so every raced hardlink loses report bytes, then retains the
+  inode under an unpredictable zero-byte `.rollback` name.
+- Before the displaced original is touched, cancellation restores the exact original inode and
+  bytes, quarantines the zero report inode, reauthenticates the complete rollback snapshot, and
+  re-raises the original signal. Once original scrubbing begins, rollback is not claimed; durable
+  scrub plus a valid final report/tombstone may commit, otherwise one fixed context-free
+  `AtomicWriteRollbackError` reports indeterminate state.
+- Owned descriptor close retries are bounded and authenticate `EBADF`. Exhaustion cannot report
+  success. Before any fixed error, raw report memoryviews and the prior failure object are cleared
+  from production traceback locals.
+- Cleanup preserves foreign entries. One-shot external swaps into quarantine or the restored target
+  produce the fixed indeterminate error; the foreign bytes and exact original bytes survive, while
+  every reachable owned report inode is zeroed.
+- Leading `//host/share` and boundary-prefixed forward-slash network paths are redacted across all
+  Markdown fields; ordinary `https://host/share` links remain intact.
+
+### TDD and verification evidence
+
+- The pre-simplification descriptor/phase RED was **5 failed, 80 deselected**, covering final commit
+  assignment, descriptor acquisition, and interrupted quarantine authentication. The controller
+  then narrowed arbitrary in-process injection out of scope and required a smaller named-stage
+  design.
+- The first compact gate exposed **5 failed, 76 passed** from obsolete native-wrapper/unlink tests;
+  these were replaced with named cancellation stages and no-unlink/tombstone assertions. Compact
+  GREEN became **84 passed**.
+- Independent compact re-review then found real close-before-effect and prepared-hardlink/install
+  failure gaps, followed by stale quarantine/restored-target terminal snapshots and a fixed-error
+  traceback-local leak. Each was reproduced and fixed. Persisted regressions cover close retry and
+  exhaustion, payload-free fixed errors, hardlinked preparation, foreign quarantine swaps, and
+  restored-original target swaps.
+- Final Task 4 CLI/report selection under `-W error`: **88 passed in 3.93s**.
+- Final Task 4 plus secure-storage selection under `-W error`: **91 passed in 3.66s**.
+- GitHub unit/contract/integration plus legacy local CLI selection under `-W error`:
+  **174 passed in 14.21s**.
+- Full offline suite under `-W error`: **614 passed in 20.91s**.
+- Tracked Python Ruff: **passed**. Mypy: **success, 74 source files**. `git diff --check`:
+  **passed**.
+- `intent doctor --help`, `intent doctor github --help`, and `intent drift --help`: **exit 0**.
+- Final adversarial re-review: **clean**, with no Critical, Important, or Minor findings under the
+  controller-approved boundary.
+
+### Known limitation and scope
+
+Strict writes intentionally retain authenticated zero-byte tombstones because portable POSIX does
+not provide conditional unlink-by-inode. This can accumulate one inode per successful replacement
+or rollback; bounded garbage collection is deferred rather than weakening foreign-entry safety.
+No live GitHub request, credential, GUI/browser action, Task 5 work, MCP work, or raw Git-object read
+occurred. The five protected untracked artifacts remain untouched and uncommitted.

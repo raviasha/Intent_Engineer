@@ -13,6 +13,17 @@
 - Ruling: Task 4 report recommendations are deterministic guidance, never mutations: `ORPHAN_REQUIREMENT` maps to `update_implementation`, conflicting/ambiguous evidence to `preserve_disagreement`, and `POSSIBLE_INTENT_CHANGE` to `update_intent`. Cost if wrong: the display profile can be revised without altering stored cases or authorization.
 - Ruling: Task 4 report files are restricted to contained `.md` paths outside `.git` and `.intent`; secure creation/replacement requires native no-replace/exchange primitives and fails closed when unavailable. Cost if wrong: unsupported platforms retain exact stdout reporting but cannot use `--output`.
 - Ruling: Task 4 existing-report replacement commits when the displaced-original temporary name is authenticated absent after native unlink. Before that point, BaseException restores the exact original inode and re-raises; after it, commit wins and the signal is suppressed because identity-preserving rollback is impossible. No strict-output durability work follows the commit point. Cost if wrong: a signal delivered after irreversible commit is reported as success, avoiding a false cancellation result after state changed.
+- Ruling: Task 4 fix round 2 replaces destructive strict cleanup with held-descriptor scrubbing and
+  zero-byte quarantine tombstones. Strict mode never pathname-unlinks an entry; it authenticates
+  target, tombstone, and held descriptors in one terminal validation bundle after the final named
+  fault stage/name mutation. Cost if wrong: zero-byte tombstones can accumulate until a future safe
+  garbage collector exists, but foreign entries and private report bytes are not sacrificed.
+- Ruling: the strict transaction threat model covers real POSIX results, external name/inode/link
+  races, ordinary failures, and named cancellation stages. Hostile in-process code, syscall wrappers
+  that act and then raise before returning, and nested `sys.settrace` exceptions inside recovery are
+  excluded. Mutations after the terminal validation snapshot/return are new local operations. Cost
+  if wrong: deterministic tests target executable transaction contracts instead of unbounded Python
+  bytecode interruption points.
 
 ## Preflight conflict and interface scan
 
@@ -39,9 +50,10 @@
 - Task 3 — completed after fix round 1; initial product `7b3a91e`, fix `8076f5e`, initial report
   `9a1aa6c`; final internal re-review clean after durable replay, association, lifecycle,
   exception-retention, and cancellation hardening.
-- Task 4 — implementation and independent-review fix round 1 complete; product `e725e8d`, fix
-  `d230f42`; final internal adversarial re-review clean after cancellation transaction,
-  protected-path, secret-local, provider-scalar, UNC/device, and Markdown-escape hardening; awaiting
+- Task 4 — implementation and independent-review fix rounds 1 and 2 complete; product `e725e8d`,
+  fixes `d230f42` and `e175ff1`; final adversarial re-review clean after cancellation transaction,
+  protected-path, secret-local, provider-scalar, UNC/device/forward-network path, Markdown escape,
+  no-unlink tombstone, external-swap, close-exhaustion, and traceback-local hardening; awaiting
   controller final review.
 - Task 5 — pending.
 
@@ -83,3 +95,14 @@
   re-authenticates after parent fsync, and uses the controller-approved commit-wins rule after
   authenticated irreversible unlink. Final internal re-review found no Critical, Important, or
   Minor findings; full offline suite **602 passed**. Controller final review remains pending.
+- Task 4 independent review 2 initially found four Important strict-transaction gaps: commit-state
+  assignment/cancellation windows, false cancellation after rollback exhaustion, stat-to-unlink
+  foreign-entry races, and forward-slash network-path leakage. The controller narrowed arbitrary
+  in-process instrumentation out of scope and required a compact named-stage transaction. The final
+  implementation uses standard descriptor-rooted opens, zero destructive unlink, held-inode
+  scrub/fsync, zero-byte tombstones, exact pre-scrub rollback, fixed indeterminate outcomes, and
+  double terminal validation bundles. Follow-up review found and closed close-before-effect,
+  prepared-hardlink, quarantine/target external-swap, partial displaced-scrub, and fixed-error
+  traceback-local gaps. Persisted one-shot regressions cover each boundary. Final review found no
+  Critical, Important, or Minor findings; Task 4 selection **88 passed**, secure-focused selection
+  **91 passed**, broader GitHub/local selection **174 passed**, and full offline suite **614 passed**.
