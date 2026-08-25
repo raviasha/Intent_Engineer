@@ -126,3 +126,87 @@ commits:
 - A timeout was not added because the required contract permits but does not require one. A later
   operational hardening task can add a bounded timeout without changing credential precedence or
   the public error contract.
+
+## Fix round 1: isolate the CLI environment and hostile provider values
+
+Independent review found that the production `gh auth token` child inherited GitHub token
+override variables, hostile `str` subclasses could execute overridden normalization methods, the
+structured-log proof itself retained a credential object, production subprocess failures were not
+tested directly, and the extra-field test used an invalid strict enum value. Product fix commit
+`c1756b89f49a34b7d9e33c5d506be6843b07ac7e` closes those findings on implementation base
+`6477a7cefa050b0ae98bb93589d65322def04fb2`.
+
+### Fix-round RED evidence
+
+After adding the review regressions and before changing production code:
+
+```bash
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 .venv/bin/python -m pytest \
+  tests/unit/capture/github/test_auth.py -q
+```
+
+Result: `4 failed, 17 passed in 0.19s`. The absent and blank supplied-environment cases failed
+because subprocess received no copied `env`, and both hostile string cases escaped through
+overridden `.strip()` as `RuntimeError`. Direct production subprocess failures, the no-production-
+log characterization, and corrected extra-field validation already passed against the baseline.
+
+### Fix-round GREEN and final verification
+
+Focused auth gate:
+
+```bash
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 .venv/bin/python -m pytest \
+  tests/unit/capture/github/test_auth.py -q
+```
+
+Fresh pre-commit result: `21 passed in 0.27s`.
+
+Package/import gate:
+
+```bash
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 .venv/bin/python -m pytest tests/unit/test_package.py -q
+```
+
+Result: `1 passed in 0.23s`; the direct GitHub auth import smoke check also passed.
+
+Tracked static gates:
+
+```bash
+git ls-files -z -- '*.py' | xargs -0 .venv/bin/ruff check
+.venv/bin/mypy src/intent_engineering
+```
+
+Results: `All checks passed!` and `Success: no issues found in 69 source files`.
+
+Full regression suite:
+
+```bash
+.venv/bin/python -m pytest -q
+```
+
+Fresh pre-commit result: `381 passed in 17.53s`.
+
+`git diff --cached --check` completed with no output before the fix commit. No live credential was
+read and no GitHub API request was made.
+
+### Fix-round implementation decisions
+
+- The production runner now copies `os.environ`, removes exactly `GH_TOKEN`, `GITHUB_TOKEN`,
+  `GH_ENTERPRISE_TOKEN`, and `GITHUB_ENTERPRISE_TOKEN`, and passes the copy through subprocess
+  `env`. HOME, XDG, host, PATH, certificate, proxy, and all other CLI configuration remain intact.
+- Credential normalization accepts only exact built-in `str` values and invokes `str.strip`
+  directly. Subclasses cannot execute overridden `strip`, `str`, or `repr` methods and are handled
+  as the same fixed detached `GitHubAuthError` from both environment and runner boundaries.
+- The production subprocess failure proof now calls `run_gh_token` directly for missing CLI and
+  secret-bearing nonzero failures, checking message/args redaction and empty cause/context.
+- The secret-bearing structured-log test was removed. Its replacement proves credential
+  resolution emits no production structured events.
+- The unknown-field test supplies `CredentialSource.ENVIRONMENT` and asserts the actual Pydantic
+  `extra_forbidden` error independently from invalid-source coverage.
+
+### Fix-round changed files
+
+- `src/intent_engineering/capture/github/auth.py`
+- `tests/unit/capture/github/test_auth.py`
+
+The same five pre-existing untracked artifacts remain excluded. Task 2 was not started.
