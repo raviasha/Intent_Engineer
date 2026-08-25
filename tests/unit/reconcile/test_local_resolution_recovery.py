@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 from intent_engineering.core.models import ReconciliationStatus, ResolutionAction
-from intent_engineering.reconcile import LocalResolutionService, ResolutionUnavailable
+from intent_engineering.reconcile import LocalResolutionService
 from intent_engineering.reconcile.service import transition_case
 from intent_engineering.storage.jsonl.case_store import JsonlCaseStore
 from intent_engineering.storage.jsonl.evidence_store import JsonlEvidenceStore
