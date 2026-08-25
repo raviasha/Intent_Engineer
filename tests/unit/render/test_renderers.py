@@ -1,5 +1,6 @@
 """Deterministic, non-canonical view rendering."""
 
+import os
 from pathlib import Path
 
 import pytest
@@ -140,3 +141,62 @@ def test_renderer_rejects_a_preexisting_output_file_symlink(
 
     assert outside.read_text(encoding="utf-8") == "outside remains unchanged"
     assert not (output_dir / "graph.mmd").exists()
+
+
+def test_renderer_replaces_a_hard_link_without_mutating_the_external_inode(
+    render_fixture: RenderFixture, tmp_path: Path
+) -> None:
+    """Fails if publishing graph.md truncates another name for its existing inode."""
+    output_dir = tmp_path / "generated"
+    output_dir.mkdir()
+    sentinel = tmp_path / "external-sentinel.md"
+    sentinel.write_text("external content remains unchanged", encoding="utf-8")
+    os.link(sentinel, output_dir / "graph.md")
+
+    render_fixture.renderer.render_all(output_dir)
+
+    assert sentinel.read_text(encoding="utf-8") == "external content remains unchanged"
+    assert (output_dir / "graph.md").read_text(encoding="utf-8") != sentinel.read_text(
+        encoding="utf-8"
+    )
+
+
+def test_renderer_rejects_a_parent_swap_without_writing_the_new_symlink_target(
+    render_fixture: RenderFixture, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Fails if a directory swap between validation and write redirects a generated view."""
+    parent = tmp_path / "parent"
+    parent.mkdir()
+    output_dir = parent / "generated"
+    output_dir.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    original_directory = parent / "original-generated"
+    real_open = os.open
+    swapped = False
+
+    def swap_after_open(
+        path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        nonlocal swapped
+        descriptor = real_open(path, flags, mode, dir_fd=dir_fd)
+        if not swapped and (path == output_dir or path == output_dir.name):
+            swapped = True
+            output_dir.rename(original_directory)
+            output_dir.symlink_to(outside, target_is_directory=True)
+        return descriptor
+
+    monkeypatch.setattr(os, "open", swap_after_open)
+
+    with pytest.raises(ValueError, match="symlink"):
+        render_fixture.renderer.render_all(output_dir)
+
+    assert swapped
+    assert not (outside / "graph.md").exists()
+    assert not (outside / "graph.mmd").exists()
+    assert not (original_directory / "graph.md").exists()
+    assert not (original_directory / "graph.mmd").exists()
