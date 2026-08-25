@@ -12,6 +12,7 @@
 - Ruling: Task 4 resolves GitHub repository scope only from the strict non-secret `GITHUB_REPOSITORY` environment value and never guesses from Git remotes. Cost if wrong: local GitHub commands require one explicit environment value, but local-only commands remain configuration- and credential-free.
 - Ruling: Task 4 report recommendations are deterministic guidance, never mutations: `ORPHAN_REQUIREMENT` maps to `update_implementation`, conflicting/ambiguous evidence to `preserve_disagreement`, and `POSSIBLE_INTENT_CHANGE` to `update_intent`. Cost if wrong: the display profile can be revised without altering stored cases or authorization.
 - Ruling: Task 4 report files are restricted to contained `.md` paths outside `.git` and `.intent`; secure creation/replacement requires native no-replace/exchange primitives and fails closed when unavailable. Cost if wrong: unsupported platforms retain exact stdout reporting but cannot use `--output`.
+- Ruling: Task 4 existing-report replacement commits when the displaced-original temporary name is authenticated absent after native unlink. Before that point, BaseException restores the exact original inode and re-raises; after it, commit wins and the signal is suppressed because identity-preserving rollback is impossible. No strict-output durability work follows the commit point. Cost if wrong: a signal delivered after irreversible commit is reported as success, avoiding a false cancellation result after state changed.
 
 ## Preflight conflict and interface scan
 
@@ -38,9 +39,10 @@
 - Task 3 — completed after fix round 1; initial product `7b3a91e`, fix `8076f5e`, initial report
   `9a1aa6c`; final internal re-review clean after durable replay, association, lifecycle,
   exception-retention, and cancellation hardening.
-- Task 4 — implementation complete at product commit `e725e8d`; internal adversarial re-review
-  clean after path-redaction, URL-preservation, symlink-swap, and hardlink-install fixes; awaiting
-  controller independent review.
+- Task 4 — implementation and independent-review fix round 1 complete; product `e725e8d`, fix
+  `d230f42`; final internal adversarial re-review clean after cancellation transaction,
+  protected-path, secret-local, provider-scalar, UNC/device, and Markdown-escape hardening; awaiting
+  controller final review.
 - Task 5 — pending.
 
 ## Review findings
@@ -68,4 +70,16 @@
   final implementation preserves HTTPS, redacts root/arbitrary paths, uses native atomic
   no-replace rename for creation, authenticates final identity/type/link count, and validates both
   sides of replacement exchange with rollback. Final internal re-review found no Critical or
-  Important findings. Controller independent review remains pending.
+  Important findings.
+- Task 4 independent review 1: no Critical, 5 Important, 1 Minor. Required phase-aware
+  BaseException/cancellation rollback for report installation, protected output-component rejection
+  at any depth with case-insensitive matching, removal of raw environment/token mappings from sync
+  and doctor cancellation frames, credential-overlap rejection for successful rate-resource
+  scalars, UNC/device path redaction, and `_`/`~` Markdown escaping. Initial combined RED was
+  **15 failed, 9 passed**; all six boundaries were fixed.
+- Task 4 fix internal reviews found further rollback interruption, multiply-linked rollback,
+  post-fsync link authentication, and terminal displaced-unlink ambiguity. Each was reproduced RED.
+  Rollback now retries authenticated native cleanup, scrubs multiply-linked owned report inodes,
+  re-authenticates after parent fsync, and uses the controller-approved commit-wins rule after
+  authenticated irreversible unlink. Final internal re-review found no Critical, Important, or
+  Minor findings; full offline suite **602 passed**. Controller final review remains pending.

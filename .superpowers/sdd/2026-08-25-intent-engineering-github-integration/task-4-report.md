@@ -2,8 +2,9 @@
 
 ## Status
 
-Implementation complete and ready for controller independent review. Product/tests/workflow
-commit: `e725e8d` (`feat: report github drift locally and in actions`). Dispatch base:
+Implementation and independent-review fix round 1 complete; ready for controller final review.
+Product/tests/workflow commits: `e725e8d` (`feat: report github drift locally and in actions`)
+and `d230f42` (`fix: harden github report boundaries`). Dispatch base:
 `e12b78a01cea6e1803f9ae1bd05b441ee561e74b`.
 
 ## TDD evidence
@@ -141,3 +142,86 @@ commit: `e725e8d` (`feat: report github drift locally and in actions`). Dispatch
 - The five protected untracked artifacts remain untouched and uncommitted:
   `.coverage 2`, `.coverage 3`, `.coverage 4`, `README 2.md`, and
   `src/intent_engineering/core/policy/dogfood 2.py`.
+
+## Independent review fix round 1
+
+Controller independent review found no Critical findings, five Important findings, and one Minor
+finding:
+
+1. strict output installation did not roll back cancellation/BaseException after native
+   no-replace rename or exchange;
+2. protected output directories were checked only as an exact, case-sensitive first component;
+3. doctor and sync cancellation traceback frames retained the raw environment mapping/token;
+4. a successful provider rate-resource scalar could reflect all or part of the credential;
+5. UNC/device absolute paths survived Markdown report rendering; and
+6. `_` and `~` remained active Markdown delimiters.
+
+Every finding was reproduced before its production change. The initial combined review RED was
+**15 failed, 9 passed**: four rollback phases, four protected-path variants, two cancellation-local
+leaks, three rate-resource overlaps, plain UNC leakage, and Markdown delimiter escaping. The six
+direct regressions then became GREEN at **24 passed**.
+
+### Review-fix behavior
+
+- Report output rejects `.git` and `.intent` components at any depth using case-insensitive
+  comparison, including case variants that resolve to protected names on default APFS.
+- Doctor and sync release raw input mappings before client construction or an async cancellation
+  point. Cancellation cleanup/re-raise remains unchanged, while repository traceback locals no
+  longer contain `GH_TOKEN`.
+- Repository status rejects full, prefix, and sanitized-fragment overlap between the authenticated
+  token and `X-RateLimit-Resource`; rejected provider values are cleared before the fixed protocol
+  error is raised.
+- Markdown scalar protection recognizes UNC, Windows device, POSIX, file-URI, and drive-letter
+  absolute paths across every case/evidence field. `_` and `~` are escaped with the rest of the
+  Markdown delimiter vocabulary.
+- Verified output installation now tracks native filesystem phase by authenticated inode state.
+  Before commit, absent-output cancellation removes the installed inode; existing-output
+  cancellation exchanges the exact displaced inode back; rollback unlink/exchange interruptions
+  are retried; outer cleanup only removes the owned report inode.
+- A raced hardlink to the owned replacement inode causes fail-closed rollback. Before removing the
+  project/temp name, rollback opens and authenticates that inode, truncates and fsyncs it when
+  multiply linked, and therefore leaves no report bytes reachable through the raced external link.
+  Both absent and existing installs re-authenticate regular type, exact inode, and single-link state
+  after parent-directory fsync.
+
+### Commit-point ruling
+
+- Ruling: existing-target replacement has one irreversible commit point: authenticated
+  disappearance of the displaced-original temporary name after native unlink. Before that point,
+  any BaseException restores the original bytes and inode, removes owned temporary state, and
+  re-raises the original signal. If native unlink completed before raising, exact identity rollback
+  is no longer possible; commit wins, the post-commit signal is suppressed, replacement bytes
+  remain, and no temporary name remains. No strict-output durability work occurs after this commit
+  point. Cost if wrong: a control signal delivered after the irreversible native unlink is reported
+  as success rather than cancellation, preventing the CLI from claiming failure after it committed.
+
+### Review-fix TDD evidence
+
+- Initial native phase RED: **4 failed** for absent/existing install cancellation immediately after
+  rename/exchange and after parent fsync. GREEN plus prior race/repeat cases: **7 passed**.
+- Rollback-interruption RED: **2 failed** when rollback unlink/exchange raised before acting. The
+  authenticated retry implementation restored exact state and made both pass.
+- Hardlink rollback/final-authentication RED: **4 failed** for absent/existing external-link leakage
+  during rollback and absent/existing links inserted during parent fsync. The scrub and post-fsync
+  authentication behavior made all four pass.
+- Terminal cleanup RED: cancellation before displaced unlink left replacement plus original temp;
+  after native unlink, cancellation was incorrectly re-raised after commit. Separate before-effect
+  and after-effect tests now prove exact rollback versus commit-wins behavior and safe retry.
+- Final transaction race/phase selection: **14 passed**.
+- Final internal adversarial re-review: **clean**, with no Critical, Important, or Minor findings.
+
+### Review-fix verification
+
+- Task 4/report/workflow/repository-status plus secure-storage selection under `-W error`:
+  **100 passed in 3.41s**.
+- GitHub unit/contract/integration plus legacy local CLI selection under `-W error`:
+  **174 passed in 13.71s**.
+- Full offline suite under `-W error`: **602 passed in 21.31s**.
+- Tracked Python Ruff check: **passed**.
+- Review-fix Ruff format check: **9 files already formatted**.
+- Mypy: **success, 74 source files**.
+- `intent doctor --help`, `intent doctor github --help`, and `intent drift --help`: **exit 0**.
+- `git diff --check`: **passed**.
+
+No live GitHub request, real credential, GUI/browser action, Task 5 work, MCP work, or raw Git
+object read occurred. The five protected untracked artifacts remain untouched and uncommitted.
