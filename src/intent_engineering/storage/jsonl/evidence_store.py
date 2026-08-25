@@ -8,7 +8,7 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from intent_engineering.core.models import EvidenceRecord
-from intent_engineering.storage._atomic import append_durable_line
+from intent_engineering.storage._atomic import append_durable_line, same_path_lock
 
 
 class EvidenceStoreError(ValueError):
@@ -30,9 +30,13 @@ class JsonlEvidenceStore:
         self.path = path
         self._by_id: dict[str, EvidenceRecord] = {}
         self._by_external_object_id: dict[str, list[EvidenceRecord]] = defaultdict(list)
-        self._rebuild_index()
+        with same_path_lock(self.path):
+            self._rebuild_index_unlocked()
 
-    def _rebuild_index(self) -> None:
+    def _rebuild_index_unlocked(self) -> None:
+        """Refresh indexes from disk while the caller holds this store's path lock."""
+        self._by_id.clear()
+        self._by_external_object_id.clear()
         if not self.path.exists():
             return
         with self.path.open(encoding="utf-8") as source:
@@ -55,26 +59,32 @@ class JsonlEvidenceStore:
 
     def put(self, record: EvidenceRecord) -> bool:
         """Append a new record, returning false only for an exact existing record."""
-        existing = self._by_id.get(record.id)
-        if existing is not None:
-            if existing != record:
-                raise ConflictingEvidenceId(record.id)
-            return False
         serialized = json.dumps(
             record.model_dump(mode="json"),
             ensure_ascii=False,
             separators=(",", ":"),
             sort_keys=True,
         ).encode("utf-8") + b"\n"
-        append_durable_line(self.path, serialized)
-        self._by_id[record.id] = record
-        self._by_external_object_id[record.external_object_id].append(record)
-        return True
+        with same_path_lock(self.path):
+            self._rebuild_index_unlocked()
+            existing = self._by_id.get(record.id)
+            if existing is not None:
+                if existing != record:
+                    raise ConflictingEvidenceId(record.id)
+                return False
+            append_durable_line(self.path, serialized)
+            self._by_id[record.id] = record
+            self._by_external_object_id[record.external_object_id].append(record)
+            return True
 
     def get(self, evidence_id: str) -> EvidenceRecord:
         """Return an immutable record by its stable evidence ID."""
-        return self._by_id[evidence_id]
+        with same_path_lock(self.path):
+            self._rebuild_index_unlocked()
+            return self._by_id[evidence_id]
 
     def versions(self, external_object_id: str) -> Sequence[EvidenceRecord]:
         """Return source versions in their durable append order."""
-        return tuple(self._by_external_object_id.get(external_object_id, ()))
+        with same_path_lock(self.path):
+            self._rebuild_index_unlocked()
+            return tuple(self._by_external_object_id.get(external_object_id, ()))

@@ -9,7 +9,7 @@ from typing import Any, cast
 import yaml  # type: ignore[import-untyped]
 
 from intent_engineering.core.models import SyncCheckpoint
-from intent_engineering.storage._atomic import atomic_write_bytes
+from intent_engineering.storage._atomic import atomic_write_bytes, same_path_lock
 
 
 class CheckpointStoreError(ValueError):
@@ -30,7 +30,8 @@ class YamlCheckpointStore:
     def __init__(self, path: Path) -> None:
         self.path = path
 
-    def _load_all(self) -> dict[str, SyncCheckpoint]:
+    def _load_all_unlocked(self) -> dict[str, SyncCheckpoint]:
+        """Load checkpoints while the caller holds this store's path lock."""
         if not self.path.exists():
             return {}
         loaded = yaml.safe_load(self.path.read_text(encoding="utf-8"))
@@ -58,7 +59,8 @@ class YamlCheckpointStore:
 
     def get(self, connector_id: str) -> SyncCheckpoint | None:
         """Return the current durable checkpoint for a connector."""
-        return self._load_all().get(connector_id)
+        with same_path_lock(self.path):
+            return self._load_all_unlocked().get(connector_id)
 
     def compare_and_set(
         self,
@@ -68,14 +70,15 @@ class YamlCheckpointStore:
         committed_at: datetime,
     ) -> SyncCheckpoint:
         """Atomically persist a new cursor only when the expected value still matches."""
-        checkpoints = self._load_all()
-        if checkpoints.get(connector_id) != expected:
-            raise StaleCheckpoint(connector_id)
-        checkpoint = SyncCheckpoint(
-            connector_id=connector_id,
-            cursor=cursor,
-            committed_at=committed_at,
-        )
-        checkpoints[connector_id] = checkpoint
-        self._write_all(checkpoints)
-        return checkpoint
+        with same_path_lock(self.path):
+            checkpoints = self._load_all_unlocked()
+            if checkpoints.get(connector_id) != expected:
+                raise StaleCheckpoint(connector_id)
+            checkpoint = SyncCheckpoint(
+                connector_id=connector_id,
+                cursor=cursor,
+                committed_at=committed_at,
+            )
+            checkpoints[connector_id] = checkpoint
+            self._write_all(checkpoints)
+            return checkpoint

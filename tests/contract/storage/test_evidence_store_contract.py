@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import multiprocessing
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -63,3 +64,58 @@ def test_evidence_versions_are_ordered_by_append_history(tmp_path: Path) -> None
     reloaded = JsonlEvidenceStore(tmp_path / "evidence.jsonl")
 
     assert reloaded.versions("commit:abc") == (first, second)
+
+
+def _put_after_barrier(
+    path: str,
+    record: EvidenceRecord,
+    barrier: object,
+    results: object,
+) -> None:
+    store = JsonlEvidenceStore(Path(path))
+    barrier.wait()  # type: ignore[union-attr]
+    try:
+        results.put(("returned", store.put(record)))  # type: ignore[union-attr]
+    except ConflictingEvidenceId:
+        results.put(("conflict", record.content_hash))  # type: ignore[union-attr]
+
+
+def concurrent_puts(path: Path, records: tuple[EvidenceRecord, EvidenceRecord]) -> list[tuple[str, object]]:
+    context = multiprocessing.get_context("fork")
+    barrier = context.Barrier(2)
+    results = context.Queue()
+    processes = [
+        context.Process(target=_put_after_barrier, args=(str(path), record, barrier, results))
+        for record in records
+    ]
+    for process in processes:
+        process.start()
+    for process in processes:
+        process.join()
+        assert process.exitcode == 0
+    output = [results.get() for _ in records]
+    results.close()
+    return output
+
+
+def test_store_instances_dedupe_the_same_evidence_id_concurrently(tmp_path: Path) -> None:
+    path = tmp_path / "evidence.jsonl"
+    record = evidence_record()
+
+    results = concurrent_puts(path, (record, record))
+
+    assert sorted(results) == [("returned", False), ("returned", True)]
+    assert JsonlEvidenceStore(path).versions(record.external_object_id) == (record,)
+
+
+def test_store_instances_reject_conflicting_evidence_id_concurrently(tmp_path: Path) -> None:
+    path = tmp_path / "evidence.jsonl"
+    first = evidence_record(content_hash="sha256:first")
+    conflicting = first.model_copy(update={"content_hash": "sha256:second"})
+
+    results = concurrent_puts(path, (first, conflicting))
+
+    assert {result[0] for result in results} == {"returned", "conflict"}
+    reloaded = JsonlEvidenceStore(path)
+    assert reloaded.get(first.id) in (first, conflicting)
+    assert len(reloaded.versions(first.external_object_id)) == 1

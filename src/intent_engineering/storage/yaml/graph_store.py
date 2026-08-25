@@ -10,7 +10,7 @@ import yaml  # type: ignore[import-untyped]
 
 from intent_engineering.core.graph.applier import apply_changeset
 from intent_engineering.core.models import ChangeSet, Graph
-from intent_engineering.storage._atomic import atomic_write_bytes
+from intent_engineering.storage._atomic import atomic_write_bytes, same_path_lock
 from intent_engineering.storage.jsonl.history_store import JsonlHistoryStore
 
 
@@ -29,22 +29,29 @@ class YamlGraphStore:
 
     def initialize(self, graph: Graph) -> None:
         """Durably establish canonical graph state."""
-        atomic_write_bytes(self.path, _yaml_bytes(graph))
+        with same_path_lock(self.path):
+            atomic_write_bytes(self.path, _yaml_bytes(graph))
 
-    def load(self) -> Graph:
-        """Load and fully validate canonical graph YAML."""
+    def _load_unlocked(self) -> Graph:
+        """Load graph state while the caller holds this graph's path lock."""
         loaded = yaml.safe_load(self.path.read_text(encoding="utf-8"))
         if not isinstance(loaded, dict):
             raise TypeError(f"graph YAML must contain a mapping: {self.path}")
         return Graph.model_validate(cast(dict[str, Any], loaded))
 
+    def load(self) -> Graph:
+        """Load and fully validate canonical graph YAML."""
+        with same_path_lock(self.path):
+            return self._load_unlocked()
+
     def apply(self, changeset: ChangeSet) -> Graph:
         """Validate, replace canonical state atomically, then append history."""
-        next_graph = apply_changeset(self.load(), changeset)
-        next_graph.assert_invariants()
-        atomic_write_bytes(self.path, _yaml_bytes(next_graph))
-        self._history_store.append(changeset)
-        return next_graph
+        with same_path_lock(self.path):
+            next_graph = apply_changeset(self._load_unlocked(), changeset)
+            next_graph.assert_invariants()
+            atomic_write_bytes(self.path, _yaml_bytes(next_graph))
+            self._history_store.append(changeset)
+            return next_graph
 
     def history(self, subject_id: str) -> Sequence[ChangeSet]:
         """Return durable ChangeSets involving a graph subject."""

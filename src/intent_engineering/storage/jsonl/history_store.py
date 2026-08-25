@@ -8,7 +8,7 @@ from collections.abc import Iterable, Sequence
 from pathlib import Path
 
 from intent_engineering.core.models import ChangeSet
-from intent_engineering.storage._atomic import append_durable_line
+from intent_engineering.storage._atomic import append_durable_line, same_path_lock
 
 
 class HistoryStoreError(ValueError):
@@ -34,9 +34,12 @@ class JsonlHistoryStore:
     def __init__(self, path: Path) -> None:
         self.path = path
         self._by_subject: dict[str, list[ChangeSet]] = defaultdict(list)
-        self._rebuild_index()
+        with same_path_lock(self.path):
+            self._rebuild_index_unlocked()
 
-    def _rebuild_index(self) -> None:
+    def _rebuild_index_unlocked(self) -> None:
+        """Refresh indexes from disk while the caller holds this store's path lock."""
+        self._by_subject.clear()
         if not self.path.exists():
             return
         with self.path.open(encoding="utf-8") as source:
@@ -63,9 +66,13 @@ class JsonlHistoryStore:
             separators=(",", ":"),
             sort_keys=True,
         ).encode("utf-8") + b"\n"
-        append_durable_line(self.path, serialized)
-        self._index(changeset)
+        with same_path_lock(self.path):
+            self._rebuild_index_unlocked()
+            append_durable_line(self.path, serialized)
+            self._index(changeset)
 
     def history(self, subject_id: str) -> Sequence[ChangeSet]:
         """Return all durable ChangeSets that changed a supplied subject."""
-        return tuple(self._by_subject.get(subject_id, ()))
+        with same_path_lock(self.path):
+            self._rebuild_index_unlocked()
+            return tuple(self._by_subject.get(subject_id, ()))

@@ -4,10 +4,11 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from pathlib import Path
+from threading import Barrier, Thread
 
 import pytest
 
-from intent_engineering.core.graph.applier import UnknownIdentity
+from intent_engineering.core.graph.applier import StaleGraphVersion, UnknownIdentity
 from intent_engineering.core.models import (
     ChangeSet,
     Edge,
@@ -137,3 +138,57 @@ def test_graph_store_rejects_unknown_mutation_identity(tmp_path: Path) -> None:
 
     with pytest.raises(UnknownIdentity, match="missing-node"):
         store.apply(changeset(nodes_superseded=("missing-node",)))
+
+
+class SnapshotBarrierGraphStore(YamlGraphStore):
+    """Force the unlocked implementation to take two identical graph snapshots."""
+
+    def __init__(self, path: Path, barrier: Barrier, *, history_path: Path) -> None:
+        super().__init__(path, history_path=history_path)
+        self._barrier = barrier
+
+    def load(self) -> Graph:
+        result = super().load()
+        self._barrier.wait()
+        return result
+
+
+def test_graph_writers_do_not_both_commit_from_the_same_baseline(tmp_path: Path) -> None:
+    path = tmp_path / "graph.yaml"
+    history_path = tmp_path / "history.jsonl"
+    YamlGraphStore(path, history_path=history_path).initialize(graph())
+    snapshot_barrier = Barrier(2)
+    start_barrier = Barrier(3)
+    results: list[Graph | StaleGraphVersion] = []
+
+    def writer(change: ChangeSet) -> None:
+        store = SnapshotBarrierGraphStore(path, snapshot_barrier, history_path=history_path)
+        start_barrier.wait()
+        try:
+            results.append(store.apply(change))
+        except StaleGraphVersion as error:
+            results.append(error)
+
+    first = Thread(
+        target=writer,
+        args=(changeset(id="cs-graph-1", nodes_added=(node("req-3"),)),),
+    )
+    second = Thread(
+        target=writer,
+        args=(changeset(id="cs-graph-2", nodes_added=(node("req-4"),)),),
+    )
+    first.start()
+    second.start()
+    start_barrier.wait()
+    first.join()
+    second.join()
+
+    successful = [result for result in results if isinstance(result, Graph)]
+    failures = [result for result in results if isinstance(result, StaleGraphVersion)]
+
+    assert len(successful) == 1
+    assert len(failures) == 1
+    assert isinstance(failures[0], StaleGraphVersion)
+    loaded = YamlGraphStore(path, history_path=history_path).load()
+    assert loaded.version == 5
+    assert {item.id for item in loaded.nodes} in ({"req-1", "req-2", "req-3"}, {"req-1", "req-2", "req-4"})
