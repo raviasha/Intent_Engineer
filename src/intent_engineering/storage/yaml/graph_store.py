@@ -19,6 +19,21 @@ def _yaml_bytes(graph: Graph) -> bytes:
     return cast(str, yaml.safe_dump(data, allow_unicode=True, sort_keys=True)).encode("utf-8")
 
 
+def _canonical_graph_payload(loaded: dict[str, Any]) -> dict[str, Any]:
+    """Normalize the supplied starter graph shape to the canonical model payload."""
+    starter_graph = loaded.get("graph")
+    if not isinstance(starter_graph, dict):
+        return loaded
+
+    payload = dict(starter_graph)
+    semantic_version = payload.pop("version", "0.1.0")
+    payload["schema_version"] = str(semantic_version)
+    payload["version"] = 0
+    payload["nodes"] = loaded.get("nodes", ())
+    payload["edges"] = loaded.get("edges", ())
+    return payload
+
+
 class YamlGraphStore:
     """Atomically replace canonical graph YAML before recording applied history."""
 
@@ -37,7 +52,7 @@ class YamlGraphStore:
         loaded = yaml.safe_load(self.path.read_text(encoding="utf-8"))
         if not isinstance(loaded, dict):
             raise TypeError(f"graph YAML must contain a mapping: {self.path}")
-        return Graph.model_validate(cast(dict[str, Any], loaded))
+        return Graph.model_validate(_canonical_graph_payload(cast(dict[str, Any], loaded)))
 
     def load(self) -> Graph:
         """Load and fully validate canonical graph YAML."""

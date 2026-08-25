@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, cast
 
 import yaml  # type: ignore[import-untyped]
+from pydantic import ValidationError
 
 from intent_engineering.capture.base import Connector
 from intent_engineering.capture.git.connector import GitConnector
@@ -40,7 +41,10 @@ def _front_matter(content: str) -> Mapping[str, Any] | None:
     closing = content.find("\n---\n", 4)
     if closing < 0:
         return None
-    loaded = yaml.safe_load(content[4:closing])
+    try:
+        loaded = yaml.safe_load(content[4:closing])
+    except yaml.YAMLError:
+        return None
     if not isinstance(loaded, Mapping):
         return None
     metadata = loaded.get("intent_engineering")
@@ -59,18 +63,26 @@ def _detection_input(record: EvidenceRecord) -> DetectionInput | None:
     payload = dict(cast(Mapping[str, Any], raw))
     for side_name in ("requirement", "implementation", "test", "decision"):
         side = payload.get(side_name)
-        if not isinstance(side, Mapping):
+        if side is None:
             continue
+        if not isinstance(side, Mapping):
+            return None
         copied_side = dict(cast(Mapping[str, Any], side))
         references = copied_side.get("evidence_refs")
-        if isinstance(references, Sequence) and not isinstance(references, str):
-            if any(item != "$self" for item in references):
-                return None
-            copied_side["evidence_refs"] = [
-                record.id if item == "$self" else item for item in references
-            ]
+        if (
+            not isinstance(references, Sequence)
+            or isinstance(references, str)
+            or len(references) != 1
+            or not isinstance(references[0], str)
+            or references[0] not in {"$self", record.id}
+        ):
+            return None
+        copied_side["evidence_refs"] = [record.id]
         payload[side_name] = copied_side
-    return DetectionInput.model_validate(payload)
+    try:
+        return DetectionInput.model_validate(payload)
+    except ValidationError:
+        return None
 
 
 def _detect_cases(delta: EvidenceDelta, graph: Graph, actor: str) -> Sequence[DriftObservation]:
@@ -102,13 +114,17 @@ class _FrontMatterReasoner(DeterministicReasoner):
                 if key not in payload and key in metadata:
                     payload[key] = metadata[key]
         assertion = payload.get("intent_assertion")
-        if isinstance(assertion, Mapping):
+        if assertion is not None:
+            if not isinstance(assertion, Mapping):
+                payload.pop("intent_assertion", None)
+                return record.model_copy(update={"payload": payload})
             copied = dict(assertion)
             references = copied.get("evidence_refs")
             valid_refs = (
                 isinstance(references, Sequence)
                 and not isinstance(references, str)
                 and len(references) == 1
+                and isinstance(references[0], str)
                 and references[0] in {"$self", record.id}
             )
             if not valid_refs or not refs_allowed((record.id,), (record,), self._actor):

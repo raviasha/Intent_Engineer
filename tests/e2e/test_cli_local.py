@@ -340,6 +340,139 @@ def test_acl_protected_evidence_is_indistinguishable_from_unknown(tmp_path: Path
     assert run_intent(repo, "status", "--format", "json").json()["evidence_count"] == 0
 
 
+def test_acl_filtered_status_and_render_exclude_protected_topology(tmp_path: Path) -> None:
+    """Unreadable evidence removes its nodes, connecting edges, labels, IDs, and case refs."""
+    from datetime import UTC, datetime
+
+    from intent_engineering.cli.runtime import load_runtime
+    from intent_engineering.core.models import (
+        Edge,
+        EvidenceRecord,
+        EvidenceSide,
+        Graph,
+        Node,
+        ReconciliationCase,
+    )
+
+    repo = init_git_repo(tmp_path)
+    assert run_intent(repo, "init").returncode == 0
+    runtime = load_runtime(repo)
+    now = datetime(2026, 8, 25, tzinfo=UTC)
+    public = EvidenceRecord(
+        id="evidence:public",
+        connector_type="fixture",
+        external_object_id="public",
+        external_version="1",
+        author="fixture",
+        observed_at=now,
+        source_locator="public.md",
+        content_hash="sha256:public",
+        payload={},
+    )
+    protected = EvidenceRecord(
+        id="evidence:secret",
+        connector_type="fixture",
+        external_object_id="secret",
+        external_version="1",
+        author="fixture",
+        observed_at=now,
+        source_locator="secret.md",
+        content_hash="sha256:secret",
+        payload={},
+    )
+    runtime.evidence_store.put(public)
+    runtime.evidence_store.put(protected)
+    runtime.graph_store.initialize(
+        Graph(
+            id="graph:acl",
+            version=0,
+            nodes=(
+                Node(
+                    id="node:public",
+                    type="REQUIREMENT",
+                    label="Public label",
+                    status="active",
+                    created_by="fixture",
+                    created_at=now,
+                    last_modified_by="fixture",
+                    last_modified_at=now,
+                    source_mode="explicit",
+                    evidence_refs=(public.id,),
+                ),
+                Node(
+                    id="node:secret",
+                    type="REQUIREMENT",
+                    label="SECRET LABEL",
+                    status="active",
+                    created_by="fixture",
+                    created_at=now,
+                    last_modified_by="fixture",
+                    last_modified_at=now,
+                    source_mode="explicit",
+                    evidence_refs=(protected.id,),
+                ),
+            ),
+            edges=(
+                Edge(
+                    id="edge:secret",
+                    **{"from": "node:public", "to": "node:secret"},
+                    relation="VERIFIED_BY",
+                    status="active",
+                    created_by="fixture",
+                    created_at=now,
+                    last_modified_by="fixture",
+                    last_modified_at=now,
+                ),
+            ),
+        )
+    )
+    side = EvidenceSide(
+        label="secret",
+        claim="SECRET CLAIM",
+        evidence_refs=(protected.id,),
+        observed_at=now,
+        authors=("fixture",),
+        confidence=0.9,
+    )
+    runtime.case_store.put(
+        ReconciliationCase(
+            id="case:secret",
+            subject_ref="node:secret",
+            case_type="CODE_LAG",
+            affected_refs=("node:secret",),
+            evidence_sides=(side,),
+            detector_id="fixture",
+            fingerprint="a" * 64,
+            created_at=now,
+        )
+    )
+    evidence_path = repo / ".intent/evidence/evidence.jsonl"
+    evidence_path.write_text(
+        public.model_dump_json()
+        + "\n"
+        + protected.model_copy(update={"acl": ("other",)}).model_dump_json()
+        + "\n",
+        encoding="utf-8",
+    )
+
+    status = run_intent(repo, "status", "--format", "json")
+    output = repo / "rendered"
+    rendered = run_intent(repo, "render", "--output", str(output), "--format", "json")
+    views = (output / "graph.md").read_text(encoding="utf-8") + (output / "graph.mmd").read_text(
+        encoding="utf-8"
+    )
+
+    assert status.returncode == 0 and rendered.returncode == 0
+    assert status.json()["node_count"] == 1
+    assert status.json()["edge_count"] == 0
+    assert status.json()["open_case_count"] == 0
+    assert "SECRET" not in status.stdout + rendered.stdout + views
+    assert "node:secret" not in status.stdout + rendered.stdout + views
+    assert "edge:secret" not in status.stdout + rendered.stdout + views
+    assert "case:secret" not in status.stdout + rendered.stdout + views
+    assert "node:public" in views and "Public label" in views
+
+
 def test_reconcile_resolve_records_a_changeset_before_case_transition(tmp_path: Path) -> None:
     """Catch direct YAML edits that resolve a case without a graph ChangeSet audit."""
     repo = init_git_repo(tmp_path)

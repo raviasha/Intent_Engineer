@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+import intent_engineering.storage.yaml.graph_store as yaml_graph_store
 from intent_engineering.core.models import ReconciliationStatus, ResolutionAction
 from intent_engineering.reconcile import LocalResolutionService
 from intent_engineering.reconcile.service import transition_case
@@ -61,22 +62,43 @@ def test_system_exit_after_each_durable_resolution_stage_recovers_exact_preimage
         case, graph_version, ResolutionAction.UPDATE_IMPLEMENTATION, canonical
     )
     if stage == "graph":
-        monkeypatch.setattr(
-            service._graph_store, "apply", lambda _: (_ for _ in ()).throw(SystemExit())
-        )
+        original_write = yaml_graph_store.atomic_write_bytes
+
+        def interrupt_after_graph_write(path: Path, content: bytes) -> None:
+            original_write(path, content)
+            raise SystemExit()
+
+        monkeypatch.setattr(yaml_graph_store, "atomic_write_bytes", interrupt_after_graph_write)
     elif stage == "history":
+        original_append = service._graph_store._history_store.append
+
+        def interrupt_after_history_write(changeset: object) -> object:
+            original_append(changeset)  # type: ignore[arg-type]
+            raise SystemExit()
+
         monkeypatch.setattr(
             service._graph_store._history_store,
             "append",
-            lambda _: (_ for _ in ()).throw(SystemExit()),
+            interrupt_after_history_write,
         )
     else:
-        monkeypatch.setattr(
-            service._case_store, "put", lambda _: (_ for _ in ()).throw(SystemExit())
-        )
+        original_put = service._case_store.put
+
+        def interrupt_after_case_write(updated: object) -> bool:
+            original_put(updated)  # type: ignore[arg-type]
+            raise SystemExit()
+
+        monkeypatch.setattr(service._case_store, "put", interrupt_after_case_write)
     with pytest.raises(SystemExit):
         service.resolve("case-1", ResolutionAction.UPDATE_IMPLEMENTATION, approve=approval)
     assert service._journal_path().exists()
+    target = {
+        "graph": service._graph_store.path,
+        "history": service._graph_store._history_store.path,
+        "case": service._case_store.path,
+    }[stage]
+    assert target.exists()
+    assert target.read_bytes() != before[target]
     fresh = LocalResolutionService(
         YamlGraphStore(tmp_path / "graph.yaml", history_path=tmp_path / "history.jsonl"),
         JsonlEvidenceStore(tmp_path / "evidence.jsonl"),
@@ -103,14 +125,20 @@ def test_system_exit_during_preview_case_append_recovers_exact_preimage(
     def interrupt(case: object) -> bool:
         nonlocal calls
         calls += 1
+        result = original_put(case)  # type: ignore[arg-type]
         if calls == append_number:
             raise SystemExit()
-        return original_put(case)  # type: ignore[arg-type]
+        return result
 
     monkeypatch.setattr(service._case_store, "put", interrupt)
     with pytest.raises(SystemExit):
         service.resolve("case-1", ResolutionAction.UPDATE_IMPLEMENTATION)
     assert service._journal_path().exists()
+    durable_preview = JsonlCaseStore(service._case_store.path).get("case-1")
+    expected_status = (
+        ReconciliationStatus.PROPOSED if append_number == 1 else ReconciliationStatus.NEEDS_HUMAN
+    )
+    assert durable_preview.status is expected_status
     fresh = LocalResolutionService(
         YamlGraphStore(tmp_path / "graph.yaml", history_path=tmp_path / "history.jsonl"),
         JsonlEvidenceStore(tmp_path / "evidence.jsonl"),
