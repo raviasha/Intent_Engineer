@@ -210,3 +210,30 @@ Final commands:
 
 Results: Ruff clean; strict mypy clean across 8 modules; focused E2E `29
 passed in 9.08s`; full pytest `214 passed in 10.12s`.
+
+### Fix round 2 follow-up — doctor state containment
+
+Product/tests: `b12a1fa89cfdc5361fecc35e9779d255c90db663`.
+
+Doctor now identifies config and graph parsing independently and refuses any
+present evidence, case, history, or checkpoint path that is not a regular
+non-symlinked state file before constructing its corresponding store.
+
+RED:
+
+```text
+.venv/bin/python -m pytest tests/e2e/test_cli_local.py::test_doctor_rejects_symlinked_state_without_reading_its_target -v
+```
+
+Result: failed because a symlinked external evidence file was accepted as a
+healthy workspace. GREEN: the same test passed after no-follow kind validation.
+
+GREEN/static:
+
+```text
+.venv/bin/python -m pytest tests/e2e/test_cli_local.py -v
+.venv/bin/ruff check src/intent_engineering/core/policy/doctor.py tests/e2e/test_cli_local.py
+.venv/bin/mypy --strict src/intent_engineering/core/policy/doctor.py
+```
+
+Results: focused E2E `30 passed in 9.48s`; Ruff clean; strict mypy clean.
