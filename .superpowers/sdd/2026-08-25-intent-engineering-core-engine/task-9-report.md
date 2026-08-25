@@ -278,3 +278,43 @@ Final commands:
 Results: Ruff clean; strict mypy clean across 2 modules; focused recovery/E2E
 `33 passed in 10.02s`; full pytest `218 passed in 10.96s`; both help commands
 exited 0.
+
+## Fix round 3 — canonical approval and descriptor containment
+
+Product/tests: `6fd1bcc7659359ae45d0292c5caf690c3823f772`,
+`f461d008d56468ca2f90c1a023d408bc08fdcaea`,
+`a0e6ce60c413af38292f7da79d7abad6d7e311de`, and
+`b2ef591e15d206bbc82a33e276f2eb38a004b044`.
+
+- Preview and commit use the exact canonical ChangeSet reconstructed from the
+  durable NEEDS_HUMAN transition; approval hashes bind the complete object.
+- Preview lifecycle writes use the recovery journal; runtime assembly recovers
+  a pending journal before exposing stores.
+- DEFER and false-positive actions are terminal only from OPEN.
+- Doctor holds project, workspace, and required subdirectory descriptors and
+  reads all canonical files through `dir_fd` plus no-follow regular-file opens.
+  Checkpoints are fully typed `SyncCheckpoint` mappings.
+
+RED/GREEN:
+
+```text
+.venv/bin/python -m pytest tests/e2e/test_cli_local.py::test_doctor_holds_original_directory_after_parent_swap -q
+```
+
+The new deterministic swap assertion protects the review finding: after the
+evidence descriptor opens, the pathname is replaced with an external symlink.
+GREEN result: doctor remains healthy from the held original descriptor and does
+not create a lock in the external directory.
+
+Final commands:
+
+```text
+.venv/bin/python -m pytest -q
+.venv/bin/ruff check src/intent_engineering/cli src/intent_engineering/reconcile src/intent_engineering/core/policy/doctor.py tests/e2e/test_cli_local.py
+.venv/bin/mypy --strict src/intent_engineering/cli src/intent_engineering/reconcile src/intent_engineering/core/policy/doctor.py
+.venv/bin/intent --help
+.venv/bin/intent reconcile --help
+```
+
+Results: full pytest `219 passed in 10.89s`; Ruff clean; strict mypy clean
+across 9 modules; both help commands exited 0.
