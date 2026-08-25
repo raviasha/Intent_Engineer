@@ -247,6 +247,47 @@ class MutablePendingConnector:
         return ",".join(f"{item.external_object_id}@{item.external_version}" for item in discovered)
 
 
+class SharedProviderConnector:
+    """One of multiple connector instances observing the same provider evidence."""
+
+    connector_type = "shared"
+
+    def __init__(self, connector_id: str) -> None:
+        self.connector_id = connector_id
+        self.active_version = "v1"
+
+    async def discover(self, cursor: str | None) -> tuple[SourceObject, ...]:
+        if cursor == self.active_version:
+            return ()
+        return (
+            SourceObject(
+                external_object_id="fixture:shared",
+                external_version=self.active_version,
+                locator="shared.md",
+            ),
+        )
+
+    async def fetch(self, object_id: str, version: str) -> RawSourceObject:
+        return RawSourceObject(
+            connector_type=self.connector_type,
+            external_object_id=object_id,
+            external_version=version,
+            author="fixture@example.test",
+            observed_at=datetime(2026, 8, 25, tzinfo=UTC),
+            source_locator="shared.md",
+            content_hash=f"sha256:shared:{version}",
+            payload={},
+        )
+
+    def normalize(self, raw: RawSourceObject):  # type: ignore[no-untyped-def]
+        from intent_engineering.capture.base import normalize_raw_source
+
+        return normalize_raw_source(raw)
+
+    def next_checkpoint(self, discovered: Sequence[SourceObject]) -> str | None:
+        return self.active_version if discovered else None
+
+
 class SelectiveBrokenCheckpointStore:
     """Fail the checkpoint read for one connector while preserving another connector's store."""
 
@@ -490,12 +531,11 @@ async def test_changed_source_replays_pending_then_new_version_in_durable_order(
 @pytest.mark.anyio
 async def test_legacy_evidence_and_checkpoint_migrate_with_one_semantic_replay(tmp_path: Path) -> None:
     """A pre-boundary row is enriched without conflicting and an empty boundary rescans once."""
-    connector = MutablePendingConnector()
+    connector = FixtureConnector()
     reasoner = RecordingReasoner()
     harness = SyncHarness(tmp_path, (connector,), reasoner=reasoner)
     source = (await connector.discover(None))[0]
     legacy = connector.normalize(await connector.fetch(source.external_object_id, source.external_version))
-    assert legacy.ingested_by is None
     assert harness.evidence_store.put(legacy) is True
     harness.checkpoint_store.compare_and_set(
         connector.connector_id,
@@ -509,10 +549,33 @@ async def test_legacy_evidence_and_checkpoint_migrate_with_one_semantic_replay(t
 
     assert migrated.status is SyncRunStatus.SUCCESS
     assert (migrated.evidence_added, migrated.changes_applied) == (0, 1)
-    assert migrated.connectors["mutable"].checkpoint_advanced is True
+    assert migrated.connectors["markdown"].checkpoint_advanced is True
     assert reasoner.deltas[0].added == (legacy,)
     assert harness.evidence_store.get(legacy.id) == legacy
-    assert harness.checkpoint_store.get("mutable").consumed_evidence_ids == (legacy.id,)  # type: ignore[union-attr]
+    assert harness.checkpoint_store.get("markdown").consumed_evidence_ids == (legacy.id,)  # type: ignore[union-attr]
+    assert (repeated.evidence_added, repeated.changes_applied, repeated.cases_created) == (0, 0, 0)
+
+
+@pytest.mark.anyio
+async def test_overlapping_provider_instances_replay_and_consume_independently(tmp_path: Path) -> None:
+    left = SharedProviderConnector("left")
+    right = SharedProviderConnector("right")
+    reasoner = RecordingReasoner()
+    harness = SyncHarness(tmp_path, (left, right), reasoner=reasoner)
+
+    first = await harness.run()
+    repeated = await harness.run()
+
+    assert first.status is SyncRunStatus.SUCCESS
+    assert first.connectors["left"].evidence_added == 1
+    assert first.connectors["right"].evidence_added == 0
+    assert len(reasoner.deltas) == 2
+    assert reasoner.deltas[0].added == reasoner.deltas[1].added
+    evidence_id = reasoner.deltas[0].added[0].id
+    assert harness.checkpoint_store.get("left").consumed_evidence_ids == (evidence_id,)  # type: ignore[union-attr]
+    assert harness.checkpoint_store.get("right").consumed_evidence_ids == (evidence_id,)  # type: ignore[union-attr]
+    assert [item.sequence for item in harness.evidence_store.ledger("left")] == [1]
+    assert [item.sequence for item in harness.evidence_store.ledger("right")] == [1]
     assert (repeated.evidence_added, repeated.changes_applied, repeated.cases_created) == (0, 0, 0)
 
 

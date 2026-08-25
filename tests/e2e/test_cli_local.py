@@ -437,9 +437,10 @@ def test_acl_protected_evidence_is_indistinguishable_from_unknown(tmp_path: Path
     assert run_intent(repo, "init").returncode == 0
     assert run_intent(repo, "ingest").returncode == 0
     evidence_path = repo / ".intent/evidence/evidence.jsonl"
-    record = json.loads(evidence_path.read_text(encoding="utf-8"))
+    envelope = json.loads(evidence_path.read_text(encoding="utf-8"))
+    record = envelope["evidence"]
     record["acl"] = ["other"]
-    evidence_path.write_text(json.dumps(record) + "\n", encoding="utf-8")
+    evidence_path.write_text(json.dumps(envelope) + "\n", encoding="utf-8")
     result = run_intent(repo, "explain", record["id"], "--format", "json")
     assert result.returncode == 1
     assert result.stderr == "intent error: local reference was not found\n"
@@ -587,7 +588,7 @@ def test_reconcile_resolve_records_a_changeset_before_case_transition(tmp_path: 
     assert run_intent(repo, "ingest").returncode == 0
     evidence_id = json.loads(
         (repo / ".intent/evidence/evidence.jsonl").read_text(encoding="utf-8")
-    )["id"]
+    )["evidence"]["id"]
     case_file = repo / ".intent/reconciliation/cases.jsonl"
     case_file.write_text(
         """{\"affected_refs\":[],\"alternatives\":[],\"case_type\":\"CODE_LAG\",\"created_at\":\"2026-08-25T00:00:00Z\",\"detector_id\":\"test\",\"evidence_sides\":[{\"authors\":[\"tester\"],\"claim\":\"old\",\"confidence\":0.9,\"current\":true,\"evidence_refs\":[\"ev-1\"],\"label\":\"requirement\",\"observed_at\":\"2026-08-25T00:00:00Z\",\"source_mode\":\"explicit\"}],\"fingerprint\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"history\":[{\"actor\":\"tester\",\"at\":\"2026-08-25T00:00:00Z\",\"new\":\"proposed\",\"prior\":\"open\"},{\"actor\":\"tester\",\"at\":\"2026-08-25T00:00:00Z\",\"new\":\"needs_human\",\"prior\":\"proposed\"}],\"id\":\"case:test\",\"impact\":\"\",\"requires_human\":true,\"resolution\":null,\"resolved_by_changeset\":null,\"status\":\"needs_human\",\"subject_ref\":\"subject:test\"}\n""".replace(

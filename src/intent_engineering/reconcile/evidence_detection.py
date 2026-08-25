@@ -12,6 +12,7 @@ from pydantic import ConfigDict, Field, ValidationError
 
 from intent_engineering.core.models import (
     DriftObservation,
+    EvidenceIngestion,
     EvidenceRecord,
     EvidenceSide,
     Graph,
@@ -36,7 +37,7 @@ class _SideDeclaration(StrictModel):
     evidence_refs: tuple[str, ...]
     confidence: float = Field(ge=0.0, le=1.0)
     source_mode: SourceMode = SourceMode.EXPLICIT
-    current: bool = True
+    current: bool | None = None
     # Legacy metadata is parsed only so it can be deliberately ignored and replaced.
     authors: tuple[str, ...] = ()
     observed_at: datetime | None = None
@@ -153,6 +154,7 @@ def _resolve_side(
     side: _SideDeclaration,
     declaring_record: EvidenceRecord,
     records: Sequence[EvidenceRecord],
+    ingestions: Sequence[EvidenceIngestion],
     actor: str,
 ) -> _ResolvedSide | None:
     if not side.evidence_refs or len(side.evidence_refs) != len(set(side.evidence_refs)):
@@ -173,6 +175,9 @@ def _resolve_side(
     authors = tuple(sorted({record.author for record in resolved if record.author}))
     if not authors:
         return None
+    current = _records_are_current(tuple(resolved), ingestions)
+    if side.current is not None and side.current is not current:
+        return None
     return _ResolvedSide(
         side=EvidenceSide(
             label=side.label,
@@ -182,28 +187,57 @@ def _resolve_side(
             authors=authors,
             confidence=side.confidence,
             source_mode=side.source_mode,
-            current=side.current,
+            current=current,
         ),
         records=tuple(resolved),
     )
 
 
+def _records_are_current(
+    records: tuple[EvidenceRecord, ...],
+    ingestions: Sequence[EvidenceIngestion],
+) -> bool:
+    for record in records:
+        associations = tuple(item for item in ingestions if item.evidence.id == record.id)
+        if not associations:
+            return False
+        for association in associations:
+            if any(
+                item.connector_id == association.connector_id
+                and item.evidence.connector_type == record.connector_type
+                and item.evidence.external_object_id == record.external_object_id
+                and item.sequence > association.sequence
+                for item in ingestions
+            ):
+                return False
+    return True
+
+
 def _record_order(
     left: EvidenceRecord,
     right: EvidenceRecord,
-    append_positions: Mapping[str, int],
+    ingestions: Sequence[EvidenceIngestion],
 ) -> EvidenceOrder:
     if (
         left.connector_type == right.connector_type
         and left.external_object_id == right.external_object_id
     ):
-        left_position = append_positions[left.id]
-        right_position = append_positions[right.id]
-        if left_position < right_position:
-            return EvidenceOrder.BEFORE
-        if left_position > right_position:
-            return EvidenceOrder.AFTER
-        return EvidenceOrder.TIED
+        left_by_connector = {
+            item.connector_id: item.sequence for item in ingestions if item.evidence.id == left.id
+        }
+        right_by_connector = {
+            item.connector_id: item.sequence for item in ingestions if item.evidence.id == right.id
+        }
+        shared = set(left_by_connector) & set(right_by_connector)
+        orders = {
+            EvidenceOrder.BEFORE
+            if left_by_connector[connector_id] < right_by_connector[connector_id]
+            else EvidenceOrder.AFTER
+            if left_by_connector[connector_id] > right_by_connector[connector_id]
+            else EvidenceOrder.TIED
+            for connector_id in shared
+        }
+        return next(iter(orders)) if len(orders) == 1 else EvidenceOrder.UNKNOWN
     if left.observed_at < right.observed_at:
         return EvidenceOrder.BEFORE
     if left.observed_at > right.observed_at:
@@ -214,10 +248,10 @@ def _record_order(
 def _side_order(
     left: _ResolvedSide,
     right: _ResolvedSide,
-    append_positions: Mapping[str, int],
+    ingestions: Sequence[EvidenceIngestion],
 ) -> EvidenceOrder:
     orders = {
-        _record_order(left_record, right_record, append_positions)
+        _record_order(left_record, right_record, ingestions)
         for left_record in left.records
         for right_record in right.records
     }
@@ -235,6 +269,7 @@ def _declared_order(left: int, right: int) -> EvidenceOrder:
 def _input_from_record(
     declaring_record: EvidenceRecord,
     records: Sequence[EvidenceRecord],
+    ingestions: Sequence[EvidenceIngestion],
     graph: Graph,
     actor: str,
 ) -> DetectionInput | None:
@@ -257,7 +292,7 @@ def _input_from_record(
         if declared_side is None:
             resolved_sides[name] = None
             continue
-        resolved = _resolve_side(declared_side, declaring_record, records, actor)
+        resolved = _resolve_side(declared_side, declaring_record, records, ingestions, actor)
         if resolved is None:
             return None
         current_refs = set(resolved.side.evidence_refs)
@@ -265,7 +300,6 @@ def _input_from_record(
             return None
         side_evidence.append(current_refs)
         resolved_sides[name] = resolved
-    append_positions = {record.id: index for index, record in enumerate(records)}
     comparisons = {
         "requirement_implementation_order": ("requirement", "implementation"),
         "decision_requirement_order": ("decision", "requirement"),
@@ -279,7 +313,7 @@ def _input_from_record(
         right = resolved_sides[right_name]
         if left is None or right is None:
             continue
-        derived = _side_order(left, right, append_positions)
+        derived = _side_order(left, right, ingestions)
         left_version = getattr(declaration, f"{left_name}_version")
         right_version = getattr(declaration, f"{right_name}_version")
         if (
@@ -329,6 +363,7 @@ def detect_evidence_drift(
     records: Sequence[EvidenceRecord],
     graph: Graph,
     actor: str,
+    ingestions: Sequence[EvidenceIngestion] = (),
 ) -> tuple[DriftObservation, ...]:
     """Detect cases from a combined authorized run without trusting packet provenance."""
     by_id: dict[str, EvidenceRecord] = {}
@@ -340,7 +375,13 @@ def detect_evidence_drift(
     stable_records = tuple(by_id.values())
     candidates: list[DriftObservation] = []
     for record in sorted(stable_records, key=lambda item: item.id):
-        detection_input = _input_from_record(record, stable_records, graph, actor)
+        detection_input = _input_from_record(
+            record,
+            stable_records,
+            ingestions,
+            graph,
+            actor,
+        )
         if detection_input is not None:
             candidates.extend(detect_drift(detection_input))
     selected: dict[str, DriftObservation] = {}

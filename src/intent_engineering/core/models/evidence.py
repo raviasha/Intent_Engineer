@@ -5,9 +5,9 @@ from __future__ import annotations
 from collections.abc import Mapping
 from datetime import datetime
 from types import MappingProxyType
-from typing import cast
+from typing import Literal, cast
 
-from pydantic import ConfigDict, field_serializer, field_validator
+from pydantic import ConfigDict, Field, field_serializer, field_validator
 
 from intent_engineering.core.models._base import StrictModel
 
@@ -48,7 +48,6 @@ class EvidenceRecord(StrictModel):
 
     id: str
     connector_type: str
-    ingested_by: str | None = None
     external_object_id: str
     external_version: str
     author: str | None
@@ -77,6 +76,18 @@ class EvidenceRecord(StrictModel):
         )
 
 
+class EvidenceIngestion(StrictModel):
+    """One atomic connector-instance association in the durable evidence ledger."""
+
+    model_config = ConfigDict(frozen=True)
+
+    storage_schema_version: Literal[1] = 1
+    connector_id: str
+    sequence: int = Field(ge=1)
+    predecessor_id: str | None = None
+    evidence: EvidenceRecord
+
+
 class EvidenceDelta(StrictModel):
     """Evidence newly durable for a source plus prior version links."""
 
@@ -84,6 +95,7 @@ class EvidenceDelta(StrictModel):
 
     added: tuple[EvidenceRecord, ...]
     prior_versions: Mapping[str, str]
+    ingestions: tuple[EvidenceIngestion, ...] = ()
 
     @field_validator("prior_versions")
     @classmethod

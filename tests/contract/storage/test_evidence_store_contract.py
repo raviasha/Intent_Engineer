@@ -119,3 +119,68 @@ def test_store_instances_reject_conflicting_evidence_id_concurrently(tmp_path: P
     reloaded = JsonlEvidenceStore(path)
     assert reloaded.get(first.id) in (first, conflicting)
     assert len(reloaded.versions(first.external_object_id)) == 1
+
+
+def test_connector_instances_can_associate_overlapping_provider_evidence_independently(
+    tmp_path: Path,
+) -> None:
+    store = JsonlEvidenceStore(tmp_path / "evidence.jsonl")
+    record = evidence_record(connector_type="shared")
+    assert hasattr(store, "associate")
+    assert hasattr(store, "ledger")
+
+    assert store.associate("left", record) is True  # type: ignore[attr-defined]
+    assert store.associate("right", record) is False  # type: ignore[attr-defined]
+
+    assert tuple(item.evidence for item in store.ledger("left", connector_type="shared")) == (  # type: ignore[attr-defined]
+        record,
+    )
+    assert tuple(item.evidence for item in store.ledger("right", connector_type="shared")) == (  # type: ignore[attr-defined]
+        record,
+    )
+
+
+def test_predecessor_chains_are_scoped_by_connector_instance(tmp_path: Path) -> None:
+    store = JsonlEvidenceStore(tmp_path / "evidence.jsonl")
+    left_v1 = evidence_record(
+        id="ev-shared-v1",
+        connector_type="shared",
+        external_version="v1",
+        content_hash="sha256:v1",
+    )
+    left_v2 = evidence_record(
+        id="ev-shared-v2",
+        connector_type="shared",
+        external_version="v2",
+        content_hash="sha256:v2",
+    )
+    assert hasattr(store, "associate")
+    assert hasattr(store, "ledger")
+
+    store.associate("left", left_v1)  # type: ignore[attr-defined]
+    store.associate("right", left_v1)  # type: ignore[attr-defined]
+    store.associate("left", left_v2)  # type: ignore[attr-defined]
+    store.associate("right", left_v2)  # type: ignore[attr-defined]
+
+    left = store.ledger("left", connector_type="shared")  # type: ignore[attr-defined]
+    right = store.ledger("right", connector_type="shared")  # type: ignore[attr-defined]
+    assert [item.sequence for item in left] == [1, 2]
+    assert [item.sequence for item in right] == [1, 2]
+    assert left[1].predecessor_id == left_v1.id
+    assert right[1].predecessor_id == left_v1.id
+
+
+def test_custom_legacy_connector_requires_explicit_association(tmp_path: Path) -> None:
+    store = JsonlEvidenceStore(tmp_path / "evidence.jsonl")
+    record = evidence_record(connector_type="shared")
+    store.put(record)
+    assert hasattr(store, "ledger")
+
+    with pytest.raises(ValueError, match="explicit legacy association required"):
+        store.ledger("custom-instance", connector_type="shared")  # type: ignore[attr-defined]
+
+    assert store.associate("custom-instance", record) is False  # type: ignore[attr-defined]
+    assert tuple(
+        item.evidence
+        for item in store.ledger("custom-instance", connector_type="shared")  # type: ignore[attr-defined]
+    ) == (record,)

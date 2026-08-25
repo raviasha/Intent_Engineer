@@ -18,6 +18,7 @@ from pydantic import ConfigDict, Field, ValidationError
 from intent_engineering.core.graph.applier import apply_changeset_with_case_effects
 from intent_engineering.core.models import (
     ChangeSet,
+    EvidenceIngestion,
     EvidenceRecord,
     Graph,
     ProjectConfig,
@@ -31,6 +32,7 @@ from intent_engineering.storage.jsonl.case_store import (
     CaseStoreError,
     parse_case_versions,
 )
+from intent_engineering.storage.jsonl.evidence_store import parse_evidence_lines
 from intent_engineering.storage.secure import (
     SecureDirectory,
     SecureFile,
@@ -206,11 +208,10 @@ def _parse_graph(content: bytes | None) -> Graph:
     return parse_graph(content)
 
 
-def _parse_evidence(content: bytes | None) -> tuple[EvidenceRecord, ...]:
-    return tuple(
-        EvidenceRecord.model_validate(value)
-        for value in _load_json_lines(content, allow_blank=True)
-    )
+def _parse_evidence(
+    content: bytes | None,
+) -> tuple[tuple[EvidenceRecord, ...], tuple[EvidenceIngestion, ...], tuple[str, ...]]:
+    return parse_evidence_lines(content)
 
 
 def _parse_history(content: bytes | None) -> tuple[ChangeSet, ...]:
@@ -256,12 +257,19 @@ def _expected_evidence_id(record: EvidenceRecord) -> str:
     return f"evidence:sha256:{sha256(material.encode('utf-8')).hexdigest()}"
 
 
-def _evidence_diagnostics(records: Sequence[EvidenceRecord]) -> list[ValidationDiagnostic]:
+def _evidence_diagnostics(
+    records: Sequence[EvidenceRecord],
+    legacy_ids: Sequence[str] = (),
+) -> list[ValidationDiagnostic]:
     diagnostics: list[ValidationDiagnostic] = []
     by_id: dict[str, EvidenceRecord] = {}
     by_version: dict[tuple[str, str, str], EvidenceRecord] = {}
     positions: dict[str, int] = {}
     for position, record in enumerate(records):
+        if record.id in legacy_ids and record.connector_type not in {"markdown", "git"}:
+            diagnostics.append(
+                _diagnostic("evidence.legacy_association_ambiguous", "evidence")
+            )
         previous_id = by_id.get(record.id)
         if previous_id is not None:
             diagnostics.append(
@@ -517,17 +525,35 @@ def _parse_markdown_cursor(cursor: str) -> dict[str, str]:
 def _checkpoint_diagnostics(
     checkpoints: Mapping[str, SyncCheckpoint],
     evidence: Sequence[EvidenceRecord],
+    ingestions: Sequence[EvidenceIngestion],
+    legacy_ids: Sequence[str],
 ) -> list[ValidationDiagnostic]:
     diagnostics: list[ValidationDiagnostic] = []
     identities = {
         (record.connector_type, record.external_object_id, record.external_version)
         for record in evidence
     }
+    evidence_ids = {record.id for record in evidence}
+    associations = {(item.connector_id, item.evidence.id) for item in ingestions}
+    associations.update(
+        (record.connector_type, record.id)
+        for record in evidence
+        if record.id in legacy_ids and record.connector_type in {"markdown", "git"}
+    )
     for connector_id in sorted(checkpoints):
         checkpoint = checkpoints[connector_id]
         if connector_id not in {"markdown", "git"}:
             diagnostics.append(_diagnostic("checkpoint.connector_unknown", "checkpoints"))
             continue
+        for evidence_id in checkpoint.consumed_evidence_ids:
+            if evidence_id not in evidence_ids:
+                diagnostics.append(
+                    _diagnostic("checkpoint.consumed_evidence_missing", "checkpoints")
+                )
+            elif (connector_id, evidence_id) not in associations:
+                diagnostics.append(
+                    _diagnostic("checkpoint.consumed_evidence_foreign", "checkpoints")
+                )
         cursor = checkpoint.cursor
         if cursor is None:
             continue
@@ -663,6 +689,8 @@ class WorkspaceValidationService:
 
         graph: Graph | None = None
         evidence: tuple[EvidenceRecord, ...] | None = None
+        ingestions: tuple[EvidenceIngestion, ...] | None = None
+        legacy_ids: tuple[str, ...] = ()
         cases: tuple[ReconciliationCase, ...] | None = None
         history: tuple[ChangeSet, ...] | None = None
         checkpoints: dict[str, SyncCheckpoint] | None = None
@@ -671,7 +699,7 @@ class WorkspaceValidationService:
         except (OSError, UnicodeError, TypeError, ValueError, yaml.YAMLError):
             diagnostics.append(_diagnostic("graph.invalid", "graph"))
         try:
-            evidence = _parse_evidence(captured.content["evidence"])
+            evidence, ingestions, legacy_ids = _parse_evidence(captured.content["evidence"])
         except (UnicodeError, json.JSONDecodeError, ValidationError, TypeError, ValueError):
             diagnostics.append(_diagnostic("evidence.invalid", "evidence"))
         try:
@@ -695,7 +723,7 @@ class WorkspaceValidationService:
             diagnostics.append(_diagnostic("checkpoints.invalid", "checkpoints"))
 
         if evidence is not None:
-            diagnostics.extend(_evidence_diagnostics(evidence))
+            diagnostics.extend(_evidence_diagnostics(evidence, legacy_ids))
         if graph is not None and evidence is not None:
             evidence_by_id = {record.id: record for record in evidence}
             diagnostics.extend(_graph_diagnostics(graph, evidence_by_id))
@@ -703,8 +731,10 @@ class WorkspaceValidationService:
                 diagnostics.extend(_history_diagnostics(history, graph, evidence_by_id, cases or ()))
             if cases is not None and history is not None:
                 diagnostics.extend(_case_diagnostics(cases, graph, evidence_by_id, history))
-        if checkpoints is not None and evidence is not None:
-            diagnostics.extend(_checkpoint_diagnostics(checkpoints, evidence))
+        if checkpoints is not None and evidence is not None and ingestions is not None:
+            diagnostics.extend(
+                _checkpoint_diagnostics(checkpoints, evidence, ingestions, legacy_ids)
+            )
         return _report(diagnostics, graph)
 
 

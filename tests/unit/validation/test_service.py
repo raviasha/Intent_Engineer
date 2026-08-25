@@ -270,6 +270,107 @@ def test_checkpoint_structure_connector_and_cursor_consistency(
     assert expected in _codes(seeded.root)
 
 
+def test_checkpoint_consumption_boundary_rejects_missing_or_foreign_associations(
+    tmp_path: Path,
+) -> None:
+    missing_root = tmp_path / "missing"
+    missing_root.mkdir()
+    missing = _seed(missing_root)
+    checkpoint_path = missing.root / ".intent/cache/checkpoints.yaml"
+    checkpoint_path.write_text(
+        yaml.safe_dump(
+            {
+                "checkpoints": {
+                    "markdown": {
+                        "connector_id": "markdown",
+                        "cursor": None,
+                        "committed_at": NOW.isoformat(),
+                        "consumed_evidence_ids": ["evidence:missing"],
+                    }
+                }
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    assert "checkpoint.consumed_evidence_missing" in _codes(missing.root)
+
+    foreign_root = tmp_path / "foreign"
+    foreign_root.mkdir()
+    foreign_project = foreign_root / "project"
+    foreign_project.mkdir()
+    initialize_project(foreign_project)
+    runtime = load_runtime(foreign_project)
+    evidence = _record()
+    assert hasattr(runtime.evidence_store, "associate")
+    runtime.evidence_store.associate("other", evidence)  # type: ignore[attr-defined]
+    checkpoint_path = foreign_project / ".intent/cache/checkpoints.yaml"
+    checkpoint_path.write_text(
+        yaml.safe_dump(
+            {
+                "checkpoints": {
+                    "markdown": {
+                        "connector_id": "markdown",
+                        "cursor": None,
+                        "committed_at": NOW.isoformat(),
+                            "consumed_evidence_ids": [evidence.id],
+                    }
+                }
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    assert "checkpoint.consumed_evidence_foreign" in _codes(foreign_project)
+
+
+def test_custom_legacy_evidence_requires_an_explicit_association_diagnostic(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "project"
+    root.mkdir()
+    initialize_project(root)
+    runtime = load_runtime(root)
+    base = _record()
+    custom = normalize_raw_source(
+        RawSourceObject(
+            connector_type="shared",
+            external_object_id=base.external_object_id,
+            external_version=base.external_version,
+            author=base.author,
+            observed_at=base.observed_at,
+            source_locator=base.source_locator,
+            content_hash=base.content_hash,
+            payload=base.payload,
+        )
+    )
+    runtime.evidence_store.put(custom)
+
+    assert "evidence.legacy_association_ambiguous" in _codes(root)
+
+
+@pytest.mark.parametrize("mutation", ["sequence", "duplicate"])
+def test_corrupt_or_duplicate_ingestion_envelopes_are_redacted(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    root = tmp_path / "project"
+    root.mkdir()
+    initialize_project(root)
+    runtime = load_runtime(root)
+    runtime.evidence_store.associate("markdown", _record())  # type: ignore[attr-defined]
+    evidence_path = root / ".intent/evidence/evidence.jsonl"
+    envelope = json.loads(evidence_path.read_text(encoding="utf-8"))
+    if mutation == "sequence":
+        envelope["sequence"] = 2
+        evidence_path.write_text(json.dumps(envelope) + "\n", encoding="utf-8")
+    else:
+        serialized = json.dumps(envelope) + "\n"
+        evidence_path.write_text(serialized + serialized, encoding="utf-8")
+
+    assert _codes(root) == ("evidence.invalid",)
+
+
 def test_prepared_transaction_is_recovered_before_validation_parses_targets(
     tmp_path: Path,
 ) -> None:

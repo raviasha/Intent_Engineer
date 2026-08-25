@@ -9,6 +9,7 @@ import pytest
 from intent_engineering.cli.runtime import _detect_cases, _FrontMatterReasoner
 from intent_engineering.core.models import (
     EvidenceDelta,
+    EvidenceIngestion,
     EvidenceRecord,
     Graph,
     Node,
@@ -32,6 +33,21 @@ def _record(
         payload=payload,
         acl=acl,
     )  # type: ignore[arg-type]
+
+
+def _detection_delta(*records: EvidenceRecord) -> EvidenceDelta:
+    sequences: dict[str, int] = {}
+    ingestions: list[EvidenceIngestion] = []
+    for record in records:
+        sequences[record.connector_type] = sequences.get(record.connector_type, 0) + 1
+        ingestions.append(
+            EvidenceIngestion(
+                connector_id=record.connector_type,
+                sequence=sequences[record.connector_type],
+                evidence=record,
+            )
+        )
+    return EvidenceDelta(added=records, prior_versions={}, ingestions=tuple(ingestions))
 
 
 def _assertion(ref: str) -> dict[str, object]:
@@ -217,7 +233,7 @@ def test_detector_requires_independent_authorized_evidence_and_connected_graph()
     assert (
         len(
             _detect_cases(
-                EvidenceDelta(added=(current, implementation), prior_versions={}),
+                _detection_delta(current, implementation),
                 graph,
                 "local",
             )
@@ -226,10 +242,7 @@ def test_detector_requires_independent_authorized_evidence_and_connected_graph()
     )
     assert (
         _detect_cases(
-            EvidenceDelta(
-                added=(_record(payload, ("other",)), implementation),
-                prior_versions={},
-            ),
+            _detection_delta(_record(payload, ("other",)), implementation),
             graph,
             "local",
         )
@@ -240,7 +253,7 @@ def test_detector_requires_independent_authorized_evidence_and_connected_graph()
     }
     assert (
         _detect_cases(
-            EvidenceDelta(added=(_record(stale), implementation), prior_versions={}),
+            _detection_delta(_record(stale), implementation),
             graph,
             "local",
         )

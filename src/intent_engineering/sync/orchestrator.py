@@ -116,21 +116,30 @@ class SyncOrchestrator:
             progress = _ConnectorProgress()
             try:
                 prior = self._checkpoint_store.get(connector.connector_id)
+                connector_type = self._connector_type(connector)
+                self._evidence_store.migrate_legacy(connector.connector_id, connector_type)
                 consumed_ids = set(prior.consumed_evidence_ids if prior is not None else ())
-                records = [
-                    record
-                    for record in self._evidence_store.for_connector(connector.connector_id)
-                    if record.id not in consumed_ids
-                ]
-                record_ids = {record.id for record in records}
-                prior_versions: dict[str, str] = {}
-                for record in records:
-                    predecessor = self._predecessor(
-                        record,
-                        self._evidence_store.versions(record.external_object_id),
+                connector_ledger = tuple(
+                    self._evidence_store.ledger(
+                        connector.connector_id,
+                        connector_type=connector_type,
                     )
-                    if predecessor is not None:
-                        prior_versions[record.external_object_id] = predecessor.id
+                )
+                associated_ids = {item.evidence.id for item in connector_ledger}
+                if consumed_ids - associated_ids:
+                    raise ValueError("checkpoint consumption association is invalid")
+                ingestions = [
+                    item
+                    for item in connector_ledger
+                    if item.evidence.id not in consumed_ids
+                ]
+                records = [item.evidence for item in ingestions]
+                record_ids = {record.id for record in records}
+                prior_versions = {
+                    item.evidence.external_object_id: item.predecessor_id
+                    for item in ingestions
+                    if item.predecessor_id is not None
+                }
                 discovered = await connector.discover(prior.cursor if prior is not None else None)
                 for source_object in discovered:
                     raw = await connector.fetch(
@@ -138,19 +147,29 @@ class SyncOrchestrator:
                         source_object.external_version,
                     )
                     record = connector.normalize(raw)
-                    if record.ingested_by not in (None, connector.connector_id):
-                        raise ValueError("evidence ingestion boundary mismatch")
-                    if record.ingested_by is None:
-                        record = record.model_copy(update={"ingested_by": connector.connector_id})
-                    predecessor = self._persist_evidence(record, progress)
-                    if predecessor is not None:
-                        prior_versions[record.external_object_id] = predecessor.id
-                    if record.id not in record_ids:
+                    if record.connector_type != connector_type:
+                        raise ValueError("connector evidence type mismatch")
+                    self._persist_evidence(connector.connector_id, record, progress)
+                    ingestion = next(
+                        item
+                        for item in reversed(
+                            self._evidence_store.ledger(
+                                connector.connector_id,
+                                connector_type=connector_type,
+                            )
+                        )
+                        if item.evidence.id == record.id
+                    )
+                    if ingestion.predecessor_id is not None:
+                        prior_versions[record.external_object_id] = ingestion.predecessor_id
+                    if record.id not in consumed_ids and record.id not in record_ids:
                         records.append(record)
+                        ingestions.append(ingestion)
                         record_ids.add(record.id)
                 delta = EvidenceDelta(
                     added=tuple(records),
                     prior_versions=prior_versions,
+                    ingestions=tuple(ingestions),
                 )
                 pending.append(
                     _PendingConnector(
@@ -260,26 +279,20 @@ class SyncOrchestrator:
 
     def _persist_evidence(
         self,
+        connector_id: str,
         record: EvidenceRecord,
         progress: _ConnectorProgress,
-    ) -> EvidenceRecord | None:
-        """Persist one normalized record immediately and return its durable predecessor."""
-        versions = self._evidence_store.versions(record.external_object_id)
-        predecessor = self._predecessor(record, versions)
-        if self._evidence_store.put(record):
+    ) -> None:
+        """Persist one atomic connector association and count only new evidence."""
+        if self._evidence_store.associate(connector_id, record):
             progress.evidence_added += 1
-        return predecessor
 
     @staticmethod
-    def _predecessor(
-        record: EvidenceRecord,
-        versions: Sequence[EvidenceRecord],
-    ) -> EvidenceRecord | None:
-        """Return the immediate durable predecessor, including when retrying an existing row."""
-        for index, version in enumerate(versions):
-            if version.id == record.id:
-                return versions[index - 1] if index else None
-        return versions[-1] if versions else None
+    def _connector_type(connector: Connector) -> str:
+        connector_type = getattr(connector, "connector_type", connector.connector_id)
+        if not isinstance(connector_type, str) or not connector_type:
+            raise ValueError("connector type must be a non-empty string")
+        return connector_type
 
     def _apply_reasoning(self, delta: EvidenceDelta, progress: _ConnectorProgress) -> None:
         """Reason and apply one connector's graph groups before combined detection."""
@@ -306,7 +319,12 @@ class SyncOrchestrator:
                 if previous is not None and previous != evidence_id:
                     raise ValueError("ambiguous combined evidence predecessor")
                 prior_versions[object_id] = evidence_id
-        return EvidenceDelta(added=records, prior_versions=prior_versions)
+        ingestions = tuple(item for pending in items for item in pending.delta.ingestions)
+        return EvidenceDelta(
+            added=records,
+            prior_versions=prior_versions,
+            ingestions=ingestions,
+        )
 
     def _apply_detected_cases(
         self,

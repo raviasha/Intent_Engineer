@@ -21,6 +21,7 @@ from intent_engineering.core.models.enums import (
 from intent_engineering.core.models.epistemic import ConfidenceChange, EpistemicState
 from intent_engineering.core.models.evidence import (
     EvidenceDelta,
+    EvidenceIngestion,
     EvidenceRecord,
     EvidenceRef,
     JsonValue,
@@ -51,6 +52,7 @@ __all__ = [
     "EdgeUpdate",
     "EpistemicState",
     "EvidenceDelta",
+    "EvidenceIngestion",
     "EvidenceRecord",
     "EvidenceRef",
     "EvidenceSide",

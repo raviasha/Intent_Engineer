@@ -74,18 +74,6 @@
       "title": "Id",
       "type": "string"
     },
-    "ingested_by": {
-      "anyOf": [
-        {
-          "type": "string"
-        },
-        {
-          "type": "null"
-        }
-      ],
-      "default": null,
-      "title": "Ingested By"
-    },
     "observed_at": {
       "format": "date-time",
       "title": "Observed At",

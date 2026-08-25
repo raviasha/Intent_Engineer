@@ -62,7 +62,7 @@ def _front_matter(content: str) -> Mapping[str, Any] | None:
 
 def _detect_cases(delta: EvidenceDelta, graph: Graph, actor: str) -> Sequence[DriftObservation]:
     """Resolve combined-run fixture declarations against evidence and final graph state."""
-    return detect_evidence_drift(delta.added, graph, actor)
+    return detect_evidence_drift(delta.added, graph, actor, delta.ingestions)
 
 
 class _FrontMatterReasoner(DeterministicReasoner):

@@ -116,7 +116,7 @@ class ImplementationConnector:
 
 
 def _detect(delta, graph):  # type: ignore[no-untyped-def]
-    return detect_evidence_drift(delta.added, graph, "fixture")
+    return detect_evidence_drift(delta.added, graph, "fixture", delta.ingestions)
 
 
 @pytest.mark.anyio

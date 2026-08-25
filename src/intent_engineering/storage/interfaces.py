@@ -6,6 +6,7 @@ from typing import Protocol
 
 from intent_engineering.core.models import (
     ChangeSet,
+    EvidenceIngestion,
     EvidenceRecord,
     Graph,
     ReconciliationCase,
@@ -36,6 +37,9 @@ class EvidenceStore(Protocol):
     def put(self, record: EvidenceRecord) -> bool:
         raise NotImplementedError
 
+    def associate(self, connector_id: str, record: EvidenceRecord) -> bool:
+        raise NotImplementedError
+
     def get(self, evidence_id: str) -> EvidenceRecord:
         raise NotImplementedError
 
@@ -43,6 +47,17 @@ class EvidenceStore(Protocol):
         raise NotImplementedError
 
     def for_connector(self, connector_id: str) -> Sequence[EvidenceRecord]:
+        raise NotImplementedError
+
+    def ledger(
+        self,
+        connector_id: str,
+        *,
+        connector_type: str | None = None,
+    ) -> Sequence[EvidenceIngestion]:
+        raise NotImplementedError
+
+    def migrate_legacy(self, connector_id: str, connector_type: str) -> None:
         raise NotImplementedError
 
 
