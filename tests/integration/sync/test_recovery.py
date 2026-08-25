@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+import yaml  # type: ignore[import-untyped]
 
 from intent_engineering.capture.base import RawSourceObject, SourceObject
 from intent_engineering.core.models import (
@@ -577,6 +578,113 @@ async def test_overlapping_provider_instances_replay_and_consume_independently(t
     assert [item.sequence for item in harness.evidence_store.ledger("left")] == [1]
     assert [item.sequence for item in harness.evidence_store.ledger("right")] == [1]
     assert (repeated.evidence_added, repeated.changes_applied, repeated.cases_created) == (0, 0, 0)
+
+
+@pytest.mark.anyio
+async def test_divergent_provider_instances_advance_three_versions_in_combined_runs(
+    tmp_path: Path,
+) -> None:
+    left = SharedProviderConnector("left")
+    right = SharedProviderConnector("right")
+    harness = SyncHarness(tmp_path, (left, right), reasoner=RecordingReasoner())
+
+    first = await harness.run()
+    left.active_version, right.active_version = "left-v2", "right-v2"
+    second = await harness.run()
+    left.active_version, right.active_version = "left-v3", "right-v3"
+    third = await harness.run()
+    repeated = await harness.run()
+
+    assert all(item.status is SyncRunStatus.SUCCESS for item in (first, second, third, repeated))
+    assert [item.evidence.external_version for item in harness.evidence_store.ledger("left")] == [
+        "v1",
+        "left-v2",
+        "left-v3",
+    ]
+    assert [item.evidence.external_version for item in harness.evidence_store.ledger("right")] == [
+        "v1",
+        "right-v2",
+        "right-v3",
+    ]
+    assert harness.evidence_store.ledger("left")[-1].predecessor_id != (
+        harness.evidence_store.ledger("right")[-1].predecessor_id
+    )
+    assert all(third.connectors[item].checkpoint_advanced for item in ("left", "right"))
+    assert (repeated.evidence_added, repeated.changes_applied, repeated.cases_created) == (0, 0, 0)
+    assert all(not repeated.connectors[item].checkpoint_advanced for item in ("left", "right"))
+
+
+async def _three_version_checkpoint_harness(
+    tmp_path: Path,
+) -> tuple[SharedProviderConnector, RecordingReasoner, SyncHarness]:
+    connector = SharedProviderConnector("prefix")
+    reasoner = RecordingReasoner()
+    harness = SyncHarness(tmp_path, (connector,), reasoner=reasoner)
+    await harness.run()
+    connector.active_version = "v2"
+    await harness.run()
+    connector.active_version = "v3"
+    await harness.run()
+    return connector, reasoner, harness
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("kind", ["missing", "skipped", "reordered"])
+async def test_runtime_rejects_non_prefix_consumption_without_mutation(
+    tmp_path: Path,
+    kind: str,
+) -> None:
+    _connector, reasoner, harness = await _three_version_checkpoint_harness(tmp_path)
+    checkpoint = harness.checkpoint_store.get("prefix")
+    assert checkpoint is not None
+    ids = tuple(item.evidence.id for item in harness.evidence_store.ledger("prefix"))
+    invalid = {
+        "missing": (ids[0], "evidence:missing"),
+        "skipped": (ids[0], ids[2]),
+        "reordered": (ids[1], ids[0]),
+    }[kind]
+    payload = checkpoint.model_dump(mode="json")
+    payload["consumed_evidence_ids"] = list(invalid)
+    harness.checkpoint_path.write_text(
+        yaml.safe_dump({"checkpoints": {"prefix": payload}}, sort_keys=True),
+        encoding="utf-8",
+    )
+    graph_before = harness.graph_path.read_bytes()
+    checkpoint_before = harness.checkpoint_path.read_bytes()
+    case_before = harness.case_store.list()
+    delta_count = len(reasoner.deltas)
+
+    result = await harness.run()
+
+    assert result.status is SyncRunStatus.FAILED
+    assert result.connectors["prefix"].redacted_error == "connector failed"
+    assert harness.graph_path.read_bytes() == graph_before
+    assert harness.checkpoint_path.read_bytes() == checkpoint_before
+    assert harness.case_store.list() == case_before
+    assert len(reasoner.deltas) == delta_count
+
+
+@pytest.mark.anyio
+async def test_runtime_accepts_exact_consumed_prefix_and_replays_only_suffix(tmp_path: Path) -> None:
+    _connector, reasoner, harness = await _three_version_checkpoint_harness(tmp_path)
+    checkpoint = harness.checkpoint_store.get("prefix")
+    assert checkpoint is not None
+    ledger = harness.evidence_store.ledger("prefix")
+    payload = checkpoint.model_dump(mode="json")
+    payload["consumed_evidence_ids"] = [ledger[0].evidence.id, ledger[1].evidence.id]
+    harness.checkpoint_path.write_text(
+        yaml.safe_dump({"checkpoints": {"prefix": payload}}, sort_keys=True),
+        encoding="utf-8",
+    )
+
+    result = await harness.run()
+
+    assert result.status is SyncRunStatus.SUCCESS
+    assert result.connectors["prefix"].checkpoint_advanced is True
+    assert reasoner.deltas[-1].added == (ledger[2].evidence,)
+    assert harness.checkpoint_store.get("prefix").consumed_evidence_ids == tuple(  # type: ignore[union-attr]
+        item.evidence.id for item in ledger
+    )
 
 
 @pytest.mark.anyio

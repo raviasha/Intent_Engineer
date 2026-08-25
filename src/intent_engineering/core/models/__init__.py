@@ -25,6 +25,7 @@ from intent_engineering.core.models.evidence import (
     EvidenceRecord,
     EvidenceRef,
     JsonValue,
+    is_exact_consumed_prefix,
 )
 from intent_engineering.core.models.graph import Confidence, Edge, Graph, Node, TypeRegistry
 from intent_engineering.core.models.implementation import ImplementationClaim
@@ -74,5 +75,6 @@ __all__ = [
     "SourceMode",
     "SyncCheckpoint",
     "TypeRegistry",
+    "is_exact_consumed_prefix",
     "is_nonterminal_case_status",
 ]

@@ -21,6 +21,7 @@ from intent_engineering.core.models import (
     Graph,
     ReconciliationCase,
     SyncCheckpoint,
+    is_exact_consumed_prefix,
 )
 from intent_engineering.extract.base import SemanticReasoner
 from intent_engineering.storage.executor import LocalChangeSetExecutor
@@ -125,8 +126,11 @@ class SyncOrchestrator:
                         connector_type=connector_type,
                     )
                 )
-                associated_ids = {item.evidence.id for item in connector_ledger}
-                if consumed_ids - associated_ids:
+                ledger_ids = tuple(item.evidence.id for item in connector_ledger)
+                if not is_exact_consumed_prefix(
+                    prior.consumed_evidence_ids if prior is not None else (),
+                    ledger_ids,
+                ):
                     raise ValueError("checkpoint consumption association is invalid")
                 ingestions = [
                     item
@@ -312,17 +316,10 @@ class SyncOrchestrator:
     @staticmethod
     def _combined_delta(items: Sequence[_PendingConnector]) -> EvidenceDelta:
         records = tuple(record for item in items for record in item.delta.added)
-        prior_versions: dict[str, str] = {}
-        for item in items:
-            for object_id, evidence_id in item.delta.prior_versions.items():
-                previous = prior_versions.get(object_id)
-                if previous is not None and previous != evidence_id:
-                    raise ValueError("ambiguous combined evidence predecessor")
-                prior_versions[object_id] = evidence_id
         ingestions = tuple(item for pending in items for item in pending.delta.ingestions)
         return EvidenceDelta(
             added=records,
-            prior_versions=prior_versions,
+            prior_versions={},
             ingestions=ingestions,
         )
 

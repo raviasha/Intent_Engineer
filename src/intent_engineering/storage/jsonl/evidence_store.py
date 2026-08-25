@@ -11,6 +11,7 @@ from pydantic import ValidationError
 
 from intent_engineering.core.models import EvidenceIngestion, EvidenceRecord
 from intent_engineering.storage._atomic import append_durable_line, same_path_lock
+from intent_engineering.storage.jsonl.strict import loads_strict_object
 from intent_engineering.storage.secure import SecureFile, coerce_secure_file
 
 
@@ -53,9 +54,7 @@ def parse_evidence_lines(
         if not line.strip():
             continue
         try:
-            payload = json.loads(line)
-            if not isinstance(payload, dict):
-                raise TypeError("evidence row must be an object")
+            payload = loads_strict_object(line)
             if "storage_schema_version" in payload:
                 ingestion = EvidenceIngestion.model_validate(payload)
                 record = ingestion.evidence

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from datetime import datetime
 from types import MappingProxyType
 from typing import Literal, cast
@@ -79,13 +79,21 @@ class EvidenceRecord(StrictModel):
 class EvidenceIngestion(StrictModel):
     """One atomic connector-instance association in the durable evidence ledger."""
 
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(frozen=True, strict=True)
 
     storage_schema_version: Literal[1] = 1
-    connector_id: str
+    connector_id: str = Field(min_length=1, pattern=r".*\S.*")
     sequence: int = Field(ge=1)
     predecessor_id: str | None = None
     evidence: EvidenceRecord
+
+    @field_validator("storage_schema_version", "sequence", mode="before")
+    @classmethod
+    def reject_boolean_or_string_integers(cls, value: object) -> object:
+        """Keep ledger control fields exact despite Literal's bool equality semantics."""
+        if type(value) is not int:
+            raise ValueError("ledger integer fields must be integers")
+        return value
 
 
 class EvidenceDelta(StrictModel):
@@ -105,3 +113,13 @@ class EvidenceDelta(StrictModel):
     @field_serializer("prior_versions")
     def serialize_prior_versions(self, prior_versions: Mapping[str, str]) -> dict[str, str]:
         return dict(prior_versions)
+
+
+def is_exact_consumed_prefix(
+    consumed_evidence_ids: Sequence[str],
+    ledger_evidence_ids: Sequence[str],
+) -> bool:
+    """Return whether consumption is exactly the ordered prefix of one connector ledger."""
+    consumed = tuple(consumed_evidence_ids)
+    ledger = tuple(ledger_evidence_ids)
+    return len(consumed) <= len(ledger) and consumed == ledger[: len(consumed)]

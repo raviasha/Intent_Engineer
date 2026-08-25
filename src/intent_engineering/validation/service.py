@@ -25,6 +25,7 @@ from intent_engineering.core.models import (
     ReconciliationCase,
     ReconciliationStatus,
     SyncCheckpoint,
+    is_exact_consumed_prefix,
 )
 from intent_engineering.core.models._base import StrictModel
 from intent_engineering.storage._atomic import same_path_lock
@@ -33,6 +34,7 @@ from intent_engineering.storage.jsonl.case_store import (
     parse_case_versions,
 )
 from intent_engineering.storage.jsonl.evidence_store import parse_evidence_lines
+from intent_engineering.storage.jsonl.strict import loads_strict_json
 from intent_engineering.storage.secure import (
     SecureDirectory,
     SecureFile,
@@ -126,15 +128,6 @@ def _report(
     )
 
 
-def _reject_duplicate_json_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
-    loaded: dict[str, object] = {}
-    for key, value in pairs:
-        if key in loaded:
-            raise ValueError("duplicate JSON key")
-        loaded[key] = value
-    return loaded
-
-
 class _UniqueKeyLoader(yaml.SafeLoader):  # type: ignore[misc]
     """Safe YAML loader that rejects duplicate mapping keys."""
 
@@ -182,15 +175,7 @@ def _load_json_lines(
             if allow_blank:
                 continue
             raise ValueError("blank JSONL record")
-        values.append(
-            json.loads(
-                line,
-                object_pairs_hook=_reject_duplicate_json_keys,
-                parse_constant=lambda _value: (_ for _ in ()).throw(
-                    ValueError("invalid JSON constant")
-                ),
-            )
-        )
+        values.append(loads_strict_json(line))
     return tuple(values)
 
 
@@ -482,10 +467,7 @@ def _graph_diagnostics(
 def _parse_markdown_cursor(cursor: str) -> dict[str, str]:
     if not cursor.startswith(_MARKDOWN_CURSOR_PREFIX):
         raise ValueError("not a manifest cursor")
-    loaded = json.loads(
-        cursor.removeprefix(_MARKDOWN_CURSOR_PREFIX),
-        object_pairs_hook=_reject_duplicate_json_keys,
-    )
+    loaded = loads_strict_json(cursor.removeprefix(_MARKDOWN_CURSOR_PREFIX))
     if not isinstance(loaded, dict) or set(loaded) != {"files"}:
         raise ValueError("invalid manifest")
     files = loaded["files"]
@@ -540,6 +522,16 @@ def _checkpoint_diagnostics(
         for record in evidence
         if record.id in legacy_ids and record.connector_type in {"markdown", "git"}
     )
+    ledger_ids_by_connector: dict[str, list[str]] = defaultdict(list)
+    for ingestion in ingestions:
+        ledger_ids_by_connector[ingestion.connector_id].append(ingestion.evidence.id)
+    for record in evidence:
+        if (
+            record.id in legacy_ids
+            and record.connector_type in {"markdown", "git"}
+            and record.id not in ledger_ids_by_connector[record.connector_type]
+        ):
+            ledger_ids_by_connector[record.connector_type].append(record.id)
     for connector_id in sorted(checkpoints):
         checkpoint = checkpoints[connector_id]
         if connector_id not in {"markdown", "git"}:
@@ -554,6 +546,13 @@ def _checkpoint_diagnostics(
                 diagnostics.append(
                     _diagnostic("checkpoint.consumed_evidence_foreign", "checkpoints")
                 )
+        if not is_exact_consumed_prefix(
+            checkpoint.consumed_evidence_ids,
+            ledger_ids_by_connector.get(connector_id, ()),
+        ):
+            diagnostics.append(
+                _diagnostic("checkpoint.consumed_evidence_prefix_invalid", "checkpoints")
+            )
         cursor = checkpoint.cursor
         if cursor is None:
             continue

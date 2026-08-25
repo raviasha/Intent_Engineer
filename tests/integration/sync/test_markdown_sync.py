@@ -62,7 +62,7 @@ class FailOnVersionUpdateDetector:
 
     def __call__(self, delta: EvidenceDelta, graph: Graph) -> Sequence[DriftObservation]:
         self.calls += 1
-        if delta.prior_versions and not self._failed:
+        if any(item.predecessor_id is not None for item in delta.ingestions) and not self._failed:
             self._failed = True
             raise RuntimeError("detector private detail")
         return ()
@@ -72,7 +72,7 @@ class TwoCasesOnVersionUpdate:
     """Emit two deterministic cases only for a changed Markdown source version."""
 
     def __call__(self, delta: EvidenceDelta, graph: Graph) -> Sequence[DriftObservation]:
-        if not delta.prior_versions:
+        if not any(item.predecessor_id is not None for item in delta.ingestions):
             return ()
         evidence_id = delta.added[0].id
         side = EvidenceSide(

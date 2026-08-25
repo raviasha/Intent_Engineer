@@ -12,6 +12,8 @@ from intent_engineering.core.models import (
     NodeType,
     SourceMode,
 )
+from intent_engineering.reconcile.detectors import EvidenceOrder
+from intent_engineering.reconcile.evidence_detection import _record_order
 from intent_engineering.reconcile.evidence_detection import (
     detect_evidence_drift as _detect_evidence_drift,
 )
@@ -133,10 +135,13 @@ def _git(
 
 
 def test_detection_derives_every_side_provenance_from_resolved_records() -> None:
+    records = (_declaration(), _git())
+    ingestions = _ingestions(*records)
     observations = detect_evidence_drift(
-        (_declaration(), _git()),
+        records,
         _graph("requirement:export"),
         "local@example.test",
+        ingestions,
     )
 
     assert len(observations) == 1
@@ -148,6 +153,14 @@ def test_detection_derives_every_side_provenance_from_resolved_records() -> None
     assert implementation.evidence_refs == ("evidence:git",)
     assert implementation.authors == ("engineer@example.test",)
     assert implementation.observed_at == GIT_AT
+    permuted = detect_evidence_drift(
+        tuple(reversed(records)),
+        _graph("requirement:export"),
+        "local@example.test",
+        ingestions,
+    )
+    assert permuted == observations
+    assert permuted[0].fingerprint == observations[0].fingerprint
 
 
 def test_missing_or_unauthorized_causal_git_evidence_creates_no_case() -> None:
@@ -308,11 +321,21 @@ def test_same_object_version_chain_orders_equal_timestamp_evidence_deterministic
         "local@example.test",
     )
 
+    ingestions = _ingestions(earlier, later, declaration)
+
+    def projected_order(records: tuple[EvidenceRecord, ...]) -> EvidenceOrder:
+        by_id = {record.id: record for record in records}
+        return _record_order(by_id[later.id], by_id[earlier.id], ingestions)
+
+    records = (earlier, later, declaration)
+    assert projected_order(records) is EvidenceOrder.AFTER
+    assert projected_order(tuple(reversed(records))) is EvidenceOrder.AFTER
+
     reversed_observations = detect_evidence_drift(
         (declaration, later, earlier),
         _graph("requirement:export"),
         "local@example.test",
-        _ingestions(earlier, later, declaration),
+        ingestions,
     )
     assert reversed_observations == observations
     assert observations == ()

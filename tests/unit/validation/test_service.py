@@ -324,6 +324,52 @@ def test_checkpoint_consumption_boundary_rejects_missing_or_foreign_associations
     assert "checkpoint.consumed_evidence_foreign" in _codes(foreign_project)
 
 
+@pytest.mark.parametrize("kind", ["missing", "skipped", "reordered", "valid"])
+def test_checkpoint_consumption_must_be_an_exact_ledger_prefix(
+    tmp_path: Path,
+    kind: str,
+) -> None:
+    root = tmp_path / "project"
+    root.mkdir()
+    initialize_project(root)
+    runtime = load_runtime(root)
+    records = tuple(
+        _record(content=f"# Version {version}\n") for version in (1, 2, 3)
+    )
+    for record in records:
+        runtime.evidence_store.associate("markdown", record)  # type: ignore[attr-defined]
+    ids = tuple(record.id for record in records)
+    consumed = {
+        "missing": (ids[0], "evidence:missing"),
+        "skipped": (ids[0], ids[2]),
+        "reordered": (ids[1], ids[0]),
+        "valid": ids[:2],
+    }[kind]
+    checkpoint_path = root / ".intent/cache/checkpoints.yaml"
+    checkpoint_path.write_text(
+        yaml.safe_dump(
+            {
+                "checkpoints": {
+                    "markdown": {
+                        "connector_id": "markdown",
+                        "cursor": None,
+                        "committed_at": NOW.isoformat(),
+                        "consumed_evidence_ids": list(consumed),
+                    }
+                }
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+
+    codes = _codes(root)
+    if kind == "valid":
+        assert "checkpoint.consumed_evidence_prefix_invalid" not in codes
+    else:
+        assert "checkpoint.consumed_evidence_prefix_invalid" in codes
+
+
 def test_custom_legacy_evidence_requires_an_explicit_association_diagnostic(
     tmp_path: Path,
 ) -> None:
@@ -349,8 +395,17 @@ def test_custom_legacy_evidence_requires_an_explicit_association_diagnostic(
     assert "evidence.legacy_association_ambiguous" in _codes(root)
 
 
-@pytest.mark.parametrize("mutation", ["sequence", "duplicate"])
-def test_corrupt_or_duplicate_ingestion_envelopes_are_redacted(
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "duplicate_sequence",
+        "invalid_constant",
+        "empty_connector",
+        "string_sequence",
+        "boolean_schema",
+    ],
+)
+def test_malformed_ingestion_envelopes_are_strictly_parsed_and_redacted(
     tmp_path: Path,
     mutation: str,
 ) -> None:
@@ -361,12 +416,18 @@ def test_corrupt_or_duplicate_ingestion_envelopes_are_redacted(
     runtime.evidence_store.associate("markdown", _record())  # type: ignore[attr-defined]
     evidence_path = root / ".intent/evidence/evidence.jsonl"
     envelope = json.loads(evidence_path.read_text(encoding="utf-8"))
-    if mutation == "sequence":
-        envelope["sequence"] = 2
-        evidence_path.write_text(json.dumps(envelope) + "\n", encoding="utf-8")
-    else:
-        serialized = json.dumps(envelope) + "\n"
-        evidence_path.write_text(serialized + serialized, encoding="utf-8")
+    if mutation == "invalid_constant":
+        envelope["evidence"]["payload"]["invalid"] = float("nan")
+    elif mutation == "empty_connector":
+        envelope["connector_id"] = "   "
+    elif mutation == "string_sequence":
+        envelope["sequence"] = "1"
+    elif mutation == "boolean_schema":
+        envelope["storage_schema_version"] = True
+    serialized = json.dumps(envelope, separators=(",", ":"), sort_keys=True)
+    if mutation == "duplicate_sequence":
+        serialized = serialized.replace('"sequence":1', '"sequence":1,"sequence":1')
+    evidence_path.write_text(serialized + "\n", encoding="utf-8")
 
     assert _codes(root) == ("evidence.invalid",)
 
