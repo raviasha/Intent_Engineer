@@ -156,6 +156,62 @@ class RawBrokenConnector:
         raise AssertionError("unreachable")
 
 
+class MultiObjectFailOnceConnector:
+    """Fail object two once after object one has been normalized successfully."""
+
+    connector_id = "multi"
+
+    def __init__(self) -> None:
+        self.batch = False
+        self._failed = False
+
+    async def discover(self, cursor: str | None) -> tuple[SourceObject, ...]:
+        names = ("baseline",) if not self.batch else ("one", "two", "three")
+        return tuple(
+            SourceObject(
+                external_object_id=f"fixture:{name}",
+                external_version="v1",
+                locator=f"{name}.md",
+            )
+            for name in names
+        )
+
+    async def fetch(self, object_id: str, version: str) -> RawSourceObject:
+        if object_id == "fixture:two" and not self._failed:
+            self._failed = True
+            raise RuntimeError("private second-object failure")
+        name = object_id.removeprefix("fixture:")
+        return RawSourceObject(
+            connector_type=self.connector_id,
+            external_object_id=object_id,
+            external_version=version,
+            author="fixture@example.test",
+            observed_at=datetime(2026, 8, 25, tzinfo=UTC),
+            source_locator=f"{name}.md",
+            content_hash=f"sha256:{name}",
+            payload={
+                "intent_assertion": {
+                    "id": f"assertion:{name}",
+                    "subject_id": f"requirement:{name}",
+                    "change_kind": "initialize",
+                    "node_type": "REQUIREMENT",
+                    "label": f"Requirement {name}",
+                    "source_mode": "explicit",
+                    "evidence_refs": (f"evidence:{self.connector_id}:{object_id}:v1",),
+                    "confidence": 0.9,
+                }
+            },
+        )
+
+    def normalize(self, raw: RawSourceObject):  # type: ignore[no-untyped-def]
+        from intent_engineering.capture.base import normalize_raw_source
+
+        return normalize_raw_source(raw)
+
+    def next_checkpoint(self, discovered: Sequence[SourceObject]) -> str | None:
+        return "batch-v1" if self.batch else "baseline-v1"
+
+
 class SelectiveBrokenCheckpointStore:
     """Fail the checkpoint read for one connector while preserving another connector's store."""
 
@@ -299,6 +355,38 @@ async def test_checkpoint_bytes_are_unchanged_when_new_evidence_fails_after_dura
     assert failed.evidence_added == 1
     assert harness.checkpoint_path.read_bytes() != checkpoint_bytes
     assert recovered.status is SyncRunStatus.SUCCESS
+
+
+@pytest.mark.anyio
+async def test_multi_object_fetch_failure_keeps_prior_records_and_retries_full_pending_delta(
+    tmp_path: Path,
+) -> None:
+    connector = MultiObjectFailOnceConnector()
+    reasoner = RecordingReasoner()
+    harness = SyncHarness(tmp_path, (connector,), reasoner=reasoner)
+    baseline = await harness.run()
+    assert baseline.status is SyncRunStatus.SUCCESS
+    checkpoint_before = harness.checkpoint_path.read_bytes()
+    connector.batch = True
+
+    failed = await harness.run()
+
+    assert failed.status is SyncRunStatus.FAILED
+    assert (failed.evidence_added, failed.changes_applied, failed.cases_created) == (1, 0, 0)
+    assert len(harness.evidence_store.list()) == 2
+    assert harness.checkpoint_path.read_bytes() == checkpoint_before
+
+    recovered = await harness.run()
+
+    assert recovered.status is SyncRunStatus.SUCCESS
+    assert (recovered.evidence_added, recovered.changes_applied, recovered.cases_created) == (2, 1, 0)
+    assert len(harness.evidence_store.list()) == 4
+    assert {record.external_object_id for record in reasoner.deltas[-1].added} == {
+        "fixture:one",
+        "fixture:two",
+        "fixture:three",
+    }
+    assert harness.checkpoint_path.read_bytes() != checkpoint_before
 
 
 @pytest.mark.anyio

@@ -101,10 +101,18 @@ class SyncOrchestrator:
                 prior = self._checkpoint_store.get(connector.connector_id)
                 discovered = await connector.discover(prior.cursor if prior is not None else None)
                 records: list[EvidenceRecord] = []
+                prior_versions: dict[str, str] = {}
                 for item in discovered:
                     raw = await connector.fetch(item.external_object_id, item.external_version)
-                    records.append(connector.normalize(raw))
-                delta = self._store_evidence_and_build_delta(records, progress)
+                    record = connector.normalize(raw)
+                    predecessor = self._persist_evidence(record, progress)
+                    if predecessor is not None:
+                        prior_versions[record.external_object_id] = predecessor.id
+                    records.append(record)
+                delta = EvidenceDelta(
+                    added=tuple(records),
+                    prior_versions=prior_versions,
+                )
                 if delta.added:
                     self._apply_delta(delta, progress)
                 checkpoint = checkpoint_after_discovery(
@@ -150,21 +158,17 @@ class SyncOrchestrator:
         )
         return result
 
-    def _store_evidence_and_build_delta(
+    def _persist_evidence(
         self,
-        records: Sequence[EvidenceRecord],
+        record: EvidenceRecord,
         progress: _ConnectorProgress,
-    ) -> EvidenceDelta:
-        """Store evidence while deriving retry-safe predecessor links from durable history."""
-        prior_versions: dict[str, str] = {}
-        for record in records:
-            versions = self._evidence_store.versions(record.external_object_id)
-            predecessor = self._predecessor(record, versions)
-            if predecessor is not None:
-                prior_versions[record.external_object_id] = predecessor.id
-            if self._evidence_store.put(record):
-                progress.evidence_added += 1
-        return EvidenceDelta(added=tuple(records), prior_versions=prior_versions)
+    ) -> EvidenceRecord | None:
+        """Persist one normalized record immediately and return its durable predecessor."""
+        versions = self._evidence_store.versions(record.external_object_id)
+        predecessor = self._predecessor(record, versions)
+        if self._evidence_store.put(record):
+            progress.evidence_added += 1
+        return predecessor
 
     @staticmethod
     def _predecessor(
