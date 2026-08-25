@@ -105,7 +105,8 @@ class SyncOrchestrator:
                     raw = await connector.fetch(item.external_object_id, item.external_version)
                     records.append(connector.normalize(raw))
                 delta = self._store_evidence_and_build_delta(records, progress)
-                self._apply_delta(delta, progress)
+                if delta.added:
+                    self._apply_delta(delta, progress)
                 checkpoint = checkpoint_after_discovery(
                     connector,
                     discovered,

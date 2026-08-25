@@ -59,14 +59,45 @@ async def test_markdown_connector_excludes_configured_globs_and_versions_content
     assert second_evidence.external_version.startswith("sha256:")
     assert second_evidence.external_version != original_version
     assert second_evidence.id != first_evidence.id
-    assert connector.next_checkpoint(second_sources) == second_evidence.external_version
+    cursor = connector.next_checkpoint(second_sources)
+    assert cursor is not None
+    assert cursor.startswith("markdown:v1:")
+    assert await connector.discover(cursor) == ()
     checkpoint = checkpoint_after_discovery(
         connector,
         second_sources,
         second_evidence.observed_at,
     )
     assert checkpoint.connector_id == "markdown"
-    assert checkpoint.cursor == second_evidence.external_version
+    assert checkpoint.cursor == cursor
+
+
+@pytest.mark.anyio
+async def test_markdown_manifest_cursor_returns_only_changed_documents_and_migrates_legacy_hash(
+    tmp_path: Path,
+) -> None:
+    """A complete versioned manifest makes no-op scans empty and old cursors safely rescan."""
+    first = tmp_path / "first.md"
+    second = tmp_path / "second.md"
+    first.write_text("# First\n", encoding="utf-8")
+    second.write_text("# Second\n", encoding="utf-8")
+    connector = MarkdownConnector(
+        tmp_path,
+        ProjectConfig(project_id="capture-test", local_actor="tester"),
+    )
+
+    initial = await connector.discover(None)
+    cursor = connector.next_checkpoint(initial)
+    second.write_text("# Second revised\n", encoding="utf-8")
+    changed = await connector.discover(cursor)
+    updated_cursor = connector.next_checkpoint(changed)
+    legacy = initial[-1].external_version
+
+    assert [source.locator for source in initial] == ["first.md", "second.md"]
+    assert [source.locator for source in changed] == ["second.md"]
+    assert updated_cursor is not None and updated_cursor.startswith("markdown:v1:")
+    assert await connector.discover(updated_cursor) == ()
+    assert await connector.discover(legacy) == await connector.discover(None)
 
 
 @pytest.mark.anyio

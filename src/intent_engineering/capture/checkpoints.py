@@ -17,7 +17,7 @@ def checkpoint_after_discovery(
 ) -> SyncCheckpoint:
     """Build a checkpoint, retaining the prior cursor for an empty successful batch."""
     cursor = connector.next_checkpoint(discovered)
-    if not discovered and prior is not None:
+    if not discovered and prior is not None and cursor is None:
         cursor = prior.cursor
     return SyncCheckpoint(
         connector_id=connector.connector_id,

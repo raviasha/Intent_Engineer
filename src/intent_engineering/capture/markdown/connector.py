@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Sequence
 from datetime import UTC, datetime
 from fnmatch import fnmatchcase
@@ -23,6 +24,39 @@ def _content_hash(content: bytes) -> str:
     return f"sha256:{sha256(content).hexdigest()}"
 
 
+_MANIFEST_CURSOR_PREFIX = "markdown:v1:"
+
+
+def _manifest_cursor(manifest: Sequence[tuple[str, str]]) -> str:
+    """Encode a complete sorted path/version snapshot in a stable, versioned cursor."""
+    payload = {"files": [[path, version] for path, version in manifest]}
+    return _MANIFEST_CURSOR_PREFIX + json.dumps(payload, separators=(",", ":"), sort_keys=True)
+
+
+def _parse_manifest_cursor(cursor: str | None) -> dict[str, str] | None:
+    """Read a valid manifest cursor; legacy or malformed values deliberately rescan."""
+    if cursor is None or not cursor.startswith(_MANIFEST_CURSOR_PREFIX):
+        return None
+    try:
+        payload = json.loads(cursor.removeprefix(_MANIFEST_CURSOR_PREFIX))
+        files = payload["files"]
+        if not isinstance(files, list):
+            return None
+        manifest: dict[str, str] = {}
+        for item in files:
+            if (
+                not isinstance(item, list)
+                or len(item) != 2
+                or not all(isinstance(value, str) for value in item)
+                or not item[0]
+            ):
+                return None
+            manifest[item[0]] = item[1]
+        return manifest
+    except (json.JSONDecodeError, KeyError, TypeError):
+        return None
+
+
 class MarkdownConnector:
     """Capture Markdown files as content-addressed local evidence."""
 
@@ -31,6 +65,7 @@ class MarkdownConnector:
     def __init__(self, root: Path, config: ProjectConfig) -> None:
         self.root = root.resolve()
         self.config = config
+        self._last_manifest: tuple[tuple[str, str], ...] = ()
 
     def _is_excluded(self, relative: PurePosixPath) -> bool:
         path = relative.as_posix()
@@ -62,12 +97,20 @@ class MarkdownConnector:
         return tuple(sorted(sources, key=lambda source: source.locator))
 
     async def discover(self, cursor: str | None) -> Sequence[SourceObject]:
-        """Discover all included Markdown files in stable path order."""
-        del cursor
+        """Discover only source versions absent from the prior full manifest cursor."""
         try:
-            return await anyio.to_thread.run_sync(self._discover_sync)
+            sources = await anyio.to_thread.run_sync(self._discover_sync)
         except (OSError, UnicodeError) as error:
             raise ConnectorError("Markdown discovery failed") from error
+        self._last_manifest = tuple((source.locator, source.external_version) for source in sources)
+        prior_manifest = _parse_manifest_cursor(cursor)
+        if prior_manifest is None:
+            return sources
+        return tuple(
+            source
+            for source in sources
+            if prior_manifest.get(source.locator) != source.external_version
+        )
 
     def _fetch_sync(self, object_id: str, version: str) -> RawSourceObject:
         if not object_id.startswith("path:"):
@@ -109,7 +152,6 @@ class MarkdownConnector:
         return normalize_raw_source(raw)
 
     def next_checkpoint(self, discovered: Sequence[SourceObject]) -> str | None:
-        """Use the last discovered content version as a deterministic local cursor."""
-        if not discovered:
-            return None
-        return discovered[-1].external_version
+        """Commit the full snapshot scanned by the latest discovery, even for an empty delta."""
+        del discovered
+        return _manifest_cursor(self._last_manifest)
