@@ -170,3 +170,8 @@ RED: doctor emitted a generic stderr failure. GREEN: 1 passed in 0.50s.
 
 Results: Ruff clean; strict mypy clean across 12 modules; full pytest `213
 passed in 10.14s`; both help commands exited 0.
+
+Follow-up redaction boundary: `b5c534199b5f32e42427a97d53d65efd09fe85f5`.
+Fresh final verification after that commit: focused E2E `28 passed in 8.94s`,
+Ruff clean, strict mypy clean across 12 modules, full pytest `213 passed in
+10.04s`, and both help commands exited 0.
