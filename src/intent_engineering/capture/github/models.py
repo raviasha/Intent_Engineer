@@ -164,7 +164,7 @@ class GitHubCommitData(GitHubProviderModel):
     """Canonical commit message and authored identity."""
 
     message: str
-    author: GitHubCommitAuthor
+    author: GitHubCommitAuthor | None
 
 
 class GitHubCommit(GitHubProviderModel):

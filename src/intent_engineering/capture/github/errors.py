@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Callable
 from datetime import datetime
 
 GITHUB_AUTH_ERROR_MESSAGE = (
@@ -25,10 +26,14 @@ _MAX_REQUEST_ID_LENGTH = 64
 
 def sanitize_endpoint(value: str) -> str:
     """Return a length-bounded path safe for public error rendering."""
+    return _sanitize_endpoint_text(value)[:_MAX_ENDPOINT_LENGTH]
+
+
+def _sanitize_endpoint_text(value: str) -> str:
     sanitized = _SAFE_ENDPOINT_CHARACTER.sub("_", value)
     if not sanitized.startswith("/"):
         sanitized = f"/{sanitized}"
-    return sanitized[:_MAX_ENDPOINT_LENGTH]
+    return sanitized
 
 
 def sanitize_request_id(value: str | None) -> str | None:
@@ -45,12 +50,37 @@ def _sanitize_request_id_text(value: str) -> str:
 
 def request_id_overlaps_secret(value: str, secret: str) -> bool:
     """Detect secret material before public request-id truncation can hide the overlap."""
-    candidates = (value.strip(), _sanitize_request_id_text(value))
-    secrets = (secret, _sanitize_request_id_text(secret))
+    return _public_prefix_overlaps_secret(
+        value,
+        secret,
+        sanitizer=_sanitize_request_id_text,
+        max_length=_MAX_REQUEST_ID_LENGTH,
+    )
+
+
+def endpoint_overlaps_secret(value: str, secret: str) -> bool:
+    """Detect credential fragments before public endpoint truncation."""
+    return _public_prefix_overlaps_secret(
+        value,
+        secret,
+        sanitizer=_sanitize_endpoint_text,
+        max_length=_MAX_ENDPOINT_LENGTH,
+    )
+
+
+def _public_prefix_overlaps_secret(
+    value: str,
+    secret: str,
+    *,
+    sanitizer: Callable[[str], str],
+    max_length: int,
+) -> bool:
+    candidates = (value.strip(), sanitizer(value))
+    secrets = (secret, sanitizer(secret))
     for candidate, normalized_secret in zip(candidates, secrets, strict=True):
         if not normalized_secret:
             continue
-        public_prefix = candidate[:_MAX_REQUEST_ID_LENGTH]
+        public_prefix = candidate[:max_length]
         fragment_length = min(4, len(normalized_secret))
         if any(
             public_prefix[index : index + fragment_length] in normalized_secret

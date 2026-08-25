@@ -19,6 +19,7 @@ from intent_engineering.capture.github.errors import (
     GitHubProtocolError,
     GitHubRateLimitError,
     GitHubTransientError,
+    endpoint_overlaps_secret,
     request_id_overlaps_secret,
     sanitize_endpoint,
     sanitize_request_id,
@@ -308,11 +309,10 @@ class GitHubClient:
         return sanitize_request_id(value)
 
     def _safe_endpoint(self, value: str) -> str:
-        sanitized = sanitize_endpoint(value)
         secret = self._authorization_secret()
-        if secret is not None and secret in sanitized:
-            return sanitized.replace(secret, "redacted")
-        return sanitized
+        if secret is not None and endpoint_overlaps_secret(value, secret):
+            return "/redacted"
+        return sanitize_endpoint(value)
 
     async def _request_page(
         self,
@@ -400,7 +400,9 @@ class GitHubClient:
         if parse_failed:
             raise GitHubProtocolError(endpoint)
         next_urls = [
-            target for target, parameters in entries if "next" in parameters.get("rel", "").split()
+            target
+            for target, parameters in entries
+            if any(relation.casefold() == "next" for relation in parameters.get("rel", "").split())
         ]
         if len(next_urls) > 1:
             raise GitHubProtocolError(endpoint)

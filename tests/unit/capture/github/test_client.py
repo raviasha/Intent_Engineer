@@ -80,6 +80,31 @@ async def test_get_pages_follows_next_links_once_in_stable_order_and_sends_param
 
 
 @pytest.mark.anyio
+async def test_uppercase_registered_next_relation_is_followed(
+    github_credentials: GitHubCredentials,
+    transport_factory: TransportFactory,
+) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if len(requests) == 1:
+            return httpx.Response(
+                200,
+                json=[{"id": 1}],
+                headers={"Link": '<https://api.github.com/items?page=2>; rel="NEXT"'},
+            )
+        return httpx.Response(200, json=[{"id": 2}])
+
+    client = _client(github_credentials, handler, transport_factory)
+    result = await client.get_pages("/items", {})
+    await client.aclose()
+
+    assert [item["id"] for item in result.items] == [1, 2]
+    assert len(requests) == 2
+
+
+@pytest.mark.anyio
 async def test_first_page_304_sends_etag_and_returns_exact_not_modified_result(
     github_credentials: GitHubCredentials,
     transport_factory: TransportFactory,
@@ -219,6 +244,7 @@ async def test_pagination_link_with_fragment_is_rejected_before_second_request(
         '<>; rel="next"',
         '<https://api.github.com/items?page=2>; rel="next", broken',
         '<https://api.github.com/items<bad?page=2>; rel="next"',
+        '<https://api.github.com/items?page=2>; rel="next"; rel="last"',
     ],
 )
 async def test_structurally_malformed_link_header_fails_closed(
@@ -757,6 +783,28 @@ async def test_long_token_prefix_reflected_in_request_id_is_fully_discarded(
     assert token[:64] not in repr(caught.value)
 
 
+@pytest.mark.anyio
+async def test_long_token_fragment_near_endpoint_cutoff_is_fully_redacted(
+    transport_factory: TransportFactory,
+) -> None:
+    token = "github" + "_pat_" + ("B" * 82)
+    credentials = GitHubCredentials.resolve({"GH_TOKEN": token}, lambda _: "unused")
+    path = f"/{'x' * 142}/prefix/{token}/private"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(401)
+
+    client = _client(credentials, handler, transport_factory)
+    with pytest.raises(GitHubPermissionError) as caught:
+        await client.get_pages(path, {})
+    await client.aclose()
+
+    assert "github_pa" not in caught.value.endpoint
+    assert "github_pa" not in str(caught.value)
+    assert token[:16] not in repr(caught.value)
+    assert len(caught.value.endpoint) <= 160
+
+
 def _user_payload() -> dict[str, object]:
     return {"id": 1, "login": "octocat", "html_url": "https://github.com/octocat"}
 
@@ -871,6 +919,27 @@ def test_provider_models_accept_strict_complete_payloads(
 def test_provider_models_accept_null_deleted_actors(model: type[object], payload: object) -> None:
     parsed = model.model_validate(payload)  # type: ignore[attr-defined]
     assert parsed.user is None  # type: ignore[attr-defined]
+
+
+@pytest.mark.parametrize("outer_author", [_user_payload(), None])
+def test_commit_model_accepts_null_embedded_author(outer_author: object) -> None:
+    commit = GitHubCommit.model_validate(
+        {
+            "sha": "d" * 40,
+            "html_url": "https://github.com/acme/demo/commit/" + "d" * 40,
+            "commit": {
+                "message": "Commit from a deleted or unlinked author",
+                "author": None,
+            },
+            "author": outer_author,
+        }
+    )
+
+    assert commit.commit.author is None
+    if outer_author is None:
+        assert commit.author is None
+    else:
+        assert commit.author is not None
 
 
 def test_provider_models_preserve_only_explicit_deeply_immutable_extra() -> None:
