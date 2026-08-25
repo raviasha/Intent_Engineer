@@ -9,6 +9,7 @@ from threading import Barrier, Thread
 
 import pytest
 
+import intent_engineering.storage._atomic as atomic_storage
 from intent_engineering.core.graph.applier import StaleGraphVersion, UnknownIdentity
 from intent_engineering.core.models import (
     ChangeSet,
@@ -212,6 +213,32 @@ def test_nested_same_path_lock_completes_without_self_deadlock(tmp_path: Path) -
         process.terminate()
         process.join()
         pytest.fail("nested same-path lock acquisition self-deadlocked")
+
+    assert process.exitcode == 0
+    assert result.get(timeout=1) == "entered"
+    result.close()
+
+
+def _acquire_lock_after_fork(path: str, result: object) -> None:
+    with same_path_lock(Path(path)):
+        result.put("entered")  # type: ignore[union-attr]
+
+
+def test_forked_child_resets_an_inherited_registry_guard(tmp_path: Path) -> None:
+    path = tmp_path / "graph.yaml"
+    with same_path_lock(path):
+        pass
+    context = multiprocessing.get_context("fork")
+    result = context.Queue()
+    with atomic_storage._PATH_LOCKS_GUARD:
+        process = context.Process(target=_acquire_lock_after_fork, args=(str(path), result))
+        process.start()
+
+    process.join(timeout=1)
+    if process.is_alive():
+        process.terminate()
+        process.join()
+        pytest.fail("forked child inherited a permanently locked registry guard")
 
     assert process.exitcode == 0
     assert result.get(timeout=1) == "entered"

@@ -27,10 +27,14 @@ class _PathLock:
         """Discard copied process state after a fork before acquiring a new lock."""
         if self.process_id == current_pid:
             return
+        self.drop_inherited_state()
+
+    def drop_inherited_state(self) -> None:
+        """Release child-side descriptors and discard copied lock ownership."""
         if self.lock_file is not None:
             self.lock_file.close()
         self.thread_lock = RLock()
-        self.process_id = current_pid
+        self.process_id = os.getpid()
         self.owner_pid = None
         self.owner_thread_id = None
         self.depth = 0
@@ -39,6 +43,18 @@ class _PathLock:
 
 _PATH_LOCKS: dict[Path, _PathLock] = {}
 _PATH_LOCKS_GUARD = Lock()
+
+
+def _reset_path_locks_after_fork() -> None:
+    """Discard copied lock state in a forked child without changing the parent."""
+    global _PATH_LOCKS, _PATH_LOCKS_GUARD
+    for path_lock in _PATH_LOCKS.values():
+        path_lock.drop_inherited_state()
+    _PATH_LOCKS = {}
+    _PATH_LOCKS_GUARD = Lock()
+
+
+os.register_at_fork(after_in_child=_reset_path_locks_after_fork)
 
 
 @contextmanager
