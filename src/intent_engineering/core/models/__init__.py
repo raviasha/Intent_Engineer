@@ -7,6 +7,7 @@ from intent_engineering.core.models.changeset import (
     ImplementationStatusChange,
     NodeUpdate,
 )
+from intent_engineering.core.models.context import ContextItem, ContextPack
 from intent_engineering.core.models.enums import (
     ChangeKind,
     ImplementationStatus,
@@ -42,6 +43,8 @@ __all__ = [
     "ClassificationEvent",
     "Confidence",
     "ConfidenceChange",
+    "ContextItem",
+    "ContextPack",
     "DriftObservation",
     "Edge",
     "EdgeUpdate",
