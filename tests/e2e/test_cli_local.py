@@ -258,6 +258,22 @@ intent_engineering:
     preview_payload = preview.json()
     assert preview_payload["case"]["status"] == "needs_human"
     graph_before = (repo / ".intent/graph.yaml").read_bytes()
+    cases_before = (repo / ".intent/reconciliation/cases.jsonl").read_bytes()
+    terminal = run_intent(
+        repo,
+        "reconcile",
+        "resolve",
+        cases[0]["id"],
+        "--action",
+        "defer",
+        "--approve",
+        preview_payload["approval"],
+        "--format",
+        "json",
+    )
+    assert terminal.returncode == 1
+    assert (repo / ".intent/graph.yaml").read_bytes() == graph_before
+    assert (repo / ".intent/reconciliation/cases.jsonl").read_bytes() == cases_before
     refused = run_intent(repo, "reconcile", "resolve", cases[0]["id"], "--approve", "wrong", "--format", "json")
     assert refused.returncode == 1
     assert (repo / ".intent/graph.yaml").read_bytes() == graph_before
