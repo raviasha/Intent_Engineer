@@ -5,6 +5,8 @@
 - Base commit: `9b099a64ef59c096a6070c295d3ca9281e21bfac`
 - Product/test commit: `e257c323a9d1baff62fdea0061ba1c6681063766`
 - Product/test commit subject: `feat: add deterministic github rest client`
+- Review-fix product/test commit: `7d2015155f5f420e23dfcbbe4cf527604a4a6b83`
+- Review-fix commit subject: `fix(github): harden REST client boundaries`
 - This report is committed separately from product and tests.
 
 ## TDD evidence
@@ -20,7 +22,7 @@ Observed result: collection stopped with the expected
 `ModuleNotFoundError: No module named 'intent_engineering.capture.github.client'` (exit 2). The
 failure was the missing REST boundary, not a typo in an existing implementation.
 
-The first GREEN for that focused suite was `39 passed in 0.10s`. Three later findings each used a
+The first GREEN for that focused suite was `39 passed in 0.10s`. Four later findings each used a
 separate focused RED/GREEN cycle:
 
 - immutable `MappingProxyType` provider data initially failed JSON serialization with
@@ -99,6 +101,80 @@ was made.
 - Frozen strict models cover the GitHub user, issue, pull request, commit, issue comment, and review
   comment fields needed by Task 3. Unknown fields are accepted only through an explicit deeply
   immutable provider-local `extra` mapping.
+
+## Review fix round 1
+
+Independent review found four Important and two Minor gaps on report base
+`7537182d47471df4ee6d383e5acbaccbd04e17da`. Each finding was verified against the implementation
+and fixed in `7d2015155f5f420e23dfcbbe4cf527604a4a6b83` without beginning Task 3.
+
+### Focused RED/GREEN evidence
+
+1. **Injected client isolation.** A hostile injected client with default Basic auth, Authorization,
+   ETag, query params, and 99-second timeout changed wrapper requests. The RED showed caller query
+   params on page one. The GREEN uses an explicit `httpx.Request` and `send(auth=None,
+   follow_redirects=False)`: wrapper bearer/fixed headers win, page-two Link URLs remain exact,
+   `If-None-Match` is first-page-only, fixed timeout extensions are present, caller state is
+   unchanged, and later cross-origin caller reuse has no wrapper bearer.
+2. **Long reflected tokens.** A realistic 94-character `github_pat_...` token reflected through
+   `X-GitHub-Request-Id` leaked a 64-character prefix in RED. A second RED showed the standalone
+   11-character `github_pat_` prefix also survived. GREEN compares raw and sanitized secret
+   fragments before public truncation and discards the request ID.
+3. **Strict JSON extras.** Seven RED cases proved sets, bytearrays, arbitrary objects, NaN,
+   infinity, non-string keys, and a nested set were accepted. GREEN rejects all seven, accepts only
+   string-keyed finite JSON shapes, and preserves detached deep immutability plus warning-free
+   serialization.
+4. **Deleted actors.** Issue, issue-comment, and review-comment payloads with `user: null` each
+   failed RED validation. All three pass GREEN with `GitHubUser | None`; non-null actors remain
+   strictly validated.
+5. **Pagination fragments.** A same-origin next URL with a fragment caused a second request in RED.
+   GREEN rejects it before another request.
+6. **Malformed Link headers.** Garbage, an unterminated target, and a missing parameter value were
+   silently accepted or followed in RED. GREEN uses a strict complete-header parser; six malformed
+   structures fail closed before request two while valid GitHub Link pagination remains accepted.
+
+### Fix-round final verification
+
+Focused GitHub tests with warnings promoted to errors:
+
+```bash
+.venv/bin/python -W error -m pytest \
+  tests/unit/capture/github/test_auth.py \
+  tests/unit/capture/github/test_client.py -q
+```
+
+Result: `87 passed in 0.14s`.
+
+Relevant capture/package tests:
+
+```bash
+.venv/bin/python -m pytest tests/unit/capture tests/unit/test_package.py -q
+```
+
+Result: `88 passed in 0.25s`.
+
+Tracked lint, formatting, and type checking:
+
+```bash
+.venv/bin/ruff check $(git ls-files '*.py')
+.venv/bin/ruff format --check src/intent_engineering/capture/github tests/unit/capture/github
+.venv/bin/mypy src/intent_engineering
+```
+
+Results: `All checks passed!`, `8 files already formatted`, and
+`Success: no issues found in 71 source files`.
+
+Full regression suite:
+
+```bash
+.venv/bin/python -m pytest -q
+```
+
+Result: `447 passed in 17.21s`.
+
+`git diff --cached --check` completed without output before the fix commit. All new regressions use
+offline `httpx.MockTransport` responses; no GitHub credential was read and no network request was
+made.
 
 ## Dependency versions
 
