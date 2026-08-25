@@ -35,8 +35,29 @@ def sanitize_request_id(value: str | None) -> str | None:
     """Return only inert, bounded GitHub request-id characters."""
     if value is None:
         return None
-    sanitized = _SAFE_REQUEST_ID_CHARACTER.sub("_", value.strip())[:_MAX_REQUEST_ID_LENGTH]
+    sanitized = _sanitize_request_id_text(value)[:_MAX_REQUEST_ID_LENGTH]
     return sanitized or None
+
+
+def _sanitize_request_id_text(value: str) -> str:
+    return _SAFE_REQUEST_ID_CHARACTER.sub("_", value.strip())
+
+
+def request_id_overlaps_secret(value: str, secret: str) -> bool:
+    """Detect secret material before public request-id truncation can hide the overlap."""
+    candidates = (value.strip(), _sanitize_request_id_text(value))
+    secrets = (secret, _sanitize_request_id_text(secret))
+    for candidate, normalized_secret in zip(candidates, secrets, strict=True):
+        if not normalized_secret:
+            continue
+        public_prefix = candidate[:_MAX_REQUEST_ID_LENGTH]
+        fragment_length = min(4, len(normalized_secret))
+        if any(
+            public_prefix[index : index + fragment_length] in normalized_secret
+            for index in range(max(0, len(public_prefix) - fragment_length + 1))
+        ):
+            return True
+    return False
 
 
 def _render_details(

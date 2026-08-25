@@ -187,6 +187,60 @@ async def test_pagination_cycle_is_rejected_before_repeating_a_request(
 
 
 @pytest.mark.anyio
+async def test_pagination_link_with_fragment_is_rejected_before_second_request(
+    github_credentials: GitHubCredentials,
+    transport_factory: TransportFactory,
+) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            json=[{"id": 1}],
+            headers={"Link": '<https://api.github.com/items?page=2#cycle-bypass>; rel="next"'},
+        )
+
+    client = _client(github_credentials, handler, transport_factory)
+    with pytest.raises(GitHubProtocolError):
+        await client.get_pages("/items", {})
+    await client.aclose()
+
+    assert len(requests) == 1
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "malformed_link",
+    [
+        "garbage",
+        '<https://api.github.com/items?page=2; rel="next"',
+        "<https://api.github.com/items?page=2>; rel",
+        '<>; rel="next"',
+        '<https://api.github.com/items?page=2>; rel="next", broken',
+        '<https://api.github.com/items<bad?page=2>; rel="next"',
+    ],
+)
+async def test_structurally_malformed_link_header_fails_closed(
+    github_credentials: GitHubCredentials,
+    transport_factory: TransportFactory,
+    malformed_link: str,
+) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json=[{"id": 1}], headers={"Link": malformed_link})
+
+    client = _client(github_credentials, handler, transport_factory)
+    with pytest.raises(GitHubProtocolError):
+        await client.get_pages("/items", {})
+    await client.aclose()
+
+    assert len(requests) == 1
+
+
+@pytest.mark.anyio
 async def test_pagination_page_cap_is_enforced_before_an_extra_request(
     github_credentials: GitHubCredentials,
     transport_factory: TransportFactory,
@@ -577,6 +631,70 @@ async def test_injected_client_headers_are_never_mutated_or_forwarded_after_wrap
 
 
 @pytest.mark.anyio
+async def test_injected_client_defaults_cannot_change_wrapper_requests(
+    github_credentials: GitHubCredentials,
+    github_secret: str,
+    transport_factory: TransportFactory,
+) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if len(requests) == 1:
+            return httpx.Response(
+                200,
+                json=[{"id": 1}],
+                headers={"Link": '<https://api.github.com/items?page=2>; rel="next"'},
+            )
+        return httpx.Response(200, json=[{"id": 2}])
+
+    injected = httpx.AsyncClient(
+        auth=httpx.BasicAuth("caller", "caller-secret"),
+        headers={
+            "Accept": "text/plain",
+            "Authorization": "Bearer caller-token",
+            "If-None-Match": '"caller-etag"',
+            "User-Agent": "caller-agent",
+            "X-Caller": "preserved",
+        },
+        params={"caller": "leak", "page": "999"},
+        timeout=httpx.Timeout(99.0),
+        transport=transport_factory(handler),
+    )
+    original_headers = tuple(injected.headers.multi_items())
+    original_params = tuple(injected.params.multi_items())
+    original_timeout = injected.timeout
+    wrapper = GitHubClient(github_credentials, client=injected)
+
+    result = await wrapper.get_pages("/items", {"state": "all"}, etag='"wrapper-etag"')
+    await wrapper.aclose()
+    await injected.get("https://uploads.github.com/post-wrapper")
+
+    assert [item["id"] for item in result.items] == [1, 2]
+    assert requests[0].url == httpx.URL("https://api.github.com/items?state=all")
+    assert requests[1].url == httpx.URL("https://api.github.com/items?page=2")
+    assert requests[0].headers["Authorization"] == f"Bearer {github_secret}"
+    assert requests[0].headers["Accept"] == "application/vnd.github+json"
+    assert requests[0].headers["User-Agent"] == "intent-engineering/0.1.0"
+    assert requests[0].headers["If-None-Match"] == '"wrapper-etag"'
+    assert "If-None-Match" not in requests[1].headers
+    assert requests[0].extensions["timeout"] == {
+        "connect": 5.0,
+        "read": 30.0,
+        "write": 30.0,
+        "pool": 5.0,
+    }
+    assert requests[1].extensions["timeout"] == requests[0].extensions["timeout"]
+    assert requests[2].url.host == "uploads.github.com"
+    assert requests[2].url.path == "/post-wrapper"
+    assert requests[2].headers["Authorization"] != f"Bearer {github_secret}"
+    assert tuple(injected.headers.multi_items()) == original_headers
+    assert tuple(injected.params.multi_items()) == original_params
+    assert injected.timeout == original_timeout
+    await injected.aclose()
+
+
+@pytest.mark.anyio
 async def test_errors_requests_pytest_rendering_and_logs_never_expose_token(
     github_credentials: GitHubCredentials,
     github_secret: str,
@@ -614,6 +732,29 @@ async def test_errors_requests_pytest_rendering_and_logs_never_expose_token(
     assert all(github_secret not in str(value) for value in public_values)
     assert caught.value.__cause__ is None
     assert caught.value.__context__ is None
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("reflected_length", [94, 11])
+async def test_long_token_prefix_reflected_in_request_id_is_fully_discarded(
+    transport_factory: TransportFactory,
+    reflected_length: int,
+) -> None:
+    token = "github" + "_pat_" + ("A" * 82)
+    credentials = GitHubCredentials.resolve({"GH_TOKEN": token}, lambda _: "unused")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        reflected = token[:reflected_length]
+        return httpx.Response(401, headers={"X-GitHub-Request-Id": f"RID:{reflected}:suffix"})
+
+    client = _client(credentials, handler, transport_factory)
+    with pytest.raises(GitHubPermissionError) as caught:
+        await client.get_pages("/items", {})
+    await client.aclose()
+
+    assert caught.value.request_id is None
+    assert "github_pat_" not in str(caught.value)
+    assert token[:64] not in repr(caught.value)
 
 
 def _user_payload() -> dict[str, object]:
@@ -697,6 +838,41 @@ def test_provider_models_accept_strict_complete_payloads(
     assert parsed is not None
 
 
+@pytest.mark.parametrize(
+    ("model", "payload"),
+    [
+        (GitHubIssue, {**_common_payload(), "user": None}),
+        (
+            GitHubIssueComment,
+            {
+                "id": 20,
+                "body": "Deleted author",
+                "user": None,
+                "updated_at": datetime(2026, 8, 25, 10, 0, tzinfo=UTC),
+                "html_url": "https://github.com/acme/demo/issues/42#issuecomment-20",
+                "issue_url": "https://api.github.com/repos/acme/demo/issues/42",
+            },
+        ),
+        (
+            GitHubReviewComment,
+            {
+                "id": 30,
+                "body": "Deleted reviewer",
+                "user": None,
+                "updated_at": datetime(2026, 8, 25, 10, 0, tzinfo=UTC),
+                "html_url": "https://github.com/acme/demo/pull/7#discussion_r30",
+                "pull_request_url": "https://api.github.com/repos/acme/demo/pulls/7",
+                "path": "src/client.py",
+                "line": 10,
+            },
+        ),
+    ],
+)
+def test_provider_models_accept_null_deleted_actors(model: type[object], payload: object) -> None:
+    parsed = model.model_validate(payload)  # type: ignore[attr-defined]
+    assert parsed.user is None  # type: ignore[attr-defined]
+
+
 def test_provider_models_preserve_only_explicit_deeply_immutable_extra() -> None:
     user = GitHubUser.model_validate(
         {
@@ -729,6 +905,41 @@ def test_immutable_provider_values_serialize_without_warnings() -> None:
 
     assert serialized_user["extra"] == {"nested": {"roles": ["reader"]}}
     assert serialized_result["items"] == [{"id": 1, "labels": ["intent"]}]
+
+
+@pytest.mark.parametrize(
+    "invalid_extra",
+    [
+        {"mutable": {"reader"}},
+        {"mutable": bytearray(b"reader")},
+        {"arbitrary": object()},
+        {"number": float("nan")},
+        {"number": float("inf")},
+        {1: "non-string-key"},
+        {"nested": [{"valid": "shape"}, {"invalid": {1, 2}}]},
+    ],
+)
+def test_provider_extra_rejects_every_non_json_or_non_finite_value(
+    invalid_extra: object,
+) -> None:
+    with pytest.raises(ValidationError):
+        GitHubUser.model_validate({**_user_payload(), "extra": invalid_extra})
+
+
+def test_provider_extra_accepts_detached_finite_json_scalars() -> None:
+    source = {
+        "text": "value",
+        "integer": 3,
+        "number": 1.5,
+        "enabled": True,
+        "empty": None,
+        "nested": ["reader", {"count": 1}],
+    }
+
+    user = GitHubUser.model_validate({**_user_payload(), "extra": source})
+    source["nested"] = []
+
+    assert user.extra["nested"] == ("reader", MappingProxyType({"count": 1}))
 
 
 def test_provider_models_reject_unknown_fields_and_malformed_required_fields() -> None:

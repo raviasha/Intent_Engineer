@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from datetime import UTC, datetime
+from math import isfinite
 from types import MappingProxyType
 from typing import Annotated, cast
 
@@ -21,20 +22,20 @@ from intent_engineering.core.models._base import StrictModel
 
 def freeze_provider_value(value: object) -> object:
     """Recursively detach and freeze JSON-shaped provider values."""
-    if type(value) is dict:
-        raw = cast(dict[object, object], value)
-        return MappingProxyType(
-            {str(key): freeze_provider_value(item) for key, item in raw.items()}
-        )
-    if isinstance(value, Mapping):
-        return MappingProxyType(
-            {str(key): freeze_provider_value(item) for key, item in value.items()}
-        )
+    if type(value) is dict or type(value) is MappingProxyType:
+        raw = cast(Mapping[object, object], value)
+        if any(type(key) is not str for key in raw):
+            raise ValueError("provider object keys must be strings")
+        return MappingProxyType({key: freeze_provider_value(item) for key, item in raw.items()})
     if type(value) is list:
         return tuple(freeze_provider_value(item) for item in cast(list[object], value))
     if type(value) is tuple:
         return tuple(freeze_provider_value(item) for item in cast(tuple[object, ...], value))
-    return value
+    if value is None or type(value) in {str, int, bool}:
+        return value
+    if type(value) is float and isfinite(value):
+        return value
+    raise ValueError("provider values must be finite JSON values")
 
 
 def thaw_provider_value(value: object) -> object:
@@ -49,7 +50,7 @@ def thaw_provider_value(value: object) -> object:
 def _prepare_model_input(value: object) -> object:
     """Copy frozen mappings into structures accepted by strict nested Pydantic models."""
     if isinstance(value, Mapping):
-        return {str(key): _prepare_model_input(item) for key, item in value.items()}
+        return {key: _prepare_model_input(item) for key, item in value.items()}
     if isinstance(value, tuple):
         return tuple(_prepare_model_input(item) for item in value)
     return value
@@ -137,7 +138,7 @@ class GitHubIssue(GitHubProviderModel):
     title: str
     body: str | None
     state: str
-    user: GitHubUser
+    user: GitHubUser | None
     labels: tuple[GitHubLabel, ...]
     milestone: GitHubMilestone | None
     updated_at: GitHubDateTime
@@ -180,7 +181,7 @@ class GitHubIssueComment(GitHubProviderModel):
 
     id: int
     body: str
-    user: GitHubUser
+    user: GitHubUser | None
     updated_at: GitHubDateTime
     html_url: str
     issue_url: str
@@ -191,7 +192,7 @@ class GitHubReviewComment(GitHubProviderModel):
 
     id: int
     body: str
-    user: GitHubUser
+    user: GitHubUser | None
     updated_at: GitHubDateTime
     html_url: str
     pull_request_url: str

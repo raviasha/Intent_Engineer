@@ -19,6 +19,7 @@ from intent_engineering.capture.github.errors import (
     GitHubProtocolError,
     GitHubRateLimitError,
     GitHubTransientError,
+    request_id_overlaps_secret,
     sanitize_endpoint,
     sanitize_request_id,
 )
@@ -32,6 +33,9 @@ GITHUB_TIMEOUT = httpx.Timeout(connect=5.0, read=30.0, write=30.0, pool=5.0)
 
 type Clock = Callable[[], datetime]
 type Sleeper = Callable[[float], Awaitable[None]]
+
+_LINK_TOKEN_PUNCTUATION = frozenset("!#$%&'*+-.^_`|~")
+_INVALID_LINK_TARGET_CHARACTERS = frozenset('<>"{}|\\^`')
 
 
 class RetryPolicy(StrictModel):
@@ -64,6 +68,7 @@ def _is_allowed_origin(url: httpx.URL) -> bool:
         and url.host == GITHUB_API_BASE_URL.host
         and _effective_port(url) == _effective_port(GITHUB_API_BASE_URL)
         and not url.userinfo
+        and not url.fragment
     )
 
 
@@ -93,6 +98,92 @@ def _retry_at(headers: httpx.Headers, clock: Clock) -> datetime | None:
         return datetime.fromtimestamp(int(reset), tz=UTC)
     except (OSError, OverflowError, TypeError, ValueError):
         return None
+
+
+def _is_link_token_character(value: str) -> bool:
+    return value.isascii() and (value.isalnum() or value in _LINK_TOKEN_PUNCTUATION)
+
+
+def _parse_link_header(value: str) -> tuple[tuple[str, Mapping[str, str]], ...]:
+    """Parse the RFC Link subset used by GitHub and reject incomplete structures."""
+    entries: list[tuple[str, Mapping[str, str]]] = []
+    index = 0
+    length = len(value)
+
+    def skip_whitespace(position: int) -> int:
+        while position < length and value[position] in " \t":
+            position += 1
+        return position
+
+    while True:
+        index = skip_whitespace(index)
+        if index >= length or value[index] != "<":
+            raise ValueError("malformed Link target")
+        target_end = value.find(">", index + 1)
+        if target_end < 0:
+            raise ValueError("unterminated Link target")
+        target = value[index + 1 : target_end]
+        if not target or any(
+            not 0x21 <= ord(character) <= 0x7E or character in _INVALID_LINK_TARGET_CHARACTERS
+            for character in target
+        ):
+            raise ValueError("invalid Link target")
+        index = target_end + 1
+        parameters: dict[str, str] = {}
+
+        while True:
+            index = skip_whitespace(index)
+            if index >= length or value[index] == ",":
+                break
+            if value[index] != ";":
+                raise ValueError("malformed Link parameter separator")
+            index = skip_whitespace(index + 1)
+            name_start = index
+            while index < length and _is_link_token_character(value[index]):
+                index += 1
+            if index == name_start:
+                raise ValueError("missing Link parameter name")
+            name = value[name_start:index].lower()
+            index = skip_whitespace(index)
+            if index >= length or value[index] != "=":
+                raise ValueError("missing Link parameter value")
+            index = skip_whitespace(index + 1)
+            if index >= length:
+                raise ValueError("missing Link parameter value")
+
+            if value[index] == '"':
+                index += 1
+                parsed_value: list[str] = []
+                while index < length and value[index] != '"':
+                    if value[index] == "\\":
+                        index += 1
+                        if index >= length:
+                            raise ValueError("unterminated Link quoted value")
+                    if ord(value[index]) < 0x20 or ord(value[index]) == 0x7F:
+                        raise ValueError("invalid Link quoted value")
+                    parsed_value.append(value[index])
+                    index += 1
+                if index >= length:
+                    raise ValueError("unterminated Link quoted value")
+                index += 1
+                parameter_value = "".join(parsed_value)
+            else:
+                value_start = index
+                while index < length and _is_link_token_character(value[index]):
+                    index += 1
+                if index == value_start:
+                    raise ValueError("invalid Link parameter value")
+                parameter_value = value[value_start:index]
+            if name in parameters:
+                raise ValueError("duplicate Link parameter")
+            parameters[name] = parameter_value
+
+        entries.append((target, parameters))
+        if index >= length:
+            return tuple(entries)
+        index = skip_whitespace(index + 1)
+        if index >= length:
+            raise ValueError("trailing Link separator")
 
 
 class GitHubClient:
@@ -130,10 +221,9 @@ class GitHubClient:
                 follow_redirects=False,
                 transport=transport,
             )
-            self._request_headers: httpx.Headers | None = None
         else:
             self._client = client
-            self._request_headers = httpx.Headers(headers)
+        self._request_headers: httpx.Headers | None = httpx.Headers(headers)
         self._clock = clock
         self._sleeper = sleeper
         self._retry_policy = retry_policy or RetryPolicy()
@@ -212,11 +302,10 @@ class GitHubClient:
         return str.removeprefix(authorization, "Bearer ")
 
     def _safe_request_id(self, value: str | None) -> str | None:
-        sanitized = sanitize_request_id(value)
         secret = self._authorization_secret()
-        if sanitized is not None and secret is not None and secret in sanitized:
+        if value is not None and secret is not None and request_id_overlaps_secret(value, secret):
             return None
-        return sanitized
+        return sanitize_request_id(value)
 
     def _safe_endpoint(self, value: str) -> str:
         sanitized = sanitize_endpoint(value)
@@ -240,13 +329,19 @@ class GitHubClient:
         )
         if etag is not None:
             headers["If-None-Match"] = etag
+        request_url = url.copy_merge_params(params) if params else url
         for attempt in range(1, self._retry_policy.max_attempts + 1):
             transport_failed = False
             try:
-                response = await self._client.get(
-                    url,
-                    params=params,
+                request = httpx.Request(
+                    "GET",
+                    request_url,
                     headers=headers or None,
+                    extensions={"timeout": GITHUB_TIMEOUT.as_dict()},
+                )
+                response = await self._client.send(
+                    request,
+                    auth=None,
                     follow_redirects=False,
                 )
             except httpx.TransportError:
@@ -296,20 +391,20 @@ class GitHubClient:
         raw_link = response.headers.get("Link")
         if raw_link is None:
             return None
-        malformed = False
+        parse_failed = False
         try:
-            next_link = response.links.get("next")
-        except (KeyError, TypeError, ValueError):
-            malformed = True
-            next_link = None
-        if next_link is None:
-            if "next" in raw_link.lower():
-                malformed = True
-            else:
-                return None
-        if malformed or type(next_link) is not dict or type(next_link.get("url")) is not str:
+            entries = _parse_link_header(raw_link)
+        except ValueError:
+            parse_failed = True
+            entries = ()
+        if parse_failed:
             raise GitHubProtocolError(endpoint)
-        return next_link["url"]
+        next_urls = [
+            target for target, parameters in entries if "next" in parameters.get("rel", "").split()
+        ]
+        if len(next_urls) > 1:
+            raise GitHubProtocolError(endpoint)
+        return next_urls[0] if next_urls else None
 
     async def get_pages(
         self,
