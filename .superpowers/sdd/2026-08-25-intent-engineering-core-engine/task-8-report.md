@@ -151,3 +151,49 @@ Success: no issues found in 5 source files
 .venv/bin/pytest -v
 183 passed in 2.37s
 ```
+
+## Fix round 2 — renderer output containment
+
+Addressed the re-review containment finding in product commit
+`cc4477dca8ebd2f5815f12d784e6ad6cd050972b` (`fix: publish generated views with directory fds`).
+
+`GraphRenderer` now opens or creates every output-directory component through a held parent
+directory FD with `O_DIRECTORY|O_NOFOLLOW`, verifies the final FD still identifies the requested
+directory, checks both targets before publishing, and writes each generated view to a same-
+directory exclusive no-follow temporary file. Each temp file is fsynced, atomically replaced by
+FD-relative `os.replace`, and the directory is fsynced. Existing hard links are safely replaced
+with a new inode; symlink targets and swapped directories are rejected without writing outside the
+held directory.
+
+### RED
+
+```text
+.venv/bin/pytest tests/unit/render -v
+2 failed, 12 passed in 0.11s
+```
+
+The hard-link regression showed the external sentinel overwritten by `graph.md`; the deterministic
+parent swap left a generated file in the displaced original directory before the symlink rejection.
+
+### GREEN
+
+```text
+.venv/bin/ruff format src/intent_engineering/render/renderer.py tests/unit/render/test_renderers.py
+1 file reformatted, 1 file left unchanged
+
+.venv/bin/ruff check src/intent_engineering/render/renderer.py tests/unit/render/test_renderers.py
+All checks passed!
+
+.venv/bin/mypy --strict src/intent_engineering/render/renderer.py
+Success: no issues found in 1 source file
+
+.venv/bin/pytest tests/unit/render -v
+14 passed in 0.16s
+```
+
+### Full verification
+
+```text
+.venv/bin/pytest -v
+185 passed in 4.22s
+```
