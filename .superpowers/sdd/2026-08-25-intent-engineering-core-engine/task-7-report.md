@@ -204,3 +204,50 @@ $ .venv/bin/pytest -v
 ### Fix commit
 
 - Product and regression tests: `f0d2e779ca8a0b9564893b522eba018b1838ff7f`
+
+## Fix round 3 — canonical manifest validation and deletion coverage
+
+### Root cause and design
+
+The initial manifest parser converted input rows straight to a dictionary. A duplicate
+row whose final value matched the current file therefore looked like a valid snapshot
+and could suppress rediscovery. It also accepted unsorted entries and arbitrary path
+or version strings. The parser now validates the raw list before lookup construction:
+paths must be normalized non-empty POSIX-relative keys, content versions must be
+lowercase SHA-256 strings, rows must be strictly path-sorted and unique, and
+reserializing the parsed rows must exactly reproduce the canonical cursor. Any failure
+is treated as legacy/malformed and triggers the safe full rescan/migration path.
+
+The real-Markdown sync suite now also proves that deletion commits the new full
+manifest with an empty semantic delta, does not re-invoke the reasoner or detector for
+the unchanged document, and leaves the following no-op checkpoint bytes unchanged.
+
+### RED
+
+```console
+$ .venv/bin/python -m pytest tests/integration/capture/test_markdown_connector.py tests/integration/sync/test_markdown_sync.py -v
+1 failed, 10 passed in 0.12s
+```
+
+The duplicate final-value-match manifest suppressed the full current snapshot instead
+of causing a safe rescan.
+
+### GREEN and verification
+
+```console
+$ .venv/bin/python -m pytest tests/integration/capture/test_markdown_connector.py tests/integration/sync/test_markdown_sync.py -v
+11 passed in 0.16s
+
+$ .venv/bin/ruff check src/intent_engineering/capture/markdown/connector.py tests/integration/capture/test_markdown_connector.py tests/integration/sync/test_markdown_sync.py
+All checks passed!
+
+$ .venv/bin/mypy --strict src/intent_engineering/capture/markdown/connector.py
+Success: no issues found in 1 source file
+
+$ .venv/bin/pytest -v
+151 passed in 1.64s
+```
+
+### Fix commit
+
+- Product and regression tests: `759bd7a8e3af90a0e3112f59cf8ae8005e8543d2`
