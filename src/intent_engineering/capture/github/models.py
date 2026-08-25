@@ -202,6 +202,20 @@ class GitHubReviewComment(GitHubProviderModel):
     line: int | None
 
 
+class GitHubRepositoryStatus(StrictModel):
+    """Validated non-sensitive scalars returned by the repository doctor probe."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    repository: str
+    accessible: bool
+    rate_limit: int = Field(ge=0, le=1_000_000_000)
+    rate_remaining: int = Field(ge=0, le=1_000_000_000)
+    rate_used: int = Field(ge=0, le=1_000_000_000)
+    rate_reset_at: datetime
+    rate_resource: str = Field(min_length=1, max_length=32, pattern=r"^[A-Za-z0-9_-]+$")
+
+
 class PageResult(StrictModel):
     """One immutable ordered pagination result and its first-page validator."""
 

@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import cast
 
@@ -11,13 +12,17 @@ import anyio
 import structlog
 import typer
 
+from intent_engineering.cli.github import GitHubDoctorResult, check_github
 from intent_engineering.cli.output import OutputFormat, emit
 from intent_engineering.cli.runtime import (
+    GitHubConfigurationError,
     Runtime,
+    github_repository_scope,
     load_runtime,
     new_run_id,
     parse_sources,
-    resolve_connectors,
+    run_selected_sync,
+    validate_github_environment,
 )
 from intent_engineering.context import ContextProvider
 from intent_engineering.core.models import (
@@ -36,7 +41,7 @@ from intent_engineering.core.policy import (
     refs_allowed,
 )
 from intent_engineering.reconcile import ResolutionUnavailable
-from intent_engineering.render import GraphRenderer
+from intent_engineering.render import GraphRenderer, render_drift_report
 from intent_engineering.storage.interfaces import GraphStore
 from intent_engineering.sync.models import SyncRunResult, SyncRunStatus
 from intent_engineering.validation import validate_project
@@ -47,7 +52,11 @@ app = typer.Typer(
     no_args_is_help=True,
 )
 reconcile_app = typer.Typer(help="Inspect and resolve durable reconciliation cases.")
+doctor_app = typer.Typer(
+    help="Check local workspace and provider health.", invoke_without_command=True
+)
 app.add_typer(reconcile_app, name="reconcile")
+app.add_typer(doctor_app, name="doctor")
 
 
 def _configure_logging() -> None:
@@ -143,7 +152,11 @@ def _authorized_graph(runtime: Runtime) -> Graph:
 
 def _invoke_sync(runtime: Runtime, sources: str) -> SyncRunResult:
     """Cross exactly one AnyIO boundary for one CLI sync-like command."""
-    return anyio.run(runtime.sync.run, new_run_id(), resolve_connectors(runtime, sources))
+
+    async def run() -> SyncRunResult:
+        return await run_selected_sync(runtime, sources, new_run_id())
+
+    return anyio.run(run)
 
 
 def _exit_for_review(required: bool) -> None:
@@ -208,6 +221,7 @@ def ingest_command(
 ) -> None:
     """Capture local evidence through the selected local source connectors."""
     _validate_sources(sources)
+    _validate_github_scope(sources)
     _sync_command(_runtime(project), sources, output_format)
 
 
@@ -217,8 +231,9 @@ def sync_command(
     sources: str = typer.Option("markdown,git", "--sources"),
     output_format: OutputFormat = typer.Option(OutputFormat.TEXT, "--format"),
 ) -> None:
-    """Synchronize Markdown and Git evidence into the local graph runtime."""
+    """Synchronize selected local and GitHub evidence through one graph runtime."""
     _validate_sources(sources)
+    _validate_github_scope(sources)
     _sync_command(_runtime(project), sources, output_format)
 
 
@@ -230,20 +245,50 @@ def _validate_sources(sources: str) -> None:
         raise typer.BadParameter("invalid source selection", param_hint="--sources") from error
 
 
+def _validate_github_scope(sources: str) -> None:
+    try:
+        validate_github_environment(sources, os.environ)
+    except GitHubConfigurationError as error:
+        raise typer.BadParameter(
+            "invalid or missing GitHub repository scope",
+            param_hint="GITHUB_REPOSITORY",
+        ) from error
+
+
 @app.command("drift")
 def drift_command(
     project: Path = typer.Option(Path("."), "--project"),
     require_review: bool = typer.Option(False, "--require-review"),
     output_format: OutputFormat = typer.Option(OutputFormat.TEXT, "--format"),
+    output: Path | None = typer.Option(None, "--output"),
 ) -> None:
     """Report open and proposed reconciliation cases requiring attention."""
+    if output is not None and output_format is not OutputFormat.MARKDOWN:
+        raise typer.BadParameter("--output requires --format markdown", param_hint="--output")
+    runtime = _runtime(project)
     cases = tuple(
-        case
-        for case in _authorized_cases(_runtime(project))
-        if is_nonterminal_case_status(case.status)
+        case for case in _authorized_cases(runtime) if is_nonterminal_case_status(case.status)
     )
+    if output_format is OutputFormat.MARKDOWN:
+        report = render_drift_report(cases)
+        if output is not None:
+            target = None
+            try:
+                if output.suffix.casefold() != ".md" or output.parts[0] in {".git", ".intent"}:
+                    raise ValueError("unsafe report target")
+                target = runtime.project_directory.file(output)
+                target.atomic_write(report.encode("utf-8"), reject_target_races=True)
+            except (OSError, TypeError, ValueError) as error:
+                _runtime_error(error)
+                raise typer.Exit(1) from error
+            finally:
+                if target is not None:
+                    target.close()
+        typer.echo(report, nl=False)
+        _exit_for_review(require_review)
+        return
     emit({"cases": cases, "review_required": bool(cases) or require_review}, output_format)
-    _exit_for_review(bool(cases) or require_review)
+    _exit_for_review(require_review)
 
 
 @app.command("status")
@@ -400,12 +445,15 @@ def render_command(
     emit({"markdown": str(markdown), "mermaid": str(mermaid)}, output_format)
 
 
-@app.command("doctor")
+@doctor_app.callback(invoke_without_command=True)
 def doctor_command(
+    context: typer.Context,
     project: Path = typer.Option(Path("."), "--project"),
     output_format: OutputFormat = typer.Option(OutputFormat.TEXT, "--format"),
 ) -> None:
     """Check local workspace health through the shared deep validation service."""
+    if context.invoked_subcommand is not None:
+        return
     report = validate_project(project)
     emit(
         {
@@ -416,6 +464,30 @@ def doctor_command(
         output_format,
     )
     if not report.valid:
+        raise typer.Exit(1)
+
+
+@doctor_app.command("github")
+def doctor_github_command(
+    project: Path = typer.Option(Path("."), "--project"),
+    output_format: OutputFormat = typer.Option(OutputFormat.TEXT, "--format"),
+) -> None:
+    """Check locally authenticated GitHub repository access without exposing credentials."""
+    try:
+        github_repository_scope(os.environ)
+    except GitHubConfigurationError as error:
+        raise typer.BadParameter(
+            "invalid or missing GitHub repository scope",
+            param_hint="GITHUB_REPOSITORY",
+        ) from error
+    runtime = _runtime(project)
+
+    async def run() -> GitHubDoctorResult:
+        return await check_github(runtime, env=os.environ)
+
+    result = anyio.run(run)
+    emit(result, output_format)
+    if not result.healthy:
         raise typer.Exit(1)
 
 

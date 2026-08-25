@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ctypes
 import os
 import secrets
 import stat
@@ -14,6 +15,9 @@ _DIRECTORY = getattr(os, "O_DIRECTORY", 0)
 _CLOEXEC = getattr(os, "O_CLOEXEC", 0)
 _DIRECTORY_FLAGS = os.O_RDONLY | _DIRECTORY | _NOFOLLOW | _CLOEXEC
 _READ_FLAGS = os.O_RDONLY | _NOFOLLOW | _CLOEXEC
+_RENAME_NOREPLACE = 1
+_RENAME_EXCHANGE = 2
+_RENAME_EXCL = 4
 
 type FileIdentity = tuple[int, int]
 
@@ -78,6 +82,67 @@ def _read_named(parent_fd: int, name: str) -> tuple[bytes, os.stat_result]:
         return _read_descriptor(descriptor), metadata
     finally:
         os.close(descriptor)
+
+
+def _rename_with_flags(
+    parent_fd: int,
+    left: str,
+    right: str,
+    *,
+    linux_flags: int,
+    darwin_flags: int,
+) -> None:
+    """Invoke one descriptor-rooted rename primitive or fail closed."""
+    library = ctypes.CDLL(None, use_errno=True)
+    try:
+        function = library.renameat2
+        flags = linux_flags
+    except AttributeError:
+        try:
+            function = library.renameatx_np
+            flags = darwin_flags
+        except AttributeError as error:
+            raise UnsafePathError() from error
+    function.argtypes = (
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    )
+    function.restype = ctypes.c_int
+    result = function(
+        parent_fd,
+        os.fsencode(left),
+        parent_fd,
+        os.fsencode(right),
+        flags,
+    )
+    if result != 0:
+        error_number = ctypes.get_errno()
+        raise OSError(error_number, os.strerror(error_number))
+
+
+def _exchange_names(parent_fd: int, left: str, right: str) -> None:
+    """Atomically exchange two entries or fail closed when the platform cannot."""
+    _rename_with_flags(
+        parent_fd,
+        left,
+        right,
+        linux_flags=_RENAME_EXCHANGE,
+        darwin_flags=_RENAME_EXCHANGE,
+    )
+
+
+def _rename_exclusive(parent_fd: int, source: str, target: str) -> None:
+    """Atomically rename only when the destination remains absent."""
+    _rename_with_flags(
+        parent_fd,
+        source,
+        target,
+        linux_flags=_RENAME_NOREPLACE,
+        darwin_flags=_RENAME_EXCL,
+    )
 
 
 class SecureDirectory:
@@ -417,18 +482,71 @@ class SecureFile:
                 return None
             raise
 
-    def _assert_safe_existing_target(self) -> None:
+    def _assert_safe_existing_target(self) -> os.stat_result | None:
         try:
             metadata = os.stat(self.name, dir_fd=self.parent_fd, follow_symlinks=False)
         except FileNotFoundError:
-            return
+            return None
         except OSError as error:
             raise UnsafePathError() from error
         _require_regular(metadata)
+        return metadata
 
-    def atomic_write(self, content: bytes) -> None:
+    def _install_verified_temporary(
+        self,
+        temporary_name: str,
+        temporary_metadata: os.stat_result,
+        expected_target: os.stat_result | None,
+    ) -> None:
+        """Install a prepared file only if the inspected target did not change."""
+        if expected_target is None:
+            _rename_exclusive(self.parent_fd, temporary_name, self.name)
+            installed = os.stat(self.name, dir_fd=self.parent_fd, follow_symlinks=False)
+            installed_is_safe = (
+                stat.S_ISREG(installed.st_mode)
+                and installed.st_nlink == 1
+                and _identity(installed) == _identity(temporary_metadata)
+            )
+            if not installed_is_safe:
+                try:
+                    os.unlink(self.name, dir_fd=self.parent_fd)
+                except OSError as error:
+                    raise UnsafePathError() from error
+                raise UnsafePathError()
+            os.fsync(self.parent_fd)
+            return
+
+        _exchange_names(self.parent_fd, temporary_name, self.name)
+        try:
+            displaced = os.stat(
+                temporary_name,
+                dir_fd=self.parent_fd,
+                follow_symlinks=False,
+            )
+            installed = os.stat(self.name, dir_fd=self.parent_fd, follow_symlinks=False)
+            unchanged = (
+                stat.S_ISREG(displaced.st_mode)
+                and displaced.st_nlink == 1
+                and _identity(displaced) == _identity(expected_target)
+                and stat.S_ISREG(installed.st_mode)
+                and installed.st_nlink == 1
+                and _identity(installed) == _identity(temporary_metadata)
+            )
+        except OSError:
+            unchanged = False
+        if not unchanged:
+            try:
+                _exchange_names(self.parent_fd, temporary_name, self.name)
+            except OSError as error:
+                raise UnsafePathError() from error
+            raise UnsafePathError()
+        os.unlink(temporary_name, dir_fd=self.parent_fd)
+        os.fsync(self.parent_fd)
+
+    def atomic_write(self, content: bytes, *, reject_target_races: bool = False) -> None:
         temporary_name: str | None = None
         descriptor = -1
+        temporary_metadata: os.stat_result | None = None
         try:
             for _ in range(32):
                 candidate = f".{self.name}.{secrets.token_hex(16)}.tmp"
@@ -445,7 +563,8 @@ class SecureFile:
                 break
             if temporary_name is None:
                 raise UnsafePathError()
-            _require_regular(os.fstat(descriptor))
+            temporary_metadata = os.fstat(descriptor)
+            _require_regular(temporary_metadata)
             view = memoryview(content)
             while view:
                 written = os.write(descriptor, view)
@@ -453,13 +572,20 @@ class SecureFile:
             os.fsync(descriptor)
             os.close(descriptor)
             descriptor = -1
-            self._assert_safe_existing_target()
-            os.replace(
-                temporary_name,
-                self.name,
-                src_dir_fd=self.parent_fd,
-                dst_dir_fd=self.parent_fd,
-            )
+            expected_target = self._assert_safe_existing_target()
+            if reject_target_races:
+                self._install_verified_temporary(
+                    temporary_name,
+                    temporary_metadata,
+                    expected_target,
+                )
+            else:
+                os.replace(
+                    temporary_name,
+                    self.name,
+                    src_dir_fd=self.parent_fd,
+                    dst_dir_fd=self.parent_fd,
+                )
             temporary_name = None
             os.fsync(self.parent_fd)
         except OSError as error:

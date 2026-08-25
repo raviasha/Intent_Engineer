@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Awaitable, Callable, Mapping
 from datetime import UTC, datetime, timedelta
 from email.utils import parsedate_to_datetime
@@ -24,7 +25,7 @@ from intent_engineering.capture.github.errors import (
     sanitize_endpoint,
     sanitize_request_id,
 )
-from intent_engineering.capture.github.models import PageResult
+from intent_engineering.capture.github.models import GitHubRepositoryStatus, PageResult
 from intent_engineering.core.models._base import StrictModel
 
 GITHUB_API_BASE_URL = httpx.URL("https://api.github.com")
@@ -37,6 +38,10 @@ type Sleeper = Callable[[float], Awaitable[None]]
 
 _LINK_TOKEN_PUNCTUATION = frozenset("!#$%&'*+-.^_`|~")
 _INVALID_LINK_TARGET_CHARACTERS = frozenset('<>"{}|\\^`')
+_CANONICAL_REPOSITORY = re.compile(
+    r"(?!-)(?!.*--)[a-z0-9-]{1,39}(?<!-)/[a-z0-9][a-z0-9._-]{0,99}\Z"
+)
+_RATE_SCALAR_MAX = 1_000_000_000
 
 
 class RetryPolicy(StrictModel):
@@ -99,6 +104,39 @@ def _retry_at(headers: httpx.Headers, clock: Clock) -> datetime | None:
         return datetime.fromtimestamp(int(reset), tz=UTC)
     except (OSError, OverflowError, TypeError, ValueError):
         return None
+
+
+def _bounded_rate_integer(value: str | None, *, maximum: int = _RATE_SCALAR_MAX) -> int | None:
+    if value is None or not value.isascii() or not value.isdecimal() or len(value) > 12:
+        return None
+    parsed = int(value)
+    return parsed if parsed <= maximum else None
+
+
+def _repository_rate_status(
+    headers: httpx.Headers,
+) -> tuple[int, int, int, datetime, str] | None:
+    limit = _bounded_rate_integer(headers.get("X-RateLimit-Limit"))
+    remaining = _bounded_rate_integer(headers.get("X-RateLimit-Remaining"))
+    used = _bounded_rate_integer(headers.get("X-RateLimit-Used"))
+    reset = _bounded_rate_integer(headers.get("X-RateLimit-Reset"), maximum=253_402_300_799)
+    resource = headers.get("X-RateLimit-Resource")
+    if (
+        limit is None
+        or remaining is None
+        or used is None
+        or reset is None
+        or remaining > limit
+        or used > limit
+        or resource is None
+        or re.fullmatch(r"[A-Za-z0-9_-]{1,32}", resource) is None
+    ):
+        return None
+    try:
+        reset_at = datetime.fromtimestamp(reset, tz=UTC)
+    except (OSError, OverflowError, ValueError):
+        return None
+    return limit, remaining, used, reset_at, resource
 
 
 def _is_link_token_character(value: str) -> bool:
@@ -407,6 +445,58 @@ class GitHubClient:
         if len(next_urls) > 1:
             raise GitHubProtocolError(endpoint)
         return next_urls[0] if next_urls else None
+
+    async def get_repository_status(self, repository: str) -> GitHubRepositoryStatus:
+        """Probe one repository and return only validated, bounded diagnostic scalars."""
+        if type(repository) is not str or _CANONICAL_REPOSITORY.fullmatch(repository) is None:
+            raise GitHubProtocolError("/")
+        current = self._absolute_url(f"/repos/{repository}", pagination=False)
+        if current is None:  # pragma: no cover - canonical repository makes this unreachable
+            raise GitHubProtocolError("/")
+        endpoint = self._safe_endpoint(current.path)
+        response = await self._request_page(
+            current,
+            params=None,
+            etag=None,
+            endpoint=endpoint,
+        )
+        if not 200 <= response.status_code <= 299:
+            error = self._status_error(response, endpoint)
+            await response.aclose()
+            del response
+            raise error from None
+
+        malformed = False
+        payload: Any = None
+        try:
+            payload = response.json()
+        except (UnicodeError, ValueError):
+            malformed = True
+        rate_status = _repository_rate_status(response.headers)
+        if (
+            malformed
+            or type(payload) is not dict
+            or type(payload.get("full_name")) is not str
+            or payload.get("full_name", "").casefold() != repository
+            or rate_status is None
+        ):
+            malformed = True
+        await response.aclose()
+        del response
+        payload = None
+        if malformed or rate_status is None:
+            repository = ""
+            raise GitHubProtocolError(endpoint) from None
+        limit, remaining, used, reset_at, resource = rate_status
+        return GitHubRepositoryStatus(
+            repository=repository,
+            accessible=True,
+            rate_limit=limit,
+            rate_remaining=remaining,
+            rate_used=used,
+            rate_reset_at=reset_at,
+            rate_resource=resource,
+        )
 
     async def get_pages(
         self,

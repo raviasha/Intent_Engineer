@@ -3,16 +3,25 @@
 from __future__ import annotations
 
 import os
-from collections.abc import Mapping, Sequence
+import re
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
 
+import anyio
 import yaml  # type: ignore[import-untyped]
 from pydantic import ValidationError
 
 from intent_engineering.capture.base import Connector
 from intent_engineering.capture.git.connector import GitConnector
+from intent_engineering.capture.github.auth import (
+    GitHubCredentials,
+    GitHubTokenRunner,
+    run_gh_token,
+)
+from intent_engineering.capture.github.client import GitHubClient
+from intent_engineering.capture.github.connector import GitHubConnector
 from intent_engineering.capture.markdown.connector import MarkdownConnector
 from intent_engineering.context import ContextProvider
 from intent_engineering.core.models import (
@@ -41,6 +50,40 @@ from intent_engineering.storage.transaction import LocalTransactionCoordinator
 from intent_engineering.storage.yaml.checkpoint_store import YamlCheckpointStore
 from intent_engineering.storage.yaml.graph_store import YamlGraphStore
 from intent_engineering.sync import SyncOrchestrator
+from intent_engineering.sync.models import SyncRunResult
+
+_GITHUB_OWNER = re.compile(r"(?!-)(?!.*--)[A-Za-z0-9-]{1,39}(?<!-)\Z")
+_GITHUB_REPOSITORY = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}\Z")
+
+type GitHubClientFactory = Callable[[GitHubCredentials], GitHubClient]
+
+
+class GitHubConfigurationError(ValueError):
+    """A fixed public failure for missing or malformed local GitHub scope."""
+
+    def __init__(self) -> None:
+        super().__init__("GitHub repository scope is unavailable")
+
+
+def github_repository_scope(env: Mapping[str, object]) -> str:
+    """Return one canonical repository scope from the standard non-secret variable."""
+    invalid = False
+    try:
+        value = env.get("GITHUB_REPOSITORY")
+    except Exception:  # noqa: BLE001 - discard hostile mapping failures at the boundary
+        invalid = True
+        value = None
+    if invalid or type(value) is not str or value != value.strip():
+        raise GitHubConfigurationError()
+    owner, separator, repository = value.partition("/")
+    if (
+        not separator
+        or "/" in repository
+        or _GITHUB_OWNER.fullmatch(owner) is None
+        or _GITHUB_REPOSITORY.fullmatch(repository) is None
+    ):
+        raise GitHubConfigurationError()
+    return f"{owner.lower()}/{repository.lower()}"
 
 
 def _front_matter(content: str) -> Mapping[str, Any] | None:
@@ -215,8 +258,14 @@ def load_runtime(root: Path) -> Runtime:
     )
 
 
-def resolve_connectors(runtime: Runtime, sources: str) -> tuple[Connector, ...]:
-    """Resolve a stable comma-delimited local connector list without provider fallbacks."""
+def resolve_connectors(
+    runtime: Runtime,
+    sources: str,
+    *,
+    github_client: GitHubClient | None = None,
+    github_repository: str | None = None,
+) -> tuple[Connector, ...]:
+    """Resolve one stable connector list for a single orchestrator transaction."""
     requested = parse_sources(sources)
     connectors: list[Connector] = []
     for source in requested:
@@ -224,6 +273,11 @@ def resolve_connectors(runtime: Runtime, sources: str) -> tuple[Connector, ...]:
             connectors.append(MarkdownConnector(runtime.project_directory, runtime.config))
         elif source == "git":
             connectors.append(GitConnector(runtime.root))
+        elif source == "github":
+            if github_client is None or github_repository is None:
+                raise GitHubConfigurationError()
+            owner, repository = github_repository.split("/", 1)
+            connectors.append(GitHubConnector(github_client, owner=owner, repository=repository))
         else:  # pragma: no cover - parse_sources establishes this boundary
             raise AssertionError(source)
     return tuple(connectors)
@@ -236,10 +290,64 @@ def parse_sources(sources: str) -> tuple[str, ...]:
         raise ValueError("sources must name one or more connectors")
     if len(requested) != len(set(requested)):
         raise ValueError("sources must not contain duplicates")
-    unknown = tuple(item for item in requested if item not in {"markdown", "git"})
+    unknown = tuple(item for item in requested if item not in {"markdown", "git", "github"})
     if unknown:
-        raise ValueError("sources must be markdown and/or git")
+        raise ValueError("sources must be markdown, git, and/or github")
     return requested
+
+
+def validate_github_environment(sources: str, env: Mapping[str, object]) -> None:
+    """Validate GitHub scope before a CLI command opens canonical project state."""
+    if "github" in parse_sources(sources):
+        github_repository_scope(env)
+
+
+def _default_github_client(credentials: GitHubCredentials) -> GitHubClient:
+    return GitHubClient(credentials)
+
+
+async def run_selected_sync(
+    runtime: Runtime,
+    sources: str,
+    run_id: str,
+    *,
+    env: Mapping[str, object] | None = None,
+    token_runner: GitHubTokenRunner = run_gh_token,
+    client_factory: GitHubClientFactory = _default_github_client,
+) -> SyncRunResult:
+    """Run all selected sources once and deterministically clean up a CLI-owned client."""
+    requested = parse_sources(sources)
+    if "github" not in requested:
+        return await runtime.sync.run(run_id, resolve_connectors(runtime, sources))
+
+    environment: Mapping[str, object] = os.environ if env is None else env
+    repository = github_repository_scope(environment)
+    credentials = GitHubCredentials.resolve(environment, token_runner)
+    client = client_factory(credentials)
+    operation_failed = False
+    try:
+        connectors = resolve_connectors(
+            runtime,
+            sources,
+            github_client=client,
+            github_repository=repository,
+        )
+        return await runtime.sync.run(run_id, connectors)
+    except BaseException:
+        operation_failed = True
+        raise
+    finally:
+        close_failed = False
+        try:
+            with anyio.CancelScope(shield=True):
+                await client.aclose()
+        except anyio.get_cancelled_exc_class():
+            if not operation_failed:
+                raise
+        except BaseException:  # noqa: BLE001 - discard untrusted close failures
+            close_failed = True
+        if close_failed and not operation_failed:
+            raise RuntimeError("GitHub client cleanup failed") from None
 
 
 def new_run_id() -> str:
