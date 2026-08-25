@@ -50,6 +50,8 @@ def test_system_exit_after_each_durable_resolution_stage_recovers_exact_preimage
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stage: str
 ) -> None:
     service = _service(tmp_path)
+    paths = service._paths()
+    before = {path: path.read_bytes() if path.exists() else None for path in paths}
     case = service._case_store.get("case-1")
     graph_version = service._graph_store.load().version
     canonical = service._canonical_changeset(
@@ -81,17 +83,31 @@ def test_system_exit_after_each_durable_resolution_stage_recovers_exact_preimage
         JsonlCaseStore(tmp_path / "cases.jsonl"),
         "tester",
     )
-    with pytest.raises(ResolutionUnavailable):
-        fresh.resolve("case-1", ResolutionAction.UPDATE_IMPLEMENTATION)
+    fresh.recover()
+    assert {path: path.read_bytes() if path.exists() else None for path in paths} == before
+    assert not fresh._journal_path().exists()
+    fresh.recover()
+    assert {path: path.read_bytes() if path.exists() else None for path in paths} == before
 
 
+@pytest.mark.parametrize("append_number", (1, 2))
 def test_system_exit_during_preview_case_append_recovers_exact_preimage(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, append_number: int
 ) -> None:
     service = _service(tmp_path, needs_human=False)
     paths = service._paths()
     before = {path: path.read_bytes() if path.exists() else None for path in paths}
-    monkeypatch.setattr(service._case_store, "put", lambda _: (_ for _ in ()).throw(SystemExit()))
+    original_put = service._case_store.put
+    calls = 0
+
+    def interrupt(case: object) -> bool:
+        nonlocal calls
+        calls += 1
+        if calls == append_number:
+            raise SystemExit()
+        return original_put(case)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(service._case_store, "put", interrupt)
     with pytest.raises(SystemExit):
         service.resolve("case-1", ResolutionAction.UPDATE_IMPLEMENTATION)
     assert service._journal_path().exists()
