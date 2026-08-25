@@ -10,9 +10,13 @@ python -m venv .venv
 .venv/bin/python -m pip install -e '.[dev]'
 ```
 
-Before proposing a change, run:
+On a clean checkout, initialize the repository's ignored local workspace once,
+then run the release checks. Validation reads the complete `.intent/` state
+(configuration, configured graph, evidence, cases, ChangeSets, checkpoints, and
+transaction recovery state), so it intentionally fails before initialization.
 
 ```bash
+.venv/bin/intent init --project .
 .venv/bin/ruff check .
 .venv/bin/mypy src/intent_engineering
 .venv/bin/pytest --cov=intent_engineering --cov-report=term-missing

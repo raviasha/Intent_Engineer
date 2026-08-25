@@ -77,13 +77,18 @@ def _record_version(
     return True
 
 
-def _parse_versions(
+def _parse_versions_with_history(
     content: bytes | None,
-) -> tuple[dict[str, ReconciliationCase], dict[str, ReconciliationCase]]:
+) -> tuple[
+    tuple[ReconciliationCase, ...],
+    dict[str, ReconciliationCase],
+    dict[str, ReconciliationCase],
+]:
+    versions: list[ReconciliationCase] = []
     latest_by_id: dict[str, ReconciliationCase] = {}
     by_fingerprint: dict[str, ReconciliationCase] = {}
     if content is None:
-        return latest_by_id, by_fingerprint
+        return (), latest_by_id, by_fingerprint
     try:
         lines = content.decode("utf-8").splitlines(keepends=True)
     except UnicodeError as error:
@@ -101,12 +106,26 @@ def _parse_versions(
                 case,
                 exact_is_noop=True,
             )
+            versions.append(case)
         except CaseStoreError:
             raise
         except (json.JSONDecodeError, ValueError) as error:
             raise CaseStoreError(
                 f"invalid reconciliation case record at line {line_number}"
             ) from error
+    return tuple(versions), latest_by_id, by_fingerprint
+
+
+def parse_case_versions(content: bytes | None) -> tuple[ReconciliationCase, ...]:
+    """Parse every durable lifecycle version through the explicit legacy migration."""
+    versions, _, _ = _parse_versions_with_history(content)
+    return versions
+
+
+def _parse_versions(
+    content: bytes | None,
+) -> tuple[dict[str, ReconciliationCase], dict[str, ReconciliationCase]]:
+    _, latest_by_id, by_fingerprint = _parse_versions_with_history(content)
     return latest_by_id, by_fingerprint
 
 

@@ -115,6 +115,30 @@ def test_stale_committed_journal_completes_without_replaying_preimages(tmp_path:
     assert not journal.exists()
 
 
+def test_snapshot_recovers_before_returning_one_locked_cross_store_view(tmp_path: Path) -> None:
+    """Validation must never parse torn targets before prepared-journal recovery."""
+    extra = tmp_path / "evidence.jsonl"
+    extra.write_bytes(b"evidence-before\n")
+
+    def crash(stage: str) -> None:
+        if stage == "target:history":
+            raise SystemExit()
+
+    coordinator, paths, journal = _coordinator(tmp_path, fault_hook=crash)
+    before = _seed(paths)
+    with pytest.raises(SystemExit), coordinator.transaction() as transaction:
+        transaction.write("graph", b"torn: [")
+        transaction.write("history", b'{"torn":')
+
+    recovery, _, _ = _coordinator(tmp_path)
+    root = SecureDirectory.open(tmp_path)
+    snapshot = recovery.snapshot({"evidence": root.file(extra.name)})
+
+    assert snapshot.recovered is True
+    assert dict(snapshot.content) == {**before, "evidence": b"evidence-before\n"}
+    assert not journal.exists()
+
+
 def _preimage(target: str, content: bytes | None) -> dict[str, object]:
     return {
         "target": target,

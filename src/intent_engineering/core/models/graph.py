@@ -100,6 +100,8 @@ class Graph(StrictModel):
     schema_version: str = "0.1.0"
     name: str | None = None
     purpose: str | None = None
+    created_at: datetime | None = None
+    source_spec: str | None = None
     nodes: tuple[Node, ...]
     edges: tuple[Edge, ...]
     type_registry: TypeRegistry = Field(default_factory=TypeRegistry)

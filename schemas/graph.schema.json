@@ -322,6 +322,19 @@
   "additionalProperties": false,
   "description": "Canonical graph state, validated whenever it is constructed.",
   "properties": {
+    "created_at": {
+      "anyOf": [
+        {
+          "format": "date-time",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Created At"
+    },
     "edges": {
       "items": {
         "$ref": "#/$defs/Edge"
@@ -368,6 +381,18 @@
       "default": "0.1.0",
       "title": "Schema Version",
       "type": "string"
+    },
+    "source_spec": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Source Spec"
     },
     "type_registry": {
       "$ref": "#/$defs/TypeRegistry"

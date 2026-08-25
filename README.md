@@ -69,7 +69,13 @@ implicit fallbacks in this release.
 
 ## Development
 
+A clean checkout does not contain project-local canonical state. Initialize its
+ignored `.intent/` workspace once before asking the production validator to
+inspect it; `intent validate` validates that workspace, not the separately
+tracked framework-graph artifact.
+
 ```bash
+intent init --project .
 ruff check .
 mypy src/intent_engineering
 pytest --cov=intent_engineering --cov-report=term-missing

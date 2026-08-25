@@ -33,13 +33,13 @@ from intent_engineering.core.policy import (
     ProjectNotInitialized,
     evidence_allowed,
     initialize_project,
-    inspect_workspace,
     refs_allowed,
 )
 from intent_engineering.reconcile import ResolutionUnavailable
 from intent_engineering.render import GraphRenderer
 from intent_engineering.storage.interfaces import GraphStore
 from intent_engineering.sync.models import SyncRunResult, SyncRunStatus
+from intent_engineering.validation import validate_project
 
 app = typer.Typer(
     name="intent",
@@ -176,10 +176,11 @@ def validate_command(
     project: Path = typer.Option(Path("."), "--project"),
     output_format: OutputFormat = typer.Option(OutputFormat.TEXT, "--format"),
 ) -> None:
-    """Validate the canonical graph and local configuration."""
-    runtime = _runtime(project)
-    graph = _graph(runtime)
-    emit({"valid": True, "graph_id": graph.id, "graph_version": graph.version}, output_format)
+    """Validate one recovered, consistent snapshot of all canonical local state."""
+    report = validate_project(project)
+    emit(report, output_format)
+    if not report.valid:
+        raise typer.Exit(1)
 
 
 def _sync_command(runtime: Runtime, sources: str, output_format: OutputFormat) -> None:
@@ -404,10 +405,17 @@ def doctor_command(
     project: Path = typer.Option(Path("."), "--project"),
     output_format: OutputFormat = typer.Option(OutputFormat.TEXT, "--format"),
 ) -> None:
-    """Check local workspace structure and canonical graph readability."""
-    healthy, diagnostics = inspect_workspace(project)
-    emit({"healthy": healthy, "diagnostics": diagnostics}, output_format)
-    if not healthy:
+    """Check local workspace health through the shared deep validation service."""
+    report = validate_project(project)
+    emit(
+        {
+            "schema_version": report.schema_version,
+            "healthy": report.valid,
+            "diagnostics": report.diagnostics,
+        },
+        output_format,
+    )
+    if not report.valid:
         raise typer.Exit(1)
 
 

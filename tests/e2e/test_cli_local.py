@@ -18,6 +18,7 @@ def test_local_quick_start(tmp_path: Path) -> None:
     assert (repo / ".intent/graph.yaml").exists()
     assert run_intent(repo, "validate", "--format", "json").json()["valid"] is True
     assert run_intent(repo, "sync", "--sources", "markdown,git").returncode == 0
+    assert run_intent(repo, "validate", "--format", "json").json()["valid"] is True
     status = run_intent(repo, "status", "--format", "json").json()
     assert status["project_id"] == repo.name
     assert run_intent(repo, "context", "--task", "local export").returncode == 0
@@ -146,15 +147,37 @@ def test_status_recovers_pending_resolution_journal_before_reading_state(tmp_pat
 def test_doctor_reports_redacted_structured_diagnostics_for_corrupt_evidence(
     tmp_path: Path,
 ) -> None:
-    """Catch doctor delegating corrupt JSONL to a traceback-producing runtime loader."""
+    """Validate and doctor share one redacted deep-snapshot diagnostic contract."""
     repo = init_git_repo(tmp_path)
     assert run_intent(repo, "init").returncode == 0
     evidence = repo / ".intent/evidence/evidence.jsonl"
     evidence.write_text("not-json\n", encoding="utf-8")
-    result = run_intent(repo, "doctor", "--format", "json")
-    assert result.returncode == 1
-    assert result.stderr == ""
-    assert result.json() == {"diagnostics": ["evidence"], "healthy": False, "version": "1"}
+    diagnostic = {
+        "code": "evidence.invalid",
+        "schema_version": "1",
+        "scope": "evidence",
+        "severity": "error",
+    }
+
+    validated = run_intent(repo, "validate", "--format", "json")
+    doctored = run_intent(repo, "doctor", "--format", "json")
+
+    assert validated.returncode == 1 and doctored.returncode == 1
+    assert validated.stderr == doctored.stderr == ""
+    assert validated.json() == {
+        "diagnostics": [diagnostic],
+        "graph_id": f"graph:{repo.name}",
+        "graph_version": 0,
+        "schema_version": "1",
+        "valid": False,
+        "version": "1",
+    }
+    assert doctored.json() == {
+        "diagnostics": [diagnostic],
+        "healthy": False,
+        "schema_version": "1",
+        "version": "1",
+    }
 
 
 def test_doctor_rejects_symlinked_state_without_reading_its_target(tmp_path: Path) -> None:
@@ -170,31 +193,77 @@ def test_doctor_rejects_symlinked_state_without_reading_its_target(tmp_path: Pat
 
     assert result.returncode == 1
     assert result.stderr == ""
-    assert result.json() == {"diagnostics": ["evidence"], "healthy": False, "version": "1"}
+    assert result.json() == {
+        "diagnostics": [
+            {
+                "code": "evidence.unsafe",
+                "schema_version": "1",
+                "scope": "evidence",
+                "severity": "error",
+            }
+        ],
+        "healthy": False,
+        "schema_version": "1",
+        "version": "1",
+    }
+
+
+def test_validate_reports_corrupt_transaction_without_path_or_content_leaks(
+    tmp_path: Path,
+) -> None:
+    repo = init_git_repo(tmp_path)
+    assert run_intent(repo, "init").returncode == 0
+    secret = "private-preimage-content"
+    journal = repo / ".intent/history/.local-transaction.json"
+    journal.write_text('{"invalid":"' + secret + '"}', encoding="utf-8")
+
+    result = run_intent(repo, "validate", "--format", "json")
+
+    assert result.returncode == 1
+    assert result.stderr == ""
+    assert result.json()["diagnostics"] == [
+        {
+            "code": "transaction.corrupt",
+            "schema_version": "1",
+            "scope": "transaction",
+            "severity": "error",
+        }
+    ]
+    assert secret not in result.stdout
+    assert str(repo) not in result.stdout
 
 
 def test_doctor_holds_original_directory_after_parent_swap(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A post-open replacement cannot redirect doctor into an external directory."""
-    from intent_engineering.core.policy import doctor
+    from intent_engineering.storage.secure import SecureDirectory
+    from intent_engineering.validation import validate_project
 
     repo = init_git_repo(tmp_path)
     assert run_intent(repo, "init").returncode == 0
-    original = doctor._open_directory
+    original = SecureDirectory.file
     outside = tmp_path / "outside"
     outside.mkdir()
+    swapped = False
 
-    def swap(parent_fd: int, name: str) -> int:
-        descriptor = original(parent_fd, name)
-        if name == "evidence":
+    def swap(
+        directory: SecureDirectory,
+        relative: str | Path,
+        *,
+        create_parents: bool = False,
+    ) -> object:
+        nonlocal swapped
+        secure_file = original(directory, relative, create_parents=create_parents)
+        if str(relative) == "evidence/evidence.jsonl" and not swapped:
+            swapped = True
             evidence = repo / ".intent/evidence"
             evidence.rename(repo / ".intent/evidence-held")
             evidence.symlink_to(outside, target_is_directory=True)
-        return descriptor
+        return secure_file
 
-    monkeypatch.setattr(doctor, "_open_directory", swap)
-    assert doctor.inspect_workspace(repo) == (True, ())
+    monkeypatch.setattr(SecureDirectory, "file", swap)
+    assert validate_project(repo).valid is True
     assert not list(outside.glob(".*.lock"))
 
 
@@ -306,6 +375,7 @@ intent_engineering:
     )
     assert run_intent(repo, "init").returncode == 0
     assert run_intent(repo, "sync", "--sources", "markdown,git").returncode == 0
+    assert run_intent(repo, "validate", "--format", "json").json()["valid"] is True
     cases = run_intent(repo, "reconcile", "list", "--format", "json").json()["cases"]
     assert len(cases) == 1
     assert cases[0]["case_type"] == "CODE_LAG"
@@ -356,6 +426,7 @@ intent_engineering:
     )
     assert resolved.returncode == 0
     assert resolved.json()["case"]["status"] == "resolved"
+    assert run_intent(repo, "validate", "--format", "json").json()["valid"] is True
     history = (repo / ".intent/history/changesets.jsonl").read_text(encoding="utf-8").splitlines()
     assert json.loads(history[-1]) == preview_payload["changeset"]
 

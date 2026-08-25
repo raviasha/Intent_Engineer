@@ -21,6 +21,8 @@ def test_framework_graph_is_valid_and_provenance_backed() -> None:
     assert graph.id == "intent-engineering-framework"
     assert graph.schema_version == "0.1.0"
     assert graph.version == 0
+    assert graph.created_at == datetime(2026, 8, 25)
+    assert graph.source_spec == "INTENT_ENGINEERING.md"
     assert all(node.evidence_refs for node in graph.nodes if node.source_mode is not None)
     graph.assert_invariants()
 

@@ -8,8 +8,10 @@ import re
 import secrets
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import ExitStack, contextmanager
+from dataclasses import dataclass
 from hashlib import sha256
 from pathlib import Path
+from types import MappingProxyType
 from typing import Literal
 
 from pydantic import ConfigDict, Field, ValidationError, model_validator
@@ -26,6 +28,14 @@ class TransactionRecoveryError(ValueError):
 
     def __init__(self) -> None:
         super().__init__("local transaction recovery failed")
+
+
+@dataclass(frozen=True)
+class LocalTransactionSnapshot:
+    """An immutable cross-store byte view captured after raw transaction recovery."""
+
+    content: Mapping[str, bytes | None]
+    recovered: bool
 
 
 class _Preimage(StrictModel):
@@ -142,8 +152,10 @@ class LocalTransactionCoordinator:
             self._fault_hook(stage)
 
     @contextmanager
-    def _locks(self) -> Iterator[None]:
+    def _locks(self, extras: Mapping[str, SecureFile] | None = None) -> Iterator[None]:
         entries = [("journal", self._journal), *self._targets.items()]
+        if extras is not None:
+            entries.extend(extras.items())
         entries.sort(key=lambda item: (*item[1].lock_key, item[0]))
         with ExitStack() as stack:
             for _, secure_file in entries:
@@ -232,10 +244,10 @@ class LocalTransactionCoordinator:
             else:
                 self._targets[name].atomic_write(content)
 
-    def _recover_unlocked(self) -> None:
+    def _recover_unlocked(self) -> bool:
         loaded = self._read_journal()
         if loaded is None:
-            return
+            return False
         journal, preimages = loaded
         try:
             if journal.state == "prepared":
@@ -243,11 +255,34 @@ class LocalTransactionCoordinator:
             self._journal.unlink()
         except Exception as error:
             raise TransactionRecoveryError() from error
+        return True
 
     def recover(self) -> None:
         """Recover a prepared transaction or finish a committed stale journal."""
         with self._locks():
             self._recover_unlocked()
+
+    def snapshot(
+        self,
+        extras: Mapping[str, SecureFile] | None = None,
+    ) -> LocalTransactionSnapshot:
+        """Recover, then read every canonical target under one deterministic lock set."""
+        extra_files = dict(extras or {})
+        if any(not _TARGET_PATTERN.fullmatch(name) for name in extra_files):
+            raise ValueError("invalid local snapshot targets")
+        if set(extra_files) & set(self._targets):
+            raise ValueError("duplicate local snapshot target")
+        all_files = {**self._targets, **extra_files}
+        lock_keys = [self._journal.lock_key, *(item.lock_key for item in all_files.values())]
+        if len(lock_keys) != len(set(lock_keys)):
+            raise ValueError("duplicate local snapshot target")
+        with self._locks(extra_files):
+            recovered = self._recover_unlocked()
+            content = {
+                name: all_files[name].read_optional()
+                for name in sorted(all_files)
+            }
+        return LocalTransactionSnapshot(MappingProxyType(content), recovered)
 
     @contextmanager
     def transaction(self) -> Iterator[LocalTransaction]:
