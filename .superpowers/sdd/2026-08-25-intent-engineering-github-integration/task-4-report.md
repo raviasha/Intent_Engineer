@@ -2,9 +2,10 @@
 
 ## Status
 
-Implementation and independent-review fix round 1 complete; ready for controller final review.
+Implementation and independent-review fix rounds 1–3 complete; ready for controller final review.
 Product/tests/workflow commits: `e725e8d` (`feat: report github drift locally and in actions`)
-and `d230f42` (`fix: harden github report boundaries`). Dispatch base:
+and `d230f42` (`fix: harden github report boundaries`); later transaction fixes are `e175ff1`
+and `66de152`. Dispatch base:
 `e12b78a01cea6e1803f9ae1bd05b441ee561e74b`.
 
 ## TDD evidence
@@ -300,5 +301,63 @@ fix is commit `e175ff1` and changes only:
 Strict writes intentionally retain authenticated zero-byte tombstones because portable POSIX does
 not provide conditional unlink-by-inode. This can accumulate one inode per successful replacement
 or rollback; bounded garbage collection is deferred rather than weakening foreign-entry safety.
+No live GitHub request, credential, GUI/browser action, Task 5 work, MCP work, or raw Git-object read
+occurred. The five protected untracked artifacts remain untouched and uncommitted.
+
+## Independent review fix round 3
+
+The third final review found that `_scrub_descriptor` authenticated the held inode's exact identity
+and regular-file type before truncation, but enforced the displaced original's single-link policy
+only after `ftruncate`. A hardlink inserted after quarantine authentication could therefore cause
+the pre-existing original and its outside link to be zeroed before the transaction returned the
+fixed indeterminate error. Product/tests commit `66de152` closes that window.
+
+### Ownership ruling and implementation
+
+- Controller ruling: the displaced pre-existing original is foreign user state. Its held descriptor
+  must still match the expected regular inode and have exactly one link immediately before any
+  destructive scrub. A mismatch performs no byte mutation and produces the phase-appropriate fixed
+  indeterminate result.
+- Process-created report and temporary inodes remain owned state. Their scrub path deliberately
+  permits multiple links so rollback removes owned private report bytes through every raced link.
+  Cost if wrong: using the displaced-original policy for owned report inodes would leave report bytes
+  reachable after a failed transaction; using the owned-report policy for a displaced original would
+  mutate bytes through an external hardlink.
+- The new `original-pre-scrub` named stage sits after quarantine authentication but before
+  `displaced_touched`. Cancellation at that boundary still restores the exact preimage. If the hook
+  returns after introducing a link, the state advances and the immediate descriptor precheck rejects
+  scrub without calling `ftruncate`.
+- `_scrub_descriptor` retains its post-scrub identity, type, size, and ownership-specific link-count
+  authentication. Repository audit found its guarded `ftruncate` to be the only destructive scrub
+  syscall in production.
+
+### TDD evidence
+
+- Initial named-stage RED: the new regression failed **1 test** with `DID NOT RAISE` because no
+  `original-pre-scrub` stage existed.
+- Stage-only RED: after adding only the named boundary, the transaction returned
+  `AtomicWriteRollbackError`, but the exact byte assertion failed (`b''` instead of the original
+  bytes), directly proving truncation occurred before link-count rejection.
+- Named-cancellation RED: adding the new phase to the existing cancellation matrix produced
+  **1 failed, 7 passed** because the state marker preceded the hook and returned the fixed
+  indeterminate error instead of restoring and re-raising `CancelledError`.
+- Ownership-policy GREEN: the hardlinked-original regression plus both owned-report hardlink cases
+  passed **3 tests**. The full named-phase/ownership selection passed **11 tests**, and all verified
+  report transaction tests passed **25 tests**.
+
+### Round-3 verification
+
+- Task 4 CLI/report/workflow selection under `-W error`: **91 passed in 3.44s** (fresh pre-commit;
+  prior run **91 passed in 3.27s**).
+- Task 4 plus secure-storage selection under `-W error`: **94 passed in 3.27s**.
+- GitHub unit/contract/integration plus legacy local CLI selection under `-W error`:
+  **174 passed in 13.59s**.
+- Full offline suite under `-W error`: **616 passed in 21.48s**.
+- Tracked Python Ruff: **passed**. Changed-file Ruff format: **2 files already formatted** after one
+  mechanical baseline-format correction in the touched test file. Mypy: **success, 74 source
+  files**. `git diff --check`: **passed**.
+- `intent --help`, `intent doctor --help`, `intent doctor github --help`, and
+  `intent drift --help`: **exit 0**.
+
 No live GitHub request, credential, GUI/browser action, Task 5 work, MCP work, or raw Git-object read
 occurred. The five protected untracked artifacts remain untouched and uncommitted.

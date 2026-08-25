@@ -24,6 +24,12 @@
   excluded. Mutations after the terminal validation snapshot/return are new local operations. Cost
   if wrong: deterministic tests target executable transaction contracts instead of unbounded Python
   bytecode interruption points.
+- Ruling: Task 4 fix round 3 distinguishes scrub authority by inode ownership. A displaced
+  pre-existing original must retain exact regular identity and `nlink == 1` immediately before
+  destructive scrub; a mismatch does not mutate bytes. Process-created report/temp inodes retain
+  scrub-through-links cleanup. Cost if wrong: applying owned cleanup to foreign state can alter an
+  outside hardlink, while applying foreign-state refusal to owned output can retain private report
+  bytes after rollback.
 
 ## Preflight conflict and interface scan
 
@@ -50,11 +56,11 @@
 - Task 3 — completed after fix round 1; initial product `7b3a91e`, fix `8076f5e`, initial report
   `9a1aa6c`; final internal re-review clean after durable replay, association, lifecycle,
   exception-retention, and cancellation hardening.
-- Task 4 — implementation and independent-review fix rounds 1 and 2 complete; product `e725e8d`,
-  fixes `d230f42` and `e175ff1`; final adversarial re-review clean after cancellation transaction,
+- Task 4 — implementation and independent-review fix rounds 1–3 complete; product `e725e8d`, fixes
+  `d230f42`, `e175ff1`, and `66de152`; final adversarial re-review clean after cancellation transaction,
   protected-path, secret-local, provider-scalar, UNC/device/forward-network path, Markdown escape,
-  no-unlink tombstone, external-swap, close-exhaustion, and traceback-local hardening; awaiting
-  controller final review.
+  no-unlink tombstone, external-swap, close-exhaustion, traceback-local, and original pre-scrub
+  hardlink hardening; awaiting controller final review.
 - Task 5 — pending.
 
 ## Review findings
@@ -106,3 +112,11 @@
   traceback-local gaps. Persisted one-shot regressions cover each boundary. Final review found no
   Critical, Important, or Minor findings; Task 4 selection **88 passed**, secure-focused selection
   **91 passed**, broader GitHub/local selection **174 passed**, and full offline suite **614 passed**.
+- Task 4 independent review 3 found one Important destructive-scrub window: a hardlink added to the
+  displaced pre-existing original immediately before `_scrub_descriptor` could be truncated before
+  the helper's post-scrub link-count check. Controller ruling preserves the ownership distinction:
+  pre-existing originals require exact regular identity and `nlink == 1` before `ftruncate`, while
+  process-created report/temp inodes retain scrub-through-links cleanup. Commit `66de152` adds the
+  `original-pre-scrub` phase, exact byte-preservation regression, and cancellation coverage. Focused
+  verified-report tests **25 passed**; Task 4 selection **91 passed**, secure-focused selection
+  **94 passed**, broader GitHub/local selection **174 passed**, and full offline suite **616 passed**.
