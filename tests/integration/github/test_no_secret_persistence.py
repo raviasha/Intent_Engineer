@@ -35,13 +35,29 @@ VALID_FINE_GRAINED_PAT = (
 )
 
 
+def _independent_hex_reflections(token: str) -> tuple[bytes, bytes, bytes]:
+    """Derive lower, upper, and deterministic mixed-case hexadecimal probes."""
+    lowercase = token.encode("utf-8").hex()
+    uppercase = lowercase.upper()
+    letter_index = 0
+    mixed_characters: list[str] = []
+    for character in lowercase:
+        if character in "abcdef":
+            mixed_characters.append(character.upper() if letter_index % 2 == 0 else character)
+            letter_index += 1
+        else:
+            mixed_characters.append(character)
+    mixed = "".join(mixed_characters)
+    return tuple(value.encode("ascii") for value in (lowercase, uppercase, mixed))
+
+
 def _audit_needles(token: str) -> tuple[bytes, ...]:
     """Derive useful credential reflections without writing a token fixture to disk."""
     token_bytes = token.encode("utf-8")
     sanitized_bytes = re.sub(r"[^A-Za-z0-9:_-]", "_", token.strip()).encode("utf-8")
     encoded = (
         base64.b64encode(token_bytes),
-        token_bytes.hex().encode("ascii"),
+        *_independent_hex_reflections(token),
     )
     variants = (token_bytes, sanitized_bytes, *encoded)
     meaningful_fragments = tuple(
@@ -355,8 +371,20 @@ def test_audit_scanner_rejects_a_final_hardlink_swap(tmp_path: Path) -> None:
         "sanitized",
         "base64",
         "hex",
+        "hex_upper",
+        "hex_mixed",
+        "hex_upper_prefix",
+        "hex_upper_suffix",
+        "hex_mixed_prefix",
+        "hex_mixed_suffix",
         "full_key",
         "base64_key",
+        "hex_upper_key",
+        "hex_mixed_key",
+        "hex_upper_prefix_key",
+        "hex_upper_suffix_key",
+        "hex_mixed_prefix_key",
+        "hex_mixed_suffix_key",
     ),
 )
 @pytest.mark.anyio
@@ -365,24 +393,33 @@ async def test_reflected_github_source_payload_is_rejected_before_evidence_persi
     representation: str,
 ) -> None:
     """A provider-reflected credential must fail closed before EvidenceRecord creation."""
-    token = "gh" + "p_Z7q.K9v+X2mN4cR8tL6sW3"
+    token = "gh" + "p_JKLMNO.KLMNO+JKLMNO"
+    hex_lower, hex_upper, hex_mixed = (
+        value.decode("ascii") for value in _independent_hex_reflections(token)
+    )
+    assert len({hex_lower, hex_upper, hex_mixed}) == 3
     reflections = {
         "full": token,
         "prefix": token[:20],
         "suffix": token[-12:],
         "sanitized": token.replace(".", "_").replace("+", "_")[4:20],
         "base64": base64.b64encode(token.encode("utf-8")).decode("ascii"),
-        "hex": token.encode("utf-8").hex(),
+        "hex": hex_lower,
+        "hex_upper": hex_upper,
+        "hex_mixed": hex_mixed,
+        "hex_upper_prefix": f"A{hex_upper}",
+        "hex_upper_suffix": f"{hex_upper}A",
+        "hex_mixed_prefix": f"A{hex_mixed}",
+        "hex_mixed_suffix": f"{hex_mixed}A",
     }
-    project = tmp_path / "payload-project"
+    project = tmp_path / f"payload-project-{representation}"
     project.mkdir()
     initialize_project(project)
     runtime = load_runtime(project)
     api = FakeGitHubApi()
-    if representation == "full_key":
-        api.payloads["issues"][0][token] = "unknown provider field"
-    elif representation == "base64_key":
-        api.payloads["issues"][0][reflections["base64"]] = "unknown provider field"
+    if representation.endswith("_key"):
+        reflection_name = representation.removesuffix("_key")
+        api.payloads["issues"][0][reflections[reflection_name]] = "unknown provider field"
     else:
         api.payloads["issues"][0]["title"] = reflections[representation]
     clients: list[GitHubClient] = []
@@ -454,6 +491,62 @@ async def test_reflected_pagination_link_is_rejected_without_following_or_retain
                 ),
             },
         )
+
+    credentials = GitHubCredentials.resolve({"GH_TOKEN": token}, lambda _: "unused")
+    client = GitHubClient(
+        credentials,
+        transport=httpx.MockTransport(handler),
+        retry_policy=RetryPolicy(max_attempts=1),
+    )
+    with pytest.raises(GitHubProtocolError) as caught:
+        await client.get_pages("/repos/acme/demo/issues", {"per_page": "100"})
+
+    assert len(requests) == 1
+    _assert_secret_free(
+        (caught.value, caught.value.args, caught.value.__cause__, caught.value.__context__), token
+    )
+    assert all(needle not in _repository_traceback(caught.value) for needle in _audit_needles(token))
+    await client.aclose()
+    assert client.is_closed is True
+
+
+@pytest.mark.parametrize("hex_case", ("upper", "mixed"))
+@pytest.mark.parametrize("hex_affix", ("none", "prefix", "suffix"))
+@pytest.mark.parametrize("header_name", ("ETag", "Link"))
+@pytest.mark.anyio
+async def test_case_insensitive_hex_reflection_in_response_headers_is_rejected(
+    header_name: str,
+    hex_affix: str,
+    hex_case: str,
+) -> None:
+    """Changing hexadecimal letter case must not bypass the raw HTTP boundary."""
+    token = "ghp_JKLMNOJKLMNOJKLMNO"
+    lowercase, uppercase, mixed = _independent_hex_reflections(token)
+    assert len({lowercase, uppercase, mixed}) == 3
+    reflection = {"upper": uppercase, "mixed": mixed}[hex_case].decode("ascii")
+    reflection = {
+        "none": reflection,
+        "prefix": f"A{reflection}",
+        "suffix": f"{reflection}A",
+    }[hex_affix]
+    if hex_affix != "none":
+        assert len(reflection) % 2 == 1
+        assert re.fullmatch(r"[0-9A-Fa-f]+", reflection) is not None
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        headers = (
+            {"ETag": f'"{reflection}"'}
+            if header_name == "ETag"
+            else {
+                "ETag": '"page-1"',
+                "Link": (
+                    f'<https://api.github.com/repos/acme/demo/{reflection}>; rel="next"'
+                ),
+            }
+        )
+        return httpx.Response(200, json=[], headers=headers)
 
     credentials = GitHubCredentials.resolve({"GH_TOKEN": token}, lambda _: "unused")
     client = GitHubClient(

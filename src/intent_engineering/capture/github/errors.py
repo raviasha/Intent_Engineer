@@ -31,6 +31,7 @@ _SAFE_REQUEST_ID_CHARACTER = re.compile(r"[^A-Za-z0-9:_-]")
 _MAX_ENDPOINT_LENGTH = 160
 _MAX_REQUEST_ID_LENGTH = 64
 _MIN_CREDENTIAL_FRAGMENT_LENGTH = 12
+_HEX_ENCODED_RUN = re.compile(r"[0-9A-Fa-f]+")
 
 
 def sanitize_endpoint(value: str) -> str:
@@ -129,6 +130,12 @@ def _value_overlaps_secret(
         secret_bytes.hex(),
     )
     if any(
+        _has_case_insensitive_hex_overlap(candidate, secret_bytes.hex())
+        for candidate in full_candidates
+        if candidate
+    ):
+        return True
+    if any(
         secret_variant in candidate
         for candidate in full_candidates
         for secret_variant in secret_variants
@@ -144,6 +151,15 @@ def _value_overlaps_secret(
         for secret_variant in secret_variants
         if candidate and secret_variant
     )
+
+
+def _has_case_insensitive_hex_overlap(candidate: str, secret_hex: str) -> bool:
+    """Compare even-length credential encodings within contiguous hexadecimal runs."""
+    for match in _HEX_ENCODED_RUN.finditer(candidate):
+        encoded_run = match.group(0)
+        if _has_meaningful_overlap(encoded_run.casefold(), secret_hex):
+            return True
+    return False
 
 
 def _has_meaningful_overlap(candidate: str, secret_variant: str) -> bool:
