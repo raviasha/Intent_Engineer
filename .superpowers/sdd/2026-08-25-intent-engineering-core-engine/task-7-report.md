@@ -94,3 +94,58 @@ $ .venv/bin/pytest -v
 - The reasoner intentionally implements only deterministic fixture node additions.
   Refinement, edge extraction, and construction of Task 5 `DetectionInput` records
   require application-specific semantic mapping and remain outside this task.
+
+## Fix round 1 — retry recovery and failure isolation
+
+### Root cause and design
+
+The original sync delta used only `EvidenceStore.put()` successes. A failure after an
+evidence append therefore left its cursor uncommitted while filtering the same record
+out of the retry delta. The connector `try` block also began after checkpoint lookup
+and caught only `ConnectorError`, so ordinary operational exceptions escaped.
+
+The recovery uses the committed checkpoint as the only consumption boundary: every
+record rediscovered beyond it enters `EvidenceDelta.added`, while `evidence_added`
+continues to count only new durable writes. Durable predecessor links are computed
+from `EvidenceStore.versions()` before each put and remain correct when a retry sees
+an already-written row. A per-connector progress accumulator preserves durable
+evidence, graph, and case counts if a later stage fails. The full connector transaction
+is guarded by `except Exception`, deliberately allowing cancellation and other
+`BaseException` signals to propagate. Duplicate connector IDs are rejected before
+accessing any store, and the deterministic fixture reasoner now defaults to a fixed
+UTC timestamp.
+
+### RED
+
+```console
+$ .venv/bin/pytest tests/integration/sync -v
+8 failed, 3 passed in 0.13s
+```
+
+The failures proved: evidence appended before a reasoner failure was omitted on retry;
+raw connector/detector/case errors escaped; prior versions were empty; duplicate IDs
+were accepted; fixture ChangeSets varied by wall clock; and failed aggregate counts
+were zeroed.
+
+### GREEN and verification
+
+```console
+$ .venv/bin/pytest tests/integration/sync -v
+13 passed in 0.10s
+
+$ .venv/bin/pytest tests/unit tests/contract tests/integration -v
+144 passed in 1.30s
+
+$ .venv/bin/ruff check src/intent_engineering/extract src/intent_engineering/sync tests/integration/sync
+All checks passed!
+
+$ .venv/bin/mypy --strict src/intent_engineering/extract/base.py src/intent_engineering/extract/deterministic.py src/intent_engineering/sync/models.py src/intent_engineering/sync/orchestrator.py
+Success: no issues found in 4 source files
+
+$ .venv/bin/pytest -v
+144 passed in 1.38s
+```
+
+### Fix commit
+
+- Product and regression tests: `8cf437572f79a9e6e5531cc3406cf4b915d3a33e`
