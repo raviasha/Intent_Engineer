@@ -16,9 +16,12 @@ from intent_engineering.core.models import (
     Node,
 )
 
+_FIXTURE_TIMESTAMP = datetime(2026, 8, 25, tzinfo=UTC)
 
-def _utc_now() -> datetime:
-    return datetime.now(UTC)
+
+def _fixture_now() -> datetime:
+    """Return the stable timestamp used by provider-free fixture reasoning."""
+    return _FIXTURE_TIMESTAMP
 
 
 class DeterministicReasoner:
@@ -28,7 +31,7 @@ class DeterministicReasoner:
         self,
         *,
         actor: str = "deterministic-reasoner",
-        clock: Callable[[], datetime] = _utc_now,
+        clock: Callable[[], datetime] = _fixture_now,
     ) -> None:
         self._actor = actor
         self._clock = clock

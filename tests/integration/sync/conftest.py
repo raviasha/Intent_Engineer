@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -14,6 +15,7 @@ from intent_engineering.capture.base import (
     normalize_raw_source,
 )
 from intent_engineering.core.models import Graph, NodeType, SourceMode
+from intent_engineering.extract.base import SemanticReasoner
 from intent_engineering.extract.deterministic import DeterministicReasoner
 from intent_engineering.storage.jsonl.case_store import JsonlCaseStore
 from intent_engineering.storage.jsonl.evidence_store import JsonlEvidenceStore
@@ -63,6 +65,55 @@ class FixtureConnector:
         return "v1" if discovered else None
 
 
+class VersionedFixtureConnector:
+    """A fixture connector that exposes exactly one active source version at a time."""
+
+    connector_id = "markdown"
+
+    def __init__(self) -> None:
+        self.active_version = "v1"
+
+    async def discover(self, cursor: str | None) -> tuple[SourceObject, ...]:
+        if cursor == self.active_version:
+            return ()
+        return (
+            SourceObject(
+                external_object_id="fixture:requirements",
+                external_version=self.active_version,
+                locator="requirements.md",
+            ),
+        )
+
+    async def fetch(self, object_id: str, version: str) -> RawSourceObject:
+        return RawSourceObject(
+            connector_type="markdown",
+            external_object_id=object_id,
+            external_version=version,
+            author="fixture@example.test",
+            observed_at=NOW,
+            source_locator="requirements.md",
+            content_hash=f"sha256:fixture-requirements-{version}",
+            payload={
+                "intent_assertion": {
+                    "id": f"assertion:local-export:{version}",
+                    "subject_id": "requirement:local-export",
+                    "change_kind": "initialize",
+                    "node_type": NodeType.REQUIREMENT,
+                    "label": "Exports remain local-first",
+                    "source_mode": SourceMode.EXPLICIT,
+                    "evidence_refs": (f"evidence:fixture-requirements-{version}",),
+                    "confidence": 0.9,
+                }
+            },
+        )
+
+    def normalize(self, raw: RawSourceObject):  # type: ignore[no-untyped-def]
+        return normalize_raw_source(raw)
+
+    def next_checkpoint(self, discovered: tuple[SourceObject, ...]) -> str | None:
+        return self.active_version if discovered else None
+
+
 class BrokenConnector:
     """A connector that fails at discovery without revealing implementation detail."""
 
@@ -84,15 +135,35 @@ class BrokenConnector:
 class SyncHarness:
     """One configured orchestrator run repeatedly against durable local adapters."""
 
-    def __init__(self, root: Path, connectors: tuple[FixtureConnector | BrokenConnector, ...]) -> None:
-        graph = YamlGraphStore(root / "graph.yaml", history_path=root / "history.jsonl")
-        graph.initialize(Graph(id="fixture-graph", version=0, nodes=(), edges=()))
+    def __init__(
+        self,
+        root: Path,
+        connectors: tuple[Any, ...],
+        *,
+        reasoner: SemanticReasoner | None = None,
+        case_detector: Any = None,
+        checkpoint_store: Any = None,
+        case_store: Any = None,
+    ) -> None:
+        self.graph_path = root / "graph.yaml"
+        self.evidence_path = root / "evidence.jsonl"
+        self.checkpoint_path = root / "checkpoints.yaml"
+        self.case_path = root / "cases.jsonl"
+        self.graph_store = YamlGraphStore(self.graph_path, history_path=root / "history.jsonl")
+        self.graph_store.initialize(Graph(id="fixture-graph", version=0, nodes=(), edges=()))
+        self.evidence_store = JsonlEvidenceStore(self.evidence_path)
+        self.checkpoint_store = checkpoint_store or YamlCheckpointStore(self.checkpoint_path)
+        self.case_store = case_store or JsonlCaseStore(self.case_path)
+        orchestrator_options: dict[str, Any] = {}
+        if case_detector is not None:
+            orchestrator_options["case_detector"] = case_detector
         self.orchestrator = SyncOrchestrator(
-            graph_store=graph,
-            evidence_store=JsonlEvidenceStore(root / "evidence.jsonl"),
-            checkpoint_store=YamlCheckpointStore(root / "checkpoints.yaml"),
-            case_store=JsonlCaseStore(root / "cases.jsonl"),
-            reasoner=DeterministicReasoner(actor="fixture"),
+            graph_store=self.graph_store,
+            evidence_store=self.evidence_store,
+            checkpoint_store=self.checkpoint_store,
+            case_store=self.case_store,
+            reasoner=reasoner or DeterministicReasoner(actor="fixture"),
+            **orchestrator_options,
         )
         self.connectors = connectors
 

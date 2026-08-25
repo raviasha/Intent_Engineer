@@ -3,18 +3,20 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from time import perf_counter
 from typing import Protocol
 
 import structlog
 
-from intent_engineering.capture.base import Connector, ConnectorError
+from intent_engineering.capture.base import Connector
 from intent_engineering.capture.checkpoints import checkpoint_after_discovery
 from intent_engineering.core.models import (
     ChangeSet,
     DriftObservation,
     EvidenceDelta,
+    EvidenceRecord,
     Graph,
     ReconciliationCase,
 )
@@ -47,6 +49,15 @@ def _no_cases(delta: EvidenceDelta, graph: Graph) -> Sequence[DriftObservation]:
     return ()
 
 
+@dataclass
+class _ConnectorProgress:
+    """Durable work completed before a connector transaction fails or commits."""
+
+    evidence_added: int = 0
+    changes_applied: int = 0
+    cases_created: int = 0
+
+
 class SyncOrchestrator:
     """Advance each connector only after all of its durable work has completed."""
 
@@ -71,19 +82,30 @@ class SyncOrchestrator:
 
     async def run(self, run_id: str, connectors: Sequence[Connector]) -> SyncRunResult:
         """Synchronize connectors independently and aggregate their durable outcomes."""
+        connector_ids = tuple(connector.connector_id for connector in connectors)
+        duplicate_id = next(
+            (
+                connector_id
+                for connector_id in connector_ids
+                if connector_ids.count(connector_id) > 1
+            ),
+            None,
+        )
+        if duplicate_id is not None:
+            raise ValueError(f"duplicate connector id: {duplicate_id}")
         started = perf_counter()
         results: dict[str, ConnectorRunResult] = {}
         for connector in connectors:
-            prior = self._checkpoint_store.get(connector.connector_id)
+            progress = _ConnectorProgress()
             try:
+                prior = self._checkpoint_store.get(connector.connector_id)
                 discovered = await connector.discover(prior.cursor if prior is not None else None)
-                records = []
+                records: list[EvidenceRecord] = []
                 for item in discovered:
                     raw = await connector.fetch(item.external_object_id, item.external_version)
                     records.append(connector.normalize(raw))
-                added = tuple(record for record in records if self._evidence_store.put(record))
-                delta = EvidenceDelta(added=added, prior_versions={})
-                changes_applied, cases_created = self._apply_delta(delta)
+                delta = self._store_evidence_and_build_delta(records, progress)
+                self._apply_delta(delta, progress)
                 checkpoint = checkpoint_after_discovery(
                     connector,
                     discovered,
@@ -99,13 +121,18 @@ class SyncOrchestrator:
                         committed_at=checkpoint.committed_at,
                     )
                 results[connector.connector_id] = ConnectorRunResult.succeeded(
-                    len(added),
-                    changes_applied,
-                    cases_created,
+                    progress.evidence_added,
+                    progress.changes_applied,
+                    progress.cases_created,
                     checkpoint_advanced,
                 )
-            except ConnectorError as error:
-                results[connector.connector_id] = ConnectorRunResult.failed(self._redact_error(error))
+            except Exception as error:  # noqa: BLE001 - boundary intentionally preserves BaseException
+                results[connector.connector_id] = ConnectorRunResult.failed(
+                    self._redact_error(error),
+                    evidence_added=progress.evidence_added,
+                    changes_applied=progress.changes_applied,
+                    cases_created=progress.cases_created,
+                )
         result = SyncRunResult.from_connector_results(
             run_id,
             results,
@@ -122,18 +149,49 @@ class SyncOrchestrator:
         )
         return result
 
-    def _apply_delta(self, delta: EvidenceDelta) -> tuple[int, int]:
+    def _store_evidence_and_build_delta(
+        self,
+        records: Sequence[EvidenceRecord],
+        progress: _ConnectorProgress,
+    ) -> EvidenceDelta:
+        """Store evidence while deriving retry-safe predecessor links from durable history."""
+        prior_versions: dict[str, str] = {}
+        for record in records:
+            versions = self._evidence_store.versions(record.external_object_id)
+            predecessor = self._predecessor(record, versions)
+            if predecessor is not None:
+                prior_versions[record.external_object_id] = predecessor.id
+            if self._evidence_store.put(record):
+                progress.evidence_added += 1
+        return EvidenceDelta(added=tuple(records), prior_versions=prior_versions)
+
+    @staticmethod
+    def _predecessor(
+        record: EvidenceRecord,
+        versions: Sequence[EvidenceRecord],
+    ) -> EvidenceRecord | None:
+        """Return the immediate durable predecessor, including when retrying an existing row."""
+        for index, version in enumerate(versions):
+            if version.id == record.id:
+                return versions[index - 1] if index else None
+        return versions[-1] if versions else None
+
+    def _apply_delta(self, delta: EvidenceDelta, progress: _ConnectorProgress) -> None:
         """Reason, validate/apply semantic changes, then persist detected cases."""
         graph = self._graph_store.load()
         assertions = self._reasoner.extract_assertions(delta)
         changeset = ChangeSet.model_validate(self._reasoner.map_to_graph(assertions, graph).model_dump())
         next_graph = self._graph_store.apply(changeset) if changeset.is_semantic else graph
-        cases_created = self._persist_detected_cases(delta, next_graph)
-        return int(changeset.is_semantic), cases_created
+        progress.changes_applied += int(changeset.is_semantic)
+        self._persist_detected_cases(delta, next_graph, progress)
 
-    def _persist_detected_cases(self, delta: EvidenceDelta, graph: Graph) -> int:
+    def _persist_detected_cases(
+        self,
+        delta: EvidenceDelta,
+        graph: Graph,
+        progress: _ConnectorProgress,
+    ) -> None:
         """Persist each new deterministic fingerprint once, after graph application."""
-        created = 0
         for observation in sorted(self._case_detector(delta, graph), key=lambda item: item.fingerprint):
             if self._case_store.find_by_fingerprint(observation.fingerprint) is not None:
                 continue
@@ -148,11 +206,10 @@ class SyncOrchestrator:
                 created_at=self._clock(),
                 requires_human=observation.requires_human,
             )
-            created += int(self._case_store.put(case))
-        return created
+            progress.cases_created += int(self._case_store.put(case))
 
     @staticmethod
-    def _redact_error(error: ConnectorError) -> str:
+    def _redact_error(error: Exception) -> str:
         """Keep operational connector detail out of summaries and logs."""
         del error
         return "connector failed"

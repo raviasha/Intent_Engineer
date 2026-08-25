@@ -45,13 +45,20 @@ class ConnectorRunResult(BaseModel):
         )
 
     @classmethod
-    def failed(cls, error: str) -> ConnectorRunResult:
+    def failed(
+        cls,
+        error: str,
+        *,
+        evidence_added: int = 0,
+        changes_applied: int = 0,
+        cases_created: int = 0,
+    ) -> ConnectorRunResult:
         """Build a non-sensitive result for one isolated connector failure."""
         return cls(
             status=SyncRunStatus.FAILED,
-            evidence_added=0,
-            changes_applied=0,
-            cases_created=0,
+            evidence_added=evidence_added,
+            changes_applied=changes_applied,
+            cases_created=cases_created,
             checkpoint_advanced=False,
             redacted_error=error,
         )
