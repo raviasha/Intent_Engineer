@@ -152,3 +152,46 @@ Result: `129 passed in 1.13s`.
 ### Fix commit
 
 `e762a7851b42a91d2e4ffba8fbb9fd49ae4f8f07` (`fix: harden local connector boundaries`).
+
+## Fix round 2 — version mismatch boundary normalization
+
+### Root cause and correction
+
+- Markdown's public `fetch()` wrapper converted filesystem and decoding errors but
+  not the `ValueError` raised when a file's bytes no longer matched the discovered
+  SHA-256 version. Git checked a supplied object version before entering its
+  protected fetch block. Both cases now return a safe, context-free
+  `ConnectorError("… fetch failed")` at the connector boundary.
+
+### RED regressions
+
+```text
+.venv/bin/pytest tests/contract/capture tests/integration/capture -v
+```
+
+Result: `2 failed, 8 passed in 0.84s`. The Markdown content-change race raised
+`ValueError: Markdown object changed before fetch`, and the supplied Git version
+mismatch raised `ValueError: Git object version must equal its commit SHA`.
+
+### GREEN and quality verification
+
+```text
+.venv/bin/pytest tests/contract/capture tests/integration/capture -v
+.venv/bin/ruff check src/intent_engineering/capture tests/contract/capture tests/integration/capture
+.venv/bin/mypy --strict src/intent_engineering/capture/base.py src/intent_engineering/capture/checkpoints.py src/intent_engineering/capture/markdown/connector.py src/intent_engineering/capture/git/connector.py
+```
+
+Result: `10 passed in 0.80s`; `All checks passed!`; and `Success: no issues found
+in 4 source files`.
+
+### Full verification
+
+```text
+.venv/bin/pytest -v
+```
+
+Result: `131 passed in 1.16s`.
+
+### Fix commit
+
+`b5fae515435684123d5d9ceb83d78793ba9e01e1` (`fix: normalize connector version mismatches`).
