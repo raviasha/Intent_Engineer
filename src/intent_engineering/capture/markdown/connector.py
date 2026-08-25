@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Sequence
 from datetime import UTC, datetime
 from fnmatch import fnmatchcase
@@ -25,6 +26,7 @@ def _content_hash(content: bytes) -> str:
 
 
 _MANIFEST_CURSOR_PREFIX = "markdown:v1:"
+_CONTENT_VERSION = re.compile(r"sha256:[0-9a-f]{64}\Z")
 
 
 def _manifest_cursor(manifest: Sequence[tuple[str, str]]) -> str:
@@ -42,19 +44,37 @@ def _parse_manifest_cursor(cursor: str | None) -> dict[str, str] | None:
         files = payload["files"]
         if not isinstance(files, list):
             return None
-        manifest: dict[str, str] = {}
+        entries: list[tuple[str, str]] = []
+        previous_path: str | None = None
         for item in files:
             if (
                 not isinstance(item, list)
                 or len(item) != 2
                 or not all(isinstance(value, str) for value in item)
-                or not item[0]
+                or not _valid_manifest_path(item[0])
+                or _CONTENT_VERSION.fullmatch(item[1]) is None
+                or (previous_path is not None and item[0] <= previous_path)
             ):
                 return None
-            manifest[item[0]] = item[1]
-        return manifest
+            entries.append((item[0], item[1]))
+            previous_path = item[0]
+        if _manifest_cursor(entries) != cursor:
+            return None
+        return dict(entries)
     except (json.JSONDecodeError, KeyError, TypeError):
         return None
+
+
+def _valid_manifest_path(path: str) -> bool:
+    """Accept only the normalized non-empty relative POSIX path shape the scanner emits."""
+    relative = PurePosixPath(path)
+    return (
+        path != "."
+        and "\x00" not in path
+        and not relative.is_absolute()
+        and ".." not in relative.parts
+        and relative.as_posix() == path
+    )
 
 
 class MarkdownConnector:

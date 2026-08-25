@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 from hashlib import sha256
 from pathlib import Path
@@ -98,6 +99,47 @@ async def test_markdown_manifest_cursor_returns_only_changed_documents_and_migra
     assert updated_cursor is not None and updated_cursor.startswith("markdown:v1:")
     assert await connector.discover(updated_cursor) == ()
     assert await connector.discover(legacy) == await connector.discover(None)
+
+
+@pytest.mark.anyio
+async def test_markdown_manifest_cursor_rejects_noncanonical_entries_before_filtering(
+    tmp_path: Path,
+) -> None:
+    """Duplicate, unsorted, or malformed rows must rescan instead of hiding source versions."""
+    first = tmp_path / "first.md"
+    second = tmp_path / "second.md"
+    first.write_text("# First\n", encoding="utf-8")
+    second.write_text("# Second\n", encoding="utf-8")
+    connector = MarkdownConnector(
+        tmp_path,
+        ProjectConfig(project_id="capture-test", local_actor="tester"),
+    )
+    initial = await connector.discover(None)
+    versions = {source.locator: source.external_version for source in initial}
+
+    def cursor(files: list[list[str]]) -> str:
+        return "markdown:v1:" + json.dumps({"files": files}, separators=(",", ":"), sort_keys=True)
+
+    malformed = (
+        cursor(
+            [
+                ["first.md", versions["first.md"]],
+                ["first.md", versions["first.md"]],
+                ["second.md", versions["second.md"]],
+            ]
+        ),
+        cursor(
+            [
+                ["second.md", versions["second.md"]],
+                ["first.md", versions["first.md"]],
+            ]
+        ),
+        cursor([["./first.md", versions["first.md"]], ["second.md", versions["second.md"]]]),
+        cursor([["first.md", "sha256:not-a-digest"], ["second.md", versions["second.md"]]]),
+    )
+
+    for invalid_cursor in malformed:
+        assert await connector.discover(invalid_cursor) == initial
 
 
 @pytest.mark.anyio

@@ -253,3 +253,37 @@ async def test_markdown_detector_and_partial_case_failures_preserve_checkpoint_b
 
     assert detector_failed.status is SyncRunStatus.FAILED
     assert case_failed.status is SyncRunStatus.FAILED
+
+
+@pytest.mark.anyio
+async def test_markdown_deletion_commits_manifest_without_semantic_reprocessing(
+    tmp_path: Path,
+) -> None:
+    """A removed document updates the full cursor while leaving unchanged evidence out of semantics."""
+    source_root = tmp_path / "sources"
+    source_root.mkdir()
+    retained = source_root / "retained.md"
+    removed = source_root / "removed.md"
+    retained.write_text("# Retained\n", encoding="utf-8")
+    removed.write_text("# Removed\n", encoding="utf-8")
+    reasoner = CountingReasoner()
+    detector = FailOnVersionUpdateDetector()
+    harness = markdown_harness(tmp_path / "state", source_root, reasoner=reasoner, detector=detector)
+
+    initial = await harness.run()
+    initial_checkpoint = harness.checkpoint_path.read_bytes()
+    removed.unlink()
+    deletion = await harness.run()
+    deletion_checkpoint = harness.checkpoint_path.read_bytes()
+    no_op = await harness.run()
+
+    assert initial.evidence_added == 2
+    assert deletion.status is SyncRunStatus.SUCCESS
+    assert (deletion.evidence_added, deletion.changes_applied, deletion.cases_created) == (0, 0, 0)
+    assert deletion_checkpoint != initial_checkpoint
+    assert reasoner.calls == 1
+    assert detector.calls == 1
+    assert no_op.status is SyncRunStatus.SUCCESS
+    assert harness.checkpoint_path.read_bytes() == deletion_checkpoint
+    assert reasoner.calls == 1
+    assert detector.calls == 1
