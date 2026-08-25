@@ -318,3 +318,37 @@ Final commands:
 
 Results: full pytest `219 passed in 10.89s`; Ruff clean; strict mypy clean
 across 9 modules; both help commands exited 0.
+
+## Fix round 4 — unified assertion validation and terminal review actions
+
+Product/tests: `5de14a89e24cd786aeb8136b7a37beaaff745f8c` and
+`8302944`.
+
+Top-level normalized and front-matter assertions now share current-record
+reference normalization and local-actor ACL validation before deterministic
+reasoning. The real Markdown reconciliation E2E directly proves preview exit
+4, terminal DEFER rejection from NEEDS_HUMAN with byte-identical graph/cases,
+wrong approval refusal, and exact approved resolution. Existing focused
+recovery, directory-swap, no-op sync, unborn Git, ACL projection, and renderer
+immutability coverage remains part of the full suite.
+
+RED/GREEN target:
+
+```text
+.venv/bin/python -m pytest tests/e2e/test_cli_local.py::test_markdown_sync_produces_a_deterministic_reconciliation_case -q
+```
+
+GREEN result: `1 passed in 1.03s` after adding terminal-action nonmutation.
+
+Final commands:
+
+```text
+.venv/bin/python -m pytest -q
+.venv/bin/ruff check src/intent_engineering/cli src/intent_engineering/reconcile src/intent_engineering/core/policy/doctor.py tests/e2e/test_cli_local.py
+.venv/bin/mypy --strict src/intent_engineering/cli src/intent_engineering/reconcile src/intent_engineering/core/policy/doctor.py
+.venv/bin/intent --help
+.venv/bin/intent reconcile --help
+```
+
+Results: full pytest `219 passed in 11.35s`; Ruff clean; strict mypy clean
+across 9 modules; both help commands exited 0.
