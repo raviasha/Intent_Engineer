@@ -1,7 +1,7 @@
 """Immutable semantic graph records and their structural invariants."""
 
 import re
-from datetime import datetime
+from datetime import date, datetime
 from typing import Annotated
 
 from pydantic import ConfigDict, Field, field_validator
@@ -100,7 +100,7 @@ class Graph(StrictModel):
     schema_version: str = "0.1.0"
     name: str | None = None
     purpose: str | None = None
-    created_at: datetime | None = None
+    created_at: date | None = None
     source_spec: str | None = None
     nodes: tuple[Node, ...]
     edges: tuple[Edge, ...]
