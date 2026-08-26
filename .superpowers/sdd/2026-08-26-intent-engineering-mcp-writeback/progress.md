@@ -14,7 +14,7 @@ Plan: `docs/superpowers/plans/2026-08-25-intent-engineering-mcp-writeback.md`
 | 6. Approved write execution | Completed | `7b9309b` | This commit | Clean after 2 review rounds |
 | 7. Connector/write CLI | Completed | `7c4e966` | This report commit | Ready; 0 Critical/Important/Minor |
 | 8. Read-only Intent MCP server | Completed | `acaf5fb` | This report commit | Ready; 0 Critical/Important/Minor |
-| 9. Guarded MCP mutation tools | Pending | — | — | Pending |
+| 9. Guarded MCP mutation tools | Completed | `2563390` | This commit | Ready; 0 Critical/Important/Minor after fixes |
 | 10. Public-alpha release proof | Pending | — | — | Pending |
 
 ## Repository invariants
@@ -200,3 +200,26 @@ Plan: `docs/superpowers/plans/2026-08-25-intent-engineering-mcp-writeback.md`
   full offline tests; Ruff, 99-source mypy, 12-file format, help, and diff checks clean. All review
   findings are fixed; final independent review found 0 Critical, 0 Important, and 0 Minor findings
   and marked the slice Ready. Product commit: `acaf5fb`. Tasks 9–10 remain untouched.
+- Task 9 precommit adds exactly four MCP mutation tools: content-addressed ChangeSet proposals,
+  first-phase reconciliation proposals, production live write previews, and separately approved
+  production execution. It registers no approval-creation surface. Fresh per-request actor/alias
+  authorization, ACL-visible evidence/targets, exact current graph baselines, bounded structured
+  input, canonical plan/approval IDs, append-only proposal deduplication, and fixed non-retaining
+  failure/cancellation boundaries guard the surface. Production E2E proves preview creates no
+  approval, missing approval makes zero provider mutation calls, a separate interactive human
+  approval delegates once, and the final receipt is immutable/redacted. Precommit gates: 21
+  focused, 47 combined Task 8/9, 400 broadened, and 1,021 full offline tests; Ruff, 100-source mypy,
+  6-file format, help, and diff checks clean. Independent review is pending; Task 10 remains
+  untouched.
+- Task 9 initial independent review found one Critical and five Important defects in stale live
+  write authorization, proposal-ledger framing/special-file handling, preview retry metadata,
+  nested evidence scope, and immutable creation provenance. Tests-only RED reproduced every issue.
+  The fix reloads policy and bindings per provider-facing request, authenticates the live connector
+  contract against the server-start snapshot before provider access, closes request-owned stores,
+  rejects unsafe/unterminated ledgers, marks preview non-idempotent, and validates complete evidence
+  scope plus original node/edge creation metadata. Re-review also drove pre-provider contributor
+  revocation, nonblocking approval-ledger reads, and production cancellation-local scrubbing.
+  Post-fix gates: 39 focused, 1,039 full offline,
+  Ruff clean, mypy clean across 101 source files, help and diff checks clean. Final independent
+  re-review found 0 Critical, 0 Important, and 0 Minor findings and marked the task Ready. Task 10
+  remains untouched.
