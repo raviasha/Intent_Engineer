@@ -370,6 +370,7 @@ class WriteOperationProfile(McpProfileModel):
     )
 
     semantic_name: ProfileText
+    target_object: ProfileText
     target_id: Selector
     before_version: Selector
     allowed_fields: Annotated[frozenset[ProfileText], Field(min_length=1)]
@@ -377,7 +378,7 @@ class WriteOperationProfile(McpProfileModel):
     input_schema: dict[str, JsonValue]
     result_version: Selector
 
-    @field_validator("semantic_name")
+    @field_validator("semantic_name", "target_object")
     @classmethod
     def validate_name(cls, value: str) -> str:
         return _require_text(value, "semantic operation name")

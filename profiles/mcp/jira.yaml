@@ -67,6 +67,7 @@ objects:
 writes:
   update_issue:
     semantic_name: update_issue
+    target_object: issue
     target_id: {path: "$.id", transforms: [string]}
     before_version: {path: "$.updated", transforms: [string]}
     allowed_fields: [summary, description, status]
@@ -87,6 +88,7 @@ writes:
     result_version: {path: "$.updated", transforms: [string]}
   add_comment:
     semantic_name: add_comment
+    target_object: issue
     target_id: {path: "$.id", transforms: [string]}
     before_version: {path: "$.updated", transforms: [string]}
     allowed_fields: [body]

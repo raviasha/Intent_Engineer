@@ -35,6 +35,16 @@ PROFILE_MATRIX = (
     ("jira", {"issue", "comment"}, {"update_issue", "add_comment"}),
     ("confluence", {"page", "comment"}, {"update_page", "add_comment"}),
 )
+WRITE_TARGETS = {
+    "slack": {
+        "post_message": "channel",
+        "reply": "thread",
+        "update_message": "message",
+    },
+    "notion": {"update_page": "page", "append_blocks": "page"},
+    "jira": {"update_issue": "issue", "add_comment": "issue"},
+    "confluence": {"update_page": "page", "add_comment": "page"},
+}
 
 
 def _load_json(path: Path) -> dict[str, JsonValue]:
@@ -250,6 +260,7 @@ def test_reference_writes_are_strict_versioned_previews(
     assert set(samples) == write_operations
     for operation_name in sorted(write_operations):
         operation = profile.writes[operation_name]
+        assert operation.target_object == WRITE_TARGETS[provider][operation_name]
         sample = cast(dict[str, JsonValue], samples[operation_name])
         fields = cast(dict[str, JsonValue], sample["fields"])
         target = sample["target"]

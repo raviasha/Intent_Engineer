@@ -430,10 +430,14 @@
         },
         "target_id": {
           "$ref": "#/$defs/Selector"
+        },
+        "target_object": {
+          "$ref": "#/$defs/ProfileText"
         }
       },
       "required": [
         "semantic_name",
+        "target_object",
         "target_id",
         "before_version",
         "allowed_fields",

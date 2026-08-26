@@ -56,6 +56,7 @@ def valid_profile_payload() -> dict[str, JsonValue]:
         "writes": {
             "update_record": {
                 "semantic_name": "update_record",
+                "target_object": "record",
                 "target_id": {"path": "$.id", "transforms": ["string"]},
                 "before_version": {"path": "$.version", "transforms": ["string"]},
                 "allowed_fields": ["text"],

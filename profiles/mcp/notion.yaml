@@ -64,6 +64,7 @@ objects:
 writes:
   update_page:
     semantic_name: update_page
+    target_object: page
     target_id: {path: "$.id", transforms: [string]}
     before_version: {path: "$.last_edited_time", transforms: [string]}
     allowed_fields: [title, properties]
@@ -87,6 +88,7 @@ writes:
     result_version: {path: "$.last_edited_time", transforms: [string]}
   append_blocks:
     semantic_name: append_blocks
+    target_object: page
     target_id: {path: "$.id", transforms: [string]}
     before_version: {path: "$.last_edited_time", transforms: [string]}
     allowed_fields: [children]

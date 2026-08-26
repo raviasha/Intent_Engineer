@@ -67,6 +67,7 @@ objects:
 writes:
   post_message:
     semantic_name: post_message
+    target_object: channel
     target_id: {path: "$.id", transforms: [string]}
     before_version: {path: "$.updated", transforms: [string]}
     allowed_fields: [text]
@@ -83,6 +84,7 @@ writes:
     result_version: {path: "$.updated", transforms: [string]}
   reply:
     semantic_name: reply
+    target_object: thread
     target_id: {path: "$.id", transforms: [string]}
     before_version: {path: "$.updated", transforms: [string]}
     allowed_fields: [text]
@@ -99,6 +101,7 @@ writes:
     result_version: {path: "$.updated", transforms: [string]}
   update_message:
     semantic_name: update_message
+    target_object: message
     target_id: {path: "$.id", transforms: [string]}
     before_version: {path: "$.updated", transforms: [string]}
     allowed_fields: [text]

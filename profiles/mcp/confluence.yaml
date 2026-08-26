@@ -63,6 +63,7 @@ objects:
 writes:
   update_page:
     semantic_name: update_page
+    target_object: page
     target_id: {path: "$.id", transforms: [string]}
     before_version: {path: "$.version.number", transforms: [string]}
     allowed_fields: [title, body]
@@ -81,6 +82,7 @@ writes:
     result_version: {path: "$.version.number", transforms: [string]}
   add_comment:
     semantic_name: add_comment
+    target_object: page
     target_id: {path: "$.id", transforms: [string]}
     before_version: {path: "$.version.number", transforms: [string]}
     allowed_fields: [body]
