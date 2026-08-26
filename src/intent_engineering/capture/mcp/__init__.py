@@ -1,5 +1,7 @@
 """Typed, local MCP provider-profile contracts."""
 
+from intent_engineering.capture.mcp.authorization import AuthorizationDecision, authorize
+from intent_engineering.capture.mcp.connector import McpCheckpoint, McpConnector
 from intent_engineering.capture.mcp.errors import (
     McpCapabilityError,
     McpClosedSessionError,
@@ -37,9 +39,12 @@ from intent_engineering.capture.mcp.session import McpConnectorConfig, McpServer
 
 __all__ = [
     "ArgumentBinding",
+    "AuthorizationDecision",
     "BindingValidationError",
     "McpCapabilityError",
+    "McpCheckpoint",
     "McpClosedSessionError",
+    "McpConnector",
     "McpConnectorConfig",
     "McpError",
     "McpPermissionError",
@@ -61,6 +66,7 @@ __all__ = [
     "TransformError",
     "WriteOperationProfile",
     "apply_transform",
+    "authorize",
     "bind_arguments",
     "create_production_session",
     "load_profile",

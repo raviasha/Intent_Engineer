@@ -15,6 +15,7 @@ class FakeMcpSession:
     def __init__(self) -> None:
         self.tools: frozenset[str] = frozenset({"search_messages", "get_message"})
         self.resources: frozenset[str] = frozenset({"resource://message"})
+        self.resource_templates: frozenset[str] = frozenset()
         self.tool_result: object = {"items": [{"id": "one"}]}
         self.resource_result: object = {"id": "one"}
         self.failure: BaseException | None = None
@@ -29,6 +30,10 @@ class FakeMcpSession:
     async def list_resources(self) -> frozenset[str]:
         await self._wait_or_fail()
         return self.resources
+
+    async def list_resource_templates(self) -> frozenset[str]:
+        await self._wait_or_fail()
+        return self.resource_templates
 
     async def call_tool(self, name: str, arguments: dict[str, JsonValue]) -> object:
         self.calls.append((name, arguments))

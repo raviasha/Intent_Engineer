@@ -578,13 +578,18 @@ class ProviderBinding(McpProfileModel):
             raise BindingValidationError("missing operation mapping")
 
     def assert_capabilities(
-        self, tools: frozenset[str], resources: frozenset[str]
+        self,
+        tools: frozenset[str],
+        resources: frozenset[str],
+        resource_templates: frozenset[str],
     ) -> None:
         """Ensure a discovered server still exposes every locally bound capability."""
         if any(name not in tools for name in self.tools.values()):
             raise BindingValidationError("missing bound tool")
-        if any(name not in resources for name in self.resources.values()):
-            raise BindingValidationError("missing bound resource")
+        for name in self.resources.values():
+            available = resource_templates if "{" in name or "}" in name else resources
+            if name not in available:
+                raise BindingValidationError("missing bound resource")
 
 
 def profile_schema_bytes() -> bytes:

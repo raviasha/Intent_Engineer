@@ -290,11 +290,52 @@ class _CapturedSdk:
         async def list_resources(self) -> object:
             return SimpleNamespace(resources=[])
 
+        async def list_resource_templates(self) -> object:
+            return SimpleNamespace(resource_templates=[])
+
         async def call_tool(self, _: str, __: dict[str, JsonValue]) -> object:
             return {"structuredContent": {"ok": True}}
 
         async def read_resource(self, _: str) -> object:
             return {"contents": [{"text": "{\"ok\":true}"}]}
+
+
+@pytest.mark.anyio
+async def test_runtime_validates_bound_resource_template_through_official_v2_capability(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class TemplateSdk(_CapturedSdk):
+        class ClientSession(_CapturedSdk.ClientSession):
+            async def list_tools(self) -> object:
+                return SimpleNamespace(
+                    tools=[
+                        SimpleNamespace(name="search_messages"),
+                        SimpleNamespace(name="get_message"),
+                    ]
+                )
+
+            async def list_resources(self) -> object:
+                return SimpleNamespace(resources=[])
+
+            async def list_resource_templates(self) -> object:
+                return SimpleNamespace(
+                    resource_templates=[
+                        SimpleNamespace(uri_template="resource://message/{message_id}")
+                    ]
+                )
+
+    template_binding = binding().model_copy(
+        update={"resources": {"record": "resource://message/{message_id}"}}
+    )
+    runtime = McpRuntime(
+        session_factory=lambda config: SessionLease(
+            create_production_session(config, sdk_loader=TemplateSdk),
+            owned=True,
+        )
+    )
+
+    monkeypatch.setenv("MCP_TEST_TOKEN", "token")
+    await runtime.validate_binding(stdio_config(), template_binding)
 
 
 @pytest.mark.anyio

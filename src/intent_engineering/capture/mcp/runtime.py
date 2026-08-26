@@ -372,6 +372,13 @@ class _OfficialMcpSession:
     async def list_resources(self) -> frozenset[str]:
         return await self._list_capabilities("list_resources", "resources", "uri")
 
+    async def list_resource_templates(self) -> frozenset[str]:
+        return await self._list_capabilities(
+            "list_resource_templates",
+            "resource_templates",
+            "uri_template",
+        )
+
     async def call_tool(self, name: str, arguments: dict[str, JsonValue]) -> JsonValue:
         client = self._require_client()
         result = await client.call_tool(name, arguments)
@@ -650,10 +657,18 @@ class McpRuntime:
                 async with self._operation(config, deadline) as session:
                     tools = _strict_capability_names(await session.list_tools())
                     resources = _strict_capability_names(await session.list_resources())
-                    binding.assert_capabilities(tools, resources)
+                    resource_templates = _strict_capability_names(
+                        await session.list_resource_templates()
+                    )
+                    binding.assert_capabilities(tools, resources, resource_templates)
                     return ("ok", None)
         except BindingValidationError:
-            missing = _missing_capability(binding, locals().get("tools"), locals().get("resources"))
+            missing = _missing_capability(
+                binding,
+                locals().get("tools"),
+                locals().get("resources"),
+                locals().get("resource_templates"),
+            )
             return ("capability", missing)
         except TimeoutError:
             return ("timeout", None)
@@ -673,7 +688,10 @@ class McpRuntime:
                 async with self._operation(config, deadline) as session:
                     tools = _strict_capability_names(await session.list_tools())
                     resources = _strict_capability_names(await session.list_resources())
-                    return ("ok", (tools, resources))
+                    resource_templates = _strict_capability_names(
+                        await session.list_resource_templates()
+                    )
+                    return ("ok", (tools, resources | resource_templates))
         except TimeoutError:
             return ("timeout", None)
         except McpError as error:
@@ -828,15 +846,22 @@ def _http_status(error: BaseException) -> int | None:
 
 
 def _missing_capability(
-    binding: ProviderBinding, tools: object | None, resources: object | None
+    binding: ProviderBinding,
+    tools: object | None,
+    resources: object | None,
+    resource_templates: object | None,
 ) -> str:
     known_tools = tools if isinstance(tools, frozenset) else frozenset()
     known_resources = resources if isinstance(resources, frozenset) else frozenset()
+    known_templates = (
+        resource_templates if isinstance(resource_templates, frozenset) else frozenset()
+    )
     for name in binding.tools.values():
         if name not in known_tools:
             return f"missing bound tool: {name}"
     for name in binding.resources.values():
-        if name not in known_resources:
+        known = known_templates if "{" in name or "}" in name else known_resources
+        if name not in known:
             return f"missing bound resource: {name}"
     return "MCP capability mismatch"
 

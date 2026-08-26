@@ -17,6 +17,7 @@ import yaml  # type: ignore[import-untyped]
 from pydantic import ConfigDict, Field, ValidationError
 
 from intent_engineering.capture.github.connector import GitHubCheckpoint
+from intent_engineering.capture.mcp.connector import McpCheckpoint, _mcp_profile_identity
 from intent_engineering.core.graph.applier import apply_changeset_with_case_effects
 from intent_engineering.core.models import (
     ChangeSet,
@@ -55,6 +56,7 @@ _GIT_CURSOR = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
 _MARKDOWN_CURSOR_PREFIX = "markdown:v1:"
 _GITHUB_CONNECTOR_PREFIX = "github:"
 _GITHUB_SHA = re.compile(r"^[0-9a-f]{40}$")
+_MCP_CONNECTOR_IDENTITY = re.compile(r"^[0-9a-f]{64}$")
 
 
 class DiagnosticSeverity(StrEnum):
@@ -294,6 +296,19 @@ def _evidence_diagnostics(
             ).encode("utf-8")
             if record.content_hash != f"sha256:{sha256(encoded).hexdigest()}":
                 diagnostics.append(_diagnostic("evidence.content_hash_mismatch", "evidence"))
+        elif record.connector_type == "mcp":
+            content = payload.get("content") if isinstance(payload, dict) else None
+            if not isinstance(content, dict):
+                diagnostics.append(_diagnostic("evidence.content_hash_mismatch", "evidence"))
+            else:
+                encoded = json.dumps(
+                    content,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ).encode("utf-8")
+                if record.content_hash != f"sha256:{sha256(encoded).hexdigest()}":
+                    diagnostics.append(_diagnostic("evidence.content_hash_mismatch", "evidence"))
 
     for position, record in enumerate(records):
         if record.parent_ref is None:
@@ -562,6 +577,84 @@ def _github_association_diagnostics(
     return diagnostics
 
 
+def _mcp_scoped_record(record: EvidenceRecord, connector_id: str) -> bool:
+    """Return whether one MCP record is deeply scoped to its ingestion identity."""
+    if record.connector_type != "mcp" or not connector_id.startswith("mcp:"):
+        return False
+    try:
+        connector_prefix, profile_identity, source_identity, scope_identity, actor_identity = (
+            connector_id.rsplit(":", 4)
+        )
+    except ValueError:
+        return False
+    if (
+        not connector_prefix.startswith("mcp:")
+        or not connector_prefix.removeprefix("mcp:")
+        or _MCP_CONNECTOR_IDENTITY.fullmatch(profile_identity) is None
+        or _MCP_CONNECTOR_IDENTITY.fullmatch(source_identity) is None
+        or _MCP_CONNECTOR_IDENTITY.fullmatch(scope_identity) is None
+        or _MCP_CONNECTOR_IDENTITY.fullmatch(actor_identity) is None
+    ):
+        return False
+    payload = record.model_dump(mode="json")["payload"]
+    if not isinstance(payload, dict) or set(payload) != {
+        "kind",
+        "profile_id",
+        "profile_version",
+        "object_type",
+        "scope_hash",
+        "source_hash",
+        "parent_context",
+        "content",
+    }:
+        return False
+    profile_id = payload.get("profile_id")
+    profile_version = payload.get("profile_version")
+    object_type = payload.get("object_type")
+    scope_hash = payload.get("scope_hash")
+    source_hash = payload.get("source_hash")
+    parent_context = payload.get("parent_context")
+    content = payload.get("content")
+    if (
+        payload.get("kind") != "mcp_object"
+        or not isinstance(profile_id, str)
+        or not profile_id
+        or not isinstance(profile_version, str)
+        or not profile_version
+        or not isinstance(object_type, str)
+        or not object_type
+        or profile_identity != _mcp_profile_identity(profile_id, profile_version, object_type)
+        or scope_hash != f"sha256:{scope_identity}"
+        or source_hash != f"sha256:{source_identity}"
+        or not record.external_object_id.startswith(f"{profile_id}:")
+        or not record.external_object_id.removeprefix(f"{profile_id}:")
+        or not isinstance(record.author, str)
+        or not record.author.strip()
+        or not isinstance(content, dict)
+        or not content
+    ):
+        return False
+    return parent_context is None or (
+        isinstance(parent_context, str) and parent_context.startswith(f"{profile_id}:")
+    )
+
+
+def _mcp_association_diagnostics(
+    ingestions: Sequence[EvidenceIngestion],
+) -> list[ValidationDiagnostic]:
+    """Validate every MCP association, including partial uncheckpointed ledgers."""
+    diagnostics: list[ValidationDiagnostic] = []
+    for ingestion in ingestions:
+        connector_id = ingestion.connector_id
+        record = ingestion.evidence
+        if connector_id.startswith("mcp:"):
+            if not _mcp_scoped_record(record, connector_id):
+                diagnostics.append(_diagnostic("evidence.mcp_association_invalid", "evidence"))
+        elif record.connector_type == "mcp":
+            diagnostics.append(_diagnostic("evidence.mcp_association_invalid", "evidence"))
+    return diagnostics
+
+
 def _checkpoint_diagnostics(
     checkpoints: Mapping[str, SyncCheckpoint],
     evidence: Sequence[EvidenceRecord],
@@ -593,6 +686,7 @@ def _checkpoint_diagnostics(
     for connector_id in sorted(checkpoints):
         checkpoint = checkpoints[connector_id]
         github_repository: str | None = None
+        is_mcp_connector = False
         if connector_id.startswith(_GITHUB_CONNECTOR_PREFIX):
             github_repository = connector_id.removeprefix(_GITHUB_CONNECTOR_PREFIX)
             try:
@@ -600,6 +694,8 @@ def _checkpoint_diagnostics(
             except (TypeError, ValidationError, ValueError):
                 diagnostics.append(_diagnostic("checkpoint.connector_unknown", "checkpoints"))
                 continue
+        elif connector_id.startswith("mcp:"):
+            is_mcp_connector = True
         elif connector_id not in {"markdown", "git"}:
             diagnostics.append(_diagnostic("checkpoint.connector_unknown", "checkpoints"))
             continue
@@ -621,7 +717,9 @@ def _checkpoint_diagnostics(
             )
         cursor = checkpoint.cursor
         if cursor is None:
-            if github_repository is not None and checkpoint.consumed_evidence_ids:
+            if is_mcp_connector or (
+                github_repository is not None and checkpoint.consumed_evidence_ids
+            ):
                 diagnostics.append(_diagnostic("checkpoint.cursor_invalid", "checkpoints"))
             continue
         if github_repository is not None:
@@ -683,6 +781,63 @@ def _checkpoint_diagnostics(
                 github_cursor.newest_updated_at is not None
                 or github_cursor.newest_commit_sha is not None
             ):
+                diagnostics.append(_diagnostic("checkpoint.cursor_invalid", "checkpoints"))
+            continue
+        if is_mcp_connector:
+            try:
+                mcp_cursor = McpCheckpoint.decode_unscoped(cursor)
+            except (TypeError, ValidationError, ValueError):
+                diagnostics.append(_diagnostic("checkpoint.cursor_invalid", "checkpoints"))
+                continue
+            if mcp_cursor.connector_id != connector_id:
+                diagnostics.append(_diagnostic("checkpoint.cursor_invalid", "checkpoints"))
+                continue
+            try:
+                (
+                    _connector_prefix,
+                    profile_identity,
+                    source_identity,
+                    scope_identity,
+                    _actor_identity,
+                ) = connector_id.rsplit(":", 4)
+            except ValueError:
+                diagnostics.append(_diagnostic("checkpoint.cursor_invalid", "checkpoints"))
+                continue
+            if (
+                profile_identity
+                != _mcp_profile_identity(
+                    mcp_cursor.profile_id,
+                    mcp_cursor.profile_version,
+                    mcp_cursor.object_type,
+                )
+                or source_identity != mcp_cursor.source_hash.removeprefix("sha256:")
+                or scope_identity != mcp_cursor.scope_hash.removeprefix("sha256:")
+            ):
+                diagnostics.append(_diagnostic("checkpoint.cursor_invalid", "checkpoints"))
+                continue
+            records_by_id = {record.id: record for record in evidence}
+            consumed_records = tuple(
+                records_by_id[evidence_id]
+                for evidence_id in checkpoint.consumed_evidence_ids
+                if evidence_id in records_by_id and (connector_id, evidence_id) in associations
+            )
+            expected_versions: dict[str, str] = {}
+            invalid_record = False
+            for record in consumed_records:
+                payload = record.payload
+                if not _mcp_scoped_record(record, connector_id) or (
+                    payload.get("profile_id") != mcp_cursor.profile_id
+                    or payload.get("profile_version") != mcp_cursor.profile_version
+                    or payload.get("object_type") != mcp_cursor.object_type
+                ):
+                    invalid_record = True
+                    continue
+                expected_versions[record.external_object_id] = record.external_version
+            if invalid_record:
+                diagnostics.append(
+                    _diagnostic("checkpoint.consumed_evidence_foreign", "checkpoints")
+                )
+            if dict(mcp_cursor.observed_versions) != expected_versions:
                 diagnostics.append(_diagnostic("checkpoint.cursor_invalid", "checkpoints"))
             continue
         if connector_id == "git":
@@ -854,6 +1009,7 @@ class WorkspaceValidationService:
             diagnostics.extend(_evidence_diagnostics(evidence, legacy_ids))
             if ingestions is not None:
                 diagnostics.extend(_github_association_diagnostics(ingestions))
+                diagnostics.extend(_mcp_association_diagnostics(ingestions))
         if graph is not None and evidence is not None:
             evidence_by_id = {record.id: record for record in evidence}
             diagnostics.extend(_graph_diagnostics(graph, evidence_by_id))
