@@ -12,7 +12,7 @@ Plan: `docs/superpowers/plans/2026-08-25-intent-engineering-mcp-writeback.md`
 | 4. Read-side MCP connector | Completed | `9954c73` | `f1960b1` | Clean after 2 fix rounds |
 | 5. Write plans, approvals, receipts | Completed | `5ba7f9b` | `54e1c6c` | Clean after 3 fix rounds |
 | 6. Approved write execution | Completed | `7b9309b` | This commit | Clean after 2 review rounds |
-| 7. Connector/write CLI | Pending | — | — | Pending |
+| 7. Connector/write CLI | Completed | `7c4e966` | This report commit | Ready; 0 Critical/Important/Minor |
 | 8. Read-only Intent MCP server | Pending | — | — | Pending |
 | 9. Guarded MCP mutation tools | Pending | — | — | Pending |
 | 10. Public-alpha release proof | Pending | — | — | Pending |
@@ -178,3 +178,14 @@ Plan: `docs/superpowers/plans/2026-08-25-intent-engineering-mcp-writeback.md`
   93 focused tests, 265 broadened MCP/mutation/storage tests, 954 full offline tests, Ruff/mypy/
   format/diff checks clean. Final review found 0 Critical, 0 Important, and 0 Minor findings.
   Product commit: `7b9309b`.
+- Task 7 wires strict local MCP bindings into credential-free, read-only connector diagnostics and
+  one combined local/provider sync. A strict role/person-alias policy powers exact live remote
+  previews, non-TTY refusal, full-preview exact interactive approval, and explicit-approval Task 6
+  execution. One immutable authorization snapshot makes ACL-scoped provider evidence visible to
+  the authorized teammate while preserving the original provider author on every version. Sync and
+  write execution share one five-target crash-recovery domain; coordinated evidence/receipt stores
+  authenticate their exact held targets. Review also drove descriptor-rooted nonblocking profile
+  reads, special-file rejection, physical read/write capability disjointness, and truly live
+  pre/post-write refetches. Final gates: 19 focused, 330 broadened, 974 full offline; Ruff clean;
+  mypy clean across 93 source files; help/diff checks clean. Independent review found 0 Critical,
+  0 Important, and 0 Minor findings and marked the slice Ready.
