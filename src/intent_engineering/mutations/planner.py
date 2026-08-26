@@ -11,6 +11,7 @@ from intent_engineering.capture.mcp.profile_models import ProviderBinding, Provi
 from intent_engineering.capture.mcp.selectors import bind_arguments
 from intent_engineering.capture.mcp.session import detached_json
 from intent_engineering.core.models import JsonValue, ReconciliationCase, ReconciliationStatus
+from intent_engineering.core.models.enums import ResolutionAction
 from intent_engineering.mutations.models import (
     RemoteObject,
     WritePlan,
@@ -37,6 +38,7 @@ def _build_result(
     actor: object,
     authorized_contributors: object,
     identity_aliases: object,
+    resolution_action: object,
     now: object,
 ) -> WritePlan | None:
     try:
@@ -53,12 +55,10 @@ def _build_result(
             or type(actor) is not str
             or not actor.strip()
             or type(authorized_contributors) is not frozenset
-            or any(
-                type(value) is not str or not value.strip()
-                for value in authorized_contributors
-            )
+            or any(type(value) is not str or not value.strip() for value in authorized_contributors)
             or actor not in authorized_contributors
             or not binding.actor_principals.get(actor)
+            or type(resolution_action) is not ResolutionAction
             or current.profile_id != profile.id
             or current.profile_version != profile.version
             or type(now) is not datetime
@@ -69,7 +69,11 @@ def _build_result(
         ):
             return None
         operation = profile.writes[operation_name]
-        if current.object_type != operation.target_object:
+        target_ref = f"{profile.id}:{current.id}"
+        if current.object_type != operation.target_object or target_ref not in {
+            case.subject_ref,
+            *case.affected_refs,
+        }:
             return None
         argument_sources = {argument.source for argument in operation.arguments.values()}
         if not {"target_id", "before_version"}.issubset(argument_sources):
@@ -83,9 +87,7 @@ def _build_result(
         after = {**before, **requested}
         if after == before:
             return None
-        write_fields = {
-            field: after[field] for field in operation.allowed_fields if field in after
-        }
+        write_fields = {field: after[field] for field in operation.allowed_fields if field in after}
         Draft202012Validator(dict(operation.input_schema)).validate(write_fields)
         active_arguments = {
             name: argument
@@ -123,10 +125,12 @@ def _build_result(
             "profile_id": current.profile_id,
             "profile_version": current.profile_version,
             "object_type": current.object_type,
+            "target_ref": target_ref,
             "binding_hash": binding_hash,
             "write_contract_hash": contract_hash,
             "operation": operation.semantic_name,
             "provider_operation": binding.tools[operation_name],
+            "resolution_action": resolution_action.value,
             "target_id": current.id,
             "before_version": current.version,
             "before": before,
@@ -146,10 +150,12 @@ def _build_result(
             profile_id=current.profile_id,
             profile_version=current.profile_version,
             object_type=current.object_type,
+            target_ref=target_ref,
             binding_hash=binding_hash,
             write_contract_hash=contract_hash,
             operation=operation.semantic_name,
             provider_operation=binding.tools[operation_name],
+            resolution_action=resolution_action,
             target_id=current.id,
             before_version=current.version,
             before=before,
@@ -178,6 +184,7 @@ def build_write_plan(
     actor: str,
     authorized_contributors: frozenset[str],
     identity_aliases: dict[str, frozenset[str]],
+    resolution_action: ResolutionAction,
     now: datetime,
 ) -> WritePlan:
     """Create one exact, expiring preview without constituting human approval."""
@@ -191,6 +198,7 @@ def build_write_plan(
         actor,
         authorized_contributors,
         identity_aliases,
+        resolution_action,
         now,
     )
     del (
@@ -203,6 +211,7 @@ def build_write_plan(
         actor,
         authorized_contributors,
         identity_aliases,
+        resolution_action,
         now,
     )
     if result is None:

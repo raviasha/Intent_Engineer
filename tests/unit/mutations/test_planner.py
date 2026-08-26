@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import traceback
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any
@@ -18,19 +19,16 @@ from intent_engineering.core.models import (
     ReconciliationCase,
     ReconciliationCaseType,
     ReconciliationStatus,
+    ResolutionAction,
 )
-from intent_engineering.mutations.models import RemoteObject, WritePlan
+from intent_engineering.mutations.models import RemoteObject, WritePlan, write_plan_id
 from intent_engineering.mutations.planner import WritePlanError, build_write_plan
 
 ROOT = Path(__file__).resolve().parents[3]
 NOW = datetime(2026, 8, 26, 12, 0, tzinfo=UTC)
 IDENTITY_ALIASES = {
-    "local:proposer": frozenset(
-        {"local:proposer", "jira-account-303", "git:proposer@example.com"}
-    ),
-    "local:reviewer": frozenset(
-        {"local:reviewer", "jira-account-404", "slack-user-404"}
-    ),
+    "local:proposer": frozenset({"local:proposer", "jira-account-303", "git:proposer@example.com"}),
+    "local:reviewer": frozenset({"local:reviewer", "jira-account-404", "slack-user-404"}),
     "local:security": frozenset({"local:security", "jira-account-505"}),
     "local:alice": frozenset(
         {"local:alice", "jira-account-101", "slack-user-101", "git:alice@example.com"}
@@ -140,6 +138,7 @@ def base_plan() -> WritePlan:
         actor="local:proposer",
         authorized_contributors=frozenset({"local:proposer"}),
         identity_aliases=IDENTITY_ALIASES,
+        resolution_action=ResolutionAction.UPDATE_REQUIREMENT,
         now=NOW,
     )
 
@@ -149,6 +148,7 @@ def test_plan_is_an_exact_hash_bound_preview_with_authorship() -> None:
 
     assert plan.id == f"write-plan:{plan.canonical_hash}"
     assert plan.target_id == "ENG-7"
+    assert plan.target_ref == "jira:ENG-7"
     assert plan.before_version == "2026-08-26T11:00:00Z"
     assert dict(plan.before) == remote_object().content
     assert dict(plan.after) == {
@@ -174,6 +174,7 @@ def test_plan_is_an_exact_hash_bound_preview_with_authorship() -> None:
         "local:proposer",
     )
     assert plan.provider_operation == "update_issue"
+    assert plan.resolution_action is ResolutionAction.UPDATE_REQUIREMENT
     assert plan.binding_hash.startswith("sha256:")
     assert plan.write_contract_hash.startswith("sha256:")
     assert plan.expires_at.isoformat() == "2026-08-26T12:15:00+00:00"
@@ -183,10 +184,12 @@ def test_plan_is_an_exact_hash_bound_preview_with_authorship() -> None:
     ("field", "changed"),
     [
         ("target_id", "ENG-8"),
+        ("target_ref", "jira:ENG-8"),
         ("before_version", "different-version"),
         ("binding_hash", "sha256:" + "1" * 64),
         ("write_contract_hash", "sha256:" + "2" * 64),
         ("provider_operation", "different_provider_tool"),
+        ("resolution_action", ResolutionAction.PRESERVE_DISAGREEMENT),
         ("after", {"summary": "Different"}),
         ("arguments", {"summary": "Different"}),
         ("evidence_refs", ("evidence:different",)),
@@ -222,6 +225,18 @@ def test_plan_roundtrips_strictly_and_detaches_nested_json() -> None:
         )
 
 
+def test_reloaded_plan_cannot_extend_the_exact_preview_window() -> None:
+    plan = base_plan()
+    material = plan.model_dump(mode="json", exclude={"id"})
+    material["expires_at"] = (
+        (plan.created_at + timedelta(days=1)).isoformat().replace("+00:00", "Z")
+    )
+    payload = {**material, "id": write_plan_id(material)}
+
+    with pytest.raises(ValidationError, match="window exceeds maximum"):
+        WritePlan.model_validate_json(json.dumps(payload))
+
+
 @pytest.mark.parametrize(
     "requested",
     [
@@ -243,6 +258,7 @@ def test_planner_fails_closed_without_retaining_requested_values(requested: obje
             actor="local:proposer",
             authorized_contributors=frozenset({"local:proposer"}),
             identity_aliases=IDENTITY_ALIASES,
+            resolution_action=ResolutionAction.UPDATE_REQUIREMENT,
             now=NOW,
         )
 
@@ -274,6 +290,7 @@ def test_planning_requires_a_human_review_case_and_nonempty_exact_change() -> No
                 actor="local:proposer",
                 authorized_contributors=frozenset({"local:proposer"}),
                 identity_aliases=IDENTITY_ALIASES,
+                resolution_action=ResolutionAction.UPDATE_REQUIREMENT,
                 now=NOW,
             )
 
@@ -297,6 +314,7 @@ def test_planning_requires_an_authorized_contributor_and_matching_profile() -> N
             actor="local:outsider",
             authorized_contributors=frozenset({"local:proposer"}),
             identity_aliases=IDENTITY_ALIASES,
+            resolution_action=ResolutionAction.UPDATE_REQUIREMENT,
             now=NOW,
         )
 
@@ -312,6 +330,7 @@ def test_planning_requires_an_authorized_contributor_and_matching_profile() -> N
             actor="local:proposer",
             authorized_contributors=frozenset({"local:proposer"}),
             identity_aliases=IDENTITY_ALIASES,
+            resolution_action=ResolutionAction.UPDATE_REQUIREMENT,
             now=NOW,
         )
 
@@ -337,14 +356,13 @@ def test_planning_rejects_a_write_contract_without_target_and_version_guards() -
             actor="local:proposer",
             authorized_contributors=frozenset({"local:proposer"}),
             identity_aliases=IDENTITY_ALIASES,
+            resolution_action=ResolutionAction.UPDATE_REQUIREMENT,
             now=NOW,
         )
 
 
 def test_planning_rejects_the_wrong_object_type_for_the_write_contract() -> None:
-    wrong_type = remote_object().model_copy(
-        update={"object_type": "comment", "id": "COMMENT-77"}
-    )
+    wrong_type = remote_object().model_copy(update={"object_type": "comment", "id": "COMMENT-77"})
     with pytest.raises(WritePlanError):
         build_write_plan(
             review_case(),
@@ -356,6 +374,34 @@ def test_planning_rejects_the_wrong_object_type_for_the_write_contract() -> None
             actor="local:proposer",
             authorized_contributors=frozenset({"local:proposer"}),
             identity_aliases=IDENTITY_ALIASES,
+            resolution_action=ResolutionAction.UPDATE_REQUIREMENT,
+            now=NOW,
+        )
+
+
+def test_planning_rejects_a_provider_target_unrelated_to_the_review_case() -> None:
+    unrelated = remote_object().model_copy(
+        update={
+            "id": "ENG-999",
+            "content": {
+                **dict(remote_object().content),
+                "issue_key": "ENG-999",
+            },
+        }
+    )
+
+    with pytest.raises(WritePlanError):
+        build_write_plan(
+            review_case(),
+            jira_profile(),
+            jira_binding(),
+            "update_issue",
+            unrelated,
+            {"summary": "must not resolve an unrelated case"},
+            actor="local:proposer",
+            authorized_contributors=frozenset({"local:proposer"}),
+            identity_aliases=IDENTITY_ALIASES,
+            resolution_action=ResolutionAction.UPDATE_REQUIREMENT,
             now=NOW,
         )
 
@@ -385,6 +431,7 @@ def test_planning_allows_absent_optional_write_fields() -> None:
         actor="local:proposer",
         authorized_contributors=frozenset({"local:proposer"}),
         identity_aliases=IDENTITY_ALIASES,
+        resolution_action=ResolutionAction.UPDATE_REQUIREMENT,
         now=NOW,
     )
 

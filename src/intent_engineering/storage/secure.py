@@ -1082,6 +1082,7 @@ class SecureFile:
                 written = os.write(descriptor, view)
                 view = view[written:]
             os.fsync(descriptor)
+            os.fsync(self.parent_fd)
         finally:
             os.close(descriptor)
 

@@ -19,11 +19,15 @@ from intent_engineering.capture.mcp.profile_models import (
 )
 from intent_engineering.core.models import JsonValue
 from intent_engineering.core.models._base import StrictModel
+from intent_engineering.core.models.enums import ResolutionAction
 
 _CONTROL = re.compile(r"[\x00-\x1f\x7f]")
 _HASH = r"^sha256:[0-9a-f]{64}$"
 _PLAN_ID = r"^write-plan:sha256:[0-9a-f]{64}$"
 _APPROVAL_ID = r"^approval:sha256:[0-9a-f]{64}$"
+_RECEIPT_ID = r"^receipt:sha256:[0-9a-f]{64}$"
+_WRITE_EVIDENCE_ID = r"^evidence:mcp-write:[0-9a-f]{64}$"
+_MAX_PLAN_WINDOW = timedelta(minutes=15)
 _MAX_APPROVAL_WINDOW = timedelta(minutes=15)
 
 
@@ -65,10 +69,7 @@ def _thaw_json(value: object) -> JsonValue:
             thawed[key] = _thaw_json(item)
         return thawed
     if type(value) is MappingProxyType:
-        return {
-            key: _thaw_json(item)
-            for key, item in cast(Mapping[str, object], value).items()
-        }
+        return {key: _thaw_json(item) for key, item in cast(Mapping[str, object], value).items()}
     if type(value) is list:
         return [_thaw_json(item) for item in cast(list[object], value)]
     if type(value) is tuple:
@@ -160,10 +161,12 @@ class WritePlan(_MutationModel):
     profile_id: str
     profile_version: str
     object_type: str
+    target_ref: str
     binding_hash: str = Field(pattern=_HASH)
     write_contract_hash: str = Field(pattern=_HASH)
     operation: str
     provider_operation: str
+    resolution_action: ResolutionAction
     target_id: str
     before_version: str
     before: Mapping[str, JsonValue]
@@ -182,6 +185,7 @@ class WritePlan(_MutationModel):
         "profile_id",
         "profile_version",
         "object_type",
+        "target_ref",
         "operation",
         "provider_operation",
         "target_id",
@@ -232,6 +236,8 @@ class WritePlan(_MutationModel):
             raise ValueError("write plan identifier does not match canonical hash")
         if self.expires_at <= self.created_at:
             raise ValueError("write plan expiry must follow creation")
+        if self.expires_at - self.created_at > _MAX_PLAN_WINDOW:
+            raise ValueError("write plan window exceeds maximum")
         if self.created_by not in self.created_by_aliases:
             raise ValueError("write plan aliases omit creator")
         if not self.before or not self.after or not self.arguments or self.before == self.after:
@@ -303,34 +309,66 @@ class ExecutionReceipt(_MutationModel):
     """Immutable result of one attempted guarded mutation; persisted in Task 6."""
 
     schema_version: Literal[1] = 1
-    id: str
+    id: str = Field(pattern=_RECEIPT_ID)
     plan_id: str = Field(pattern=_PLAN_ID)
+    plan_hash: str = Field(pattern=_HASH)
     approval_id: str = Field(pattern=_APPROVAL_ID)
+    target_version: str
+    executed_by: str
     status: Literal["succeeded", "rejected", "failed"]
     attempted_at: datetime
     completed_at: datetime
     resulting_version: str | None = None
-    evidence_ref: str
-    redacted_error: str | None = None
+    evidence_ref: str | None = Field(default=None, pattern=_WRITE_EVIDENCE_ID)
+    redacted_error: (
+        Literal[
+            "target_changed",
+            "permission_denied",
+            "provider_failure",
+        ]
+        | None
+    ) = None
 
-    @field_validator("id", "evidence_ref")
+    @field_validator("target_version", "executed_by")
     @classmethod
     def validate_text(cls, value: str) -> str:
         return _text(value, "receipt field")
+
+    @field_validator("resulting_version")
+    @classmethod
+    def validate_optional_result_version(cls, value: str | None) -> str | None:
+        return None if value is None else _text(value, "resulting version")
 
     @field_validator("attempted_at", "completed_at")
     @classmethod
     def normalize_time(cls, value: datetime) -> datetime:
         return _utc(value)
 
+    @property
+    def canonical_hash(self) -> str:
+        return _canonical_hash(
+            cast(Mapping[str, JsonValue], self.model_dump(mode="json", exclude={"id"}))
+        )
+
     @model_validator(mode="after")
     def validate_receipt(self) -> ExecutionReceipt:
+        if self.id != f"receipt:{self.canonical_hash}":
+            raise ValueError("receipt identifier does not match canonical hash")
         if self.completed_at < self.attempted_at:
             raise ValueError("receipt completion precedes attempt")
-        if self.status == "succeeded" and self.resulting_version is None:
-            raise ValueError("successful receipt requires resulting version")
-        if self.status != "succeeded" and self.resulting_version is not None:
-            raise ValueError("unsuccessful receipt cannot contain resulting version")
+        if self.status == "succeeded":
+            if (
+                self.resulting_version is None
+                or self.evidence_ref is None
+                or self.redacted_error is not None
+            ):
+                raise ValueError("successful receipt has incomplete result")
+        elif (
+            self.resulting_version is not None
+            or self.evidence_ref is not None
+            or self.redacted_error is None
+        ):
+            raise ValueError("unsuccessful receipt has invalid result")
         return self
 
 
@@ -371,12 +409,15 @@ def approval_id(material: Mapping[str, JsonValue]) -> str:
     return f"approval:{_canonical_hash(material)}"
 
 
+def receipt_id(material: Mapping[str, JsonValue]) -> str:
+    """Return the validated ID for receipt fields excluding ID."""
+    return f"receipt:{_canonical_hash(material)}"
+
+
 def provider_binding_hash(binding: ProviderBinding) -> str:
     """Hash the complete validated local provider mapping and identity aliases."""
     validated = ProviderBinding.model_validate_json(binding.model_dump_json())
-    return _canonical_hash(
-        cast(Mapping[str, JsonValue], validated.model_dump(mode="json"))
-    )
+    return _canonical_hash(cast(Mapping[str, JsonValue], validated.model_dump(mode="json")))
 
 
 def provider_write_contract_hash(

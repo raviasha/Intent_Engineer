@@ -12,6 +12,7 @@ import pytest
 from pydantic import ValidationError
 
 from intent_engineering.capture.mcp import ProviderBinding
+from intent_engineering.core.models import ResolutionAction
 from intent_engineering.mutations.approval import ApprovalError, approve_plan
 from intent_engineering.mutations.models import (
     ApprovalRecord,
@@ -159,6 +160,7 @@ def test_approval_rejects_exact_local_and_cross_provider_author_aliases(
         actor="local:proposer",
         authorized_contributors=frozenset({"local:proposer"}),
         identity_aliases=IDENTITY_ALIASES,
+        resolution_action=ResolutionAction.UPDATE_REQUIREMENT,
         now=NOW,
     )
     with pytest.raises(ApprovalError):
@@ -260,8 +262,8 @@ def test_approval_record_rejects_mismatched_plan_hash_and_unbounded_window() -> 
 
     long_material = approval.model_dump(mode="json", exclude={"id"})
     long_material["expires_at"] = (
-        approval.approved_at + timedelta(days=30)
-    ).isoformat().replace("+00:00", "Z")
+        (approval.approved_at + timedelta(days=30)).isoformat().replace("+00:00", "Z")
+    )
     long_window = {**long_material, "id": approval_id(long_material)}
     with pytest.raises(ValidationError):
         ApprovalRecord.model_validate_json(json.dumps(long_window))
@@ -294,6 +296,7 @@ def test_approval_reauthenticates_reloaded_plan_creator_aliases() -> None:
         actor="local:proposer",
         authorized_contributors=frozenset({"local:proposer"}),
         identity_aliases=aliases,
+        resolution_action=ResolutionAction.UPDATE_REQUIREMENT,
         now=NOW,
     )
     material = plan.model_dump(mode="json", exclude={"id"})

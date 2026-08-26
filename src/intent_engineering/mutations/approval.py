@@ -7,12 +7,11 @@ from typing import cast
 
 from intent_engineering.capture.mcp.profile_models import ProviderBinding
 from intent_engineering.core.models import JsonValue
+from intent_engineering.mutations.authorization import authenticated_approval_aliases
 from intent_engineering.mutations.models import (
     ApprovalRecord,
     WritePlan,
     approval_id,
-    identity_aliases_for,
-    provider_binding_hash,
 )
 
 _MAX_APPROVAL_WINDOW = timedelta(minutes=15)
@@ -36,9 +35,6 @@ def _approval_result(
     try:
         plan = WritePlan.model_validate_json(plan.model_dump_json())
         binding = ProviderBinding.model_validate_json(binding.model_dump_json())
-        provider_principals = (
-            binding.actor_principals.get(actor) if type(actor) is str else None
-        )
         if (
             type(actor) is not str
             or not actor.strip()
@@ -54,28 +50,19 @@ def _approval_result(
             or confirmation != f"approve {plan.id}"
             or type(authorized_approvers) is not frozenset
             or any(type(value) is not str or not value.strip() for value in authorized_approvers)
-            or actor not in authorized_approvers
-            or actor == plan.created_by
-            or provider_binding_hash(binding) != plan.binding_hash
-            or binding.profile_id != plan.profile_id
-            or binding.profile_version != plan.profile_version
-            or actor in plan.conflicting_authors
-            or not provider_principals
         ):
             return None
-        creator_provider_principals = binding.actor_principals.get(plan.created_by)
-        if not creator_provider_principals:
-            return None
-        authenticated_creator_aliases = identity_aliases_for(
-            identity_aliases,
-            plan.created_by,
-            creator_provider_principals,
+        authenticated_actor_aliases = authenticated_approval_aliases(
+            plan,
+            binding,
+            actor,
+            authorized_contributors=frozenset({plan.created_by}),
+            authorized_approvers=authorized_approvers,
+            identity_aliases=identity_aliases,
         )
-        if authenticated_creator_aliases != plan.created_by_aliases:
+        if authenticated_actor_aliases is None:
             return None
-        actor_aliases = frozenset(
-            identity_aliases_for(identity_aliases, actor, provider_principals)
-        )
+        actor_aliases = frozenset(authenticated_actor_aliases)
         if not actor_aliases.isdisjoint(plan.created_by_aliases) or not actor_aliases.isdisjoint(
             plan.conflicting_authors
         ):
