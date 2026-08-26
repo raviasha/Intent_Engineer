@@ -555,7 +555,11 @@ def _policy_result(policy_file: object) -> MutationPolicy | None:
         return None
 
 
-def policy_actor_aliases(runtime: Runtime) -> frozenset[str]:
+def policy_actor_aliases(
+    runtime: Runtime,
+    *,
+    actor: str | None = None,
+) -> frozenset[str]:
     """Return the local policy aliases authenticated for the selected runtime actor."""
     directory = None
     try:
@@ -572,7 +576,8 @@ def policy_actor_aliases(runtime: Runtime) -> frozenset[str]:
             directory.close()
     if policy is None:
         return frozenset()
-    return policy.identities.get(runtime.config.local_actor, frozenset())
+    selected_actor = runtime.config.local_actor if actor is None else actor
+    return policy.identities.get(selected_actor, frozenset())
 
 
 def load_write_workflow(_project: Path) -> WriteWorkflow:

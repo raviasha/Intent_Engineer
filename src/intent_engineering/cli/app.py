@@ -275,6 +275,33 @@ def sync_command(
     _sync_command(_runtime(project), sources, output_format)
 
 
+@app.command("mcp")
+def mcp_command(
+    project: Path = typer.Option(Path("."), "--project"),
+) -> None:
+    """Serve authorized local Intent context over the protocol-clean MCP stdio transport."""
+    from intent_engineering.integrations.mcp_server import run_stdio
+
+    abort: BaseException | None = None
+    try:
+        run_stdio(project)
+        ok = True
+    except Exception:  # noqa: BLE001 - retain no runtime/parser/provider failure
+        ok = False
+    except BaseException as error:  # noqa: BLE001 - preserve detached interrupt/cancellation
+        error.__traceback__ = None
+        error.__cause__ = None
+        error.__context__ = None
+        abort = error
+        ok = False
+    del project
+    if abort is not None:
+        raise abort
+    if not ok:
+        typer.echo("intent error: MCP server failed", err=True)
+        raise typer.Exit(1) from None
+
+
 def _validate_sources(sources: str) -> None:
     """Reject command usage before touching project state or opening runtime stores."""
     try:

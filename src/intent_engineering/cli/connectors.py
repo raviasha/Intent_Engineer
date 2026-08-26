@@ -188,16 +188,20 @@ def connector_catalog(runtime: Runtime) -> ConnectorCatalog:
     return ConnectorCatalog(runtime, _load_configured(runtime))
 
 
-def configured_actor_principals(runtime: Runtime) -> frozenset[str]:
+def configured_actor_principals(
+    runtime: Runtime,
+    *,
+    actor: str | None = None,
+) -> frozenset[str]:
     """Return only provider principals authenticated for the runtime's local actor."""
     configured = _configured_result(runtime)
     if configured is None:
         return frozenset()
-    actor = runtime.config.local_actor
+    selected_actor = runtime.config.local_actor if actor is None else actor
     return frozenset(
         principal
         for item in configured
-        for principal in item.config.binding.actor_principals.get(actor, frozenset())
+        for principal in item.config.binding.actor_principals.get(selected_actor, frozenset())
     )
 
 

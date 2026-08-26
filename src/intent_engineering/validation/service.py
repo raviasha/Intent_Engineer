@@ -871,8 +871,14 @@ def _checkpoint_diagnostics(
 class WorkspaceValidationService:
     """Capture and deeply validate one local workspace without exposing local data."""
 
-    def __init__(self, root: Path) -> None:
+    def __init__(
+        self,
+        root: Path,
+        *,
+        project_directory: SecureDirectory | None = None,
+    ) -> None:
         self._root = root
+        self._project_directory = project_directory
 
     def _capture(self) -> _CapturedWorkspace:
         project_directory: SecureDirectory | None = None
@@ -880,7 +886,11 @@ class WorkspaceValidationService:
         files: list[SecureFile] = []
         try:
             try:
-                project_directory = SecureDirectory.open(self._root)
+                project_directory = (
+                    SecureDirectory.open(self._root)
+                    if self._project_directory is None
+                    else self._project_directory.duplicate()
+                )
                 workspace_directory = project_directory.subdirectory(".intent")
             except (OSError, UnsafePathError) as error:
                 raise _CaptureFailure("workspace.not_initialized", "workspace") from error
@@ -1033,5 +1043,16 @@ def validate_project(root: Path) -> ValidationReport:
     """Shared fail-closed entry point for CLI validation and workspace doctoring."""
     try:
         return WorkspaceValidationService(root).validate()
+    except Exception:  # noqa: BLE001 - public diagnostics never expose local failures
+        return _report((_diagnostic("validation.internal_failure", "validation"),))
+
+
+def validate_project_directory(directory: SecureDirectory) -> ValidationReport:
+    """Validate the exact descriptor-held project selected by a long-lived caller."""
+    try:
+        return WorkspaceValidationService(
+            directory.path,
+            project_directory=directory,
+        ).validate()
     except Exception:  # noqa: BLE001 - public diagnostics never expose local failures
         return _report((_diagnostic("validation.internal_failure", "validation"),))

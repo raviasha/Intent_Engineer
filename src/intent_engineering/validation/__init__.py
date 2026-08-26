@@ -6,6 +6,7 @@ from intent_engineering.validation.service import (
     ValidationReport,
     WorkspaceValidationService,
     validate_project,
+    validate_project_directory,
 )
 
 __all__ = [
@@ -14,4 +15,5 @@ __all__ = [
     "ValidationReport",
     "WorkspaceValidationService",
     "validate_project",
+    "validate_project_directory",
 ]
