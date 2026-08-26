@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import json
 from collections import defaultdict
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
+from contextlib import contextmanager
 from pathlib import Path
 
 from pydantic import ValidationError
@@ -13,6 +14,7 @@ from intent_engineering.core.models import EvidenceIngestion, EvidenceRecord
 from intent_engineering.storage._atomic import append_durable_line, same_path_lock
 from intent_engineering.storage.jsonl.strict import loads_strict_object
 from intent_engineering.storage.secure import SecureFile, coerce_secure_file
+from intent_engineering.storage.transaction import LocalTransactionCoordinator
 
 
 class EvidenceStoreError(ValueError):
@@ -90,15 +92,32 @@ def parse_evidence_lines(
 class JsonlEvidenceStore:
     """Persist evidence and connector associations together in one append-only file."""
 
-    def __init__(self, path: Path | SecureFile) -> None:
+    def __init__(
+        self,
+        path: Path | SecureFile,
+        *,
+        transactions: LocalTransactionCoordinator | None = None,
+    ) -> None:
         self._file = coerce_secure_file(path)
+        if transactions is not None and not transactions.target_matches("evidence", self._file):
+            raise ValueError("evidence transaction target is unavailable")
+        self._transactions = transactions
         self.path = self._file.path
         self._by_id: dict[str, EvidenceRecord] = {}
         self._by_external_object_id: dict[str, list[EvidenceRecord]] = defaultdict(list)
         self._ledger_by_connector: dict[str, list[EvidenceIngestion]] = defaultdict(list)
         self._legacy_ids: set[str] = set()
-        with same_path_lock(self._file):
+        with self._locked():
             self._rebuild_index_unlocked()
+
+    @contextmanager
+    def _locked(self) -> Iterator[None]:
+        if self._transactions is None:
+            with same_path_lock(self._file):
+                yield
+            return
+        with self._transactions.coordinated(), same_path_lock(self._file):
+            yield
 
     def _rebuild_index_unlocked(self) -> None:
         """Refresh indexes from disk while the caller holds this store's path lock."""
@@ -129,7 +148,7 @@ class JsonlEvidenceStore:
 
     def put(self, record: EvidenceRecord) -> bool:
         """Append a legacy/unassociated record for import and migration workflows."""
-        with same_path_lock(self._file):
+        with self._locked():
             self._rebuild_index_unlocked()
             existing = self._by_id.get(record.id)
             if existing is not None:
@@ -144,7 +163,7 @@ class JsonlEvidenceStore:
 
     def associate(self, connector_id: str, record: EvidenceRecord) -> bool:
         """Atomically append a connector association and return whether evidence is new."""
-        with same_path_lock(self._file):
+        with self._locked():
             self._rebuild_index_unlocked()
             existing = self._by_id.get(record.id)
             if existing is not None and existing != record:
@@ -174,7 +193,7 @@ class JsonlEvidenceStore:
 
     def migrate_legacy(self, connector_id: str, connector_type: str) -> None:
         """Materialize only safe built-in legacy ownership; custom mappings require a caller."""
-        with same_path_lock(self._file):
+        with self._locked():
             self._rebuild_index_unlocked()
             candidates = tuple(
                 record
@@ -194,13 +213,13 @@ class JsonlEvidenceStore:
             self.associate(connector_id, record)
 
     def get(self, evidence_id: str) -> EvidenceRecord:
-        with same_path_lock(self._file):
+        with self._locked():
             self._rebuild_index_unlocked()
             return self._by_id[evidence_id]
 
     def versions(self, external_object_id: str) -> Sequence[EvidenceRecord]:
         """Return global provider versions for read-only legacy consumers."""
-        with same_path_lock(self._file):
+        with self._locked():
             self._rebuild_index_unlocked()
             return tuple(self._by_external_object_id.get(external_object_id, ()))
 
@@ -211,7 +230,7 @@ class JsonlEvidenceStore:
         connector_type: str | None = None,
     ) -> Sequence[EvidenceIngestion]:
         """Return authenticated per-connector append provenance."""
-        with same_path_lock(self._file):
+        with self._locked():
             self._rebuild_index_unlocked()
             entries = tuple(self._ledger_by_connector.get(connector_id, ()))
             associated_ids = {item.evidence.id for item in entries}
@@ -242,12 +261,12 @@ class JsonlEvidenceStore:
         return tuple(item.evidence for item in self.ledger(connector_id))
 
     def list(self) -> Sequence[EvidenceRecord]:
-        with same_path_lock(self._file):
+        with self._locked():
             self._rebuild_index_unlocked()
             return tuple(self._by_id.values())
 
     def ingestions(self) -> Sequence[EvidenceIngestion]:
-        with same_path_lock(self._file):
+        with self._locked():
             self._rebuild_index_unlocked()
             return tuple(
                 item

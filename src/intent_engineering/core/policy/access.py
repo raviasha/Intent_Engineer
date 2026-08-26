@@ -2,17 +2,29 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Sequence
+from collections.abc import Collection, Iterable, Sequence
 
 from intent_engineering.core.models import EvidenceRecord
 
 
-def evidence_allowed(record: EvidenceRecord, actor: str) -> bool:
-    """Allow public evidence and ACL evidence explicitly granted to the local actor."""
-    return not record.acl or actor in record.acl
+def _principals(actor: str | Collection[str]) -> frozenset[str]:
+    if type(actor) is str:
+        return frozenset({actor})
+    if any(type(item) is not str or not item for item in actor):
+        return frozenset()
+    return frozenset(actor)
 
 
-def refs_allowed(references: Sequence[str], records: Iterable[EvidenceRecord], actor: str) -> bool:
+def evidence_allowed(record: EvidenceRecord, actor: str | Collection[str]) -> bool:
+    """Allow public evidence or ACL evidence granted to an authenticated actor alias."""
+    return not record.acl or not frozenset(record.acl).isdisjoint(_principals(actor))
+
+
+def refs_allowed(
+    references: Sequence[str],
+    records: Iterable[EvidenceRecord],
+    actor: str | Collection[str],
+) -> bool:
     """Fail closed: every nonempty reference must resolve and be readable."""
     index = {record.id: record for record in records}
     return all(

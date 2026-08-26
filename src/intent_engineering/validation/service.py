@@ -911,6 +911,7 @@ class WorkspaceValidationService:
                 "history": workspace_directory.file("history/changesets.jsonl"),
                 "cases": workspace_directory.file("reconciliation/cases.jsonl"),
                 "evidence": workspace_directory.file("evidence/evidence.jsonl"),
+                "receipts": workspace_directory.file("approvals/receipts.jsonl"),
                 "checkpoints": workspace_directory.file("cache/checkpoints.yaml"),
             }
             files.extend(state_files.values())
@@ -930,12 +931,14 @@ class WorkspaceValidationService:
                         "graph": graph_file,
                         "history": state_files["history"],
                         "cases": state_files["cases"],
+                        "evidence": state_files["evidence"],
+                        "receipts": state_files["receipts"],
                     },
+                    legacy_target_sets=(frozenset({"graph", "history", "cases"}),),
                 )
                 snapshot = transactions.snapshot(
                     {
                         "config": config_file,
-                        "evidence": state_files["evidence"],
                         "checkpoints": state_files["checkpoints"],
                     }
                 )

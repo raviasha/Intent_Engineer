@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal
@@ -15,6 +17,7 @@ from intent_engineering.mutations.models import ExecutionReceipt
 from intent_engineering.storage._atomic import append_durable_line, same_path_lock
 from intent_engineering.storage.jsonl.strict import loads_strict_object
 from intent_engineering.storage.secure import SecureFile, coerce_secure_file
+from intent_engineering.storage.transaction import LocalTransactionCoordinator
 
 
 class ReceiptStoreError(ValueError):
@@ -163,13 +166,30 @@ def _validated_claim(
 class JsonlReceiptStore:
     """Append a durable claim before mutation and at most one terminal receipt."""
 
-    def __init__(self, path: Path | SecureFile) -> None:
+    def __init__(
+        self,
+        path: Path | SecureFile,
+        *,
+        transactions: LocalTransactionCoordinator | None = None,
+    ) -> None:
         self._file = coerce_secure_file(path)
+        if transactions is not None and not transactions.target_matches("receipts", self._file):
+            raise ValueError("receipt transaction target is unavailable")
+        self._transactions = transactions
         self.path = self._file.path
         self._claims: dict[tuple[str, str], _Claim] = {}
         self._receipts: dict[tuple[str, str], ExecutionReceipt] = {}
-        with same_path_lock(self._file):
+        with self._locked():
             self._rebuild_unlocked()
+
+    @contextmanager
+    def _locked(self) -> Iterator[None]:
+        if self._transactions is None:
+            with same_path_lock(self._file):
+                yield
+            return
+        with self._transactions.coordinated(), same_path_lock(self._file):
+            yield
 
     def _decode_unlocked(
         self,
@@ -200,7 +220,7 @@ class JsonlReceiptStore:
         if claim is None:
             raise ReceiptStoreError("invalid execution claim") from None
         key = (claim.plan_id, claim.approval_id)
-        with same_path_lock(self._file):
+        with self._locked():
             self._rebuild_unlocked()
             if key in self._claims:
                 return False
@@ -209,7 +229,7 @@ class JsonlReceiptStore:
             return True
 
     def complete(self, receipt: ExecutionReceipt) -> bool:
-        with same_path_lock(self._file):
+        with self._locked():
             self._rebuild_unlocked()
             serialized = validate_receipt_completion(self._file.read_optional(), receipt)
             if not serialized:
@@ -220,16 +240,16 @@ class JsonlReceiptStore:
             return True
 
     def get_for(self, plan_id: str, approval_id: str) -> ExecutionReceipt | None:
-        with same_path_lock(self._file):
+        with self._locked():
             self._rebuild_unlocked()
             return self._receipts.get((plan_id, approval_id))
 
     def is_claimed(self, plan_id: str, approval_id: str) -> bool:
-        with same_path_lock(self._file):
+        with self._locked():
             self._rebuild_unlocked()
             return (plan_id, approval_id) in self._claims
 
     def list(self) -> tuple[ExecutionReceipt, ...]:
-        with same_path_lock(self._file):
+        with self._locked():
             self._rebuild_unlocked()
             return tuple(self._receipts[key] for key in sorted(self._receipts))

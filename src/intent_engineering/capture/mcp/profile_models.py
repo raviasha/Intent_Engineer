@@ -412,7 +412,11 @@ class WriteOperationProfile(McpProfileModel):
 
     @model_validator(mode="after")
     def validate_write_contract(self) -> WriteOperationProfile:
-        if not self.target_id.required or not self.before_version.required or not self.result_version.required:
+        if (
+            not self.target_id.required
+            or not self.before_version.required
+            or not self.result_version.required
+        ):
             raise ValueError("write selectors must be required")
         schema = _thaw_json(self.input_schema)
         if not isinstance(schema, dict) or schema.get("type") != "object":
@@ -480,8 +484,12 @@ class ProviderProfile(McpProfileModel):
 
     @field_validator("writes", mode="after")
     @classmethod
-    def freeze_writes(cls, value: dict[str, WriteOperationProfile]) -> dict[str, WriteOperationProfile]:
-        return cast(dict[str, WriteOperationProfile], _freeze_mapping(value, "semantic operation name"))
+    def freeze_writes(
+        cls, value: dict[str, WriteOperationProfile]
+    ) -> dict[str, WriteOperationProfile]:
+        return cast(
+            dict[str, WriteOperationProfile], _freeze_mapping(value, "semantic operation name")
+        )
 
     @field_serializer("writes")
     def serialize_writes(
@@ -543,9 +551,7 @@ class ProviderBinding(McpProfileModel):
 
     @field_validator("actor_principals", mode="after")
     @classmethod
-    def freeze_principals(
-        cls, value: dict[str, frozenset[str]]
-    ) -> dict[str, frozenset[str]]:
+    def freeze_principals(cls, value: dict[str, frozenset[str]]) -> dict[str, frozenset[str]]:
         frozen: dict[str, frozenset[str]] = {}
         for actor, principals in value.items():
             frozen[_require_text(actor, "binding actor identifier")] = frozenset(
@@ -577,6 +583,14 @@ class ProviderBinding(McpProfileModel):
             raise BindingValidationError("operation mapping has wrong capability kind")
         if expected - provided:
             raise BindingValidationError("missing operation mapping")
+        read_tool_names = {
+            self.tools[name]
+            for name, operation in profile.operations.items()
+            if operation.kind == "tool"
+        }
+        write_tool_names = {self.tools[name] for name in profile.writes}
+        if not read_tool_names.isdisjoint(write_tool_names):
+            raise BindingValidationError("read and write capabilities overlap")
 
     def assert_capabilities(
         self,
@@ -596,6 +610,8 @@ class ProviderBinding(McpProfileModel):
 def profile_schema_bytes() -> bytes:
     """Return canonical bytes for the checked-in provider profile schema."""
     return (
-        json.dumps(ProviderProfile.model_json_schema(), ensure_ascii=False, indent=2, sort_keys=True)
+        json.dumps(
+            ProviderProfile.model_json_schema(), ensure_ascii=False, indent=2, sort_keys=True
+        )
         + "\n"
     ).encode("utf-8")

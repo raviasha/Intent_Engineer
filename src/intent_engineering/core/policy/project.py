@@ -13,12 +13,17 @@ import yaml  # type: ignore[import-untyped]
 
 from intent_engineering.core.models import Graph, ProjectConfig
 
-_DIRECTORIES = ("evidence", "reconciliation", "history", "approvals", "cache")
+_REQUIRED_DIRECTORIES = ("evidence", "reconciliation", "history", "approvals", "cache")
+_DIRECTORIES = (*_REQUIRED_DIRECTORIES, "connectors")
 _STATE_FILES = (
     ("evidence", "evidence.jsonl"),
     ("reconciliation", "cases.jsonl"),
     ("history", "changesets.jsonl"),
     ("cache", "checkpoints.yaml"),
+    ("approvals", "plans.jsonl"),
+    ("approvals", "approvals.jsonl"),
+    ("approvals", "receipts.jsonl"),
+    ("approvals", "policy.yaml"),
 )
 _DIRECTORY_FLAGS = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
 
@@ -117,7 +122,7 @@ def _is_complete_valid(workspace_fd: int) -> bool:
         ProjectConfig.model_validate(cast(dict[str, Any], config_data))
         Graph.model_validate(cast(dict[str, Any], graph_data))
         descriptors = tuple(
-            os.open(name, _DIRECTORY_FLAGS, dir_fd=workspace_fd) for name in _DIRECTORIES
+            os.open(name, _DIRECTORY_FLAGS, dir_fd=workspace_fd) for name in _REQUIRED_DIRECTORIES
         )
         return True
     except (OSError, TypeError, ValueError, yaml.YAMLError):
@@ -141,7 +146,14 @@ def _state_is_empty(workspace_fd: int) -> bool:
                 continue
         finally:
             os.close(directory_fd)
-    return True
+    try:
+        connector_fd = os.open("connectors", _DIRECTORY_FLAGS, dir_fd=workspace_fd)
+    except OSError:
+        return True
+    try:
+        return not os.listdir(connector_fd)
+    finally:
+        os.close(connector_fd)
 
 
 def initialize_project(root: Path, *, force: bool = False) -> InitializedProject:
@@ -161,6 +173,8 @@ def initialize_project(root: Path, *, force: bool = False) -> InitializedProject
             raise ProjectAlreadyInitialized("local workspace has an unsafe path") from error
         try:
             if existed and _is_complete_valid(workspace_fd):
+                connector_fd = _open_or_create_directory(workspace_fd, "connectors")
+                os.close(connector_fd)
                 return InitializedProject(
                     root, workspace, workspace / "config.yaml", workspace / "graph.yaml"
                 )

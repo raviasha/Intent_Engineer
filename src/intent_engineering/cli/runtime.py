@@ -210,9 +210,18 @@ def load_runtime(root: Path) -> Runtime:
         raise UnsafePathError("configured graph path is unsafe") from error
     history_file = workspace_directory.file("history/changesets.jsonl")
     case_file = workspace_directory.file("reconciliation/cases.jsonl")
+    evidence_file = workspace_directory.file("evidence/evidence.jsonl")
+    receipts_file = workspace_directory.file("approvals/receipts.jsonl")
     transactions = LocalTransactionCoordinator(
         workspace_directory.file("history/.local-transaction.json"),
-        {"graph": graph_file, "history": history_file, "cases": case_file},
+        {
+            "graph": graph_file,
+            "history": history_file,
+            "cases": case_file,
+            "evidence": evidence_file,
+            "receipts": receipts_file,
+        },
+        legacy_target_sets=(frozenset({"graph", "history", "cases"}),),
     )
     # Raw preimages must be restored before a torn YAML or JSONL file reaches a parser.
     transactions.recover()
@@ -221,7 +230,7 @@ def load_runtime(root: Path) -> Runtime:
         history_path=history_file,
         transactions=transactions,
     )
-    evidence_store = JsonlEvidenceStore(workspace_directory.file("evidence/evidence.jsonl"))
+    evidence_store = JsonlEvidenceStore(evidence_file, transactions=transactions)
     case_store = JsonlCaseStore(case_file)
     checkpoint_store = YamlCheckpointStore(workspace_directory.file("cache/checkpoints.yaml"))
     changeset_executor = LocalChangeSetExecutor(graph_store, case_store, transactions)
@@ -264,6 +273,7 @@ def resolve_connectors(
     *,
     github_client: GitHubClient | None = None,
     github_repository: str | None = None,
+    mcp_connectors: Sequence[Connector] = (),
 ) -> tuple[Connector, ...]:
     """Resolve one stable connector list for a single orchestrator transaction."""
     requested = parse_sources(sources)
@@ -278,6 +288,10 @@ def resolve_connectors(
                 raise GitHubConfigurationError()
             owner, repository = github_repository.split("/", 1)
             connectors.append(GitHubConnector(github_client, owner=owner, repository=repository))
+        elif source == "mcp":
+            if not mcp_connectors:
+                raise ValueError("MCP connector selection is unavailable")
+            connectors.extend(mcp_connectors)
         else:  # pragma: no cover - parse_sources establishes this boundary
             raise AssertionError(source)
     return tuple(connectors)
@@ -290,9 +304,9 @@ def parse_sources(sources: str) -> tuple[str, ...]:
         raise ValueError("sources must name one or more connectors")
     if len(requested) != len(set(requested)):
         raise ValueError("sources must not contain duplicates")
-    unknown = tuple(item for item in requested if item not in {"markdown", "git", "github"})
+    unknown = tuple(item for item in requested if item not in {"markdown", "git", "github", "mcp"})
     if unknown:
-        raise ValueError("sources must be markdown, git, and/or github")
+        raise ValueError("sources must be markdown, git, github, and/or mcp")
     return requested
 
 
@@ -314,11 +328,15 @@ async def run_selected_sync(
     env: Mapping[str, object] | None = None,
     token_runner: GitHubTokenRunner = run_gh_token,
     client_factory: GitHubClientFactory = _default_github_client,
+    mcp_connectors: Sequence[Connector] = (),
 ) -> SyncRunResult:
     """Run all selected sources once and deterministically clean up a CLI-owned client."""
     requested = parse_sources(sources)
     if "github" not in requested:
-        return await runtime.sync.run(run_id, resolve_connectors(runtime, sources))
+        return await runtime.sync.run(
+            run_id,
+            resolve_connectors(runtime, sources, mcp_connectors=mcp_connectors),
+        )
 
     environment: Mapping[str, object] = os.environ if env is None else env
     repository = github_repository_scope(environment)
@@ -333,6 +351,7 @@ async def run_selected_sync(
             sources,
             github_client=client,
             github_repository=repository,
+            mcp_connectors=mcp_connectors,
         )
         return await runtime.sync.run(run_id, connectors)
     except BaseException:

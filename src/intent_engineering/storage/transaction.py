@@ -6,7 +6,7 @@ import base64
 import json
 import re
 import secrets
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from hashlib import sha256
@@ -126,6 +126,7 @@ class LocalTransactionCoordinator:
         targets: Mapping[str, SecureFile],
         *,
         fault_hook: Callable[[str], None] | None = None,
+        legacy_target_sets: Sequence[frozenset[str]] = (),
     ) -> None:
         if not targets or any(not _TARGET_PATTERN.fullmatch(name) for name in targets):
             raise ValueError("invalid local transaction targets")
@@ -133,9 +134,19 @@ class LocalTransactionCoordinator:
             raise ValueError("duplicate local transaction target")
         if journal.lock_key in {target.lock_key for target in targets.values()}:
             raise ValueError("journal cannot also be a transaction target")
+        current_names = frozenset(targets)
+        legacy_sets = tuple(frozenset(names) for names in legacy_target_sets)
+        if len(legacy_sets) != len(set(legacy_sets)) or any(
+            not names
+            or not names < current_names
+            or any(not _TARGET_PATTERN.fullmatch(name) for name in names)
+            for names in legacy_sets
+        ):
+            raise ValueError("invalid legacy transaction targets")
         self._journal = journal.duplicate()
         self._targets = {name: target.duplicate() for name, target in targets.items()}
         self._fault_hook = fault_hook
+        self._legacy_target_sets = frozenset(legacy_sets)
 
     @property
     def target_names(self) -> frozenset[str]:
@@ -146,6 +157,18 @@ class LocalTransactionCoordinator:
     def journal_path(self) -> Path:
         """Expose the diagnostic path label without using it for canonical I/O."""
         return self._journal.path
+
+    def target_matches(self, name: str, target: SecureFile) -> bool:
+        """Authenticate one store file against this coordinator's held target identity."""
+        expected = self._targets.get(name)
+        return expected is not None and expected.lock_key == target.lock_key
+
+    def target_file(self, name: str) -> SecureFile:
+        """Return a duplicate of one descriptor-held canonical transaction target."""
+        try:
+            return self._targets[name].duplicate()
+        except KeyError as error:
+            raise ValueError("unknown local transaction target") from error
 
     def _fault(self, stage: str) -> None:
         if self._fault_hook is not None:
@@ -179,9 +202,7 @@ class LocalTransactionCoordinator:
                     target=name,
                     existed=content is not None,
                     content=(
-                        None
-                        if content is None
-                        else base64.b64encode(content).decode("ascii")
+                        None if content is None else base64.b64encode(content).decode("ascii")
                     ),
                     digest=_digest(content or b""),
                 )
@@ -217,7 +238,10 @@ class LocalTransactionCoordinator:
             )
             journal = _Journal.model_validate(loaded)
             names = tuple(record.target for record in journal.preimages)
-            if len(names) != len(set(names)) or set(names) != set(self._targets):
+            name_set = frozenset(names)
+            if len(names) != len(name_set) or (
+                name_set != frozenset(self._targets) and name_set not in self._legacy_target_sets
+            ):
                 raise ValueError("journal target set mismatch")
             preimages: dict[str, bytes | None] = {}
             for record in journal.preimages:
@@ -237,7 +261,7 @@ class LocalTransactionCoordinator:
             raise TransactionRecoveryError() from error
 
     def _restore(self, preimages: Mapping[str, bytes | None]) -> None:
-        for name in sorted(self._targets):
+        for name in sorted(preimages):
             content = preimages[name]
             if content is None:
                 self._targets[name].unlink(missing_ok=True)
@@ -262,6 +286,13 @@ class LocalTransactionCoordinator:
         with self._locks():
             self._recover_unlocked()
 
+    @contextmanager
+    def coordinated(self) -> Iterator[None]:
+        """Recover and serialize one non-transactional target operation."""
+        with self._locks():
+            self._recover_unlocked()
+            yield
+
     def snapshot(
         self,
         extras: Mapping[str, SecureFile] | None = None,
@@ -278,10 +309,7 @@ class LocalTransactionCoordinator:
             raise ValueError("duplicate local snapshot target")
         with self._locks(extra_files):
             recovered = self._recover_unlocked()
-            content = {
-                name: all_files[name].read_optional()
-                for name in sorted(all_files)
-            }
+            content = {name: all_files[name].read_optional() for name in sorted(all_files)}
         return LocalTransactionSnapshot(MappingProxyType(content), recovered)
 
     @contextmanager

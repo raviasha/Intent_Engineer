@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -142,6 +143,87 @@ def test_status_recovers_pending_resolution_journal_before_reading_state(tmp_pat
     assert result.returncode == 0
     assert graph.read_bytes() == snapshots[graph]
     assert not coordinator.journal_path.exists()
+
+
+def test_sync_and_write_share_one_complete_crash_recovery_domain(tmp_path: Path) -> None:
+    """A recovered write cannot later clobber a newer synchronized graph."""
+    from intent_engineering.cli.runtime import load_runtime
+    from intent_engineering.core.models import EvidenceRecord
+    from intent_engineering.storage.jsonl.evidence_store import JsonlEvidenceStore
+    from intent_engineering.storage.jsonl.receipt_store import JsonlReceiptStore
+    from intent_engineering.storage.transaction import LocalTransactionCoordinator
+    from intent_engineering.storage.yaml.graph_store import serialize_graph
+
+    repo = init_git_repo(tmp_path)
+    assert run_intent(repo, "init").returncode == 0
+    runtime = load_runtime(repo)
+    workspace = runtime.workspace_directory
+    targets = {
+        "graph": workspace.file("graph.yaml"),
+        "history": workspace.file("history/changesets.jsonl"),
+        "cases": workspace.file("reconciliation/cases.jsonl"),
+        "evidence": workspace.file("evidence/evidence.jsonl"),
+        "receipts": workspace.file("approvals/receipts.jsonl"),
+    }
+
+    def crash(stage: str) -> None:
+        if stage == "target:graph":
+            raise SystemExit()
+
+    interrupted = LocalTransactionCoordinator(
+        workspace.file("history/.local-transaction.json"),
+        targets,
+        fault_hook=crash,
+    )
+    with pytest.raises(SystemExit), interrupted.transaction() as transaction:
+        transaction.write("graph", b"not: [graph")
+
+    evidence = EvidenceRecord(
+        id="evidence:after-interrupted-write",
+        connector_type="fixture",
+        external_object_id="after-interrupted-write",
+        external_version="1",
+        author="local:test",
+        observed_at=datetime(2026, 8, 26, 12, 0, tzinfo=UTC),
+        source_locator="fixture://after-interrupted-write",
+        content_hash="sha256:" + "1" * 64,
+        payload={"kind": "fixture"},
+        acl=(),
+    )
+    assert runtime.evidence_store.put(evidence)
+    receipts = JsonlReceiptStore(targets["receipts"], transactions=runtime.transactions)
+    assert receipts.claim(
+        "write-plan:sha256:" + "2" * 64,
+        "approval:sha256:" + "3" * 64,
+        "local:test",
+        datetime(2026, 8, 26, 12, 0, tzinfo=UTC),
+    )
+    assert runtime.transactions.target_names == frozenset(targets)
+    with pytest.raises(ValueError):
+        JsonlEvidenceStore(
+            workspace.file("evidence/wrong-evidence.jsonl"),
+            transactions=runtime.transactions,
+        )
+    with pytest.raises(ValueError):
+        JsonlReceiptStore(
+            workspace.file("approvals/wrong-receipts.jsonl"),
+            transactions=runtime.transactions,
+        )
+    graph = runtime.graph_store.load()
+    with runtime.transactions.transaction() as transaction:
+        transaction.write("graph", serialize_graph(graph.model_copy(update={"version": 1})))
+
+    recovered = load_runtime(repo)
+    assert recovered.graph_store.load().version == 1
+    assert recovered.evidence_store.get(evidence.id) == evidence
+    recovered_receipts = JsonlReceiptStore(
+        recovered.workspace_directory.file("approvals/receipts.jsonl"),
+        transactions=recovered.transactions,
+    )
+    assert recovered_receipts.is_claimed(
+        "write-plan:sha256:" + "2" * 64,
+        "approval:sha256:" + "3" * 64,
+    )
 
 
 def test_doctor_reports_redacted_structured_diagnostics_for_corrupt_evidence(

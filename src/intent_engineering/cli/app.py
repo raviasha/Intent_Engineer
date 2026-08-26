@@ -12,6 +12,12 @@ import anyio
 import structlog
 import typer
 
+from intent_engineering.capture.base import Connector
+from intent_engineering.cli.connectors import (
+    configured_actor_principals,
+    connector_catalog,
+    connectors_app,
+)
 from intent_engineering.cli.github import GitHubDoctorResult, check_github
 from intent_engineering.cli.output import OutputFormat, emit
 from intent_engineering.cli.runtime import (
@@ -24,6 +30,7 @@ from intent_engineering.cli.runtime import (
     run_selected_sync,
     validate_github_environment,
 )
+from intent_engineering.cli.writes import policy_actor_aliases, write_app
 from intent_engineering.context import ContextProvider
 from intent_engineering.core.models import (
     EvidenceRecord,
@@ -57,6 +64,8 @@ doctor_app = typer.Typer(
 )
 app.add_typer(reconcile_app, name="reconcile")
 app.add_typer(doctor_app, name="doctor")
+app.add_typer(connectors_app, name="connectors")
+app.add_typer(write_app, name="write")
 
 
 def _configure_logging() -> None:
@@ -115,33 +124,54 @@ def _evidence(runtime: Runtime) -> tuple[EvidenceRecord, ...]:
         raise typer.Exit(1) from error
 
 
-def _authorized_evidence(runtime: Runtime) -> tuple[EvidenceRecord, ...]:
-    """Project only evidence that the configured local actor may read."""
-    return tuple(
-        record
-        for record in _evidence(runtime)
-        if evidence_allowed(record, runtime.config.local_actor)
+def _authorized_principals(runtime: Runtime) -> frozenset[str]:
+    """Resolve the local actor through fail-closed provider and policy registries."""
+    return frozenset(
+        {
+            runtime.config.local_actor,
+            *configured_actor_principals(runtime),
+            *policy_actor_aliases(runtime),
+        }
     )
 
 
-def _authorized_cases(runtime: Runtime) -> tuple[ReconciliationCase, ...]:
+def _authorized_evidence(
+    runtime: Runtime,
+    principals: frozenset[str] | None = None,
+) -> tuple[EvidenceRecord, ...]:
+    """Project only evidence that the configured local actor may read."""
+    selected_principals = _authorized_principals(runtime) if principals is None else principals
+    return tuple(
+        record for record in _evidence(runtime) if evidence_allowed(record, selected_principals)
+    )
+
+
+def _authorized_cases(
+    runtime: Runtime,
+    principals: frozenset[str] | None = None,
+) -> tuple[ReconciliationCase, ...]:
     """Project only cases whose full evidence packet is locally readable."""
+    selected_principals = _authorized_principals(runtime) if principals is None else principals
     records = _evidence(runtime)
     return tuple(
         case
         for case in _cases(runtime)
-        if refs_allowed(case.all_evidence_refs, records, runtime.config.local_actor)
+        if refs_allowed(case.all_evidence_refs, records, selected_principals)
     )
 
 
-def _authorized_graph(runtime: Runtime) -> Graph:
+def _authorized_graph(
+    runtime: Runtime,
+    principals: frozenset[str] | None = None,
+) -> Graph:
     """Project canonical state to locally readable topology without mutating it."""
+    selected_principals = _authorized_principals(runtime) if principals is None else principals
     graph = _graph(runtime)
     records = _evidence(runtime)
     nodes = tuple(
         node
         for node in graph.nodes
-        if refs_allowed(node.evidence_refs, records, runtime.config.local_actor)
+        if refs_allowed(node.evidence_refs, records, selected_principals)
     )
     node_ids = {node.id for node in nodes}
     edges = tuple(
@@ -154,7 +184,15 @@ def _invoke_sync(runtime: Runtime, sources: str) -> SyncRunResult:
     """Cross exactly one AnyIO boundary for one CLI sync-like command."""
 
     async def run() -> SyncRunResult:
-        return await run_selected_sync(runtime, sources, new_run_id())
+        mcp_connectors: tuple[Connector, ...] = ()
+        if "mcp" in parse_sources(sources):
+            mcp_connectors = connector_catalog(runtime).read_connectors()
+        return await run_selected_sync(
+            runtime,
+            sources,
+            new_run_id(),
+            mcp_connectors=mcp_connectors,
+        )
 
     return anyio.run(run)
 
@@ -231,7 +269,7 @@ def sync_command(
     sources: str = typer.Option("markdown,git", "--sources"),
     output_format: OutputFormat = typer.Option(OutputFormat.TEXT, "--format"),
 ) -> None:
-    """Synchronize selected local and GitHub evidence through one graph runtime."""
+    """Synchronize selected local, GitHub, and MCP evidence through one graph runtime."""
     _validate_sources(sources)
     _validate_github_scope(sources)
     _sync_command(_runtime(project), sources, output_format)
@@ -274,8 +312,11 @@ def drift_command(
     if output is not None and output_format is not OutputFormat.MARKDOWN:
         raise typer.BadParameter("--output requires --format markdown", param_hint="--output")
     runtime = _runtime(project)
+    principals = _authorized_principals(runtime)
     cases = tuple(
-        case for case in _authorized_cases(runtime) if is_nonterminal_case_status(case.status)
+        case
+        for case in _authorized_cases(runtime, principals)
+        if is_nonterminal_case_status(case.status)
     )
     if output_format is OutputFormat.MARKDOWN:
         report = render_drift_report(cases)
@@ -305,15 +346,16 @@ def status_command(
 ) -> None:
     """Summarize durable graph, evidence, and reconciliation state."""
     runtime = _runtime(project)
-    graph = _authorized_graph(runtime)
-    cases = _authorized_cases(runtime)
+    principals = _authorized_principals(runtime)
+    graph = _authorized_graph(runtime, principals)
+    cases = _authorized_cases(runtime, principals)
     emit(
         {
             "project_id": runtime.config.project_id,
             "graph_version": graph.version,
             "node_count": len(graph.nodes),
             "edge_count": len(graph.edges),
-            "evidence_count": len(_authorized_evidence(runtime)),
+            "evidence_count": len(_authorized_evidence(runtime, principals)),
             "open_case_count": sum(is_nonterminal_case_status(case.status) for case in cases),
         },
         output_format,
@@ -328,18 +370,20 @@ def explain_command(
 ) -> None:
     """Explain the local graph node, evidence object, or reconciliation case by reference."""
     runtime = _runtime(project)
+    principals = _authorized_principals(runtime)
     graph = _graph(runtime)
     records = _evidence(runtime)
     matching_nodes = tuple(
         node
         for node in graph.nodes
-        if node.id == reference
-        and refs_allowed(node.evidence_refs, records, runtime.config.local_actor)
+        if node.id == reference and refs_allowed(node.evidence_refs, records, principals)
     )
-    matching_cases = tuple(case for case in _authorized_cases(runtime) if case.id == reference)
+    matching_cases = tuple(
+        case for case in _authorized_cases(runtime, principals) if case.id == reference
+    )
     matching_evidence = tuple(
         record
-        for record in _authorized_evidence(runtime)
+        for record in _authorized_evidence(runtime, principals)
         if reference in {record.id, record.external_object_id, record.source_locator}
     )
     if not (matching_nodes or matching_cases or matching_evidence):
@@ -365,13 +409,17 @@ def context_command(
 ) -> None:
     """Build a conservative, bounded context pack for a task or exact symbol."""
     runtime = _runtime(project)
+    principals = _authorized_principals(runtime)
     provider = ContextProvider(
-        _graph(runtime), _authorized_cases(runtime), runtime.config, _authorized_evidence(runtime)
+        _graph(runtime),
+        _authorized_cases(runtime, principals),
+        runtime.config,
+        _authorized_evidence(runtime, principals),
     )
     pack = (
-        provider.for_symbol(symbol, actor=runtime.config.local_actor)
+        provider.for_symbol(symbol, actor=principals)
         if symbol is not None
-        else provider.for_task(task, actor=runtime.config.local_actor)
+        else provider.for_task(task, actor=principals)
     )
     emit(pack, output_format)
 
@@ -383,7 +431,8 @@ def reconcile_list_command(
     output_format: OutputFormat = typer.Option(OutputFormat.TEXT, "--format"),
 ) -> None:
     """List durable reconciliation cases in stable ID order."""
-    cases = _authorized_cases(_runtime(project))
+    runtime = _runtime(project)
+    cases = _authorized_cases(runtime, _authorized_principals(runtime))
     if status is not None:
         cases = tuple(case for case in cases if case.status is status)
     emit({"cases": cases}, output_format)
@@ -397,9 +446,14 @@ def reconcile_show_command(
 ) -> None:
     """Show one durable reconciliation case and its lifecycle history."""
     runtime = _runtime(project)
+    principals = _authorized_principals(runtime)
     try:
         case = runtime.case_store.get(case_id)
-        if not refs_allowed(case.all_evidence_refs, _evidence(runtime), runtime.config.local_actor):
+        if not refs_allowed(
+            case.all_evidence_refs,
+            _evidence(runtime),
+            principals,
+        ):
             raise KeyError(case_id)
     except KeyError as error:
         typer.echo("intent error: reconciliation case was not found", err=True)
@@ -436,15 +490,16 @@ def render_command(
 ) -> None:
     """Render non-canonical Markdown and Mermaid graph views through the safe renderer."""
     runtime = _runtime(project)
+    principals = _authorized_principals(runtime)
     output_dir = output if output is not None else runtime.workspace / "cache" / "render"
     try:
 
         class _ProjectionStore:
             def load(self) -> Graph:
-                return _authorized_graph(runtime)
+                return _authorized_graph(runtime, principals)
 
         markdown, mermaid = GraphRenderer(
-            cast(GraphStore, _ProjectionStore()), _authorized_cases(runtime)
+            cast(GraphStore, _ProjectionStore()), _authorized_cases(runtime, principals)
         ).render_all(output_dir)
     except Exception as error:
         _runtime_error(error)

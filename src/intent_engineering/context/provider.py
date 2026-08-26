@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 from collections import deque
-from collections.abc import Iterable, Sequence
+from collections.abc import Collection, Iterable, Sequence
 from typing import TypeVar
 
 from intent_engineering.core.models import (
@@ -75,12 +75,19 @@ class ContextProvider:
         self._evidence = {record.id: record for record in evidence}
 
     def for_task(
-        self, task: str, repository_scope: str | None = None, actor: str | None = None
+        self,
+        task: str,
+        repository_scope: str | None = None,
+        actor: str | Collection[str] | None = None,
     ) -> ContextPack:
         """Return bounded context for a natural-language task."""
         return self._build(query=task, repository_scope=repository_scope, actor=actor)
 
-    def for_symbol(self, symbol_ref: str, actor: str | None = None) -> ContextPack:
+    def for_symbol(
+        self,
+        symbol_ref: str,
+        actor: str | Collection[str] | None = None,
+    ) -> ContextPack:
         """Return bounded context for a symbol identifier or label."""
         return self._build(
             query=symbol_ref,
@@ -94,7 +101,7 @@ class ContextProvider:
         *,
         query: str,
         repository_scope: str | None,
-        actor: str | None,
+        actor: str | Collection[str] | None,
         exact_seed_id: str | None = None,
     ) -> ContextPack:
         query_tokens = _tokens(query)
@@ -189,7 +196,10 @@ class ContextProvider:
         return selected
 
     def _selected_cases(
-        self, selected_ids: set[str], repository_scope: str | None, actor: str | None
+        self,
+        selected_ids: set[str],
+        repository_scope: str | None,
+        actor: str | Collection[str] | None,
     ) -> tuple[ReconciliationCase, ...]:
         return tuple(
             case
@@ -199,11 +209,19 @@ class ContextProvider:
             and self._refs_allowed(case.all_evidence_refs, repository_scope, actor)
         )
 
-    def _node_allowed(self, node: Node, repository_scope: str | None, actor: str | None) -> bool:
+    def _node_allowed(
+        self,
+        node: Node,
+        repository_scope: str | None,
+        actor: str | Collection[str] | None,
+    ) -> bool:
         return self._refs_allowed(node.evidence_refs, repository_scope, actor)
 
     def _refs_allowed(
-        self, evidence_refs: Sequence[str], repository_scope: str | None, actor: str | None
+        self,
+        evidence_refs: Sequence[str],
+        repository_scope: str | None,
+        actor: str | Collection[str] | None,
     ) -> bool:
         records = tuple(self._evidence.get(reference) for reference in evidence_refs)
         return all(record is not None for record in records) and all(
@@ -218,9 +236,16 @@ class ContextProvider:
         return scope if isinstance(scope, str) else None
 
     def _evidence_allowed(
-        self, record: EvidenceRecord, repository_scope: str | None, actor: str | None
+        self,
+        record: EvidenceRecord,
+        repository_scope: str | None,
+        actor: str | Collection[str] | None,
     ) -> bool:
-        if record.acl and (actor is None or actor not in record.acl):
+        if record.acl and (
+            actor is None
+            or (type(actor) is str and actor not in record.acl)
+            or (type(actor) is not str and frozenset(record.acl).isdisjoint(actor))
+        ):
             return False
         scope = self._scope(record)
         return repository_scope is None or scope == repository_scope

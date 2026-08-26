@@ -17,6 +17,7 @@ from yaml.events import (  # type: ignore[import-untyped]
 )
 
 from intent_engineering.capture.mcp.profile_models import ProviderProfile
+from intent_engineering.capture.mcp.session import McpConnectorConfig
 from intent_engineering.storage.secure import SecureDirectory, UnsafePathError
 
 _ERROR_MESSAGE = "invalid MCP provider profile"
@@ -58,8 +59,10 @@ def _reject_unsafe_yaml_events(content: str) -> None:
                 raise ValueError("profile YAML is too deeply nested")
         if isinstance(event, CollectionEndEvent):
             depth -= 1
-        if isinstance(event, NodeEvent) and event.tag is not None and not event.tag.startswith(
-            "tag:yaml.org,2002:"
+        if (
+            isinstance(event, NodeEvent)
+            and event.tag is not None
+            and not event.tag.startswith("tag:yaml.org,2002:")
         ):
             raise ValueError("unsafe YAML tag")
     if document_count != 1:
@@ -115,3 +118,63 @@ def load_profile(path: Path) -> ProviderProfile:
     if profile is None:
         raise ProfileValidationError()
     return profile
+
+
+def load_profile_bytes(content: bytes) -> ProviderProfile:
+    """Load descriptor-authenticated profile bytes behind the fixed failure boundary."""
+    profile: ProviderProfile | None = None
+    try:
+        profile = ProviderProfile.model_validate(_load_profile_mapping(content))
+    except (
+        TypeError,
+        UnicodeError,
+        ValidationError,
+        ValueError,
+        RecursionError,
+        yaml.YAMLError,
+    ):
+        profile = None
+    content = b""
+    if profile is None:
+        raise ProfileValidationError()
+    return profile
+
+
+def load_connector_config_bytes(content: bytes) -> McpConnectorConfig:
+    """Decode one already descriptor-authenticated local connector document."""
+    result: McpConnectorConfig | None = None
+    try:
+        result = McpConnectorConfig.model_validate(_load_profile_mapping(content))
+    except (
+        TypeError,
+        UnicodeError,
+        ValidationError,
+        ValueError,
+        RecursionError,
+        yaml.YAMLError,
+    ):
+        result = None
+    content = b""
+    if result is None:
+        raise ProfileValidationError()
+    return result
+
+
+def load_strict_yaml_mapping_bytes(content: bytes) -> dict[str, object]:
+    """Return one detached strict mapping from descriptor-authenticated YAML bytes."""
+    result: dict[str, object] | None = None
+    try:
+        loaded = _load_profile_mapping(content)
+        result = dict(loaded)
+    except (
+        TypeError,
+        UnicodeError,
+        ValueError,
+        RecursionError,
+        yaml.YAMLError,
+    ):
+        result = None
+    content = b""
+    if result is None:
+        raise ProfileValidationError()
+    return result

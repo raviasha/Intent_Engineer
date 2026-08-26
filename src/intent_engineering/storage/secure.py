@@ -315,6 +315,7 @@ class SecureDirectory:
         relative: str | PurePosixPath | Path,
         *,
         expected_identities: tuple[FileIdentity, ...] | None = None,
+        nonblocking: bool = False,
     ) -> SecureRead:
         """Read a descendant regular file and optionally pin every ancestor identity."""
         parts = _relative_parts(relative)
@@ -335,7 +336,8 @@ class SecureDirectory:
                 identities.append(_identity(metadata))
                 os.close(descriptor)
                 descriptor = next_descriptor
-            content, metadata = _read_named(descriptor, parts[-1])
+            reader = _read_named_nonblocking if nonblocking else _read_named
+            content, metadata = reader(descriptor, parts[-1])
             identities.append(_identity(metadata))
         finally:
             os.close(descriptor)
@@ -369,6 +371,7 @@ class SecureDirectory:
         suffix: str,
         *,
         excluded: Callable[[PurePosixPath], bool] | None = None,
+        reject_symlinks: bool = False,
     ) -> tuple[tuple[PurePosixPath, SecureRead], ...]:
         """Return a stable no-follow recursive snapshot of regular single-link files."""
         results: list[tuple[PurePosixPath, SecureRead]] = []
@@ -391,7 +394,11 @@ class SecureDirectory:
                 except OSError as error:
                     raise UnsafePathError() from error
                 if stat.S_ISLNK(metadata.st_mode):
+                    if reject_symlinks and name.endswith(suffix):
+                        raise UnsafePathError()
                     continue
+                if reject_symlinks and name.endswith(suffix) and not stat.S_ISREG(metadata.st_mode):
+                    raise UnsafePathError()
                 if stat.S_ISDIR(metadata.st_mode):
                     try:
                         child_fd = os.open(name, _DIRECTORY_FLAGS, dir_fd=directory_fd)

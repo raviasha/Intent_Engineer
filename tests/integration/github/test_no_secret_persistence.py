@@ -967,6 +967,7 @@ intent_engineering:
         "history",
         "approvals",
         "cache",
+        "connectors",
     }
     assert {
         entry.name for entry in workspace.iterdir() if entry.is_dir() and not entry.is_symlink()
@@ -1014,7 +1015,10 @@ intent_engineering:
     assert len(runtime.cases()) >= 1
     assert len(runtime.graph_store.history("module:release-proof")) >= 1
     assert not (workspace / "history/.local-transaction.json").exists()
-    assert not any((workspace / "approvals").iterdir())
+    assert {entry.name for entry in (workspace / "approvals").iterdir()} == {
+        ".receipts.jsonl.lock"
+    }
+    assert (workspace / "approvals/.receipts.jsonl.lock").read_bytes() == b""
     assert {entry.name for entry in (workspace / "cache").iterdir()} == {
         ".checkpoints.yaml.lock",
         "checkpoints.yaml",
