@@ -92,6 +92,10 @@ async def test_intent_mcp_stdio_is_protocol_clean_and_read_only(tmp_path: Path) 
         "intent_validate",
         "intent_reconcile_list",
         "intent_reconcile_show",
+        "intent_changeset_propose",
+        "intent_reconciliation_propose",
+        "intent_write_preview",
+        "intent_write_execute",
     }
     assert status.structured_content["schema_version"] == "1"
     assert invalid.is_error is True

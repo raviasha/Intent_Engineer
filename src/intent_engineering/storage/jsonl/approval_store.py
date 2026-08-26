@@ -12,7 +12,7 @@ from pydantic import ValidationError
 from intent_engineering.mutations.models import ApprovalRecord, WritePlan
 from intent_engineering.storage._atomic import append_durable_line, same_path_lock
 from intent_engineering.storage.jsonl.strict import loads_strict_object
-from intent_engineering.storage.secure import SecureFile, coerce_secure_file
+from intent_engineering.storage.secure import SecureFile, UnsafePathError, coerce_secure_file
 
 
 class MutationStoreError(ValueError):
@@ -34,7 +34,13 @@ class _ImmutableJsonlStore[RecordT: (WritePlan, ApprovalRecord)]:
             self._rebuild_unlocked()
 
     def _decode_unlocked(self) -> dict[str, RecordT] | None:
-        content = self._file.read_optional()
+        try:
+            content = self._file.read_bytes_nonblocking()
+        except UnsafePathError:
+            if not self._file.exists():
+                content = None
+            else:  # pragma: no cover - a safe existing file was replaced during inspection
+                raise
         records: dict[str, RecordT] = {}
         encodings: dict[str, bytes] = {}
         try:
@@ -121,6 +127,10 @@ class _ImmutableJsonlStore[RecordT: (WritePlan, ApprovalRecord)]:
         with same_path_lock(self._file):
             self._rebuild_unlocked()
             return tuple(self._by_id.values())
+
+    def close(self) -> None:
+        """Release the store's held descriptor when a short-lived workflow is done."""
+        self._file.close()
 
 
 class JsonlWritePlanStore(_ImmutableJsonlStore[WritePlan]):

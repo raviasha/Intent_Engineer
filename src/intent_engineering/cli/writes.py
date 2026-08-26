@@ -25,10 +25,10 @@ from intent_engineering.capture.mcp.session import thaw_json
 from intent_engineering.cli.connectors import (
     ConfiguredConnector,
     ConnectorCatalog,
-    load_connector_catalog,
+    connector_catalog,
 )
 from intent_engineering.cli.output import OutputFormat, emit, normalize
-from intent_engineering.cli.runtime import Runtime
+from intent_engineering.cli.runtime import Runtime, load_runtime
 from intent_engineering.core.models import JsonValue, ResolutionAction
 from intent_engineering.core.models._base import StrictModel
 from intent_engineering.mutations.approval import approve_plan
@@ -374,6 +374,11 @@ class WriteWorkflow:
         self.approvals = approvals
         self.policy = policy
 
+    def close(self) -> None:
+        """Release descriptors owned by this workflow's immutable stores."""
+        self.plans.close()
+        self.approvals.close()
+
     def preview(self, plan_id: str, **_kwargs: object) -> WritePlan:
         """Strictly reload the complete hash-bound preview."""
         return WritePlan.model_validate_json(self.plans.get(plan_id).model_dump_json())
@@ -449,46 +454,51 @@ class WriteWorkflow:
         now: datetime | None = None,
     ) -> WritePlan:
         """Fetch current provider state, build Task 5's exact plan, and persist it."""
-        selected = self.catalog._selected(connector_id)
-        if operation not in selected.profile.writes:
-            raise ValueError("external write operation unavailable")
-        actor = self.catalog.runtime.config.local_actor
-        case = self.catalog.runtime.case_store.get(case_id)
-        if not self._case_is_authorized(case.all_evidence_refs, actor):
-            raise ValueError("external write case unavailable")
-        operation_profile = selected.profile.writes[operation]
-        prefix = f"{selected.profile.id}:"
-        references = (case.subject_ref, *case.affected_refs)
-        targets = tuple(
-            reference.removeprefix(prefix)
-            for reference in references
-            if reference.startswith(prefix)
-        )
-        if len(set(targets)) != 1:
-            raise ValueError("external write target unavailable")
-        gateway = McpMutationGateway(
-            self.catalog.mcp_runtime,
-            selected,
-            local_actor=actor,
-            object_type=operation_profile.target_object,
-            semantic_operation=operation,
-        )
-        current = await gateway.fetch_object(targets[0])
-        plan = build_write_plan(
-            case,
-            selected.profile,
-            selected.config.binding,
-            operation,
-            current,
-            requested_fields,
-            actor=actor,
-            authorized_contributors=self.policy.contributors,
-            identity_aliases=self._identity_aliases(),
-            resolution_action=resolution_action,
-            now=datetime.now(UTC) if now is None else now,
-        )
-        self.plans.put(plan)
-        return plan
+        try:
+            selected = self.catalog._selected(connector_id)
+            if operation not in selected.profile.writes:
+                raise ValueError("external write operation unavailable")
+            actor = self.catalog.runtime.config.local_actor
+            if actor not in self.policy.contributors:
+                raise ValueError("external write contributor unavailable")
+            case = self.catalog.runtime.case_store.get(case_id)
+            if not self._case_is_authorized(case.all_evidence_refs, actor):
+                raise ValueError("external write case unavailable")
+            operation_profile = selected.profile.writes[operation]
+            prefix = f"{selected.profile.id}:"
+            references = (case.subject_ref, *case.affected_refs)
+            targets = tuple(
+                reference.removeprefix(prefix)
+                for reference in references
+                if reference.startswith(prefix)
+            )
+            if len(set(targets)) != 1:
+                raise ValueError("external write target unavailable")
+            gateway = McpMutationGateway(
+                self.catalog.mcp_runtime,
+                selected,
+                local_actor=actor,
+                object_type=operation_profile.target_object,
+                semantic_operation=operation,
+            )
+            current = await gateway.fetch_object(targets[0])
+            plan = build_write_plan(
+                case,
+                selected.profile,
+                selected.config.binding,
+                operation,
+                current,
+                requested_fields,
+                actor=actor,
+                authorized_contributors=self.policy.contributors,
+                identity_aliases=self._identity_aliases(),
+                resolution_action=resolution_action,
+                now=datetime.now(UTC) if now is None else now,
+            )
+            self.plans.put(plan)
+            return plan
+        finally:
+            requested_fields.clear()
 
     async def execute(
         self,
@@ -580,8 +590,9 @@ def policy_actor_aliases(
     return policy.identities.get(selected_actor, frozenset())
 
 
-def load_write_workflow(_project: Path) -> WriteWorkflow:
-    catalog = load_connector_catalog(_project)
+def write_workflow(runtime: Runtime) -> WriteWorkflow:
+    """Assemble guarded writes over one already-held project runtime."""
+    catalog = connector_catalog(runtime)
     approvals_directory = catalog.runtime.workspace_directory.subdirectory("approvals")
     try:
         plans = JsonlWritePlanStore(approvals_directory.file("plans.jsonl"))
@@ -594,8 +605,14 @@ def load_write_workflow(_project: Path) -> WriteWorkflow:
     finally:
         approvals_directory.close()
     if policy is None:
+        plans.close()
+        approvals.close()
         raise ValueError("external write policy unavailable") from None
     return WriteWorkflow(catalog, plans, approvals, policy)
+
+
+def load_write_workflow(_project: Path) -> WriteWorkflow:
+    return write_workflow(load_runtime(_project))
 
 
 def _write_error(exit_code: int = 1) -> None:
@@ -744,4 +761,11 @@ def execute_write(
     emit(payload, output_format)
 
 
-__all__ = ["ConsoleTerminal", "Terminal", "WriteWorkflow", "load_write_workflow", "write_app"]
+__all__ = [
+    "ConsoleTerminal",
+    "Terminal",
+    "WriteWorkflow",
+    "load_write_workflow",
+    "write_app",
+    "write_workflow",
+]

@@ -27,6 +27,11 @@ from mcp.types import (
 from pydantic import AnyUrl
 
 from intent_engineering.cli.runtime import load_runtime
+from intent_engineering.integrations.mcp_server.mutations import (
+    MutationPort,
+    load_mutation_services,
+    register_mutation_tools,
+)
 from intent_engineering.integrations.mcp_server.prompts import register_read_prompts
 from intent_engineering.integrations.mcp_server.resources import register_read_resources
 from intent_engineering.integrations.mcp_server.tools import McpReadServices, register_read_tools
@@ -105,22 +110,41 @@ class _IntentMCPServer(MCPServer[Any]):
         return cast(ReadResourceResult | InputRequiredResult, response)
 
 
-def build_server(services: McpReadServices) -> MCPServer:
-    """Build the exact version-1 read-only MCP protocol surface."""
+def build_server(
+    services: McpReadServices,
+    *,
+    mutation_services: MutationPort | None = None,
+) -> MCPServer:
+    """Build the exact version-1 read surface with optional guarded mutations."""
+    if mutation_services is None:
+        description = "Read-only evidence-backed intent, context, drift, and reconciliation."
+        instructions = (
+            "Use read tools and resources to inspect authorized local intent. "
+            "This server has no mutation capability."
+        )
+    else:
+        description = (
+            "Evidence-backed intent reads, proposal creation, guarded write preview, "
+            "and independently approved execution."
+        )
+        instructions = (
+            "Use read tools and resources to inspect authorized local intent. Mutation tools "
+            "may persist proposals and previews. They cannot create approvals; execution "
+            "requires an independently persisted approval."
+        )
     server = _IntentMCPServer(
         name="intent-engineering",
         title="Intent Engineering",
-        description="Read-only evidence-backed intent, context, drift, and reconciliation.",
-        instructions=(
-            "Use read tools and resources to inspect authorized local intent. "
-            "This server cannot create approvals or execute writes."
-        ),
+        description=description,
+        instructions=instructions,
         version="0.1.0",
         log_level="ERROR",
     )
     register_read_tools(server, services)
     register_read_resources(server, services)
     register_read_prompts(server)
+    if mutation_services is not None:
+        register_mutation_tools(server, mutation_services)
     return server
 
 
@@ -131,4 +155,8 @@ def load_mcp_services(project: Path) -> McpReadServices:
 
 def run_stdio(project: Path) -> None:
     """Run the official MCP v2 stdio transport without writing to stdout."""
-    build_server(load_mcp_services(project)).run(transport="stdio")
+    read_services = load_mcp_services(project)
+    build_server(
+        read_services,
+        mutation_services=load_mutation_services(read_services.runtime),
+    ).run(transport="stdio")
