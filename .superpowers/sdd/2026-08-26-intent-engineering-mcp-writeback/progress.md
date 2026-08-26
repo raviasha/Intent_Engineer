@@ -146,3 +146,16 @@ Plan: `docs/superpowers/plans/2026-08-25-intent-engineering-mcp-writeback.md`
   ACL decisions, and made all version identities unambiguous. Final gates: 24 focused contracts,
   162 MCP/package/secure tests, 826 full offline tests, Ruff/mypy/schema/diff checks clean. Final
   independent re-review found 0 Critical, 0 Important, and 0 Minor. Product commit: `ab6e85b`.
+- Task 4 added the ACL-aware, profile-driven MCP read connector; full profile/source/scope/actor
+  replay identities; canonical exact-prefix checkpoints; official MCP v2 resource-template
+  capability validation; reserved-boundary URI expansion; partial-failure durable replay; and deep
+  MCP evidence/checkpoint validation. Independent review drove null ACL/author, source provenance,
+  cursor redaction, duplicate, resource-template, URI-collision, and uncheckpointed-association
+  fixes. Final gates: 208 focused tests, 861 full offline tests, Ruff clean, mypy clean across 83
+  source files, and diff checks clean. Final independent review found 0 Critical and 0 Important
+  findings and marked the slice Ready.
+- Ruling: MCP read evidence persists full profile-contract, source-contract, and scope digests in its
+  immutable payload and binds them to full connector identity segments. Distinct local source
+  contracts that produce the same provider object/version therefore fail closed instead of
+  silently aliasing provenance. Cost if wrong: compatible duplicate capture configurations require
+  an explicit source migration/deduplication rule rather than sharing one evidence identity.
