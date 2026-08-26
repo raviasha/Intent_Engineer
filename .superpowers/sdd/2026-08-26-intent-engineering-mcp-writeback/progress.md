@@ -13,7 +13,7 @@ Plan: `docs/superpowers/plans/2026-08-25-intent-engineering-mcp-writeback.md`
 | 5. Write plans, approvals, receipts | Completed | `5ba7f9b` | `54e1c6c` | Clean after 3 fix rounds |
 | 6. Approved write execution | Completed | `7b9309b` | This commit | Clean after 2 review rounds |
 | 7. Connector/write CLI | Completed | `7c4e966` | This report commit | Ready; 0 Critical/Important/Minor |
-| 8. Read-only Intent MCP server | Pending | — | — | Pending |
+| 8. Read-only Intent MCP server | Completed | `acaf5fb` | This report commit | Ready; 0 Critical/Important/Minor |
 | 9. Guarded MCP mutation tools | Pending | — | — | Pending |
 | 10. Public-alpha release proof | Pending | — | — | Pending |
 
@@ -189,3 +189,14 @@ Plan: `docs/superpowers/plans/2026-08-25-intent-engineering-mcp-writeback.md`
   pre/post-write refetches. Final gates: 19 focused, 330 broadened, 974 full offline; Ruff clean;
   mypy clean across 93 source files; help/diff checks clean. Independent review found 0 Critical,
   0 Important, and 0 Minor findings and marked the slice Ready.
+- Task 8 adds the exact read-only Intent MCP tool, resource, and prompt surface over the official
+  SDK v2 stdio transport. One descriptor-held transaction snapshot and one freshly authenticated
+  actor/principal set ACL-filter every state-bearing response; held-directory validation, public
+  schemas, and static prompts expose no ACL-scoped project payload. Terminal, missing, unauthorized,
+  and mixed-ACL objects are hidden identically. Independent review drove bounded prompt handling
+  and fixed SDK tool/prompt/resource failures with no wire error data, append-ordered evidence
+  chains, and case-to-authorized-graph filtering. Final precommit gates: 26 focused, 301 broadened,
+  and 1,000
+  full offline tests; Ruff, 99-source mypy, 12-file format, help, and diff checks clean. All review
+  findings are fixed; final independent review found 0 Critical, 0 Important, and 0 Minor findings
+  and marked the slice Ready. Product commit: `acaf5fb`. Tasks 9–10 remain untouched.
