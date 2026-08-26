@@ -14,6 +14,7 @@ from pathlib import Path, PurePosixPath
 _NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
 _DIRECTORY = getattr(os, "O_DIRECTORY", 0)
 _CLOEXEC = getattr(os, "O_CLOEXEC", 0)
+_NONBLOCK = getattr(os, "O_NONBLOCK", 0)
 _DIRECTORY_FLAGS = os.O_RDONLY | _DIRECTORY | _NOFOLLOW | _CLOEXEC
 _READ_FLAGS = os.O_RDONLY | _NOFOLLOW | _CLOEXEC
 _RENAME_NOREPLACE = 1
@@ -92,6 +93,20 @@ def _read_descriptor(descriptor: int) -> bytes:
 def _read_named(parent_fd: int, name: str) -> tuple[bytes, os.stat_result]:
     try:
         descriptor = os.open(name, _READ_FLAGS, dir_fd=parent_fd)
+    except OSError as error:
+        raise UnsafePathError() from error
+    try:
+        metadata = os.fstat(descriptor)
+        _require_regular(metadata)
+        return _read_descriptor(descriptor), metadata
+    finally:
+        os.close(descriptor)
+
+
+def _read_named_nonblocking(parent_fd: int, name: str) -> tuple[bytes, os.stat_result]:
+    """Authenticate the final descriptor without blocking on a FIFO before its kind is known."""
+    try:
+        descriptor = os.open(name, _READ_FLAGS | _NONBLOCK, dir_fd=parent_fd)
     except OSError as error:
         raise UnsafePathError() from error
     try:
@@ -489,6 +504,10 @@ class SecureFile:
 
     def read_bytes(self) -> bytes:
         return _read_named(self.parent_fd, self.name)[0]
+
+    def read_bytes_nonblocking(self) -> bytes:
+        """Read one regular file after a nonblocking descriptor-kind authentication."""
+        return _read_named_nonblocking(self.parent_fd, self.name)[0]
 
     def read_optional(self) -> bytes | None:
         try:
