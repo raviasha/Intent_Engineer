@@ -7,7 +7,7 @@ Plan: `docs/superpowers/plans/2026-08-25-intent-engineering-mcp-writeback.md`
 | Task | Status | Product commit | Report commit | Review |
 | --- | --- | --- | --- | --- |
 | 1. Typed provider profiles and safe selectors | Completed | `00e41c7` | This commit | Clean after 2 fix rounds |
-| 2. Shared MCP client runtime | Pending | — | — | Pending |
+| 2. Shared MCP client runtime | Completed | `60dfd4a` | This commit | Clean after 4 fix rounds |
 | 3. Reference provider profiles | Pending | — | — | Pending |
 | 4. Read-side MCP connector | Pending | — | — | Pending |
 | 5. Write plans, approvals, receipts | Pending | — | — | Pending |
@@ -42,6 +42,31 @@ Plan: `docs/superpowers/plans/2026-08-25-intent-engineering-mcp-writeback.md`
   adds `mcp>=2,<3` there and records the resolved SDK version only if it is available from the
   offline environment; it will not invent an unused lock file or contact an index. Cost if wrong:
   dependency resolution remains range-based in CI, matching the repository's existing practice.
+- Ruling: Task 2 resolved the declared dependency to official MCP Python SDK `2.1.1` in the ignored
+  virtual environment. Production SDK imports stay behind the runtime factory, and public models,
+  the session port, and injected-fake tests remain importable without the SDK. Stdio delegates its
+  baseline child environment to the SDK's safe inherited-variable allowlist and adds only explicitly
+  resolved configured references; HTTP redirects remain disabled for credential-bearing sessions.
+  Cost if wrong: SDK-minor API changes inside the declared `>=2,<3` range may require a narrow
+  adapter compatibility update, while provider-neutral consumers remain unchanged.
+- Ruling: Task 2 gives each production session one dedicated asyncio lifecycle owner. The owner
+  enters and exits the complete official-SDK context stack in the same task, while callers wait
+  only to the single absolute operation deadline and any shielded cleanup completes in the
+  background with a consumed, redacted result. Stdio launch values are scrubbed from retained SDK
+  parameters immediately after process creation, and a session accepts exactly one start. Cost if
+  wrong: another async backend would require an equivalent task-owner adapter rather than moving
+  AnyIO cancel scopes between tasks.
+- Ruling: Later Tasks 3+ implement the user-approved hybrid authorship policy. Every authorized
+  contributor may add authenticated evidence; compatible graph projection may be automatic.
+  Conflicting, overlapping, superseding, or destructive changes require independent authorized
+  approval, and a conflicting author cannot self-approve by default. Preserve original
+  provider/workspace/account author identity, timestamps, object/version lineage, content hashes,
+  evidence references, and per-author semantic/text diffs without last-write-wins. Review cases
+  retain competing changes side by side, and append approver identity, time, evidence, and
+  resolution. Contributor and approver authorization remain distinct; external system/code
+  write-back still requires preview plus explicit approval. Cost if wrong: later ingestion,
+  projection, case, approval, and history contracts must be revised together rather than silently
+  collapsing author provenance.
 
 ## Preflight conflict and interface scan
 
@@ -103,3 +128,13 @@ Plan: `docs/superpowers/plans/2026-08-25-intent-engineering-mcp-writeback.md`
   3 passed; full offline suite 742 passed; schema regeneration was byte-identical at 11,508 bytes;
   Ruff and mypy were clean. Final independent re-review found all findings addressed and no new
   Critical or Important breakage.
+- Task 2 established the official SDK v2.1.1 stdio and Streamable HTTP adapter, strict frozen
+  configs/session port, detached JSON decoding, fixed redacted errors, explicit owned/borrowed
+  leases, bounded capability pagination, and deterministic fakes. Review found lifecycle,
+  stderr-fd, pagination, decoder, classification, shell, and environment-retention gaps. Four
+  TDD fix rounds added a same-task lifecycle owner, absolute caller deadlines with eventual SDK
+  cleanup, original-failure preservation, a real subprocess `/dev/null` stderr sink, MCP/HTTP
+  classification, a 128-page bound, resolver/stdio-env scrubbing, one-start ownership, and the
+  delayed start/close publication guard. Final gates: 60 runtime tests, 134 MCP tests, 802 full
+  offline tests, Ruff/mypy/schema/package/secure checks clean. Final independent re-review found
+  0 Critical and 0 Important findings. Product commit: `60dfd4a`.
