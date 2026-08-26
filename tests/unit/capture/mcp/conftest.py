@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sys
 from collections.abc import Callable
 from pathlib import Path
 
@@ -11,6 +12,10 @@ import yaml  # type: ignore[import-untyped]
 from intent_engineering.capture.mcp.profile_loader import load_profile
 from intent_engineering.capture.mcp.profile_models import ProviderProfile
 from intent_engineering.core.models import JsonValue
+
+_REPOSITORY_ROOT = Path(__file__).resolve().parents[4]
+if str(_REPOSITORY_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPOSITORY_ROOT))
 
 
 def valid_profile_payload() -> dict[str, JsonValue]:
