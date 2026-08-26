@@ -159,3 +159,13 @@ Plan: `docs/superpowers/plans/2026-08-25-intent-engineering-mcp-writeback.md`
   contracts that produce the same provider object/version therefore fail closed instead of
   silently aliasing provenance. Cost if wrong: compatible duplicate capture configurations require
   an explicit source migration/deduplication rule rather than sharing one evidence identity.
+- Task 5 precommit: immutable hash-bound write previews preserve exact before/after state, guarded
+  target version, provider arguments, evidence references, and conflicting authors. Approval is a
+  separate interactive record made by an authorized actor who is neither the proposer nor a
+  conflicting evidence author. Plan/approval ledgers are descriptor-safe and append-only. Provider
+  execution, receipts, CLI, and MCP mutation tools remain explicitly excluded until later tasks.
+- Task 5 review ruling: contributor and approver authorization are separate allowlists, while
+  person identity is an explicit alias set spanning local actor names, Git/email identities, and
+  provider principals. Plans and approvals persist those aliases, so cross-source conflicts cannot
+  be approved by the same person merely by switching identity namespaces. Each write contract also
+  declares its target object type and hashes its exact local provider capability mapping.
