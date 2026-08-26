@@ -1,0 +1,15 @@
+id: confluence-local
+profile_path: profiles/mcp/confluence.yaml
+server:
+  id: confluence-server
+  transport: stdio
+  command: confluence-mcp-server
+  args: []
+  environment_refs: {CONFLUENCE_TOKEN: "env:CONFLUENCE_TOKEN"}
+binding:
+  profile_id: confluence
+  profile_version: "1"
+  tools: {discover_pages: search_pages, fetch_page: get_page, discover_comments: search_comments, fetch_comment: get_comment, update_page: update_page, add_comment: add_comment}
+  resources: {}
+  actor_principals: {local-asha: [confluence-account-101], local-ben: [confluence-account-202]}
+scope: {site_id: confluence-site-1, space_key: INTENT}

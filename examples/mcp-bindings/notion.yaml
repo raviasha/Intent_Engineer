@@ -1,0 +1,15 @@
+id: notion-local
+profile_path: profiles/mcp/notion.yaml
+server:
+  id: notion-server
+  transport: stdio
+  command: notion-mcp-server
+  args: []
+  environment_refs: {NOTION_TOKEN: "env:NOTION_TOKEN"}
+binding:
+  profile_id: notion
+  profile_version: "1"
+  tools: {discover_pages: search_pages, fetch_page: get_page, discover_blocks: search_blocks, fetch_block: get_block, update_page: update_page, append_blocks: append_blocks}
+  resources: {}
+  actor_principals: {local-asha: [notion-user-101], local-ben: [notion-user-202]}
+scope: {workspace_id: notion-workspace-1}

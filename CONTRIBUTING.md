@@ -29,8 +29,20 @@ GitHub tests and release evidence are offline and use injected fake HTTP; never
 use a live token or `gh` login in the test suite. The local GitHub workflow and
 the repository Action are documented in [docs/github.md](docs/github.md). Keep
 the Action read-only, retain its clean-checkout initialization step, and do not
-claim hosted OAuth, GitHub Apps, webhooks, pull-request comments, external
-writes, or MCP write-back as shipped functionality.
+claim hosted OAuth, GitHub Apps, webhooks, or pull-request comments as shipped functionality.
+
+## MCP and guarded write-back
+
+MCP tests use the official SDK with deterministic fake sessions; never invoke a live provider.
+Profiles and bindings are strict semantic contracts and examples contain only environment
+references. Preserve source authorship and version chains in evidence. Do not collapse competing
+authors into one mutable record. A mutation surface may propose or preview, but no Intent MCP tool
+may create its own approval. Provider writes must reuse the production preview, interactive local
+approval, executor, target-version check, receipt, and atomic commit services.
+
+The release harness proves a missing approval and a changed target make zero provider mutation
+calls, a second identical sync is a no-op, and sentinel credentials occur in no persisted project
+file or captured output.
 
 ## Test-driven changes
 

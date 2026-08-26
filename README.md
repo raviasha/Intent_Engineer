@@ -30,6 +30,26 @@ intent context --task "add local export"
 intent drift --require-review
 ```
 
+For team conversations and external requirements, configure GitHub and/or a compatible MCP source,
+then schedule capture independently from reconciliation:
+
+```bash
+# Frequent capture: append new source-authored versions and refresh derived state.
+intent sync --sources markdown,git,github,mcp
+
+# Your review cadence: compare intent, requirements, code, and tests.
+intent drift --format markdown --output .intent/reports/drift.md --require-review
+```
+
+Each source version retains its original author, provider identity, timestamp, locator, content
+hash, predecessor, and ACL. Multiple teammates' changes remain separate evidence versions; a
+conflict becomes a case with both sides rather than a last-write-wins overwrite. Authorized low-risk
+projection can be automatic, while conflicting, superseding, destructive, and external-provider
+changes require human review. External writes additionally require `intent write preview`, a
+separate interactive `intent write approve`, and `intent write execute` against the unchanged
+target. See [the MCP and agent guide](docs/mcp.md) and
+[provider-profile guide](docs/provider-profiles.md).
+
 `intent reconcile resolve <case-id>` is deliberately two-phase. The first call
 records a deterministic preview and returns an approval hash with review-required
 exit status. Re-run it with the exact `--approve <hash>` to apply the approved
@@ -66,9 +86,9 @@ a network connection nor a secret. GitHub ingestion is opt-in: it uses a local
 credential and an explicit, non-secret `GITHUB_REPOSITORY=owner/repository`
 scope. The repository-local GitHub Action provides manual/nightly scheduling; it
 is not a hosted Intent Engineering service. Evidence ACLs are enforced
-fail-closed for the configured local actor. Hosted OAuth, GitHub App
-installation, webhooks, collaboration UI, and external MCP writes are not
-shipped in this slice. See [the GitHub guide](docs/github.md).
+fail-closed for the configured local actor. Hosted OAuth, GitHub App installation, webhooks, a
+collaboration UI, and unattended external writes are not shipped. Conversation capture is
+polling/manual/scheduled, not a hosted continuous daemon. See [the GitHub guide](docs/github.md).
 
 ## Development
 
