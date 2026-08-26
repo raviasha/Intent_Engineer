@@ -6,9 +6,9 @@ Plan: `docs/superpowers/plans/2026-08-25-intent-engineering-mcp-writeback.md`
 
 | Task | Status | Product commit | Report commit | Review |
 | --- | --- | --- | --- | --- |
-| 1. Typed provider profiles and safe selectors | Completed | `00e41c7` | This commit | Clean after 2 fix rounds |
-| 2. Shared MCP client runtime | Completed | `60dfd4a` | This commit | Clean after 4 fix rounds |
-| 3. Reference provider profiles | Pending | — | — | Pending |
+| 1. Typed provider profiles and safe selectors | Completed | `00e41c7` | `09419d4` | Clean after 2 fix rounds |
+| 2. Shared MCP client runtime | Completed | `60dfd4a` | `e8c4090` | Clean after 4 fix rounds |
+| 3. Reference provider profiles | Completed | `ab6e85b` | This commit | Clean after 2 fix rounds |
 | 4. Read-side MCP connector | Pending | — | — | Pending |
 | 5. Write plans, approvals, receipts | Pending | — | — | Pending |
 | 6. Approved write execution | Pending | — | — | Pending |
@@ -138,3 +138,11 @@ Plan: `docs/superpowers/plans/2026-08-25-intent-engineering-mcp-writeback.md`
   delayed start/close publication guard. Final gates: 60 runtime tests, 134 MCP tests, 802 full
   offline tests, Ruff/mypy/schema/package/secure checks clean. Final independent re-review found
   0 Critical and 0 Important findings. Product commit: `60dfd4a`.
+- Task 3 added strict Slack, Notion, Jira, and Confluence reference profiles, complete illustrative
+  bindings, and deterministic object/discovery/write/revision fixtures. Review found cross-target
+  Slack writes, permissive nested Notion schemas, vacuous revision/ACL coverage, and ambiguous
+  primary/revision version collisions. Two TDD fix rounds bound Slack identities only to guarded
+  targets, made nested schemas exact, added same-object cross-author version history, separated
+  ACL decisions, and made all version identities unambiguous. Final gates: 24 focused contracts,
+  162 MCP/package/secure tests, 826 full offline tests, Ruff/mypy/schema/diff checks clean. Final
+  independent re-review found 0 Critical, 0 Important, and 0 Minor. Product commit: `ab6e85b`.
