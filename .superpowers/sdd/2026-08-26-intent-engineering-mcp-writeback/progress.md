@@ -8,10 +8,10 @@ Plan: `docs/superpowers/plans/2026-08-25-intent-engineering-mcp-writeback.md`
 | --- | --- | --- | --- | --- |
 | 1. Typed provider profiles and safe selectors | Completed | `00e41c7` | `09419d4` | Clean after 2 fix rounds |
 | 2. Shared MCP client runtime | Completed | `60dfd4a` | `e8c4090` | Clean after 4 fix rounds |
-| 3. Reference provider profiles | Completed | `ab6e85b` | This commit | Clean after 2 fix rounds |
-| 4. Read-side MCP connector | Pending | — | — | Pending |
-| 5. Write plans, approvals, receipts | Pending | — | — | Pending |
-| 6. Approved write execution | Pending | — | — | Pending |
+| 3. Reference provider profiles | Completed | `ab6e85b` | `b54c209` | Clean after 2 fix rounds |
+| 4. Read-side MCP connector | Completed | `9954c73` | `f1960b1` | Clean after 2 fix rounds |
+| 5. Write plans, approvals, receipts | Completed | `5ba7f9b` | `54e1c6c` | Clean after 3 fix rounds |
+| 6. Approved write execution | Completed | `7b9309b` | This commit | Clean after 2 review rounds |
 | 7. Connector/write CLI | Pending | — | — | Pending |
 | 8. Read-only Intent MCP server | Pending | — | — | Pending |
 | 9. Guarded MCP mutation tools | Pending | — | — | Pending |
@@ -169,3 +169,12 @@ Plan: `docs/superpowers/plans/2026-08-25-intent-engineering-mcp-writeback.md`
   provider principals. Plans and approvals persist those aliases, so cross-source conflicts cannot
   be approved by the same person merely by switching identity namespaces. Each write contract also
   declares its target object type and hashes its exact local provider capability mapping.
+- Task 6 added a durable claim-before-mutation ledger, exact immutable receipt replay, one non-
+  retried provider write, post-write semantic revalidation, fixed provider errors, authorship-
+  preserving write evidence, and one atomic receipt/evidence/case/graph/history transaction.
+  Independent review drove shared person-level separation-of-duties reauthentication, canonical
+  case-target binding, first-create parent-directory fsync, real cross-process contention, locally
+  normalized result evidence, and cancellation-safe plan/approval/receipt boundaries. Final gates:
+  93 focused tests, 265 broadened MCP/mutation/storage tests, 954 full offline tests, Ruff/mypy/
+  format/diff checks clean. Final review found 0 Critical, 0 Important, and 0 Minor findings.
+  Product commit: `7b9309b`.
