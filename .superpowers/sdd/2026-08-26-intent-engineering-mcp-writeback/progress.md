@@ -15,7 +15,7 @@ Plan: `docs/superpowers/plans/2026-08-25-intent-engineering-mcp-writeback.md`
 | 7. Connector/write CLI | Completed | `7c4e966` | This report commit | Ready; 0 Critical/Important/Minor |
 | 8. Read-only Intent MCP server | Completed | `acaf5fb` | This report commit | Ready; 0 Critical/Important/Minor |
 | 9. Guarded MCP mutation tools | Completed | `2563390` | This commit | Ready; 0 Critical/Important/Minor after fixes |
-| 10. Public-alpha release proof | Pending | — | — | Pending |
+| 10. Public-alpha release proof | In progress | pending | pending | Precommit review in progress |
 
 ## Repository invariants
 
@@ -223,3 +223,16 @@ Plan: `docs/superpowers/plans/2026-08-25-intent-engineering-mcp-writeback.md`
   Ruff clean, mypy clean across 101 source files, help and diff checks clean. Final independent
   re-review found 0 Critical, 0 Important, and 0 Minor findings and marked the task Ready. Task 10
   remains untouched.
+- Task 10 precommit documents the installed/scheduled operating model, author/version preservation,
+  independent human review, and exact external-write approval separation. Four credential-free
+  example bindings validate against their production profiles. Independent review rejected the
+  initial split/no-op harness, weak write assertions, incomplete sentinel scan, and incomplete clean
+  setup. The replacement uses one production project/runtime for combined sync, real reasoner and
+  detectors, validation, drift, MCP context, reconciliation review, and guarded writes. It proves 11
+  first-run evidence objects, two graph changes, one source-derived conflict, exact no-op replay, a
+  second-author Slack version with predecessor, missing-approval zero calls, one reviewed mutation
+  with receipt/write evidence, changed-target zero mutation, production credential resolution, and
+  no sentinel in files/output/logs. Clean-project docs now copy both profile and binding. Current
+  gates: 2 focused, 1,041 full offline, Ruff/format clean, mypy 101 clean, diff check clean. Final
+  independent fix re-review reproduced the central release path and found 0 Critical, 0 Important,
+  and 0 Minor findings; Task 10 is Ready. Product/docs/tests commit: `f1a4cb1`.
