@@ -1,0 +1,100 @@
+id: confluence
+version: "1"
+display_name: Confluence
+operations:
+  discover_pages:
+    semantic_name: discover_pages
+    kind: tool
+    pagination: cursor
+    arguments:
+      cursor: {source: cursor}
+      scope: {source: scope}
+    item_selector: {path: "$.results"}
+    next_cursor_selector: {path: "$.next_cursor", required: false}
+  fetch_page:
+    semantic_name: fetch_page
+    kind: tool
+    pagination: none
+    arguments:
+      page_id: {source: object_id}
+    item_selector: {path: "$"}
+  discover_comments:
+    semantic_name: discover_comments
+    kind: tool
+    pagination: cursor
+    arguments:
+      cursor: {source: cursor}
+      scope: {source: scope}
+    item_selector: {path: "$.results"}
+    next_cursor_selector: {path: "$.next_cursor", required: false}
+  fetch_comment:
+    semantic_name: fetch_comment
+    kind: tool
+    pagination: none
+    arguments:
+      comment_id: {source: object_id}
+    item_selector: {path: "$"}
+objects:
+  page:
+    discover_operation: discover_pages
+    fetch_operation: fetch_page
+    external_id: {path: "$.id", transforms: [string]}
+    external_version: {path: "$.version.number", transforms: [string]}
+    author: {path: "$.version.by.account_id", transforms: [string]}
+    observed_at: {path: "$.version.when", transforms: [iso_datetime]}
+    locator: {path: "$.links.webui", transforms: [string]}
+    parent_ref: {path: "$.space.id", transforms: [string]}
+    acl: {path: "$.restrictions.allowed_principals", transforms: [string_list]}
+    content:
+      body: {path: "$.body.storage.value", transforms: [string]}
+      title: {path: "$.title", transforms: [string]}
+  comment:
+    discover_operation: discover_comments
+    fetch_operation: fetch_comment
+    external_id: {path: "$.id", transforms: [string]}
+    external_version: {path: "$.version.number", transforms: [string]}
+    author: {path: "$.version.by.account_id", transforms: [string]}
+    observed_at: {path: "$.version.when", transforms: [iso_datetime]}
+    locator: {path: "$.links.webui", transforms: [string]}
+    parent_ref: {path: "$.page.id", transforms: [string]}
+    acl: {path: "$.restrictions.allowed_principals", transforms: [string_list]}
+    content:
+      body: {path: "$.body.storage.value", transforms: [string]}
+writes:
+  update_page:
+    semantic_name: update_page
+    target_id: {path: "$.id", transforms: [string]}
+    before_version: {path: "$.version.number", transforms: [string]}
+    allowed_fields: [title, body]
+    arguments:
+      page_id: {source: target_id}
+      expected_version: {source: before_version}
+      title: {source: field, field: title}
+      body: {source: field, field: body}
+    input_schema:
+      type: object
+      required: [title, body]
+      additionalProperties: false
+      properties:
+        title: {type: string, minLength: 1}
+        body: {type: string, minLength: 1}
+    result_version: {path: "$.version.number", transforms: [string]}
+  add_comment:
+    semantic_name: add_comment
+    target_id: {path: "$.id", transforms: [string]}
+    before_version: {path: "$.version.number", transforms: [string]}
+    allowed_fields: [body]
+    arguments:
+      page_id: {source: target_id}
+      expected_version: {source: before_version}
+      body: {source: field, field: body}
+    input_schema:
+      type: object
+      required: [body]
+      additionalProperties: false
+      properties:
+        body: {type: string, minLength: 1}
+    result_version: {path: "$.version.number", transforms: [string]}
+redacted_paths:
+  - "$.token"
+  - "$.authorization"

@@ -1,0 +1,106 @@
+id: jira
+version: "1"
+display_name: Jira
+operations:
+  discover_issues:
+    semantic_name: discover_issues
+    kind: tool
+    pagination: cursor
+    arguments:
+      cursor: {source: cursor}
+      scope: {source: scope}
+    item_selector: {path: "$.issues"}
+    next_cursor_selector: {path: "$.next_cursor", required: false}
+  fetch_issue:
+    semantic_name: fetch_issue
+    kind: tool
+    pagination: none
+    arguments:
+      issue_id: {source: object_id}
+    item_selector: {path: "$"}
+  discover_comments:
+    semantic_name: discover_comments
+    kind: tool
+    pagination: cursor
+    arguments:
+      cursor: {source: cursor}
+      scope: {source: scope}
+    item_selector: {path: "$.comments"}
+    next_cursor_selector: {path: "$.next_cursor", required: false}
+  fetch_comment:
+    semantic_name: fetch_comment
+    kind: tool
+    pagination: none
+    arguments:
+      comment_id: {source: object_id}
+    item_selector: {path: "$"}
+objects:
+  issue:
+    discover_operation: discover_issues
+    fetch_operation: fetch_issue
+    external_id: {path: "$.id", transforms: [string]}
+    external_version: {path: "$.updated", transforms: [string]}
+    author: {path: "$.last_modified_by.account_id", transforms: [string]}
+    observed_at: {path: "$.updated", transforms: [iso_datetime]}
+    locator: {path: "$.self", transforms: [string]}
+    parent_ref: {path: "$.project.id", transforms: [string]}
+    acl: {path: "$.security.allowed_principals", transforms: [string_list]}
+    content:
+      description: {path: "$.fields.description", transforms: [string]}
+      issue_key: {path: "$.key", transforms: [string]}
+      original_author_id: {path: "$.author.account_id", transforms: [string]}
+      status: {path: "$.fields.status", transforms: [string]}
+      summary: {path: "$.fields.summary", transforms: [string]}
+  comment:
+    discover_operation: discover_comments
+    fetch_operation: fetch_comment
+    external_id: {path: "$.id", transforms: [string]}
+    external_version: {path: "$.updated", transforms: [string]}
+    author: {path: "$.last_modified_by.account_id", transforms: [string]}
+    observed_at: {path: "$.updated", transforms: [iso_datetime]}
+    locator: {path: "$.self", transforms: [string]}
+    parent_ref: {path: "$.issue_id", transforms: [string]}
+    acl: {path: "$.security.allowed_principals", transforms: [string_list]}
+    content:
+      body: {path: "$.body", transforms: [string]}
+      original_author_id: {path: "$.author.account_id", transforms: [string]}
+writes:
+  update_issue:
+    semantic_name: update_issue
+    target_id: {path: "$.id", transforms: [string]}
+    before_version: {path: "$.updated", transforms: [string]}
+    allowed_fields: [summary, description, status]
+    arguments:
+      issue_id: {source: target_id}
+      expected_version: {source: before_version}
+      summary: {source: field, field: summary}
+      description: {source: field, field: description}
+      status: {source: field, field: status}
+    input_schema:
+      type: object
+      required: [summary, description, status]
+      additionalProperties: false
+      properties:
+        summary: {type: string, minLength: 1}
+        description: {type: string}
+        status: {type: string, minLength: 1}
+    result_version: {path: "$.updated", transforms: [string]}
+  add_comment:
+    semantic_name: add_comment
+    target_id: {path: "$.id", transforms: [string]}
+    before_version: {path: "$.updated", transforms: [string]}
+    allowed_fields: [body]
+    arguments:
+      issue_id: {source: target_id}
+      expected_version: {source: before_version}
+      body: {source: field, field: body}
+    input_schema:
+      type: object
+      required: [body]
+      additionalProperties: false
+      properties:
+        body: {type: string, minLength: 1}
+    result_version: {path: "$.updated", transforms: [string]}
+redacted_paths:
+  - "$.token"
+  - "$.authorization"

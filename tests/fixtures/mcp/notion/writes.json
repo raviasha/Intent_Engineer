@@ -1,0 +1,14 @@
+{
+  "update_page": {
+    "target": {"id": "notion-page-1", "last_edited_time": "2026-08-20T11:00:00Z"},
+    "fields": {"title": "Approved export intent", "properties": {"status": "approved"}},
+    "result": {"last_edited_time": "2026-08-20T12:00:00Z"},
+    "expected_arguments": {"page_id": "notion-page-1", "expected_version": "2026-08-20T11:00:00Z", "title": "Approved export intent", "properties": {"status": "approved"}}
+  },
+  "append_blocks": {
+    "target": {"id": "notion-page-1", "last_edited_time": "2026-08-20T11:00:00Z"},
+    "fields": {"children": [{"type": "paragraph", "text": "Approval recorded."}]},
+    "result": {"last_edited_time": "2026-08-20T12:05:00Z"},
+    "expected_arguments": {"page_id": "notion-page-1", "expected_version": "2026-08-20T11:00:00Z", "children": [{"type": "paragraph", "text": "Approval recorded."}]}
+  }
+}

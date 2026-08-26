@@ -1,0 +1,27 @@
+{
+  "object_type": "issue",
+  "revisions": [
+    {
+      "id": "jira-issue-1001",
+      "key": "INTENT-42",
+      "updated": "2026-08-20T11:55:00Z",
+      "author": {"account_id": "jira-account-101"},
+      "last_modified_by": {"account_id": "jira-account-101"},
+      "self": "https://jira.example.test/rest/api/3/issue/jira-issue-1001",
+      "project": {"id": "jira-project-1"},
+      "security": {"allowed_principals": ["jira-account-101", "jira-group:engineering"]},
+      "fields": {"summary": "Keep exports local", "description": "Local export only.", "status": "Draft"}
+    },
+    {
+      "id": "jira-issue-1001",
+      "key": "INTENT-42",
+      "updated": "2026-08-20T11:58:00Z",
+      "author": {"account_id": "jira-account-101"},
+      "last_modified_by": {"account_id": "jira-account-202"},
+      "self": "https://jira.example.test/rest/api/3/issue/jira-issue-1001",
+      "project": {"id": "jira-project-1"},
+      "security": {"allowed_principals": ["jira-account-202", "jira-group:engineering"]},
+      "fields": {"summary": "Keep exports local by default", "description": "Central export needs approval.", "status": "In Review"}
+    }
+  ]
+}

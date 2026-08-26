@@ -1,0 +1,14 @@
+{
+  "update_issue": {
+    "target": {"id": "jira-issue-1001", "updated": "2026-08-20T12:00:00Z"},
+    "fields": {"summary": "Keep exports local by default", "description": "Enable centralized export only after independent approval.", "status": "Approved"},
+    "result": {"updated": "2026-08-20T13:00:00Z"},
+    "expected_arguments": {"issue_id": "jira-issue-1001", "expected_version": "2026-08-20T12:00:00Z", "summary": "Keep exports local by default", "description": "Enable centralized export only after independent approval.", "status": "Approved"}
+  },
+  "add_comment": {
+    "target": {"id": "jira-issue-1001", "updated": "2026-08-20T12:00:00Z"},
+    "fields": {"body": "Independent approval recorded."},
+    "result": {"updated": "2026-08-20T13:05:00Z"},
+    "expected_arguments": {"issue_id": "jira-issue-1001", "expected_version": "2026-08-20T12:00:00Z", "body": "Independent approval recorded."}
+  }
+}

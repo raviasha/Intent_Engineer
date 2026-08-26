@@ -1,0 +1,22 @@
+{
+  "raw": {
+    "id": "notion-page-1",
+    "last_edited_time": "2026-08-20T11:00:00Z",
+    "last_edited_by": {"id": "notion-user-101", "name": "Asha"},
+    "url": "https://www.notion.so/notion-page-1",
+    "parent": {"id": "notion-database-1"},
+    "allowed_principals": ["notion-user-101", "notion-group:engineering"],
+    "properties": {"title": "Export intent", "summary": "Local-first export is the current decision."},
+    "_transport": {"request_id": "notion-request-1"}
+  },
+  "expected": {
+    "external_id": "notion-page-1",
+    "external_version": "2026-08-20T11:00:00Z",
+    "author": "notion-user-101",
+    "observed_at": "2026-08-20T11:00:00Z",
+    "locator": "https://www.notion.so/notion-page-1",
+    "parent_ref": "notion-database-1",
+    "acl": ["notion-user-101", "notion-group:engineering"],
+    "content": {"summary": "Local-first export is the current decision.", "title": "Export intent"}
+  }
+}

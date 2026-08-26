@@ -1,0 +1,7 @@
+{
+  "raw": {
+    "results": [{"id": "confluence-page-1"}],
+    "next_cursor": "confluence-page-cursor-2",
+    "_transport": {"request_id": "confluence-discover-1"}
+  }
+}

@@ -1,0 +1,23 @@
+{
+  "object_type": "page",
+  "revisions": [
+    {
+      "id": "confluence-page-1",
+      "title": "Export architecture",
+      "version": {"number": 5, "when": "2026-08-20T12:50:00Z", "by": {"account_id": "confluence-account-101"}},
+      "links": {"webui": "https://confluence.example.test/spaces/INTENT/pages/confluence-page-1"},
+      "space": {"id": "confluence-space-1"},
+      "restrictions": {"allowed_principals": ["confluence-account-101", "confluence-group:engineering"]},
+      "body": {"storage": {"value": "<p>Exports remain local.</p>"}}
+    },
+    {
+      "id": "confluence-page-1",
+      "title": "Export architecture",
+      "version": {"number": 6, "when": "2026-08-20T12:55:00Z", "by": {"account_id": "confluence-account-202"}},
+      "links": {"webui": "https://confluence.example.test/spaces/INTENT/pages/confluence-page-1"},
+      "space": {"id": "confluence-space-1"},
+      "restrictions": {"allowed_principals": ["confluence-account-202", "confluence-group:engineering"]},
+      "body": {"storage": {"value": "<p>Central export requires approval.</p>"}}
+    }
+  ]
+}

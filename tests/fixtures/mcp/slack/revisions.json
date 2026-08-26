@@ -1,0 +1,29 @@
+{
+  "object_type": "message",
+  "revisions": [
+    {
+      "id": "workspace-1:C111:1700000000.000100",
+      "updated": "1700000000.000100",
+      "updated_at": "2026-08-20T10:14:00Z",
+      "user": {"id": "U123"},
+      "last_modified_by": {"id": "U123"},
+      "channel": {"id": "C111"},
+      "thread_id": "workspace-1:C111:1699999999.000100",
+      "permalink": "https://example.slack.com/archives/C111/p1700000000000100",
+      "allowed_principals": ["U123", "slack-group:ENG"],
+      "text": "Exports should remain local."
+    },
+    {
+      "id": "workspace-1:C111:1700000000.000100",
+      "updated": "1700000000.000150",
+      "updated_at": "2026-08-20T10:15:00Z",
+      "user": {"id": "U123"},
+      "last_modified_by": {"id": "U456"},
+      "channel": {"id": "C111"},
+      "thread_id": "workspace-1:C111:1699999999.000100",
+      "permalink": "https://example.slack.com/archives/C111/p1700000000000100",
+      "allowed_principals": ["U123", "U456", "slack-group:ENG"],
+      "text": "Exports may be centralized after independent approval."
+    }
+  ]
+}

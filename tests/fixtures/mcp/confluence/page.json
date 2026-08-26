@@ -1,0 +1,22 @@
+{
+  "raw": {
+    "id": "confluence-page-1",
+    "title": "Export architecture",
+    "version": {"number": 7, "when": "2026-08-20T13:00:00Z", "by": {"account_id": "confluence-account-101", "display_name": "Asha"}},
+    "links": {"webui": "https://confluence.example.test/spaces/INTENT/pages/confluence-page-1"},
+    "space": {"id": "confluence-space-1"},
+    "restrictions": {"allowed_principals": ["confluence-account-101", "confluence-group:engineering"]},
+    "body": {"storage": {"value": "<p>Exports remain local by default.</p>"}},
+    "_transport": {"request_id": "confluence-request-1"}
+  },
+  "expected": {
+    "external_id": "confluence-page-1",
+    "external_version": "7",
+    "author": "confluence-account-101",
+    "observed_at": "2026-08-20T13:00:00Z",
+    "locator": "https://confluence.example.test/spaces/INTENT/pages/confluence-page-1",
+    "parent_ref": "confluence-space-1",
+    "acl": ["confluence-account-101", "confluence-group:engineering"],
+    "content": {"body": "<p>Exports remain local by default.</p>", "title": "Export architecture"}
+  }
+}

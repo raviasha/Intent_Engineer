@@ -1,0 +1,20 @@
+{
+  "post_message": {
+    "target": {"id": "channel:C111", "updated": "channel-v1"},
+    "fields": {"text": "Approved export decision."},
+    "result": {"updated": "channel-v2"},
+    "expected_arguments": {"channel_id": "channel:C111", "text": "Approved export decision.", "expected_channel_version": "channel-v1"}
+  },
+  "reply": {
+    "target": {"id": "workspace-1:C111:1699999999.000100", "updated": "thread-v1"},
+    "fields": {"text": "I approve the local default."},
+    "result": {"updated": "thread-v2"},
+    "expected_arguments": {"thread_ref": "workspace-1:C111:1699999999.000100", "text": "I approve the local default.", "expected_thread_version": "thread-v1"}
+  },
+  "update_message": {
+    "target": {"id": "workspace-1:C111:1700000000.000100", "updated": "message-v1"},
+    "fields": {"text": "The export must remain local unless independently approved."},
+    "result": {"updated": "message-v2"},
+    "expected_arguments": {"message_ref": "workspace-1:C111:1700000000.000100", "text": "The export must remain local unless independently approved.", "expected_version": "message-v1"}
+  }
+}

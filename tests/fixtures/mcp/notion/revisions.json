@@ -1,0 +1,23 @@
+{
+  "object_type": "page",
+  "revisions": [
+    {
+      "id": "notion-page-1",
+      "last_edited_time": "2026-08-20T10:55:00Z",
+      "last_edited_by": {"id": "notion-user-101"},
+      "url": "https://www.notion.so/notion-page-1",
+      "parent": {"id": "notion-database-1"},
+      "allowed_principals": ["notion-user-101", "notion-group:engineering"],
+      "properties": {"title": "Export intent", "summary": "Exports remain local."}
+    },
+    {
+      "id": "notion-page-1",
+      "last_edited_time": "2026-08-20T10:58:00Z",
+      "last_edited_by": {"id": "notion-user-202"},
+      "url": "https://www.notion.so/notion-page-1",
+      "parent": {"id": "notion-database-1"},
+      "allowed_principals": ["notion-user-202", "notion-group:engineering"],
+      "properties": {"title": "Export intent", "summary": "Central export requires approval."}
+    }
+  ]
+}
