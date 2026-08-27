@@ -80,6 +80,7 @@ modules.
 **Files:**
 - Create: `src/intent_engineering/intent_workflow/__init__.py`
 - Create: `src/intent_engineering/intent_workflow/models.py`
+- Create: `src/intent_engineering/core/models/source_roles.py`
 - Modify: `src/intent_engineering/core/models/project.py`
 - Modify: `src/intent_engineering/core/models/__init__.py`
 - Modify: `src/intent_engineering/core/policy/project.py`
@@ -90,7 +91,7 @@ modules.
 
 **Interfaces:**
 - Consumes: existing `StrictModel`, `ChangeSet`, `JsonValue`, `ProjectConfig`, `Node`, and `Edge`.
-- Produces: `SourceRole`, `SourceRoleAssignment`, `ProposalKind`, `IntentProposal`, `ProposalDecision`, `TaskClassification`, `TaskEnvelope`, `ClarificationAnswer`, and `PreflightResult`.
+- Produces: core `SourceRole` and `SourceRoleAssignment`, plus application `ProposalKind`, `IntentProposal`, `ProposalDecision`, `TaskClassification`, `TaskEnvelope`, and `PreflightResult`.
 
 - [ ] **Step 1: Write strict-model and compatibility tests**
 
@@ -168,8 +169,10 @@ Expected: collection fails because `intent_engineering.intent_workflow` does not
 
 - [ ] **Step 3: Implement the exact workflow models**
 
-In `models.py`, define string enums and strict frozen records. Use canonical JSON with
-`allow_nan=False`, sorted keys, compact separators, and SHA-256 identities:
+Define `SourceRole` and `SourceRoleAssignment` in `core/models/source_roles.py`, re-export them from
+`core.models` and `intent_workflow.models`, and keep `ProjectConfig` free of an application-layer
+import. Define the remaining application records in `intent_workflow/models.py`. Use canonical JSON
+with `allow_nan=False`, sorted keys, compact separators, and SHA-256 identities:
 
 ```python
 class SourceRole(StrEnum):
@@ -299,7 +302,7 @@ Expected: all tests and static checks pass.
 - [ ] **Step 6: Commit Task 1**
 
 ```bash
-git add src/intent_engineering/intent_workflow src/intent_engineering/core/models/project.py src/intent_engineering/core/models/__init__.py src/intent_engineering/core/policy/project.py schemas/intent-meta-model.yaml graph/framework-intent-graph.yaml tests/unit/intent_workflow/test_models.py tests/integration/test_framework_graph.py
+git add src/intent_engineering/intent_workflow src/intent_engineering/core/models/source_roles.py src/intent_engineering/core/models/project.py src/intent_engineering/core/models/__init__.py src/intent_engineering/core/policy/project.py schemas/intent-meta-model.yaml graph/framework-intent-graph.yaml tests/unit/intent_workflow/test_models.py tests/integration/test_framework_graph.py
 git commit -m "feat: define intent workflow contracts"
 ```
 
@@ -591,8 +594,9 @@ def test_cli_bootstrap_captures_prd_but_requires_review(clean_project) -> None:
     result = run_intent(clean_project, "bootstrap", "--prd", "docs/prd.md", "--format", "json")
     assert result.returncode == 4
     payload = result.json()
-    assert payload["status"] == "review_required"
-    assert payload["proposal_id"].startswith("intent-proposal:sha256:")
+    assert payload["status"] == "agent_submission_required"
+    assert payload["evidence_refs"]
+    assert payload["context_packet"]["source_role"] == "declared_intent"
     assert payload["graph_version"] == 0
 
 
@@ -879,6 +883,11 @@ class ClarificationSession(StrictModel):
 Raw question/answer text lives in immutable conversation `EvidenceRecord` versions, not the session
 ledger. The session stores each digest/reference, preventing a second mutable copy while preserving
 exact agent/human author and chronology.
+
+Extend Task 2's `IntentLedgerRecord` with exactly one optional `clarification` event payload and
+update its one-of validator to accept proposal, decision, or clarification. Existing proposal and
+decision bytes remain canonical and decode unchanged; clarification events share the contiguous
+sequence so questions, answers, proposal, and decision have one durable order.
 
 Require 1–16 questions, each with stable ID and 1–2,048 characters; 1–16 answers, each 1–16 KiB;
 one answer per question; exact actor, timestamp, and evidence reference on each answer. Session records
