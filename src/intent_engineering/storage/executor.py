@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from typing import cast
 
 from intent_engineering.core.graph.applier import apply_changeset_with_case_effects
@@ -17,6 +17,7 @@ from intent_engineering.storage.jsonl.case_store import (
     validate_case_appends,
 )
 from intent_engineering.storage.jsonl.history_store import serialize_changeset
+from intent_engineering.storage.secure import SecureFile
 from intent_engineering.storage.transaction import LocalTransaction, LocalTransactionCoordinator
 from intent_engineering.storage.yaml.graph_store import (
     YamlGraphStore,
@@ -80,7 +81,10 @@ class LocalChangeSetExecutor:
         resolved_cases: Sequence[ReconciliationCase] = (),
         intent_proposal_preimage: bytes | None = None,
         intent_proposal_append: bytes | None = None,
+        evidence_preimage: bytes | None = None,
         rollback_base_exceptions: bool = False,
+        read_only_extras: Mapping[str, SecureFile] | None = None,
+        extra_preimages: Mapping[str, bytes | None] | None = None,
     ) -> Graph:
         """Prevalidate all groups, then durably commit every declared local effect."""
         if (intent_proposal_preimage is None) != (intent_proposal_append is None) or (
@@ -90,6 +94,12 @@ class LocalChangeSetExecutor:
             raise ValueError("invalid intent proposal transaction effect")
         if intent_proposal_append is not None and "intent_proposals" not in self._transactions.target_names:
             raise ValueError("intent proposal transaction target is unavailable")
+        if evidence_preimage is not None and "evidence" not in self._transactions.target_names:
+            raise ValueError("evidence transaction target is unavailable")
+        if (read_only_extras is None) != (extra_preimages is None) or (
+            read_only_extras is not None and set(read_only_extras) != set(extra_preimages or {})
+        ):
+            raise ValueError("invalid read-only transaction binding")
         validated: ChangeSet | None = None
         effects: tuple[ReconciliationCase, ...] = ()
         graph: Graph | None = None
@@ -102,8 +112,14 @@ class LocalChangeSetExecutor:
             validated = ChangeSet.model_validate(changeset.model_dump())
             effects = self._ordered_effects(validated, created_cases, resolved_cases)
             with self._transactions.transaction(
-                rollback_base_exceptions=rollback_base_exceptions
+                rollback_base_exceptions=rollback_base_exceptions,
+                extras=read_only_extras,
             ) as transaction:
+                if extra_preimages is not None and any(
+                    transaction.read_optional(name) != content
+                    for name, content in extra_preimages.items()
+                ):
+                    raise ValueError("read-only transaction binding changed")
                 graph = parse_graph(transaction.read("graph"))
                 next_graph = apply_changeset_with_case_effects(graph, validated)
                 known_nodes = {node.id for node in next_graph.nodes}
@@ -121,6 +137,11 @@ class LocalChangeSetExecutor:
                     if transaction.read_optional("intent_proposals") != intent_proposal_preimage:
                         raise ValueError("intent proposal ledger changed")
                     transaction.append("intent_proposals", intent_proposal_append)
+                if (
+                    evidence_preimage is not None
+                    and transaction.read_optional("evidence") != evidence_preimage
+                ):
+                    raise ValueError("evidence authorization changed")
                 transaction.write("graph", serialize_graph(next_graph))
                 transaction.append("history", serialize_changeset(validated))
                 if case_bytes:
@@ -137,7 +158,10 @@ class LocalChangeSetExecutor:
             resolved_cases = ()
             intent_proposal_preimage = None
             intent_proposal_append = None
+            evidence_preimage = None
             rollback_base_exceptions = False
+            read_only_extras = None
+            extra_preimages = None
             validated = None
             effects = ()
             graph = None

@@ -107,7 +107,106 @@
   evidence was 11 Round 2 tests plus the prior 22 security regressions, with the reported full
   result of 1232 passing tests. Detailed evidence: `task-5-report.md`; controlling strengthened
   scope: `task-5-brief.md`.
-- Task 6: pending
+- Task 6: PRECOMMIT_REVIEW_READY (implementer `/root/intent_workflow_task6`, exact base
+  `f1ca752818b39c7d76a8657fdd769cdc1f33ec92`; no commit/staging). Required missing-coordinator RED
+  was `2 errors in 0.27s`; first expanded integration RED was `6 failed, 6 errors`; final self-audit
+  RED was `3 failed, 30 passed`. Final clarification/governance GREEN is `33 passed`; required
+  governance/mutation gate is `55 passed`; final ledger/bootstrap/preflight/recovery compatibility
+  is `241 passed`; Ruff is clean on required and all changed Python paths; mypy is clean across 111
+  source files; fresh full offline suite is `1265 passed in 50.50s`; and `git diff --check` is clean.
+  The implementation adds evidence-only raw clarification, exact event/proposal chronology, strict
+  backward-compatible ledger frames, detached typed proposals, deterministic local risk review,
+  live person-level alias independence, and atomic decision/graph/history/case confirmation. It adds
+  no capability, host hook, provider/model call, or external write. Detailed evidence:
+  `task-6-report.md`; controlling strengthened scope: `task-6-brief.md`.
+- Task 6: Fix Round 1/5 PRECOMMIT_REVIEW_READY after independent review reported `0 Critical / 5
+  Important / 0 Minor`, Not Ready. Tests-only focused RED was `7 failed, 31 passed in 1.86s`; an
+  additional earlier-question revision chronology probe was RED in isolation. Final focused GREEN
+  is `39 passed in 1.17s`; combined governance/mutation/ledger/bootstrap/preflight/recovery is `247
+  passed in 3.79s`; Ruff and mypy (111 source files) are clean; fresh full offline warnings-as-errors
+  is `1271 passed in 64.96s`; diff-check is clean. The fixes durably associate divergent human turns
+  as blocking conflict events, preserve all authoritative existing-semantic provenance, reject
+  stale risk before case creation, derive exact affected references for every supported mutation
+  group, and atomically bind session closure to the exact proposal/decision/activation. All work
+  remains unstaged pending scoped re-review. Detailed evidence: `task-6-report.md`.
+- Task 6: Fix Round 2/5 PRECOMMIT_REVIEW_READY after scoped re-review reported `0 Critical / 3
+  Important / 0 Minor`, Not Ready. The authoritative tests-only RED was `6 failed, 38 passed in
+  2.55s` after correcting one test-fixture-only `-W error` warning; no production edit preceded that
+  RED. Final focused GREEN is `44 passed in 2.34s`; combined governance/mutation/ledger/bootstrap/
+  preflight/recovery/executor/validation compatibility is `260 passed in 3.83s`; Ruff and mypy (111
+  source files) are clean; fresh full offline warnings-as-errors is `1276 passed in 52.26s`; and
+  diff-check is clean. A final evidence-side flag self-audit was tests-first (`4 failed, 40 passed`)
+  and restored the focused suite to `44 passed in 1.23s` before all gates were rerun. The fixes make
+  exact divergent-conflict replay byte-idempotent while retaining new conflict chronology, create
+  distinct attributable current/proposal evidence sides for every affected current assertion, and
+  require each proposed clarification event's immediate exact typed proposal association without
+  rewriting legacy or incomplete-session ledgers. All work remains unstaged pending final scoped
+  re-review. Detailed evidence: `task-6-report.md`.
+- Task 6: Fix Round 3/5 PRECOMMIT_REVIEW_READY after final narrow re-review reported `0 Critical / 1
+  Important / 0 Minor`, Not Ready. Tests-only focused RED was `6 failed, 41 passed in 3.79s`; final
+  epistemic GREEN was `47 passed in 1.15s`. A final current-evidence ACL probe was independently RED
+  at `1 failed, 47 passed` and brought the final focused suite to `48 passed in 1.22s`. Combined
+  governance/mutation/ledger/bootstrap/preflight/recovery/executor/validation compatibility is `264
+  passed in 3.32s`; Ruff and mypy (111 source files) are clean; fresh full offline warnings-as-errors
+  is `1280 passed in 48.16s`; and diff-check is clean. Current and proposed review evidence now
+  carries exact per-assertion source mode and confidence, with stable separate sides for mixed
+  epistemics and grouping only across fully identical metadata. Added inferred nodes, derived
+  current nodes, confidence changes, edges, and implementation status no longer receive invented
+  explicit/1.0 defaults; inaccessible current evidence fails before case mutation. All work remains
+  unstaged pending final narrow re-review. Detailed evidence: `task-6-report.md`.
+- Task 6: Fix Round 4/5 PRECOMMIT_REVIEW_READY after the next final narrow review reported `0
+  Critical / 1 Important / 0 Minor`, Not Ready. Exact tests-only focused RED was `1 failed, 48
+  passed in 1.78s`; the expanded conflicting actor/time/subset/policy/stale characterization remained
+  `1 failed, 53 passed`; final focused GREEN is `54 passed in 1.11s`, with the prior Round 3
+  epistemic/ACL selection independently `7 passed`. Combined governance/mutation/ledger/bootstrap/
+  preflight/recovery/executor/validation compatibility is `270 passed in 2.77s`; Ruff and mypy (111
+  source files) are clean; fresh full offline warnings-as-errors is `1286 passed in 44.92s`; and
+  diff-check is clean. Exact applied high-risk replay now authenticates current live authority and
+  every durable decision/closure/activation/case/graph/history binding before returning a detached
+  byte-noop `APPLIED` result; all conflicting inputs and stale state remain fixed failures. All work
+  remains unstaged pending final narrow re-review. Detailed evidence: `task-6-report.md`.
+- Task 6: Fix Round 5/5 PRECOMMIT_REVIEW_READY after scoped review reported `0 Critical / 2
+  Important / 0 Minor`, Not Ready. Exact tests-only focused RED was `8 failed, 54 passed in 2.66s`;
+  final focused GREEN is `62 passed in 1.54s`, and the prior epistemic/ACL/authenticated-replay
+  matrix is `13 passed, 24 deselected`. Combined governance/mutation/ledger/bootstrap/preflight/
+  recovery/executor/validation compatibility is `278 passed in 3.89s`; Ruff and mypy (111 source
+  files) are clean. The first fresh full run encountered the known unchanged fork lock race once
+  (`1 failed, 1293 passed`), its isolated probe passed, and the authoritative fresh full offline
+  warnings-as-errors rerun is `1294 passed in 67.78s`. Replay now authenticates a canonical complete
+  post-activation digest for every affected graph object plus an independently derived exact review
+  case preimage and transition; same-version semantic/provenance tampering, ACL-hidden evidence
+  manipulation, and coordinated case-version forgery fixed-fail without durable mutation. All work
+  remains unstaged pending the same scoped reviewer. Detailed evidence: `task-6-report.md`.
+- Task 6: Fix Round 6/6 PRECOMMIT_REVIEW_READY after the final narrow review reported `0 Critical /
+  1 Important / 0 Minor`, Not Ready. The authoritative tests-only behavioral RED was `1 failed in
+  0.88s` before production edits; the exact race GREEN is `1 passed in 0.29s` and complete focused
+  clarification/governance GREEN is `63 passed in 1.36s`. The mandated governance/mutation gate is
+  `87 passed in 1.92s`; broadened ledger/bootstrap/preflight/recovery/executor/validation/host
+  compatibility is `303 passed in 3.73s`; Ruff and mypy (111 source files) are clean; and the fresh
+  full offline warnings-as-errors suite is `1295 passed in 46.05s`. A final immutable live-snapshot
+  bundle now reauthenticates exact actor aliases, contributor/reviewer role and independence,
+  proposal and canonical current/proposed case evidence ACLs, source-role association,
+  project/policy/provider binding, ledger, and baseline before decision construction. Exact evidence
+  bytes join config/policy/binding preimages at the atomic activation boundary. The deterministic
+  alias revocation during case persistence fixed-fails without any later graph or decision mutation.
+  All work remains unstaged pending the same scoped reviewer. Detailed evidence: `task-6-report.md`.
+- Task 6: Fix Round 7/7 PRECOMMIT_REVIEW_READY after narrow review reported `0 Critical / 1
+  Important / 0 Minor`, Not Ready. The authoritative tests-only RED was `1 failed in 0.79s` before
+  production edits; exact torn-state GREEN is `1 passed in 0.25s`, full focused clarification/
+  governance is `64 passed in 1.54s`, and the replay/concurrency/tamper selection is `17 passed`.
+  Mandated governance/mutation is `88 passed in 2.12s`; broadened ledger/bootstrap/preflight/
+  recovery/executor/validation/host compatibility is `304 passed in 3.84s`; Ruff and mypy (111
+  source files) are clean. The first full run encountered the known unchanged fork lock race once,
+  its isolated case passed, and the authoritative fresh full offline warnings-as-errors rerun is
+  `1296 passed in 54.29s`. Every `APPLIED` path now uses one fresh durable-state authenticator that
+  requires exact decision, closure, activation history tail, complete graph effect/version, resolved
+  case transition/preimage, and live authority/ACL; an exact decision+closed ledger with missing
+  activation fixed-fails byte-noop. All work remains unstaged pending the same scoped reviewer.
+  Detailed evidence: `task-6-report.md`.
+- Task 6: READY. Final scoped Round 7 review verdict is `0 Critical / 0 Important / 0 Minor`, Ready.
+  The reviewer accepted the complete focused, replay/concurrency/tamper, compatibility, static, and
+  fresh full-suite evidence recorded in `task-6-report.md`; no further implementation change was
+  requested. Authorized for the exact Task 6 commit.
 - Task 7: pending
 - Task 8: pending
 - Task 9: pending

@@ -33,6 +33,7 @@ from intent_engineering.intent_workflow.models import (
 from intent_engineering.intent_workflow.proposal_store import (
     IntentLedgerRecord,
     IntentProposalStore,
+    serialize_intent_ledger_record,
 )
 from intent_engineering.storage.executor import LocalChangeSetExecutor
 from intent_engineering.storage.jsonl.evidence_store import (
@@ -452,15 +453,7 @@ class BootstrapService:
             return _review_for(stored)
         ledger = self._store.bytes()
         record = IntentLedgerRecord(sequence=len(ledger.splitlines()), proposal=proposal)
-        frame = (
-            json.dumps(
-                record.model_dump(mode="json"),
-                ensure_ascii=False,
-                separators=(",", ":"),
-                sort_keys=True,
-            ).encode("utf-8")
-            + b"\n"
-        )
+        frame = serialize_intent_ledger_record(record)
         try:
             with self._transactions.transaction(
                 rollback_base_exceptions=True
@@ -673,15 +666,7 @@ class BootstrapService:
             sequence=len(ledger.splitlines()),
             decision=decision,
         )
-        return (
-            json.dumps(
-                record.model_dump(mode="json"),
-                ensure_ascii=False,
-                separators=(",", ":"),
-                sort_keys=True,
-            ).encode("utf-8")
-            + b"\n"
-        )
+        return serialize_intent_ledger_record(record)
 
     def _replay_result(
         self,

@@ -37,7 +37,10 @@ from intent_engineering.intent_workflow.models import (
     TaskClassification,
     TaskEnvelope,
 )
-from intent_engineering.intent_workflow.proposal_store import IntentLedgerRecord
+from intent_engineering.intent_workflow.proposal_store import (
+    IntentLedgerRecord,
+    serialize_intent_ledger_record,
+)
 from intent_engineering.storage.jsonl.case_store import (
     parse_case_versions,
     validate_case_appends,
@@ -224,10 +227,12 @@ def _parse_proposals(content: bytes) -> tuple[IntentProposal, ...]:
             raise ValueError("invalid intent proposal ledger")
         record = IntentLedgerRecord.model_validate_json(encoded[:-1])
         if (
-            _canonical_json(record.model_dump(mode="json")) + b"\n" != encoded
+            serialize_intent_ledger_record(record) != encoded
             or record.sequence != expected_sequence
         ):
             raise ValueError("invalid intent proposal ledger")
+        if record.clarification is not None:
+            continue
         if record.proposal is not None:
             if record.proposal.id in proposals:
                 raise ValueError("invalid intent proposal ledger")
