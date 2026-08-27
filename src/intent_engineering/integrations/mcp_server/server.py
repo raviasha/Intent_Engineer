@@ -27,6 +27,11 @@ from mcp.types import (
 from pydantic import AnyUrl
 
 from intent_engineering.cli.runtime import load_runtime
+from intent_engineering.integrations.mcp_server.intent_workflow import (
+    IntentWorkflowPort,
+    load_intent_workflow_services,
+    register_intent_workflow_tools,
+)
 from intent_engineering.integrations.mcp_server.mutations import (
     MutationPort,
     load_mutation_services,
@@ -46,16 +51,30 @@ class _IntentMCPServer(MCPServer[Any]):
         arguments: dict[str, Any],
         context: Context[Any, Any] | None = None,
     ) -> CallToolResult | InputRequiredResult:
+        workflow_tool = name in {
+            "intent_bootstrap_propose",
+            "intent_proposal_show",
+            "intent_proposal_confirm",
+        }
         failed = False
         response: CallToolResult | InputRequiredResult | None = None
         try:
             response = await super().call_tool(name, arguments, context)
         except ToolError:
             failed = True
+        except MCPError:
+            if not workflow_tool:
+                raise
+            failed = True
         finally:
             del name, arguments, context
         if failed:
-            raise ToolError("invalid intent tool arguments") from None
+            message = (
+                "invalid intent workflow arguments"
+                if workflow_tool
+                else "invalid intent tool arguments"
+            )
+            raise ToolError(message) from None
         return cast(CallToolResult | InputRequiredResult, response)
 
     async def get_prompt(
@@ -114,15 +133,16 @@ def build_server(
     services: McpReadServices,
     *,
     mutation_services: MutationPort | None = None,
+    intent_workflow_services: IntentWorkflowPort | None = None,
 ) -> MCPServer:
     """Build the exact version-1 read surface with optional guarded mutations."""
-    if mutation_services is None:
+    if mutation_services is None and intent_workflow_services is None:
         description = "Read-only evidence-backed intent, context, drift, and reconciliation."
         instructions = (
             "Use read tools and resources to inspect authorized local intent. "
             "This server has no mutation capability."
         )
-    else:
+    elif mutation_services is not None:
         description = (
             "Evidence-backed intent reads, proposal creation, guarded write preview, "
             "and independently approved execution."
@@ -131,6 +151,12 @@ def build_server(
             "Use read tools and resources to inspect authorized local intent. Mutation tools "
             "may persist proposals and previews. They cannot create approvals; execution "
             "requires an independently persisted approval."
+        )
+    else:
+        description = "Evidence-backed intent reads and reviewed onboarding proposals."
+        instructions = (
+            "Use read tools to inspect authorized local intent. Workflow tools may persist "
+            "typed proposals and activate only governed reviewed cores."
         )
     server = _IntentMCPServer(
         name="intent-engineering",
@@ -145,6 +171,8 @@ def build_server(
     register_read_prompts(server)
     if mutation_services is not None:
         register_mutation_tools(server, mutation_services)
+    if intent_workflow_services is not None:
+        register_intent_workflow_tools(server, intent_workflow_services)
     return server
 
 
@@ -159,4 +187,5 @@ def run_stdio(project: Path) -> None:
     build_server(
         read_services,
         mutation_services=load_mutation_services(read_services.runtime),
+        intent_workflow_services=load_intent_workflow_services(read_services.runtime),
     ).run(transport="stdio")

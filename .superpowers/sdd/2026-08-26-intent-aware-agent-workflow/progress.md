@@ -69,7 +69,23 @@
   controlling strengthened scope: `task-3-brief.md`. Independent final verdict: 0 Critical / 0
   Important / 0 Minor, Ready; reviewer evidence was 10 fix-focused tests, 6 schema-1/canonical
   compatibility tests, and a clean diff check.
-- Task 4: pending
+- Task 4: review approved after clean Fix Round 1 re-review (implementer `/root/intent_workflow_task4`, exact
+  base `ef1c2ead86c634f818b78fac8b93d2b5b722c53a`; no commit/staging; 6 Important addressed, 0
+  Important open). Required missing-surface RED was `9 failed in 2.18s`; review-fix tests-only RED
+  was `9 failed, 12 passed in 5.25s`. Final Task 4 pair is `21 passed in 4.48s`; focused
+  CLI/MCP/legacy gate is `58 passed in 23.28s`; adjacent descriptor/evidence/config/MCP regressions
+  are `119 passed` and `33 passed`; all three help commands exit 0; Ruff is clean; mypy is clean
+  across 108 source files; fresh full offline suite is `1157 passed in 43.41s`; and `git diff
+  --check` is clean. The implementation provides
+  descriptor-safe capture-only CLI onboarding, atomic canonical source roles, ACL-safe complete
+  proposal review/TTY confirmation, and optional provider-neutral official-SDK MCP proposal tools
+  without approval creation, external writes, or Task 5 preflight. Detailed evidence:
+  `task-4-report.md`; controlling strengthened scope: `task-4-brief.md`. Final reviewer verdict:
+  Ready, 0 new Critical / 0 new Important / 0 new Minor; reviewer evidence was 21 fix-focused tests,
+  20 shared regressions, a clean diff check, and the reported full result of 1157 passing tests.
+- Task 4: Minor (deferred): full-config `yaml.safe_dump` preserves unrelated semantic fields but
+  drops unrelated YAML comments and lexical formatting. A bespoke comment-preserving rewriter was
+  intentionally not introduced in Fix Round 1.
 - Task 5: pending
 - Task 6: pending
 - Task 7: pending

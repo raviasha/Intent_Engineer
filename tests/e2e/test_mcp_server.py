@@ -57,6 +57,10 @@ async def test_intent_mcp_stdio_is_protocol_clean_and_read_only(tmp_path: Path) 
                 "intent_context",
                 {"format": "PRIVATE-MISSING-MCP-WIRE-ARG-" + "x" * 200},
             )
+            invalid_workflow = await client.call_tool(
+                "intent_bootstrap_propose",
+                {"submission": {"private": "PRIVATE-WORKFLOW-WIRE-" + "x" * 1_100_000}},
+            )
             prompts = await client.list_prompts()
             prepared = await client.get_prompt("prepare_task", {"task": "implement local export"})
             with pytest.raises(MCPError, match="not found"):
@@ -96,11 +100,17 @@ async def test_intent_mcp_stdio_is_protocol_clean_and_read_only(tmp_path: Path) 
         "intent_reconciliation_propose",
         "intent_write_preview",
         "intent_write_execute",
+        "intent_bootstrap_propose",
+        "intent_proposal_show",
+        "intent_proposal_confirm",
     }
     assert status.structured_content["schema_version"] == "1"
     assert invalid.is_error is True
     assert "invalid intent tool arguments" in repr(invalid.content)
     assert "PRIVATE-MISSING-MCP-WIRE-ARG" not in repr(invalid)
+    assert invalid_workflow.is_error is True
+    assert "invalid intent workflow arguments" in repr(invalid_workflow.content)
+    assert "PRIVATE-WORKFLOW-WIRE" not in repr(invalid_workflow)
     assert {prompt.name for prompt in prompts.prompts} == {
         "prepare_task",
         "review_reconciliation",

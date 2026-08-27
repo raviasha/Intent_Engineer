@@ -19,6 +19,11 @@ from intent_engineering.cli.connectors import (
     connectors_app,
 )
 from intent_engineering.cli.github import GitHubDoctorResult, check_github
+from intent_engineering.cli.intent_workflow import (
+    bootstrap_command,
+    proposals_app,
+    sources_app,
+)
 from intent_engineering.cli.output import OutputFormat, emit
 from intent_engineering.cli.runtime import (
     GitHubConfigurationError,
@@ -66,6 +71,9 @@ app.add_typer(reconcile_app, name="reconcile")
 app.add_typer(doctor_app, name="doctor")
 app.add_typer(connectors_app, name="connectors")
 app.add_typer(write_app, name="write")
+app.add_typer(sources_app, name="sources")
+app.add_typer(proposals_app, name="proposals")
+app.command("bootstrap")(bootstrap_command)
 
 
 def _configure_logging() -> None:

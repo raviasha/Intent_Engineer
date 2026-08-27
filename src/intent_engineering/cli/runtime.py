@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import re
 from collections.abc import Callable, Mapping, Sequence
@@ -204,7 +205,9 @@ def load_runtime(root: Path) -> Runtime:
     workspace = workspace_path(root)
     if not isinstance(loaded, dict):
         raise TypeError("project configuration is invalid")
-    config = ProjectConfig.model_validate(cast(dict[str, Any], loaded))
+    config = ProjectConfig.model_validate_json(
+        json.dumps(cast(dict[str, Any], loaded), ensure_ascii=False, separators=(",", ":"))
+    )
     try:
         graph_file = workspace_directory.file(configured_graph_relative(config.graph_path))
         graph_file.assert_regular()

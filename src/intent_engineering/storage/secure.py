@@ -83,21 +83,35 @@ def _require_regular(metadata: os.stat_result) -> None:
         raise UnsafePathError()
 
 
-def _read_descriptor(descriptor: int) -> bytes:
+def _read_descriptor(descriptor: int, *, max_bytes: int | None = None) -> bytes:
     chunks: list[bytes] = []
     chunk = b""
+    total = 0
     try:
         while True:
-            chunk = os.read(descriptor, 65536)
+            request_size = (
+                65536 if max_bytes is None else min(65536, max_bytes + 1 - total)
+            )
+            if request_size <= 0:
+                raise UnsafePathError()
+            chunk = os.read(descriptor, request_size)
             if not chunk:
                 return b"".join(chunks)
+            total += len(chunk)
+            if max_bytes is not None and total > max_bytes:
+                raise UnsafePathError()
             chunks.append(chunk)
     finally:
         chunk = b""
         chunks.clear()
 
 
-def _read_named(parent_fd: int, name: str) -> tuple[bytes, os.stat_result]:
+def _read_named(
+    parent_fd: int,
+    name: str,
+    *,
+    max_bytes: int | None = None,
+) -> tuple[bytes, os.stat_result]:
     try:
         descriptor = os.open(name, _READ_FLAGS, dir_fd=parent_fd)
     except OSError as error:
@@ -105,12 +119,17 @@ def _read_named(parent_fd: int, name: str) -> tuple[bytes, os.stat_result]:
     try:
         metadata = os.fstat(descriptor)
         _require_regular(metadata)
-        return _read_descriptor(descriptor), metadata
+        return _read_descriptor(descriptor, max_bytes=max_bytes), metadata
     finally:
         os.close(descriptor)
 
 
-def _read_named_nonblocking(parent_fd: int, name: str) -> tuple[bytes, os.stat_result]:
+def _read_named_nonblocking(
+    parent_fd: int,
+    name: str,
+    *,
+    max_bytes: int | None = None,
+) -> tuple[bytes, os.stat_result]:
     """Authenticate the final descriptor without blocking on a FIFO before its kind is known."""
     try:
         descriptor = os.open(name, _READ_FLAGS | _NONBLOCK, dir_fd=parent_fd)
@@ -119,7 +138,7 @@ def _read_named_nonblocking(parent_fd: int, name: str) -> tuple[bytes, os.stat_r
     try:
         metadata = os.fstat(descriptor)
         _require_regular(metadata)
-        return _read_descriptor(descriptor), metadata
+        return _read_descriptor(descriptor, max_bytes=max_bytes), metadata
     finally:
         os.close(descriptor)
 
@@ -323,8 +342,11 @@ class SecureDirectory:
         *,
         expected_identities: tuple[FileIdentity, ...] | None = None,
         nonblocking: bool = False,
+        max_bytes: int | None = None,
     ) -> SecureRead:
         """Read a descendant regular file and optionally pin every ancestor identity."""
+        if max_bytes is not None and (type(max_bytes) is not int or max_bytes < 0):
+            raise UnsafePathError()
         parts = _relative_parts(relative)
         descriptor = os.dup(self.descriptor)
         identities: list[FileIdentity] = [self.identity]
@@ -344,7 +366,7 @@ class SecureDirectory:
                 os.close(descriptor)
                 descriptor = next_descriptor
             reader = _read_named_nonblocking if nonblocking else _read_named
-            content, metadata = reader(descriptor, parts[-1])
+            content, metadata = reader(descriptor, parts[-1], max_bytes=max_bytes)
             identities.append(_identity(metadata))
         finally:
             os.close(descriptor)
