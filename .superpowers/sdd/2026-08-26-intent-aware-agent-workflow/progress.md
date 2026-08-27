@@ -264,6 +264,24 @@
   approved the fast-but-safe final cadence: one precommit full suite followed by postcommit focused
   Task 7, Ruff, mypy, base-to-HEAD diff, index, and protected-name verification. Authorized for the
   exact Task 7 commit.
-- Task 8: pending
+- Task 8: PRECOMMIT_REVIEW_READY at exact base
+  `d91beef4b0ab0b2caba8bbfebd1f4999f1b8b2a2` (implementer
+  `/root/intent_workflow_task8`, unsupported mandatory-mode branch, no staging/commit). Installed
+  `codex-cli 0.148.0-alpha.9` has stable enabled hooks/plugins/unified execution, but the official
+  contract permits specialized tool paths to opt out, describes hooks as a guardrail rather than a
+  complete enforcement boundary, and does not re-run `PreToolUse` for `write_stdin` continuation of
+  an existing unified-exec session. The mandatory every-mutation invariant therefore cannot be
+  proven. The supported bridge prototype was rejected despite focused GREEN; its plugin and all
+  Task7/CLI changes were removed. The retained host-neutral adapter is reusable, while Codex
+  detection records incomplete coverage and raises fixed `MandatoryHookUnavailable`. Exact initial
+  RED: two collection errors in `0.05s`; unsupported-branch RED/GREEN: `17 failed in 0.57s`, then
+  `30 passed in 0.17s`; after grouped review fixes for caller-forged completeness, workflow/task
+  binding, completion revocation, exact scalar/container types, canonical UTC `Z` JSON, and
+  cancellation traceback state scrubbing, focused is `42 passed in 0.24s`; required
+  Task8/Task7/MCP/wire is `117 passed in 3.33s`; Ruff and mypy (115 source files) are clean; fresh
+  post-fix full offline warnings-as-errors is `1464 passed in 50.57s`; and `git diff --check` is
+  clean. Final finding-only independent review is `0 Critical / 0 Important / 0 Minor`, Ready;
+  its exact selector is `7 passed`. Detailed evidence:
+  `task-8-report.md`; controlling scope: `task-8-brief.md`.
 - Task 9: pending
 - Task 10: pending
