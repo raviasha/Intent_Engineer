@@ -150,6 +150,8 @@ class IntentProposalStore:
                 if canonical != encoded_line:
                     return None
                 record = IntentLedgerRecord.model_validate_json(line)
+                if _serialize(record) != encoded_line:
+                    return None
                 if record.sequence != expected_sequence:
                     return None
                 proposal = record.proposal

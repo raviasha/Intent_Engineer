@@ -85,9 +85,16 @@ def _require_regular(metadata: os.stat_result) -> None:
 
 def _read_descriptor(descriptor: int) -> bytes:
     chunks: list[bytes] = []
-    while chunk := os.read(descriptor, 65536):
-        chunks.append(chunk)
-    return b"".join(chunks)
+    chunk = b""
+    try:
+        while True:
+            chunk = os.read(descriptor, 65536)
+            if not chunk:
+                return b"".join(chunks)
+            chunks.append(chunk)
+    finally:
+        chunk = b""
+        chunks.clear()
 
 
 def _read_named(parent_fd: int, name: str) -> tuple[bytes, os.stat_result]:
@@ -1073,25 +1080,35 @@ class SecureFile:
         self._atomic_write_unverified(content)
 
     def append(self, content: bytes) -> None:
+        payload = memoryview(content)
+        content = b""
+        descriptor = -1
         try:
-            descriptor = os.open(
-                self.name,
-                os.O_WRONLY | os.O_APPEND | os.O_CREAT | _NOFOLLOW | _CLOEXEC,
-                0o644,
-                dir_fd=self.parent_fd,
-            )
-        except OSError as error:
-            raise UnsafePathError() from error
-        try:
+            try:
+                descriptor = os.open(
+                    self.name,
+                    os.O_WRONLY
+                    | os.O_APPEND
+                    | os.O_CREAT
+                    | _NOFOLLOW
+                    | _CLOEXEC
+                    | _NONBLOCK,
+                    0o644,
+                    dir_fd=self.parent_fd,
+                )
+            except OSError as error:
+                raise UnsafePathError() from error
             _require_regular(os.fstat(descriptor))
-            view = memoryview(content)
-            while view:
-                written = os.write(descriptor, view)
-                view = view[written:]
+            offset = 0
+            while offset < len(payload):
+                offset += os.write(descriptor, payload[offset:])
             os.fsync(descriptor)
             os.fsync(self.parent_fd)
         finally:
-            os.close(descriptor)
+            payload.release()
+            payload = memoryview(b"")
+            if descriptor >= 0:
+                os.close(descriptor)
 
     def unlink(self, *, missing_ok: bool = False) -> None:
         try:

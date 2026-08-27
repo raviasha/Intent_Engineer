@@ -117,8 +117,13 @@ def atomic_write_bytes(path: Path | SecureFile, content: bytes) -> None:
 
 def append_durable_line(path: Path | SecureFile, line: bytes) -> None:
     """Append one complete JSONL record and flush it durably."""
-    secure_file = coerce_secure_file(path)
+    payload = line
+    line = b""
+    secure_file: SecureFile | None = None
     try:
-        secure_file.append(line)
+        secure_file = coerce_secure_file(path)
+        secure_file.append(payload)
     finally:
-        secure_file.close()
+        payload = b""
+        if secure_file is not None:
+            secure_file.close()

@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
+import multiprocessing
+import os
 import stat
 from pathlib import Path
+from typing import Any
 
 import pytest
 import yaml  # type: ignore[import-untyped]
 
 from intent_engineering.cli.runtime import load_runtime
-from intent_engineering.core.policy.project import initialize_project
+from intent_engineering.core.policy.project import ProjectAlreadyInitialized, initialize_project
 
 
 def _configure_graph_path(project: Path, graph_path: str) -> None:
@@ -114,3 +117,54 @@ def test_reinitializing_a_legacy_workspace_creates_only_the_missing_empty_ledger
 
     assert ledger.read_bytes() == b""
     assert (project / ".intent/graph.yaml").read_bytes() == graph_before
+
+
+def _force_initialize_probe(project: str, connection: Any) -> None:
+    try:
+        initialize_project(Path(project), force=True)
+    except ProjectAlreadyInitialized as error:
+        result = (
+            "fixed-unsafe"
+            if error.args == ("local workspace has an unsafe path",)
+            and error.__context__ is None
+            else "unsafe-error"
+        )
+    except Exception:  # noqa: BLE001 - child reports any unexpected public failure
+        result = "unexpected-error"
+    else:
+        result = "accepted"
+    connection.send(result)
+    connection.close()
+
+
+def test_force_initialization_rejects_intent_proposal_fifo_without_blocking_or_replacement(
+    tmp_path: Path,
+) -> None:
+    """Catches force-state inspection blocking on or replacing a proposal-ledger FIFO."""
+    project = tmp_path / "project"
+    project.mkdir()
+    initialize_project(project)
+    ledger = project / ".intent/history/intent-proposals.jsonl"
+    ledger.unlink()
+    os.mkfifo(ledger)
+    (project / ".intent/graph.yaml").write_bytes(b"graph: [")
+    before = os.lstat(ledger)
+    context = multiprocessing.get_context("fork")
+    receiving, sending = context.Pipe(duplex=False)
+    process = context.Process(target=_force_initialize_probe, args=(str(project), sending))
+    process.start()
+    sending.close()
+    process.join(1.0)
+    result = "blocked"
+    if process.is_alive():
+        process.terminate()
+        process.join()
+    elif receiving.poll():
+        result = receiving.recv()
+    receiving.close()
+
+    after = os.lstat(ledger)
+    assert result == "fixed-unsafe"
+    assert stat.S_ISFIFO(after.st_mode)
+    assert (after.st_dev, after.st_ino) == (before.st_dev, before.st_ino)
+    assert (project / ".intent/graph.yaml").read_bytes() == b"graph: ["

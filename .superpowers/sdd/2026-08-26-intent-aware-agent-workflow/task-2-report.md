@@ -131,3 +131,89 @@ then passed (`1 passed in 0.23s`) and the required clean full rerun above passed
   it passed immediately in isolation and the subsequent complete suite passed. No Task 2 product
   change was made for that unrelated nondeterministic failure.
 - No open Task 2 correctness concern remains.
+
+## Fix Round 1 — independent review hardening
+
+Independent review of commit `66ad92a` reported 0 Critical, 3 Important, and 0 Minor findings.
+All three Important findings were reproduced and fixed within the Task 2 storage boundary.
+
+### Fix-round RED
+
+Command:
+
+```text
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 .venv/bin/python -m pytest -p anyio.pytest_plugin tests/unit/intent_workflow/test_proposal_store.py tests/unit/cli/test_runtime_paths.py -k 'typed_noncanonical or low_level or fifo_replacement or force_initialization_rejects_intent_proposal_fifo' -q -W error
+```
+
+Exact result before production edits:
+
+```text
+FFFFFFF                                                                  [100%]
+7 failed, 28 deselected in 2.96s
+```
+
+The seven failures independently demonstrated:
+
+- outer `schema_version` values `true` and `1.0`, plus a normalized UTC timestamp spelling, were
+  accepted as durable replay;
+- real interruptions inside `os.write` and `os.read` retained private proposal markers in shared
+  storage traceback locals;
+- a FIFO swap after decode blocked the append process;
+- force initialization blocked while inspecting a FIFO proposal ledger.
+
+### Fix-round GREEN and gates
+
+The same narrow command after the minimal fixes:
+
+```text
+.......                                                                  [100%]
+7 passed, 28 deselected in 0.32s
+```
+
+Complete Task 2 focused gate:
+
+```text
+.....................................                                    [100%]
+37 passed in 0.85s
+```
+
+Shared-storage regression subset:
+
+```text
+.............................                                            [100%]
+29 passed in 0.51s
+```
+
+Static gates:
+
+```text
+All checks passed!
+Success: no issues found in 105 source files
+```
+
+Fresh full offline warnings-as-errors gate:
+
+```text
+........................................................................ [100%]
+1080 passed in 38.36s
+```
+
+`git diff --check` completed with no output.
+
+### Fix-round implementation review
+
+- Ledger replay now compares every durable frame byte-for-byte with serialization of the validated
+  `IntentLedgerRecord`. JSON that is lexically canonical but changes under Pydantic validation or
+  normalization therefore fails without rewrite.
+- `_read_descriptor` clears the current chunk and accumulated chunks in `finally`, including
+  `BaseException` exits from the actual read loop.
+- `append_durable_line` clears its line copy, and `SecureFile.append` clears its input and memoryview
+  on every exit while retaining `O_APPEND`, complete-write looping, file `fsync`, and parent `fsync`.
+- Append opens now include `O_NONBLOCK`; a FIFO swapped in after decode either fails at open or is
+  rejected by descriptor-kind authentication before any write.
+- Project regular-file inspection reuses the existing no-follow, nonblocking file flags, so force
+  initialization rejects a FIFO promptly without replacing it or rewriting graph state.
+- Both real low-level interruption tests preserve the original exception object and confirm fixed
+  context discipline and exact prior bytes.
+
+No open fix-round concern remains.

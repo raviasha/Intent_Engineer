@@ -25,6 +25,7 @@ from intent_engineering.intent_workflow.proposal_store import (
     IntentProposalStore,
     IntentProposalStoreError,
 )
+from intent_engineering.storage import secure as secure_storage
 from intent_engineering.storage.secure import SecureDirectory
 from intent_engineering.storage.transaction import LocalTransactionCoordinator
 
@@ -319,6 +320,33 @@ def test_fifo_symlink_hardlink_and_malformed_ledgers_fail_without_blocking_or_re
         assert outside.read_bytes() == outside_before
 
 
+@pytest.mark.parametrize(
+    "replacement",
+    [
+        (b',"schema_version":1,"sequence":0}', b',"schema_version":true,"sequence":0}'),
+        (b',"schema_version":1,"sequence":0}', b',"schema_version":1.0,"sequence":0}'),
+        (b'"proposed_at":"2026-08-26T00:00:00Z"', b'"proposed_at":"2026-08-26T00:00:00+00:00"'),
+    ],
+)
+def test_typed_noncanonical_representations_are_rejected_without_rewrite(
+    tmp_path: Path,
+    proposal: IntentProposal,
+    replacement: tuple[bytes, bytes],
+) -> None:
+    """Catches raw-canonical JSON that strict models coerce or normalize on replay."""
+    path = tmp_path / "intent-proposals.jsonl"
+    raw = _canonical_record(0, proposal=proposal).replace(*replacement)
+    assert raw != _canonical_record(0, proposal=proposal)
+    path.write_bytes(raw)
+
+    with pytest.raises(IntentProposalStoreError) as caught:
+        IntentProposalStore(path).list()
+
+    assert caught.value.args == ("intent proposal ledger unavailable",)
+    assert caught.value.__context__ is None
+    assert path.read_bytes() == raw
+
+
 def _repository_traceback_locals(error: BaseException) -> str:
     frames: list[str] = []
     current = error.__traceback__
@@ -378,6 +406,131 @@ def test_read_interruption_clears_decoded_proposal_from_repository_traceback(
 
     assert caught.value is interruption
     assert secret not in _repository_traceback_locals(caught.value)
+
+
+def test_low_level_append_interruption_clears_payload_from_shared_storage_frames(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catches the actual write loop retaining proposal bytes after interruption."""
+    secret = "PRIVATE-LOW-LEVEL-APPEND-8197"
+    path = tmp_path / "intent-proposals.jsonl"
+    store = IntentProposalStore(path)
+    before = store.bytes()
+    interruption = KeyboardInterrupt("low-level append interrupted")
+    original_write = secure_storage.os.write
+
+    def interrupt_private_write(descriptor: int, content: object) -> int:
+        if secret.encode() in bytes(content):
+            raise interruption
+        return original_write(descriptor, content)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(secure_storage.os, "write", interrupt_private_write)
+
+    with pytest.raises(KeyboardInterrupt) as caught:
+        store.put(_proposal(assumption=secret))
+
+    assert caught.value is interruption
+    assert caught.value.__context__ is None
+    assert secret not in _repository_traceback_locals(caught.value)
+    assert path.read_bytes() == before
+
+
+def test_low_level_nonblocking_read_interruption_clears_accumulated_payload(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catches the actual read loop retaining completed private chunks after interruption."""
+    secret = "PRIVATE-LOW-LEVEL-READ-8197"
+    path = tmp_path / "intent-proposals.jsonl"
+    store = IntentProposalStore(path)
+    store.put(_proposal(assumption=secret))
+    before = path.read_bytes()
+    interruption = KeyboardInterrupt("low-level read interrupted")
+    original_read = secure_storage.os.read
+    observed_private = False
+
+    def interrupt_after_private_read(descriptor: int, size: int) -> bytes:
+        nonlocal observed_private
+        if observed_private:
+            raise interruption
+        content = original_read(descriptor, size)
+        if secret.encode() in content:
+            observed_private = True
+        return content
+
+    monkeypatch.setattr(secure_storage.os, "read", interrupt_after_private_read)
+
+    with pytest.raises(KeyboardInterrupt) as caught:
+        store.list()
+
+    assert caught.value is interruption
+    assert caught.value.__context__ is None
+    assert secret not in _repository_traceback_locals(caught.value)
+    assert path.read_bytes() == before
+
+
+def _fifo_swap_before_append_probe(path: str, proposal_json: str, connection: Any) -> None:
+    store = IntentProposalStore(Path(path))
+    original_decode = store._decode_unlocked
+
+    def decode_then_swap() -> Any:
+        state = original_decode()
+        os.unlink(path)
+        os.mkfifo(path)
+        metadata = os.lstat(path)
+        connection.send(("swapped", metadata.st_dev, metadata.st_ino))
+        return state
+
+    store._decode_unlocked = decode_then_swap  # type: ignore[method-assign]
+    try:
+        store.put(IntentProposal.model_validate_json(proposal_json))
+    except IntentProposalStoreError as error:
+        result = (
+            "fixed-unavailable"
+            if error.args == ("intent proposal ledger unavailable",)
+            and error.__context__ is None
+            else "unsafe-error"
+        )
+    except Exception:  # noqa: BLE001 - child reports any unexpected public failure
+        result = "unexpected-error"
+    else:
+        result = "accepted"
+    connection.send(("result", result))
+    connection.close()
+
+
+def test_fifo_replacement_after_decode_before_append_fails_fast_without_mutation(
+    tmp_path: Path,
+) -> None:
+    """Catches an authenticated regular ledger being swapped to a blocking FIFO before append."""
+    path = tmp_path / "intent-proposals.jsonl"
+    path.write_bytes(b"")
+    proposal = _proposal()
+    context = multiprocessing.get_context("fork")
+    receiving, sending = context.Pipe(duplex=False)
+    process = context.Process(
+        target=_fifo_swap_before_append_probe,
+        args=(str(path), proposal.model_dump_json(), sending),
+    )
+    process.start()
+    sending.close()
+    assert receiving.poll(1.0)
+    swapped = receiving.recv()
+    assert swapped[0] == "swapped"
+    process.join(1.0)
+    result = "blocked"
+    if process.is_alive():
+        process.terminate()
+        process.join()
+    elif receiving.poll():
+        result = receiving.recv()[1]
+    receiving.close()
+
+    after = os.lstat(path)
+    assert result == "fixed-unavailable"
+    assert stat.S_ISFIFO(after.st_mode)
+    assert (after.st_dev, after.st_ino) == swapped[1:]
 
 
 def test_corrupt_secret_bearing_ledger_raises_fixed_error_without_context_or_rewrite(

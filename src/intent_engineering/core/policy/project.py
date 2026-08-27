@@ -91,7 +91,7 @@ def _open_or_create_directory(parent_fd: int, name: str) -> int:
 
 
 def _read_regular(parent_fd: int, name: str) -> bytes:
-    descriptor = os.open(name, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0), dir_fd=parent_fd)
+    descriptor = os.open(name, _FILE_READ_FLAGS, dir_fd=parent_fd)
     try:
         if not stat.S_ISREG(os.fstat(descriptor).st_mode):
             raise ProjectAlreadyInitialized("local workspace has an unsafe path")
