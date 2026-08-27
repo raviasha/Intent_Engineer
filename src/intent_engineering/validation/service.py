@@ -26,6 +26,7 @@ from intent_engineering.core.models import (
     Graph,
     ProjectConfig,
     ReconciliationCase,
+    ReconciliationCaseType,
     ReconciliationStatus,
     SyncCheckpoint,
     is_exact_consumed_prefix,
@@ -57,6 +58,7 @@ _MARKDOWN_CURSOR_PREFIX = "markdown:v1:"
 _GITHUB_CONNECTOR_PREFIX = "github:"
 _GITHUB_SHA = re.compile(r"^[0-9a-f]{40}$")
 _MCP_CONNECTOR_IDENTITY = re.compile(r"^[0-9a-f]{64}$")
+_MCP_WRITE_EVIDENCE = re.compile(r"^evidence:mcp-write:[0-9a-f]{64}$")
 
 
 class DiagnosticSeverity(StrEnum):
@@ -186,7 +188,7 @@ def _parse_config(content: bytes) -> ProjectConfig:
     loaded = _load_yaml(content)
     if not isinstance(loaded, dict):
         raise TypeError("configuration must be a mapping")
-    return ProjectConfig.model_validate(cast(dict[str, Any], loaded))
+    return ProjectConfig.model_validate_json(json.dumps(cast(dict[str, Any], loaded)))
 
 
 def _parse_graph(content: bytes | None) -> Graph:
@@ -236,7 +238,47 @@ def _parse_checkpoints(content: bytes | None) -> dict[str, SyncCheckpoint]:
     return checkpoints
 
 
+def _conversation_identity(record: EvidenceRecord) -> tuple[str, str, str] | None:
+    payload = record.model_dump(mode="json")["payload"]
+    if not isinstance(payload, dict) or set(payload) != {"content", "role"}:
+        return None
+    role = payload["role"]
+    if role not in {"human", "agent"}:
+        return None
+    encoded_content = json.dumps(
+        payload["content"],
+        allow_nan=False,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    content_hash = f"sha256:{sha256(encoded_content).hexdigest()}"
+    version_material = {
+        "acl": sorted(record.acl),
+        "author": record.author,
+        "captured_at": record.observed_at.isoformat().replace("+00:00", "Z"),
+        "content_hash": content_hash,
+        "conversation_ref": record.external_object_id,
+        "role": role,
+    }
+    encoded_version = json.dumps(
+        version_material,
+        allow_nan=False,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    version = f"sha256:{sha256(encoded_version).hexdigest()}"
+    return content_hash, version, f"evidence:conversation:{version.removeprefix('sha256:')}"
+
+
 def _expected_evidence_id(record: EvidenceRecord) -> str:
+    if record.connector_type == "conversation":
+        identity = _conversation_identity(record)
+        if identity is not None:
+            return identity[2]
+    if record.connector_type == "mcp-write" and _MCP_WRITE_EVIDENCE.fullmatch(record.id):
+        return record.id
     material = (
         f"{record.connector_type}\x00{record.external_object_id}\x00"
         f"{record.external_version}\x00{record.content_hash}"
@@ -281,13 +323,19 @@ def _evidence_diagnostics(
         if _SHA256.fullmatch(record.content_hash) is None:
             diagnostics.append(_diagnostic("evidence.content_hash_invalid", "evidence"))
         payload = record.model_dump(mode="json")["payload"]
-        if record.connector_type == "markdown":
+        if record.connector_type == "conversation":
+            identity = _conversation_identity(record)
+            if identity is None or record.content_hash != identity[0]:
+                diagnostics.append(_diagnostic("evidence.content_hash_mismatch", "evidence"))
+            if identity is None or record.external_version != identity[1]:
+                diagnostics.append(_diagnostic("evidence.version_mismatch", "evidence"))
+        elif record.connector_type == "markdown":
             content = payload.get("content") if isinstance(payload, dict) else None
             if not isinstance(content, str) or record.content_hash != (
                 f"sha256:{sha256(content.encode('utf-8')).hexdigest()}"
             ):
                 diagnostics.append(_diagnostic("evidence.content_hash_mismatch", "evidence"))
-        elif record.connector_type in {"git", "github"}:
+        elif record.connector_type in {"git", "github", "mcp-write"}:
             encoded = json.dumps(
                 payload,
                 ensure_ascii=False,
@@ -352,12 +400,13 @@ def _case_diagnostics(
             expected_observed_at = max(record.observed_at for record in records)
             if side.authors != expected_authors or side.observed_at != expected_observed_at:
                 diagnostics.append(_diagnostic("case.provenance_mismatch", "cases"))
-        seen_refs: set[str] = set()
-        for side in case.evidence_sides:
-            current_refs = set(side.evidence_refs)
-            if seen_refs & current_refs:
-                diagnostics.append(_diagnostic("case.evidence_overlap", "cases"))
-            seen_refs.update(current_refs)
+        if case.case_type is ReconciliationCaseType.CONFLICTING_SOURCES:
+            seen_refs: set[str] = set()
+            for side in case.evidence_sides:
+                current_refs = set(side.evidence_refs)
+                if seen_refs & current_refs:
+                    diagnostics.append(_diagnostic("case.evidence_overlap", "cases"))
+                seen_refs.update(current_refs)
         previous_at = case.created_at
         for event in case.history:
             if event.at < previous_at:
@@ -374,7 +423,13 @@ def _case_diagnostics(
         for case_id in changeset.reconciliation_cases_resolved
     }
     for case_id, versions in versions_by_id.items():
-        if case_id not in created_by_changeset:
+        # Task preflight creates an evidence-backed review case without changing
+        # canonical graph semantics, so it intentionally has no graph history row.
+        workflow_review_case = versions[0].detector_id in {
+            "intent_workflow.preflight.v1",
+            "intent_workflow.proposal_governance.v1",
+        }
+        if case_id not in created_by_changeset and not workflow_review_case:
             diagnostics.append(_diagnostic("history.case_creation_missing", "history"))
         latest = versions[-1]
         if latest.status is ReconciliationStatus.RESOLVED and (

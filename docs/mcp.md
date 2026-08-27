@@ -21,8 +21,15 @@ cp "$INTENT_ENGINEERING_SOURCE/examples/mcp-bindings/slack.yaml" .intent/connect
 export SLACK_TOKEN='provided-by-your-secret-store'
 intent connectors inspect slack-local
 intent connectors test slack-local
+intent sources add '<connector-id-from-inspect>' \
+  'https://workspace.example/channels/export/thread-42' --role proposed_intent
 intent sync --sources mcp
 ```
+
+The binding's `profile_path` is repository-relative, so copying only the binding is insufficient.
+The same two-file setup applies to the shipped `jira`, `confluence`, and `notion` compatible
+profiles. Bind local actor aliases to provider principals in `.intent/connectors/<provider>.yaml`
+and `.intent/approvals/policy.yaml`; credential values remain outside both files.
 
 The repository ships polling, not hosted webhooks. Run sync manually, from cron, or from CI at the
 cadence appropriate for conversations. Run reconciliation reporting separately at the cadence at
@@ -45,8 +52,17 @@ intent mcp --project .
 ```
 
 It exposes authorized context, explain, impact, drift, status, validation, reconciliation views,
-and proposal/preview/execution tools. The server cannot approve its own proposal. External writes
-are deliberately split:
+and proposal/preview/execution tools. `intent_context` is read-only. An active agent may submit its
+typed PRD proposal with `intent_bootstrap_propose` and its attributed task classification with
+`intent_preflight`; those submissions are revalidated against current durable state. Aligned tasks
+may receive a short-lived process-local capability, while new/ambiguous and conflicting tasks remain
+token-free. The diagnostic CLI `intent preflight --task "..."` only renders context and does not mint
+authorization.
+
+Active-agent reasoning may submit proposals. Scheduled semantic reasoning is optional; the default
+CLI uses no model and deterministic assurance only. Regardless of origin, confidence is not a claim
+of truth and never grants authority to confirm a proposal, resolve a conflict, or mutate a provider.
+The server cannot approve its own proposal. External writes are deliberately split:
 
 ```bash
 intent write preview <case-id> --connector-id <id> --operation <semantic-write> --fields '{"field":"value"}'
@@ -57,6 +73,10 @@ intent write execute <plan-id> --approval-id <approval-id>
 Approval is interactive and binds the preview hash, actor identities, provider binding, target
 version, and expiry. A changed target, role/configuration drift, missing approval, or same-person
 conflict rejects before mutation. Scheduled jobs and coding agents cannot manufacture approval.
+
+The audited Codex host cannot prove complete mandatory mutation interception, so no Codex plugin is
+shipped. A future supported host can compose the provider-neutral adapter. Disabled host mode is a
+no-op. See [the complete adoption guide](intent-aware-agent.md).
 
 Not shipped: hosted ingestion, OAuth brokering, webhooks, a collaboration UI, universal MCP server
 compatibility, or unattended external writes.

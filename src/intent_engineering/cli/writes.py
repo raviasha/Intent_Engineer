@@ -29,7 +29,7 @@ from intent_engineering.cli.connectors import (
 )
 from intent_engineering.cli.output import OutputFormat, emit, normalize
 from intent_engineering.cli.runtime import Runtime, load_runtime
-from intent_engineering.core.models import JsonValue, ResolutionAction
+from intent_engineering.core.models import JsonValue, ProjectConfig, ResolutionAction
 from intent_engineering.core.models._base import StrictModel
 from intent_engineering.mutations.approval import approve_plan
 from intent_engineering.mutations.committer import LocalWriteCommitter
@@ -368,11 +368,15 @@ class WriteWorkflow:
         plans: JsonlWritePlanStore,
         approvals: JsonlApprovalStore,
         policy: MutationPolicy,
+        actor: str,
     ) -> None:
+        if actor not in policy.identities:
+            raise ValueError("external write actor unavailable")
         self.catalog = catalog
         self.plans = plans
         self.approvals = approvals
         self.policy = policy
+        self.actor = actor
 
     def close(self) -> None:
         """Release descriptors owned by this workflow's immutable stores."""
@@ -423,7 +427,7 @@ class WriteWorkflow:
         approval = approve_plan(
             plan,
             selected.config.binding,
-            actor=self.catalog.runtime.config.local_actor,
+            actor=self.actor,
             now=datetime.now(UTC) if now is None else now,
             expires_in=timedelta(minutes=15),
             confirmation=confirmation,
@@ -458,7 +462,7 @@ class WriteWorkflow:
             selected = self.catalog._selected(connector_id)
             if operation not in selected.profile.writes:
                 raise ValueError("external write operation unavailable")
-            actor = self.catalog.runtime.config.local_actor
+            actor = self.actor
             if actor not in self.policy.contributors:
                 raise ValueError("external write contributor unavailable")
             case = self.catalog.runtime.case_store.get(case_id)
@@ -517,7 +521,7 @@ class WriteWorkflow:
             gateway = McpMutationGateway(
                 self.catalog.mcp_runtime,
                 selected,
-                local_actor=runtime.config.local_actor,
+                local_actor=self.actor,
                 object_type=plan.object_type,
                 semantic_operation=plan.operation,
                 connector_id=plan.connector_id,
@@ -548,7 +552,7 @@ class WriteWorkflow:
             return await executor.execute(
                 plan.id,
                 approval_id,
-                actor=runtime.config.local_actor,
+                actor=self.actor,
                 now=datetime.now(UTC) if now is None else now,
             )
         finally:
@@ -590,8 +594,22 @@ def policy_actor_aliases(
     return policy.identities.get(selected_actor, frozenset())
 
 
+def _configured_actor(runtime: Runtime) -> str:
+    source = runtime.workspace_directory.read_relative("config.yaml", nonblocking=True)
+    config = ProjectConfig.model_validate_json(
+        json.dumps(load_strict_yaml_mapping_bytes(source.content))
+    )
+    if (
+        config.project_id != runtime.config.project_id
+        or config.graph_path != runtime.config.graph_path
+    ):
+        raise ValueError("external write actor unavailable")
+    return config.local_actor
+
+
 def write_workflow(runtime: Runtime) -> WriteWorkflow:
     """Assemble guarded writes over one already-held project runtime."""
+    actor = _configured_actor(runtime)
     catalog = connector_catalog(runtime)
     approvals_directory = catalog.runtime.workspace_directory.subdirectory("approvals")
     try:
@@ -604,11 +622,11 @@ def write_workflow(runtime: Runtime) -> WriteWorkflow:
             policy_file.close()
     finally:
         approvals_directory.close()
-    if policy is None:
+    if policy is None or actor not in policy.identities:
         plans.close()
         approvals.close()
         raise ValueError("external write policy unavailable") from None
-    return WriteWorkflow(catalog, plans, approvals, policy)
+    return WriteWorkflow(catalog, plans, approvals, policy, actor)
 
 
 def load_write_workflow(_project: Path) -> WriteWorkflow:

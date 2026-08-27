@@ -23,6 +23,7 @@ from intent_engineering.core.models import (
     SourceMode,
 )
 from intent_engineering.core.policy.project import initialize_project
+from intent_engineering.intent_workflow.conversation import ConversationCapture
 from intent_engineering.storage.executor import LocalChangeSetExecutor
 from intent_engineering.storage.jsonl.case_store import serialize_case
 from intent_engineering.storage.jsonl.history_store import serialize_changeset
@@ -203,6 +204,73 @@ def test_evidence_ids_versions_hashes_and_parent_links_are_consistent(tmp_path: 
     }
 
 
+@pytest.mark.parametrize(
+    ("field", "expected_code"),
+    [
+        ("content", "evidence.content_hash_mismatch"),
+        ("content_hash", "evidence.content_hash_mismatch"),
+        ("external_version", "evidence.version_mismatch"),
+        ("id", "evidence.id_mismatch"),
+    ],
+)
+def test_review_fix_conversation_identity_rejects_byte_preserving_tampering(
+    tmp_path: Path,
+    field: str,
+    expected_code: str,
+) -> None:
+    root = tmp_path / field
+    root.mkdir()
+    initialize_project(root)
+    runtime = load_runtime(root)
+    record = ConversationCapture(
+        runtime.evidence_store,
+        connector_id="conversation:codex",
+    ).record_turn(
+        conversation_ref="codex:review-fix",
+        role="human",
+        author="local-asha",
+        content={"decision": "approved"},
+        captured_at=NOW,
+        acl=("local-asha",),
+    )
+    assert validate_project(root).valid is True
+    evidence_path = root / ".intent/evidence/evidence.jsonl"
+    original = evidence_path.read_bytes()
+
+    def changed(value: str) -> str:
+        return value[:-1] + ("0" if value[-1] != "0" else "1")
+
+    replacements = {
+        "content": (
+            b'"content":{"decision":"approved"}',
+            b'"content":{"decision":"rejected"}',
+        ),
+        "content_hash": (
+            f'"content_hash":"{record.content_hash}"'.encode(),
+            f'"content_hash":"{changed(record.content_hash)}"'.encode(),
+        ),
+        "external_version": (
+            f'"external_version":"{record.external_version}"'.encode(),
+            f'"external_version":"{changed(record.external_version)}"'.encode(),
+        ),
+        "id": (
+            f'"id":"{record.id}"'.encode(),
+            f'"id":"{changed(record.id)}"'.encode(),
+        ),
+    }
+    old, new = replacements[field]
+    assert len(old) == len(new)
+    assert original.count(old) == 1
+    tampered = original.replace(old, new)
+    assert len(tampered) == len(original)
+    evidence_path.write_bytes(tampered)
+
+    report = validate_project(root)
+
+    assert report.valid is False
+    assert expected_code in {item.code for item in report.diagnostics}
+
+
 def test_changeset_history_evidence_baselines_ids_and_graph_version_are_consistent(
     tmp_path: Path,
 ) -> None:
@@ -253,9 +321,42 @@ def test_case_lifecycle_and_resolution_must_match_changeset_history(tmp_path: Pa
 @pytest.mark.parametrize(
     ("payload", "expected"),
     [
-        ({"checkpoints": {"unknown": {"connector_id": "unknown", "cursor": None, "committed_at": NOW.isoformat()}}}, "checkpoint.connector_unknown"),
-        ({"checkpoints": {"git": {"connector_id": "git", "cursor": "not-a-sha", "committed_at": NOW.isoformat()}}}, "checkpoint.cursor_invalid"),
-        ({"checkpoints": {"markdown": {"connector_id": "git", "cursor": None, "committed_at": NOW.isoformat()}}}, "checkpoints.invalid"),
+        (
+            {
+                "checkpoints": {
+                    "unknown": {
+                        "connector_id": "unknown",
+                        "cursor": None,
+                        "committed_at": NOW.isoformat(),
+                    }
+                }
+            },
+            "checkpoint.connector_unknown",
+        ),
+        (
+            {
+                "checkpoints": {
+                    "git": {
+                        "connector_id": "git",
+                        "cursor": "not-a-sha",
+                        "committed_at": NOW.isoformat(),
+                    }
+                }
+            },
+            "checkpoint.cursor_invalid",
+        ),
+        (
+            {
+                "checkpoints": {
+                    "markdown": {
+                        "connector_id": "git",
+                        "cursor": None,
+                        "committed_at": NOW.isoformat(),
+                    }
+                }
+            },
+            "checkpoints.invalid",
+        ),
     ],
 )
 def test_checkpoint_structure_connector_and_cursor_consistency(
@@ -313,7 +414,7 @@ def test_checkpoint_consumption_boundary_rejects_missing_or_foreign_associations
                         "connector_id": "markdown",
                         "cursor": None,
                         "committed_at": NOW.isoformat(),
-                            "consumed_evidence_ids": [evidence.id],
+                        "consumed_evidence_ids": [evidence.id],
                     }
                 }
             },
@@ -333,9 +434,7 @@ def test_checkpoint_consumption_must_be_an_exact_ledger_prefix(
     root.mkdir()
     initialize_project(root)
     runtime = load_runtime(root)
-    records = tuple(
-        _record(content=f"# Version {version}\n") for version in (1, 2, 3)
-    )
+    records = tuple(_record(content=f"# Version {version}\n") for version in (1, 2, 3))
     for record in records:
         runtime.evidence_store.associate("markdown", record)  # type: ignore[attr-defined]
     ids = tuple(record.id for record in records)

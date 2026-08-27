@@ -110,7 +110,7 @@ def _live_fake_workflow(runtime, provider: _WriteRuntime) -> WriteWorkflow:
         loaded.catalog.configured,
         mcp_runtime=provider,  # type: ignore[arg-type]
     )
-    return WriteWorkflow(catalog, loaded.plans, loaded.approvals, loaded.policy)
+    return WriteWorkflow(catalog, loaded.plans, loaded.approvals, loaded.policy, loaded.actor)
 
 
 class _CancellingWriteRuntime(_WriteRuntime):

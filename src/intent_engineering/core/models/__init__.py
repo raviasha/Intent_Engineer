@@ -30,7 +30,6 @@ from intent_engineering.core.models.evidence import (
 from intent_engineering.core.models.graph import Confidence, Edge, Graph, Node, TypeRegistry
 from intent_engineering.core.models.implementation import ImplementationClaim
 from intent_engineering.core.models.project import ProjectConfig, SyncCheckpoint
-from intent_engineering.core.models.source_roles import SourceRole, SourceRoleAssignment
 from intent_engineering.core.models.reconciliation import (
     ClassificationEvent,
     DriftObservation,
@@ -39,6 +38,7 @@ from intent_engineering.core.models.reconciliation import (
     ReconciliationEvidenceSide,
     is_nonterminal_case_status,
 )
+from intent_engineering.core.models.source_roles import SourceRole, SourceRoleAssignment
 
 __all__ = [
     "CandidateAssertion",

@@ -459,6 +459,32 @@ def context_command(
     emit(pack, output_format)
 
 
+@app.command("preflight")
+def preflight_diagnostic_command(
+    task: str = typer.Option(..., "--task"),
+    project: Path = typer.Option(Path("."), "--project"),
+    output_format: OutputFormat = typer.Option(OutputFormat.TEXT, "--format"),
+) -> None:
+    """Render task context diagnostically without classifying or minting authorization."""
+    runtime = _runtime(project)
+    principals = _authorized_principals(runtime)
+    provider = ContextProvider(
+        _graph(runtime),
+        _authorized_cases(runtime, principals),
+        runtime.config,
+        _authorized_evidence(runtime, principals),
+    )
+    emit(
+        {
+            "schema_version": "1",
+            "mode": "diagnostic",
+            "authorization_issued": False,
+            "context": provider.for_task(task, actor=principals),
+        },
+        output_format,
+    )
+
+
 @reconcile_app.command("list")
 def reconcile_list_command(
     project: Path = typer.Option(Path("."), "--project"),

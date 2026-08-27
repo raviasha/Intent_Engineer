@@ -2,15 +2,19 @@
 
 from __future__ import annotations
 
+import asyncio
 import shutil
 from pathlib import Path
 
 import pytest
+import yaml  # type: ignore[import-untyped]
 
 from intent_engineering.capture.mcp import load_profile
 from intent_engineering.capture.mcp.profile_loader import load_connector_config_bytes
+from intent_engineering.intent_workflow.models import TaskClassification
 from tests.e2e.public_alpha_harness import PublicAlphaHarness
 from tests.helpers.cli import init_git_repo, run_intent
+from tests.integration.mcp.test_read_sync import McpSyncHarness
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -74,14 +78,54 @@ def test_public_alpha_docs_and_bindings_match_the_shipped_operating_model(
 ) -> None:
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     guide = (ROOT / "docs/mcp.md").read_text(encoding="utf-8")
+    adoption = (ROOT / "docs/intent-aware-agent.md").read_text(encoding="utf-8")
     profiles = (ROOT / "docs/provider-profiles.md").read_text(encoding="utf-8")
     examples = (ROOT / "examples/mcp-bindings/README.md").read_text(encoding="utf-8")
 
-    for text in (readme, guide):
+    for text in (readme, guide, adoption):
         assert "intent sync" in text
         assert "intent drift" in text
         assert "intent write approve" in text
         assert "unattended external writes" in text
+    for command in (
+        "intent init --project .",
+        "intent bootstrap --prd docs/prd.md",
+        "intent sources add",
+        "intent connectors test",
+        "intent proposals show",
+        "intent proposals confirm",
+        "intent preflight --task",
+        "intent context --task",
+        "intent reconcile resolve",
+    ):
+        assert command in adoption
+    for truth in (
+        "agent_submission_required",
+        "MandatoryHookUnavailable",
+        "Codex mandatory mutation hook is unavailable",
+        "disabled",
+        "new_or_ambiguous",
+        "conflicting",
+        "insufficient evidence",
+        "does not mint",
+        "optional",
+        "confidence",
+        "ClarificationCoordinator",
+    ):
+        assert truth in adoption
+    assert "insufficient_evidence" not in adoption
+    assert {item.value for item in TaskClassification} == {
+        "aligned",
+        "conflicting",
+        "new_or_ambiguous",
+        "no_semantic_impact",
+    }
+    assert adoption.index("intent sources add markdown") < adoption.index(
+        "intent_bootstrap_propose"
+    )
+    assert adoption.index("intent sources add '<source-role-connector-id>'") < adoption.index(
+        "intent_bootstrap_propose"
+    )
     assert "polling" in guide
     assert "original author" in guide.lower()
     assert "--connector-id" in guide
@@ -92,7 +136,50 @@ def test_public_alpha_docs_and_bindings_match_the_shipped_operating_model(
     assert "profiles/mcp/slack.yaml" in examples
 
     clean_project = init_git_repo(tmp_path)
+    (clean_project / "docs").mkdir()
+    (clean_project / "docs/prd.md").write_text(
+        "# Local export\n\nExports remain local by default.\n",
+        encoding="utf-8",
+    )
     assert run_intent(clean_project, "init").returncode == 0
+    bootstrap = run_intent(
+        clean_project,
+        "bootstrap",
+        "--prd",
+        "docs/prd.md",
+        "--project",
+        ".",
+        "--format",
+        "json",
+    )
+    assert bootstrap.returncode == 4, bootstrap.stderr
+    assert bootstrap.json()["status"] == "agent_submission_required"
+    prd_role = run_intent(
+        clean_project,
+        "sources",
+        "add",
+        "markdown",
+        "docs/prd.md",
+        "--role",
+        "declared_intent",
+        "--project",
+        ".",
+        "--format",
+        "json",
+    )
+    assert prd_role.returncode == 0, prd_role.stderr
+    diagnostic = run_intent(
+        clean_project,
+        "preflight",
+        "--task",
+        "inspect local export",
+        "--format",
+        "json",
+    )
+    assert diagnostic.returncode == 0, diagnostic.stderr
+    assert diagnostic.json()["mode"] == "diagnostic"
+    assert diagnostic.json()["authorization_issued"] is False
+    assert "token" not in diagnostic.stdout
     (clean_project / "profiles/mcp").mkdir(parents=True)
     shutil.copy2(ROOT / "profiles/mcp/slack.yaml", clean_project / "profiles/mcp/slack.yaml")
     shutil.copy2(
@@ -119,3 +206,132 @@ def test_public_alpha_docs_and_bindings_match_the_shipped_operating_model(
         rendered = (ROOT / f"examples/mcp-bindings/{provider}.yaml").read_text()
         assert f"env:{provider.upper()}_TOKEN" in rendered
         assert "test_secret" not in rendered
+
+
+def test_review_fix_public_cli_uses_canonical_mcp_authority_identity(
+    tmp_path: Path,
+) -> None:
+    project = init_git_repo(tmp_path)
+    assert run_intent(project, "init").returncode == 0
+    config_path = project / ".intent/config.yaml"
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    config["local_actor"] = "local-asha"
+    config_path.write_text(yaml.safe_dump(config, sort_keys=True), encoding="utf-8")
+    (project / "profiles/mcp").mkdir(parents=True)
+    shutil.copy2(ROOT / "profiles/mcp/slack.yaml", project / "profiles/mcp/slack.yaml")
+    shutil.copy2(
+        ROOT / "examples/mcp-bindings/slack.yaml",
+        project / ".intent/connectors/slack.yaml",
+    )
+
+    captured = McpSyncHarness(tmp_path / "captured-slack")
+    actual_connector = captured.connector()
+    result = asyncio.run(captured.orchestrator.run("capture", (actual_connector,)))
+    assert result.evidence_added == 1
+    record = captured.evidence_store.ledger(
+        actual_connector.connector_id,
+        connector_type="mcp",
+    )[0].evidence
+
+    listed = run_intent(project, "connectors", "list", "--format", "json")
+    inspected = run_intent(
+        project,
+        "connectors",
+        "inspect",
+        "slack-local",
+        "--format",
+        "json",
+    )
+    assert listed.returncode == inspected.returncode == 0
+    listed_ids = listed.json()["connectors"][0]["source_role_connector_ids"]
+    inspected_ids = inspected.json()["source_role_connector_ids"]
+    assert listed_ids == inspected_ids
+    assert inspected_ids["message"] == actual_connector.connector_id
+
+    ambiguous = run_intent(
+        project,
+        "sources",
+        "add",
+        "slack-local",
+        record.source_locator,
+        "--role",
+        "proposed_intent",
+        "--format",
+        "json",
+    )
+    assert ambiguous.returncode == 1
+    configured = run_intent(
+        project,
+        "sources",
+        "add",
+        actual_connector.connector_id,
+        record.source_locator,
+        "--role",
+        "proposed_intent",
+        "--format",
+        "json",
+    )
+    assert configured.returncode == 0, configured.stderr
+    assert configured.json()["source_role"]["connector_id"] == actual_connector.connector_id
+    persisted = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    assert persisted["source_roles"] == [
+        {
+            "connector_id": actual_connector.connector_id,
+            "inherited": False,
+            "role": "proposed_intent",
+            "scope": record.source_locator,
+        }
+    ]
+
+
+def test_scheduled_workflow_is_read_only_and_orders_capture_before_assurance() -> None:
+    workflow_path = ROOT / ".github/workflows/intent-sync.yml"
+    raw = workflow_path.read_text(encoding="utf-8")
+    workflow = yaml.safe_load(raw)
+
+    assert set(workflow["on"]) == {"schedule", "workflow_dispatch"}
+    assert workflow["on"]["schedule"] == [{"cron": "17 2 * * *"}]
+    job = workflow["jobs"]["drift"]
+    assert job["permissions"] == {
+        "contents": "read",
+        "issues": "read",
+        "pull-requests": "read",
+    }
+    steps = job["steps"]
+    assert steps[0] == {"uses": "actions/checkout@v4", "with": {"fetch-depth": 0}}
+    assert steps[1] == {
+        "uses": "actions/setup-python@v5",
+        "with": {"python-version": "3.12"},
+    }
+    assert [step["name"] for step in steps[2:7]] == [
+        "Install Intent Engineering",
+        "Initialize or load local intent state",
+        "Validate local intent state",
+        "Capture configured source versions",
+        "Render drift and assurance report",
+    ]
+    assert steps[7] == {
+        "uses": "actions/upload-artifact@v4",
+        "with": {"name": "intent-drift", "path": "intent-drift.md"},
+    }
+    commands = [step.get("run", "") for step in steps]
+    assert commands[2] == "python -m pip install ."
+    assert commands[3] == "intent init"
+    assert "--force" not in commands[3]
+    assert commands[4] == "intent validate"
+    assert commands[5] == "intent sync --sources markdown,git,github"
+    assert commands[6] == "intent drift --format markdown --output intent-drift.md"
+    assert steps[5]["env"] == {
+        "GH_TOKEN": "${{ secrets.GITHUB_TOKEN }}",
+        "GITHUB_REPOSITORY": "${{ github.repository }}",
+    }
+    forbidden = (
+        "proposals confirm",
+        "reconcile resolve",
+        "write preview",
+        "write approve",
+        "write execute",
+        "contents: write",
+        "echo $",
+    )
+    assert not any(value in raw for value in forbidden)

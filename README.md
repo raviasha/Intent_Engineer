@@ -24,11 +24,22 @@ Requires Python 3.12 or newer.
 ```bash
 python -m pip install -e '.[dev]'
 intent init --project .
+intent bootstrap --prd docs/prd.md --format json
+intent sources add markdown docs/prd.md --role declared_intent
+intent proposals list --format json
 intent sync --sources markdown,git
 intent status
 intent context --task "add local export"
+intent preflight --task "add local export" --format json
 intent drift --require-review
 ```
+
+Bootstrap first captures the PRD and asks an active agent for a typed proposal; it does not silently
+invent canonical intent. Review and confirm that proposal before treating its core as active. The CLI
+`preflight` command is diagnostic only and never mints a mutation capability. See the executable
+[intent-aware agent adoption guide](docs/intent-aware-agent.md) for source roles, compatible
+Slack/Jira/Confluence/Notion setup, clarification, independent review, host support, post-task
+evidence, and scheduling.
 
 For team conversations and external requirements, configure GitHub and/or a compatible MCP source,
 then schedule capture independently from reconciliation:
@@ -49,6 +60,11 @@ changes require human review. External writes additionally require `intent write
 separate interactive `intent write approve`, and `intent write execute` against the unchanged
 target. See [the MCP and agent guide](docs/mcp.md) and
 [provider-profile guide](docs/provider-profiles.md).
+
+Active-agent reasoning may submit evidence-backed proposals. Scheduled semantic inference is
+optional and can only open grounded review cases; confidence is not a claim of truth and never
+authorizes canonical changes. Mandatory Codex mutation coverage is not currently available, so no
+Codex plugin is shipped. Disabling host integration leaves ordinary coding behavior unchanged.
 
 `intent reconcile resolve <case-id>` is deliberately two-phase. The first call
 records a deterministic preview and returns an approval hash with review-required

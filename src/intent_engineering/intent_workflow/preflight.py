@@ -266,7 +266,9 @@ def _parse_proposals(content: bytes) -> tuple[IntentProposal, ...]:
         ):
             raise ValueError("invalid intent proposal ledger")
         decisions[decision.proposal_id] = decision
-    return tuple(proposal for proposal_id, proposal in proposals.items() if proposal_id not in decisions)
+    return tuple(
+        proposal for proposal_id, proposal in proposals.items() if proposal_id not in decisions
+    )
 
 
 def _snapshot_state(
@@ -498,9 +500,8 @@ class PreflightService:
             configured_roles = set(config.source_roles)
             submitted_roles = set(proposal.source_roles)
             if (
-                (proposal.kind is ProposalKind.BOOTSTRAP and not submitted_roles)
-                or not submitted_roles.issubset(configured_roles)
-            ):
+                proposal.kind is ProposalKind.BOOTSTRAP and not submitted_roles
+            ) or not submitted_roles.issubset(configured_roles):
                 raise ValueError("invalid provisional source role")
             used_roles: set[SourceRoleAssignment] = set()
             for evidence_id in proposal.evidence_refs:
@@ -577,8 +578,7 @@ class PreflightService:
         inherited = tuple(
             assignment
             for assignment in assignments
-            if assignment.inherited
-            and locator.startswith(f"{assignment.scope.rstrip('/')}/")
+            if assignment.inherited and locator.startswith(f"{assignment.scope.rstrip('/')}/")
         )
         return max(inherited, key=lambda assignment: len(assignment.scope), default=None)
 
@@ -706,7 +706,7 @@ class PreflightService:
                         envelope.created_at,
                         evidence_index[submission.agent_evidence_ref].observed_at,
                     ),
-                    authors=(envelope.actor, self._agent_principal),
+                    authors=tuple(sorted((envelope.actor, self._agent_principal))),
                     confidence=1.0,
                     source_mode=SourceMode.EXPLICIT,
                 ),
@@ -800,7 +800,10 @@ class PreflightService:
         submission: AgentClassificationSubmission,
         principals: frozenset[str],
     ) -> AuthenticatedPreflightResult:
-        if type(envelope) is not TaskEnvelope or type(submission) is not AgentClassificationSubmission:
+        if (
+            type(envelope) is not TaskEnvelope
+            or type(submission) is not AgentClassificationSubmission
+        ):
             raise ValueError("invalid preflight input")
         envelope = TaskEnvelope.model_validate_json(envelope.model_dump_json())
         submission = AgentClassificationSubmission.model_validate_json(submission.model_dump_json())
@@ -825,9 +828,7 @@ class PreflightService:
             or submission.requested_scope != tuple(sorted(envelope.requested_scope))
         ):
             raise ValueError("stale preflight binding")
-        human, agent = self._validate_turns(
-            envelope, submission, evidence, ingestions, principals
-        )
+        human, agent = self._validate_turns(envelope, submission, evidence, ingestions, principals)
         selected, relevant_evidence = self._validate_references(
             submission,
             graph,
@@ -897,9 +898,7 @@ class PreflightService:
             case _:
                 raise ValueError("invalid classification")
 
-        result_evidence = tuple(
-            dict.fromkeys((human.id, agent.id, *submission.evidence_refs))
-        )
+        result_evidence = tuple(dict.fromkeys((human.id, agent.id, *submission.evidence_refs)))
         result = PreflightResult(
             task_id=envelope.id,
             graph_version=graph.version,

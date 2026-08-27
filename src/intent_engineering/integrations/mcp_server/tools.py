@@ -127,8 +127,8 @@ class McpReadServices:
             config_read = self.runtime.workspace_directory.read_relative(
                 "config.yaml", nonblocking=True
             )
-            config = ProjectConfig.model_validate(
-                load_strict_yaml_mapping_bytes(config_read.content)
+            config = ProjectConfig.model_validate_json(
+                json.dumps(load_strict_yaml_mapping_bytes(config_read.content))
             )
             if (
                 config.project_id != self.runtime.config.project_id

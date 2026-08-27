@@ -126,16 +126,20 @@ def test_catalog_loads_descriptor_safe_config_without_resolving_credentials(tmp_
 
     catalog = load_connector_catalog(project)
 
-    assert catalog.summaries() == (
-        {
-            "id": "slack-local",
-            "profile_id": "slack",
-            "profile_version": "1",
-            "transport": "stdio",
-            "enabled": True,
-        },
-    )
+    summaries = catalog.summaries()
+    assert len(summaries) == 1
+    summary = dict(summaries[0])
+    source_role_connector_ids = summary.pop("source_role_connector_ids")
+    assert summary == {
+        "id": "slack-local",
+        "profile_id": "slack",
+        "profile_version": "1",
+        "transport": "stdio",
+        "enabled": True,
+    }
+    assert set(cast(dict[str, str], source_role_connector_ids)) == {"message", "thread"}
     inspected = catalog.inspect("slack-local")
+    assert inspected["source_role_connector_ids"] == source_role_connector_ids
     assert inspected["environment_names"] == ["SLACK_TOKEN"]
     assert "env:SLACK_TOKEN" not in json.dumps(inspected)
 

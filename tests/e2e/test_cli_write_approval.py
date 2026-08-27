@@ -241,7 +241,7 @@ def _workflow_with_runtime(project: Path, runtime: _WriteRuntime) -> WriteWorkfl
         loaded.catalog.configured,
         mcp_runtime=runtime,  # type: ignore[arg-type]
     )
-    return WriteWorkflow(catalog, loaded.plans, loaded.approvals, loaded.policy)
+    return WriteWorkflow(catalog, loaded.plans, loaded.approvals, loaded.policy, loaded.actor)
 
 
 def _set_actor(project: Path, actor: str) -> None:

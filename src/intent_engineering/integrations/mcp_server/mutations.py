@@ -424,12 +424,19 @@ class McpMutationServices:
                 "config.yaml",
                 nonblocking=True,
             )
-            config = ProjectConfig.model_validate(load_strict_yaml_mapping_bytes(source.content))
+            config = ProjectConfig.model_validate_json(
+                json.dumps(load_strict_yaml_mapping_bytes(source.content))
+            )
             actor = config.local_actor
+            expected_actor = (
+                self.workflow.actor
+                if self.workflow is not None
+                else self.runtime.config.local_actor
+            )
             if (
                 config.project_id != self.runtime.config.project_id
                 or config.graph_path != self.runtime.config.graph_path
-                or actor != self.runtime.config.local_actor
+                or actor != expected_actor
             ):
                 return None
             principals = frozenset(

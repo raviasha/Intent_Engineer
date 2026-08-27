@@ -61,6 +61,40 @@ class ConnectorCatalog:
             raise ConnectorConfigurationError("MCP connector is unavailable")
         return matches[0]
 
+    def _source_role_connector_ids(
+        self,
+        item: ConfiguredConnector,
+    ) -> dict[str, str]:
+        """Derive exact producer identities without contacting the provider."""
+        return {
+            object_name: McpConnector(
+                self.mcp_runtime,
+                config=item.config,
+                profile=item.profile,
+                object_name=object_name,
+                local_actor=self.runtime.config.local_actor,
+            ).connector_id
+            for object_name in sorted(item.profile.objects)
+        }
+
+    def source_role_connector_id(self, connector_id: str) -> str:
+        """Resolve one exact canonical MCP producer identity or fail closed."""
+        identities = {
+            item.config.id: self._source_role_connector_ids(item) for item in self.configured
+        }
+        exact = tuple(
+            identity
+            for by_object in identities.values()
+            for identity in by_object.values()
+            if identity == connector_id
+        )
+        if len(exact) == 1:
+            return exact[0]
+        configured = identities.get(connector_id)
+        if configured is not None and len(configured) == 1:
+            return next(iter(configured.values()))
+        raise ConnectorConfigurationError("MCP connector is unavailable")
+
     def summaries(self) -> tuple[dict[str, object], ...]:
         """Return stable, credential-free connector summaries."""
         return tuple(
@@ -70,6 +104,7 @@ class ConnectorCatalog:
                 "profile_version": item.profile.version,
                 "transport": item.config.server.transport,
                 "enabled": True,
+                "source_role_connector_ids": self._source_role_connector_ids(item),
             }
             for item in self.configured
         )
@@ -89,6 +124,7 @@ class ConnectorCatalog:
             "resources": dict(sorted(item.config.binding.resources.items())),
             "environment_names": sorted(item.config.server.environment_refs),
             "header_names": sorted(item.config.server.headers),
+            "source_role_connector_ids": self._source_role_connector_ids(item),
         }
 
     def read_connectors(self, connector_id: str | None = None) -> tuple[Connector, ...]:

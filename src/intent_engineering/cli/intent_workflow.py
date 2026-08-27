@@ -139,18 +139,19 @@ def _canonical_provider_scope(value: str) -> str:
     return value
 
 
-def _source_scope(runtime: Runtime, connector_id: str, scope: str) -> str:
-    configured_ids = {item.config.id for item in connector_catalog(runtime).configured}
+def _source_identity_and_scope(
+    runtime: Runtime,
+    connector_id: str,
+    scope: str,
+) -> tuple[str, str]:
     if connector_id == "markdown":
-        return _canonical_scope(scope)
+        return connector_id, _canonical_scope(scope)
     if connector_id == "git":
-        return (
+        return connector_id, (
             _canonical_provider_scope(scope)
             if _URI_SCHEME.match(scope)
             else _canonical_scope(scope)
         )
-    if connector_id in configured_ids:
-        return _canonical_provider_scope(scope)
     if connector_id.startswith("github:"):
         repository = connector_id.removeprefix("github:")
         GitHubCheckpoint(repository=repository)
@@ -163,8 +164,9 @@ def _source_scope(runtime: Runtime, connector_id: str, scope: str) -> str:
             parsed.path == repository_path or parsed.path.startswith(f"{repository_path}/")
         ):
             raise ValueError("GitHub source scope mismatch")
-        return canonical
-    raise ValueError("unknown connector")
+        return connector_id, canonical
+    canonical_id = connector_catalog(runtime).source_role_connector_id(connector_id)
+    return canonical_id, _canonical_provider_scope(scope)
 
 
 def _snapshot_config(runtime: Runtime) -> tuple[ProjectConfig, bytes]:
@@ -341,9 +343,13 @@ def _source_role_result(
     try:
         runtime = load_runtime(project)
         config, preimage = _snapshot_config(runtime)
-        canonical_scope = _source_scope(runtime, connector_id, scope)
+        canonical_connector_id, canonical_scope = _source_identity_and_scope(
+            runtime,
+            connector_id,
+            scope,
+        )
         assignment = SourceRoleAssignment(
-            connector_id=connector_id,
+            connector_id=canonical_connector_id,
             scope=canonical_scope,
             role=role,
             inherited=inherited,
@@ -351,7 +357,7 @@ def _source_role_result(
         retained = tuple(
             item
             for item in config.source_roles
-            if (item.connector_id, item.scope) != (connector_id, canonical_scope)
+            if (item.connector_id, item.scope) != (canonical_connector_id, canonical_scope)
         )
         updated = config.model_copy(update={"source_roles": (*retained, assignment)})
         updated = ProjectConfig.model_validate_json(updated.model_dump_json())
@@ -360,20 +366,28 @@ def _source_role_result(
             if config_file.read_bytes_nonblocking() != preimage:
                 raise ValueError("project configuration changed")
             if updated == config:
-                return True, {
-                    "status": "unchanged",
-                    "source_role": assignment.model_dump(mode="json"),
-                }, None
+                return (
+                    True,
+                    {
+                        "status": "unchanged",
+                        "source_role": assignment.model_dump(mode="json"),
+                    },
+                    None,
+                )
             encoded = yaml.safe_dump(
                 updated.model_dump(mode="json"),
                 allow_unicode=True,
                 sort_keys=True,
             ).encode("utf-8")
             config_file.atomic_write(encoded, reject_target_races=True)
-        return True, {
-            "status": "configured",
-            "source_role": assignment.model_dump(mode="json"),
-        }, None
+        return (
+            True,
+            {
+                "status": "configured",
+                "source_role": assignment.model_dump(mode="json"),
+            },
+            None,
+        )
     except Exception:  # noqa: BLE001 - config/path details remain private
         return False, None, None
     except BaseException as error:  # noqa: BLE001 - preserve detached control flow
@@ -543,11 +557,15 @@ def _confirmation_result(
             actor=config.local_actor,
             at=datetime.now(UTC),
         )
-        return True, {
-            "status": "activated",
-            "proposal_id": proposal_id,
-            "graph_version": graph.version,
-        }, None
+        return (
+            True,
+            {
+                "status": "activated",
+                "proposal_id": proposal_id,
+                "graph_version": graph.version,
+            },
+            None,
+        )
     except Exception:  # noqa: BLE001 - proposal/config details remain private
         return False, None, None
     except BaseException as error:  # noqa: BLE001 - preserve detached control flow

@@ -120,9 +120,7 @@ def _evidence_attribution(
     evidence_index: Mapping[str, EvidenceRecord],
 ) -> tuple[datetime, tuple[str, ...]]:
     records = tuple(evidence_index[reference] for reference in evidence_refs)
-    authors = tuple(
-        sorted({record.author for record in records if record.author is not None})
-    )
+    authors = tuple(sorted({record.author for record in records if record.author is not None}))
     if not records or not authors:
         raise ValueError("semantic assertion evidence is not attributable")
     return max(record.observed_at for record in records), authors
@@ -148,7 +146,11 @@ def _group_epistemic_sides(
             EvidenceSide(
                 label=(label if not multiple else f"{label}:{','.join(subject_refs)}"),
                 claim=(
-                    ("Current canonical graph assertions for: " if current else "Proposed semantic change supported by assertions for: ")
+                    (
+                        "Current canonical graph assertions for: "
+                        if current
+                        else "Proposed semantic change supported by assertions for: "
+                    )
                     + ", ".join(subject_refs)
                 ),
                 evidence_refs=refs,
@@ -257,9 +259,7 @@ def _decision_id(material: Mapping[str, object]) -> str:
     return f"proposal-decision:{_digest(material)}"
 
 
-def _review_case_fingerprint(
-    proposal: IntentProposal, reasons: tuple[str, ...]
-) -> str:
+def _review_case_fingerprint(proposal: IntentProposal, reasons: tuple[str, ...]) -> str:
     return _digest(
         {
             "proposal_id": proposal.id,
@@ -274,7 +274,9 @@ def _changeset_id(prefix: str, changeset: ChangeSet) -> str:
     return f"changeset:{prefix}:{_digest(changeset.model_dump(mode='json', exclude={'id'}))}"
 
 
-def _records(snapshot: LocalTransactionSnapshot) -> tuple[
+def _records(
+    snapshot: LocalTransactionSnapshot,
+) -> tuple[
     Graph,
     tuple[EvidenceRecord, ...],
     dict[str, str | None],
@@ -289,8 +291,10 @@ def _records(snapshot: LocalTransactionSnapshot) -> tuple[
 
 
 def _principals(value: object) -> frozenset[str]:
-    if type(value) is not frozenset or not value or any(
-        type(item) is not str or not item for item in cast(frozenset[object], value)
+    if (
+        type(value) is not frozenset
+        or not value
+        or any(type(item) is not str or not item for item in cast(frozenset[object], value))
     ):
         raise ValueError("invalid clarification principals")
     return cast(frozenset[str], value)
@@ -510,7 +514,9 @@ class ClarificationCoordinator:
             )
         fresh = self._transactions.snapshot()
         fresh_graph, fresh_evidence, fresh_predecessors = _records(fresh)
-        if fresh_graph != graph or any(record.id not in self._evidence_index(fresh_evidence) for record in captured):
+        if fresh_graph != graph or any(
+            record.id not in self._evidence_index(fresh_evidence) for record in captured
+        ):
             raise ValueError("clarification evidence changed")
         durable_questions = tuple(
             ClarificationQuestion(
@@ -715,7 +721,9 @@ class ClarificationCoordinator:
     ) -> ClarificationIntentProposal:
         if type(submission) is not ClarificationProposalSubmission:
             raise ValueError("invalid clarification proposal")
-        submission = ClarificationProposalSubmission.model_validate_json(submission.model_dump_json())
+        submission = ClarificationProposalSubmission.model_validate_json(
+            submission.model_dump_json()
+        )
         principals = _principals(principals)
         session = self._store.session(submission.session_id)
         required = {item.id for item in session.questions if item.required}
@@ -915,7 +923,9 @@ class ProposalConfirmationService:
         policy_bytes = snapshot.content.get("authority_policy")
         if config_bytes is None or policy_bytes is None:
             raise ValueError("authority unavailable")
-        config = ProjectConfig.model_validate(load_strict_yaml_mapping_bytes(config_bytes))
+        config = ProjectConfig.model_validate_json(
+            json.dumps(load_strict_yaml_mapping_bytes(config_bytes))
+        )
         policy = MutationPolicy.model_validate(load_strict_yaml_mapping_bytes(policy_bytes))
         principals: dict[str, set[str]] = {}
         for name, content in snapshot.content.items():
@@ -971,9 +981,7 @@ class ProposalConfirmationService:
         _, ingestions, _ = parse_evidence_lines(snapshot.content.get("evidence"))
         connector_ids: dict[str, set[str]] = {}
         for ingestion in ingestions:
-            connector_ids.setdefault(ingestion.evidence.id, set()).add(
-                ingestion.connector_id
-            )
+            connector_ids.setdefault(ingestion.evidence.id, set()).add(ingestion.connector_id)
         used: set[SourceRoleAssignment] = set()
         for record in evidence:
             if record.id not in proposal.evidence_refs:
@@ -1004,7 +1012,8 @@ class ProposalConfirmationService:
             or (
                 current_nodes.get(item.subject_ref) is not None
                 and current_nodes[item.subject_ref].intent_fidelity_confidence is not None
-                and item.new_confidence < cast(float, current_nodes[item.subject_ref].intent_fidelity_confidence)
+                and item.new_confidence
+                < cast(float, current_nodes[item.subject_ref].intent_fidelity_confidence)
             )
             for item in changeset.confidence_changes
         ):
@@ -1060,10 +1069,7 @@ class ProposalConfirmationService:
                         for reference in (edge.from_id, edge.to_id)
                     ),
                     *(item.subject_ref for item in proposal.changeset.confidence_changes),
-                    *(
-                        item.claim_id
-                        for item in proposal.changeset.implementation_status_changes
-                    ),
+                    *(item.claim_id for item in proposal.changeset.implementation_status_changes),
                 }
             )
         )
@@ -1089,8 +1095,7 @@ class ProposalConfirmationService:
             {item.node_id: item.replacement for item in proposal.changeset.nodes_updated}
         )
         proposed_confidences = {
-            item.subject_ref: item.new_confidence
-            for item in proposal.changeset.confidence_changes
+            item.subject_ref: item.new_confidence for item in proposal.changeset.confidence_changes
         }
         proposed_assertions: list[_EpistemicAssertion] = []
         for node_id in affected:
@@ -1110,9 +1115,7 @@ class ProposalConfirmationService:
             )
         evidence_sides = _group_epistemic_sides(
             tuple(current_assertions), label="current", current=True
-        ) + _group_epistemic_sides(
-            tuple(proposed_assertions), label="proposal", current=False
-        )
+        ) + _group_epistemic_sides(tuple(proposed_assertions), label="proposal", current=False)
         subject = affected[0]
         case_time = proposal.proposed_at
         history = (
@@ -1154,7 +1157,11 @@ class ProposalConfirmationService:
         latest = {case.id: case for case in versions}
         existing = latest.get(candidate.id)
         if existing is not None:
-            if existing.model_dump(mode="json", exclude={"status", "resolution", "resolved_by_changeset", "history"}) != candidate.model_dump(mode="json", exclude={"status", "resolution", "resolved_by_changeset", "history"}):
+            if existing.model_dump(
+                mode="json", exclude={"status", "resolution", "resolved_by_changeset", "history"}
+            ) != candidate.model_dump(
+                mode="json", exclude={"status", "resolution", "resolved_by_changeset", "history"}
+            ):
                 raise ValueError("review case conflict")
             return existing
         append = validate_case_appends(snapshot.content.get("cases"), (candidate,))
@@ -1209,12 +1216,31 @@ class ProposalConfirmationService:
             for edge in changeset.edges_added
             if not ({edge.from_id, edge.to_id} & added_ids - selected)
         )
+        evidence_refs = tuple(
+            dict.fromkeys(
+                (
+                    *proposal.evidence_refs,
+                    *(ref for node in nodes_added for ref in node.evidence_refs),
+                    *(ref for update in nodes_updated for ref in update.replacement.evidence_refs),
+                    *(
+                        ref
+                        for change in changeset.confidence_changes
+                        for ref in change.evidence_refs
+                    ),
+                    *(
+                        ref
+                        for change in changeset.implementation_status_changes
+                        for ref in change.evidence_refs
+                    ),
+                )
+            )
+        )
         candidate = ChangeSet(
             id="",
             actor=actor,
             timestamp=at,
             baseline_graph_version=proposal.baseline_graph_version,
-            evidence_refs=proposal.evidence_refs,
+            evidence_refs=evidence_refs,
             nodes_added=nodes_added,
             nodes_updated=nodes_updated,
             nodes_superseded=changeset.nodes_superseded,
@@ -1304,10 +1330,7 @@ class ProposalConfirmationService:
                     *(update.node_id for update in changeset.nodes_updated),
                     *changeset.nodes_superseded,
                     *(change.subject_ref for change in changeset.confidence_changes),
-                    *(
-                        change.claim_id
-                        for change in changeset.implementation_status_changes
-                    ),
+                    *(change.claim_id for change in changeset.implementation_status_changes),
                 }
             )
         )
@@ -1352,9 +1375,7 @@ class ProposalConfirmationService:
         graph, evidence, _ = _records(snapshot)
         ledger = snapshot.content.get("intent_proposals")
         actor_aliases = self._aliases(actor, policy, provider_principals)
-        proposer_aliases = self._aliases(
-            proposal.proposed_by, policy, provider_principals
-        )
+        proposer_aliases = self._aliases(proposal.proposed_by, policy, provider_principals)
         conflict_aliases = tuple(
             sorted(
                 {
@@ -1374,11 +1395,8 @@ class ProposalConfirmationService:
             or proposal.changeset.actor != proposal.proposed_by
             or proposal.changeset.timestamp != proposal.proposed_at
             or proposal.changeset.evidence_refs != proposal.evidence_refs
-            or config.project_id
-            not in {graph.id.removeprefix("graph:"), graph.name}
-            or not refs_allowed(
-                proposal.evidence_refs, evidence, frozenset(actor_aliases)
-            )
+            or config.project_id not in {graph.id.removeprefix("graph:"), graph.name}
+            or not refs_allowed(proposal.evidence_refs, evidence, frozenset(actor_aliases))
         ):
             raise ValueError("confirmation authority changed")
         self._validate_source_roles(proposal, config, evidence, snapshot)
@@ -1386,9 +1404,7 @@ class ProposalConfirmationService:
             if (
                 review_case is None
                 or actor not in policy.approvers
-                or not set(actor_aliases).isdisjoint(
-                    set(proposer_aliases) | set(conflict_aliases)
-                )
+                or not set(actor_aliases).isdisjoint(set(proposer_aliases) | set(conflict_aliases))
             ):
                 raise ValueError("review authority changed")
             canonical_case = self._review_case(
@@ -1398,13 +1414,10 @@ class ProposalConfirmationService:
                 reasons,
                 frozenset(actor_aliases),
             )
-            if (
-                canonical_case != review_case
-                or not refs_allowed(
-                    canonical_case.all_evidence_refs,
-                    evidence,
-                    frozenset(actor_aliases),
-                )
+            if canonical_case != review_case or not refs_allowed(
+                canonical_case.all_evidence_refs,
+                evidence,
+                frozenset(actor_aliases),
             ):
                 raise ValueError("review case authority changed")
             review_case = canonical_case
@@ -1436,9 +1449,7 @@ class ProposalConfirmationService:
         graph, evidence, _ = _records(snapshot)
         ledger = snapshot.content.get("intent_proposals")
         actor_aliases = self._aliases(actor, policy, provider_principals)
-        proposer_aliases = self._aliases(
-            proposal.proposed_by, policy, provider_principals
-        )
+        proposer_aliases = self._aliases(proposal.proposed_by, policy, provider_principals)
         conflict_aliases = tuple(
             sorted(
                 {
@@ -1453,13 +1464,10 @@ class ProposalConfirmationService:
             ledger is None
             or self._store.bytes() != ledger
             or self._store.get(proposal.id) != proposal
-            or config.project_id
-            not in {graph.id.removeprefix("graph:"), graph.name}
+            or config.project_id not in {graph.id.removeprefix("graph:"), graph.name}
             or not set(selected).issubset(added)
             or (added and not selected)
-            or not refs_allowed(
-                proposal.evidence_refs, evidence, frozenset(actor_aliases)
-            )
+            or not refs_allowed(proposal.evidence_refs, evidence, frozenset(actor_aliases))
             or at < proposal.proposed_at
         ):
             raise ValueError("applied confirmation binding changed")
@@ -1548,11 +1556,8 @@ class ProposalConfirmationService:
                 ResolutionAction.UPDATE_REQUIREMENT,
                 activation.id,
             )
-            if (
-                versions[-1] != expected_case
-                or not refs_allowed(
-                    expected_case.all_evidence_refs, evidence, frozenset(actor_aliases)
-                )
+            if versions[-1] != expected_case or not refs_allowed(
+                expected_case.all_evidence_refs, evidence, frozenset(actor_aliases)
             ):
                 raise ValueError("resolved review case replay mismatch")
         return ProposalConfirmationResult(
@@ -1595,10 +1600,7 @@ class ProposalConfirmationService:
         existing_decision = self._store.decision_for(proposal.id)
         added = tuple(sorted(node.id for node in proposal.changeset.nodes_added))
         selected = tuple(sorted(selected_node_ids or added))
-        if (
-            config.project_id != graph.id.removeprefix("graph:")
-            and config.project_id != graph.name
-        ):
+        if config.project_id != graph.id.removeprefix("graph:") and config.project_id != graph.name:
             raise ValueError("project binding changed")
         if (
             not set(selected).issubset(added)
@@ -1620,9 +1622,7 @@ class ProposalConfirmationService:
             )
         case: ReconciliationCase | None = None
         if high_risk:
-            case = self._review_case(
-                proposal, graph, evidence, reasons, frozenset(actor_aliases)
-            )
+            case = self._review_case(proposal, graph, evidence, reasons, frozenset(actor_aliases))
             case = self._ensure_case(snapshot, case)
             if actor not in policy.approvers:
                 return ProposalConfirmationResult(
@@ -1631,9 +1631,7 @@ class ProposalConfirmationService:
                     graph_version=graph.version,
                     case_id=case.id,
                 )
-            if not set(actor_aliases).isdisjoint(
-                set(proposer_aliases) | set(conflict_aliases)
-            ):
+            if not set(actor_aliases).isdisjoint(set(proposer_aliases) | set(conflict_aliases)):
                 raise ValueError("reviewer is not independent")
             snapshot = self._transactions.snapshot(self._extras)
         authenticated = self._authenticate_confirmation_snapshot(
@@ -1728,9 +1726,7 @@ class ProposalConfirmationService:
                 clarification=closed_event,
             )
         )
-        extras_preimages = {
-            name: snapshot.content.get(name) for name in self._extras
-        }
+        extras_preimages = {name: snapshot.content.get(name) for name in self._extras}
         try:
             self._executor.apply(
                 changeset,

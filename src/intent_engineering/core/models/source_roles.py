@@ -25,7 +25,10 @@ class SourceRoleAssignment(StrictModel):
 
     model_config = ConfigDict(frozen=True, strict=True)
 
-    connector_id: Annotated[str, Field(min_length=1, max_length=256)]
+    # Production MCP connector identities contain four SHA-256 components plus
+    # the configured connector id.  Keep the field bounded while allowing that
+    # canonical identity to be assigned an explicit source role.
+    connector_id: Annotated[str, Field(min_length=1, max_length=512)]
     scope: Annotated[str, Field(min_length=1, max_length=2048)]
     role: SourceRole
     inherited: bool

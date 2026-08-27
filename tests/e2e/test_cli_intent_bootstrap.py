@@ -168,6 +168,7 @@ def _propose(project: Path, submission: BootstrapSubmission):
 
 def _state(project: Path) -> dict[str, bytes]:
     workspace = project / ".intent"
+
     def optional(relative: str) -> bytes:
         path = workspace / relative
         return path.read_bytes() if path.exists() else b"<absent>"
@@ -537,11 +538,22 @@ def test_sources_support_catalog_uri_and_configured_github_scope_without_network
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     catalog_project = _connector_project(tmp_path)
+    inspection = run_intent(
+        catalog_project,
+        "connectors",
+        "inspect",
+        "slack-local",
+        "--format",
+        "json",
+    )
+    assert inspection.returncode == 0
+    connector_id = inspection.json()["source_role_connector_ids"]["message"]
+    assert isinstance(connector_id, str)
     slack = run_intent(
         catalog_project,
         "sources",
         "add",
-        "slack-local",
+        connector_id,
         "https://example.slack.com/archives/C111/p1700000001000100",
         "--role",
         "proposed_intent",
@@ -646,9 +658,7 @@ def test_proposal_list_show_and_confirmation_use_acl_safe_full_preview(
         mode="json"
     )
     assert shown_payload["core_node_ids"] == [node.id for node in review.core_nodes]
-    assert shown_payload["provisional_node_ids"] == [
-        node.id for node in review.provisional_nodes
-    ]
+    assert shown_payload["provisional_node_ids"] == [node.id for node in review.provisional_nodes]
     assert [event for event, _ in accepted.events] == ["preview", "confirmation"]
     preview = accepted.events[0][1]
     assert isinstance(preview, dict)
