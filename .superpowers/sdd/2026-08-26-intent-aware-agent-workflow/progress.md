@@ -305,4 +305,49 @@
   invocation remains unsupported; only the reusable
   provider-neutral `after_task` seam is implemented. Detailed evidence: `task-9-report.md`;
   controlling scope: `task-9-brief.md`.
-- Task 10: pending
+- Task 9: COMMITTED as `049f158fdde65095f15494a8f4654c672e3adaa3` with exact message
+  `feat: reconcile completed tasks with intent`. Postcommit Task 9 pair was `66 passed`; Ruff and
+  mypy (117 source files) remained clean; the 17-path base-to-HEAD allowlist and diff check were
+  clean; the index and tracked worktree were clean; protected names were absent from the commit and
+  index.
+- Task 10: PRECOMMIT_REVIEW_READY (implementer `/root/intent_workflow_task10`, exact base
+  `049f158fdde65095f15494a8f4654c672e3adaa3`; no staging/commit). Required two-file-only RED was
+  `1 failed in 0.05s`. The complete same-project proof is `1 passed in 2.88s` and covers real PRD
+  capture/review/activation, teammate conversation lineage, source roles, aligned host-neutral
+  preflight/mutation/post-task Git+test evidence, clarification, contributor confirmation,
+  independent conflict review, fixed mandatory-Codex refusal, disabled no-op, scheduled combined
+  capture/assurance replay, shared CLI/MCP/validation, exact provider write governance, and real-
+  boundary sentinel secrecy. Initial affected regressions were `284 passed in 6.13s`; focused Task
+  1–10 was `473 passed in 8.32s`; broad was `726 passed in 19.77s`; and the initial full
+  warnings-as-errors run was `1532 passed in 53.37s`. Coverage is 15,515 statements / 1,809 missed /
+  88% across 116 tracked source files with no configured threshold. Repository-wide Ruff check,
+  changed-path format, mypy (116 protected-excluded source files), four help commands, workflow
+  structure, and diff check were clean.
+  The new repository-wide Ruff format gate identifies a pre-existing 66-file untouched formatting
+  baseline, so no unrelated bulk rewrite was made. Documentation and the read-only scheduled action
+  preserve the Task 8 unsupported mandatory-Codex ruling and prohibit unattended approvals/writes.
+  Independent review returned `0 Critical / 4 Important / 1 Minor`, Not Ready. One grouped
+  tests-first fix round produced `6 failed, 1 passed in 3.99s` before fixes and `7 passed in 5.91s`
+  after: public source roles now persist the exact canonical MCP producer identity exposed by
+  connector list/inspect; validator recomputes canonical conversation content/hash/version/ID;
+  official `intent_status` supplies the E2E MCP version; the first fix retained the held stores and
+  original transaction coordinator; and docs order source authority before proposal/confirmation
+  while mapping insufficient evidence to `new_or_ambiguous`. Post-fix affected is `51 passed in
+  11.03s`, focused is `473 passed in 7.82s`, broad is `727 passed in 21.04s`, and the sole fresh full
+  warnings-as-errors run is `1537 passed in 53.48s`; accepted 88% coverage was not rerun. Ruff,
+  14-path format, protected-excluded 116-file mypy, four help commands, two workflow structural tests,
+  and diff check are clean. A first ineffective mypy exclude regex inadvertently included the
+  protected duplicate filename (117-file clean result) before the corrected authoritative 116-file
+  command; no protected file was modified or staged. The same finding-only review then identified
+  the remaining `replace(self.runtime, ...)` wrapper as a literal second Runtime. A new service-
+  identity regression failed `1 failed in 2.62s`; the guarded workflow now snapshots the strict live
+  configured actor, validates it against policy, and the MCP mutation boundary re-authenticates the
+  same actor while every workflow/MCP service retains `is self.runtime`. Final single-Runtime is `1
+  passed in 3.63s`, finding selector is `7 passed in 5.08s`, Task 10 E2E/public-alpha is `5 passed in
+  6.12s`, and write regressions are `22 passed in 1.83s`; scoped Ruff, 19-path format, protected-
+  excluded 116-file mypy, and diff are clean. The fresh full `1537 passed in 53.48s` and accepted 88%
+  coverage were not repeated. The SAME-reviewer one-point re-review returned `0 Critical / 0
+  Important / 0 Minor`, Ready. Product/test/docs/workflow committed as
+  `1cca7b18dcb813e90a6f7b1d710ffa163e8294aa` with exact message
+  `feat: complete intent-aware agent workflow`; only Task 10 metadata remains for its separate
+  commit. Detailed evidence: `task-10-report.md`; controlling scope: `task-10-brief.md`.
