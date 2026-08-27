@@ -81,25 +81,46 @@ def _reject_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]
 class LocalTransaction:
     """The mutation handle yielded while a coordinator owns every target lock."""
 
-    def __init__(self, owner: LocalTransactionCoordinator) -> None:
+    def __init__(
+        self,
+        owner: LocalTransactionCoordinator,
+        extras: Mapping[str, SecureFile] | None = None,
+        *,
+        read_only: bool = False,
+    ) -> None:
         self._owner = owner
+        self._extras = dict(extras or {})
+        self._read_only = read_only
         self._active = True
 
     def _target(self, name: str) -> SecureFile:
         if not self._active:
             raise RuntimeError("local transaction is no longer active")
+        if self._read_only:
+            raise ValueError("read-only local transaction")
         try:
             return self._owner._targets[name]
         except KeyError as error:
             raise ValueError("unknown local transaction target") from error
 
+    def _read_target(self, name: str) -> SecureFile:
+        if not self._active:
+            raise RuntimeError("local transaction is no longer active")
+        target = self._owner._targets.get(name)
+        if target is not None:
+            return target
+        try:
+            return self._extras[name]
+        except KeyError as error:
+            raise ValueError("unknown local transaction target") from error
+
     def read_optional(self, name: str) -> bytes | None:
         """Read one target while the transaction's complete lock set is held."""
-        return self._target(name).read_optional()
+        return self._read_target(name).read_optional()
 
     def read(self, name: str) -> bytes:
         """Read one existing target while the transaction is active."""
-        return self._target(name).read_bytes()
+        return self._read_target(name).read_bytes()
 
     def write(self, name: str, content: bytes) -> None:
         """Durably replace one target and expose its deterministic crash stage."""
@@ -115,6 +136,8 @@ class LocalTransaction:
 
     def _finish(self) -> None:
         self._active = False
+        self._read_only = True
+        self._extras.clear()
 
 
 class LocalTransactionCoordinator:
@@ -313,19 +336,52 @@ class LocalTransactionCoordinator:
         return LocalTransactionSnapshot(MappingProxyType(content), recovered)
 
     @contextmanager
+    def read_transaction(
+        self,
+        extras: Mapping[str, SecureFile] | None = None,
+    ) -> Iterator[LocalTransaction]:
+        """Yield a read-only view while the complete canonical lock set remains held."""
+        extra_files = dict(extras or {})
+        if any(not _TARGET_PATTERN.fullmatch(name) for name in extra_files):
+            raise ValueError("invalid local transaction extras")
+        if set(extra_files) & set(self._targets):
+            raise ValueError("duplicate local transaction target")
+        all_files = {**self._targets, **extra_files}
+        lock_keys = [self._journal.lock_key, *(item.lock_key for item in all_files.values())]
+        if len(lock_keys) != len(set(lock_keys)):
+            raise ValueError("duplicate local transaction target")
+        with self._locks(extra_files):
+            self._recover_unlocked()
+            transaction = LocalTransaction(self, extra_files, read_only=True)
+            try:
+                yield transaction
+            finally:
+                transaction._finish()
+
+    @contextmanager
     def transaction(
         self,
         *,
         rollback_base_exceptions: bool = False,
+        extras: Mapping[str, SecureFile] | None = None,
     ) -> Iterator[LocalTransaction]:
-        """Yield a locked mutation scope with durable preimages and crash recovery."""
-        with self._locks():
+        """Yield a mutation scope with durable targets and locked read-only extras."""
+        extra_files = dict(extras or {})
+        if any(not _TARGET_PATTERN.fullmatch(name) for name in extra_files):
+            raise ValueError("invalid local transaction extras")
+        if set(extra_files) & set(self._targets):
+            raise ValueError("duplicate local transaction target")
+        all_files = {**self._targets, **extra_files}
+        lock_keys = [self._journal.lock_key, *(item.lock_key for item in all_files.values())]
+        if len(lock_keys) != len(set(lock_keys)):
+            raise ValueError("duplicate local transaction target")
+        with self._locks(extra_files):
             self._recover_unlocked()
             preimages = self._snapshot()
             transaction_id = secrets.token_hex(32)
             prepared = self._journal_for(preimages, "prepared", transaction_id)
             self._write_journal(prepared)
-            transaction = LocalTransaction(self)
+            transaction = LocalTransaction(self, extra_files)
             try:
                 self._fault("journal_prepared")
                 yield transaction

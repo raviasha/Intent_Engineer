@@ -6,6 +6,10 @@ from intent_engineering.intent_workflow.bootstrap import (
     BootstrapService,
     BootstrapSubmission,
 )
+from intent_engineering.intent_workflow.conversation import (
+    ConversationCapture,
+    ConversationCaptureError,
+)
 from intent_engineering.intent_workflow.models import (
     IntentProposal,
     PreflightResult,
@@ -18,14 +22,27 @@ from intent_engineering.intent_workflow.models import (
     TaskClassification,
     TaskEnvelope,
 )
+from intent_engineering.intent_workflow.preflight import (
+    AgentClassificationSubmission,
+    PreflightError,
+    PreflightService,
+    PrincipalResolver,
+    classification_evidence_content,
+)
 
 __all__ = [
+    "AgentClassificationSubmission",
     "BootstrapError",
     "BootstrapReview",
     "BootstrapService",
     "BootstrapSubmission",
+    "ConversationCapture",
+    "ConversationCaptureError",
     "IntentProposal",
+    "PreflightError",
     "PreflightResult",
+    "PreflightService",
+    "PrincipalResolver",
     "ProposalDecision",
     "ProposalDecisionRecord",
     "ProposalDecisionV2",
@@ -34,4 +51,5 @@ __all__ = [
     "SourceRoleAssignment",
     "TaskClassification",
     "TaskEnvelope",
+    "classification_evidence_content",
 ]

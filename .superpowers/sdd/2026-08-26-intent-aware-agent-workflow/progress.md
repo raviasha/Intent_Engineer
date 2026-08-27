@@ -86,7 +86,27 @@
 - Task 4: Minor (deferred): full-config `yaml.safe_dump` preserves unrelated semantic fields but
   drops unrelated YAML comments and lexical formatting. A bespoke comment-preserving rewriter was
   intentionally not introduced in Fix Round 1.
-- Task 5: pending
+- Task 5: READY (implementer `/root/intent_workflow_task5`, exact base
+  `3cef53684b2b44e0324284e53f8f22852b92446f`; no commit/staging). Required missing-module RED was
+  `2 errors in 0.26s`. First independent review was Not Ready with `0 Critical / 6 Important /
+  0 Minor`; Fix Round 1 tests-only RED was `21 failed, 46 passed in 1.05s` and final focused GREEN is
+  `67 passed in 0.90s`. Fix Round 1 re-review was Not Ready with `0 Critical / 2 Important / 0 Minor`;
+  Fix Round 2 tests-only RED was `2 failed, 73 passed in 1.21s`, focused GREEN is `75 passed in
+  0.86s`, and the prior 22 security regressions pass separately. Task 5 plus context is `95 passed`;
+  transaction/evidence/case/proposal/bootstrap/reconciliation compatibility is `172 passed`; Ruff
+  is clean on all changed Python paths; mypy is clean across 110 source files; clean fresh full
+  offline suite is `1232 passed in 44.56s`; and `git diff --check` is clean. Fix Round 1 derives ACL
+  principals only from the held policy or trusted exact-snapshot resolver, atomically
+  reauthenticates authorization preimages, uses latest
+  case lifecycle versions, requires visible exact-semantic conflict reuse with concurrent winner
+  validation, and validates every unresolved proposal candidate's nested ACL/provenance/type
+  association. Fix Round 2 requires exact caller/resolver principal equality and nonempty complete
+  source-role association for BOOTSTRAP proposals while retaining requirement-kind compatibility.
+  No capability issuance, model/provider call, external write, clarification session, or host hook
+  was added. Final scoped reviewer verdict: Ready, `0 Critical / 0 Important / 0 Minor`; reviewer
+  evidence was 11 Round 2 tests plus the prior 22 security regressions, with the reported full
+  result of 1232 passing tests. Detailed evidence: `task-5-report.md`; controlling strengthened
+  scope: `task-5-brief.md`.
 - Task 6: pending
 - Task 7: pending
 - Task 8: pending

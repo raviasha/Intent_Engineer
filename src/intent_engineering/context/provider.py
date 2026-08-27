@@ -47,6 +47,17 @@ _CODE_TYPES = frozenset(
         NodeType.DEPLOYMENT,
     }
 )
+_REF_LIMITS = {
+    "relevant_intent": 10,
+    "relevant_requirements": 10,
+    "decisions": 10,
+    "constraints": 10,
+    "acceptance_criteria": 10,
+    "code_refs": 20,
+    "test_refs": 20,
+    "open_reconciliation_cases": 10,
+    "evidence_refs": 20,
+}
 _Item = TypeVar("_Item")
 
 
@@ -70,7 +81,8 @@ class ContextProvider:
         evidence: Sequence[EvidenceRecord] = (),
     ) -> None:
         self._graph = graph
-        self._cases = tuple(cases)
+        latest_cases = {case.id: case for case in cases}
+        self._cases = tuple(latest_cases[case_id] for case_id in sorted(latest_cases))
         self._config = config
         self._evidence = {record.id: record for record in evidence}
 
@@ -96,6 +108,70 @@ class ContextProvider:
             exact_seed_id=symbol_ref or None,
         )
 
+    def for_refs(
+        self,
+        node_ids: Sequence[str],
+        *,
+        actor: str | Collection[str],
+    ) -> ContextPack:
+        """Return bounded two-hop context for exact active, ACL-visible node IDs."""
+        requested: tuple[str, ...] = ()
+        principals: str | frozenset[str] = ""
+        pack: ContextPack | None = None
+        returned_ids: set[str] = set()
+        failed = False
+        try:
+            if (
+                isinstance(node_ids, str)
+                or not node_ids
+                or len(node_ids) > 256
+                or any(type(node_id) is not str or not node_id for node_id in node_ids)
+                or len(node_ids) != len(set(node_ids))
+            ):
+                raise ValueError("invalid exact context references")
+            requested = tuple(sorted(node_ids))
+            if type(actor) is str:
+                principals = actor
+            else:
+                principals = frozenset(actor)
+                if not principals or any(type(item) is not str or not item for item in principals):
+                    raise ValueError("invalid context principal")
+            pack = self._build(
+                query="",
+                repository_scope=None,
+                actor=principals,
+                exact_seed_ids=frozenset(requested),
+                fixed_caps=True,
+            )
+            returned_ids = {
+                item.id
+                for category in (
+                    pack.relevant_intent,
+                    pack.relevant_requirements,
+                    pack.decisions,
+                    pack.constraints,
+                    pack.acceptance_criteria,
+                    pack.code_refs,
+                    pack.test_refs,
+                )
+                for item in category
+            }
+            if not set(requested).issubset(returned_ids):
+                raise ValueError("unavailable exact context references")
+            return pack
+        except Exception:  # noqa: BLE001 - hide absent versus unauthorized references
+            failed = True
+        finally:
+            node_ids = ()
+            actor = ""
+            requested = ()
+            principals = ""
+            pack = None
+            returned_ids.clear()
+        if failed:
+            raise ValueError("intent context unavailable") from None
+        raise ValueError("intent context unavailable") from None
+
     def _build(
         self,
         *,
@@ -103,6 +179,8 @@ class ContextProvider:
         repository_scope: str | None,
         actor: str | Collection[str] | None,
         exact_seed_id: str | None = None,
+        exact_seed_ids: frozenset[str] | None = None,
+        fixed_caps: bool = False,
     ) -> ContextPack:
         query_tokens = _tokens(query)
         active_nodes = {
@@ -114,13 +192,19 @@ class ContextProvider:
             node_id: len(query_tokens & _tokens(node.label))
             for node_id, node in active_nodes.items()
         }
-        seed_ids = (
-            {exact_seed_id}
-            if exact_seed_id is not None and exact_seed_id in active_nodes
-            else set()
-        )
-        if exact_seed_id is None:
+        seed_ids = set(exact_seed_ids or ())
+        if exact_seed_ids is None:
+            seed_ids = (
+                {exact_seed_id}
+                if exact_seed_id is not None and exact_seed_id in active_nodes
+                else set()
+            )
+        if exact_seed_id is None and exact_seed_ids is None:
             seed_ids = {node_id for node_id, score in scores.items() if score > 0}
+        if exact_seed_ids is not None:
+            if not seed_ids.issubset(active_nodes):
+                raise ValueError("unavailable exact context references")
+            scores.update({node_id: 1 for node_id in seed_ids})
         selected_ids = self._expand(seed_ids, active_nodes)
         selected_nodes = tuple(active_nodes[node_id] for node_id in selected_ids)
         selected_cases = self._selected_cases(selected_ids, repository_scope, actor)
@@ -145,7 +229,16 @@ class ContextProvider:
             "code_refs": ordered(node for node in selected_nodes if node.type in _CODE_TYPES),
             "test_refs": ordered(node for node in selected_nodes if node.type is NodeType.TEST),
         }
-        capped_nodes = {name: tuple(self._cap(name, nodes)) for name, nodes in grouped.items()}
+        capped_nodes = {
+            name: tuple(
+                self._cap(
+                    name,
+                    nodes,
+                    hard_limit=_REF_LIMITS[name] if fixed_caps else None,
+                )
+            )
+            for name, nodes in grouped.items()
+        }
         node_items = {
             name: tuple(self._item_for_node(node) for node in nodes)
             for name, nodes in capped_nodes.items()
@@ -153,10 +246,23 @@ class ContextProvider:
         ordered_cases = tuple(
             sorted(selected_cases, key=lambda case: (-self._case_score(case, scores), case.id))
         )
-        capped_cases = tuple(self._cap("open_reconciliation_cases", ordered_cases))
+        capped_cases = tuple(
+            self._cap(
+                "open_reconciliation_cases",
+                ordered_cases,
+                hard_limit=(
+                    _REF_LIMITS["open_reconciliation_cases"] if fixed_caps else None
+                ),
+            )
+        )
         case_items = tuple(self._item_for_case(case) for case in capped_cases)
         context_nodes = tuple(node for nodes in capped_nodes.values() for node in nodes)
-        evidence_refs = self._evidence_refs(context_nodes, capped_cases, scores)
+        evidence_refs = self._evidence_refs(
+            context_nodes,
+            capped_cases,
+            scores,
+            hard_limit=_REF_LIMITS["evidence_refs"] if fixed_caps else None,
+        )
 
         return ContextPack(
             task=query,
@@ -250,8 +356,16 @@ class ContextProvider:
         scope = self._scope(record)
         return repository_scope is None or scope == repository_scope
 
-    def _cap(self, category: str, values: Sequence[_Item]) -> tuple[_Item, ...]:
+    def _cap(
+        self,
+        category: str,
+        values: Sequence[_Item],
+        *,
+        hard_limit: int | None = None,
+    ) -> tuple[_Item, ...]:
         limit = self._config.context_limits.get(category, len(values))
+        if hard_limit is not None:
+            limit = min(limit, hard_limit)
         return tuple(values[: max(0, limit)])
 
     @staticmethod
@@ -282,7 +396,12 @@ class ContextProvider:
         )
 
     def _evidence_refs(
-        self, nodes: Sequence[Node], cases: Sequence[ReconciliationCase], scores: dict[str, int]
+        self,
+        nodes: Sequence[Node],
+        cases: Sequence[ReconciliationCase],
+        scores: dict[str, int],
+        *,
+        hard_limit: int | None = None,
     ) -> tuple[str, ...]:
         evidence_scores: dict[str, int] = {}
         for node in nodes:
@@ -295,7 +414,10 @@ class ContextProvider:
         ordered = tuple(
             sorted(evidence_scores, key=lambda reference: (-evidence_scores[reference], reference))
         )
-        return tuple(str(value) for value in self._cap("evidence_refs", ordered))
+        return tuple(
+            str(value)
+            for value in self._cap("evidence_refs", ordered, hard_limit=hard_limit)
+        )
 
     @staticmethod
     def _warnings(nodes: Sequence[Node], scores: dict[str, int]) -> tuple[str, ...]:

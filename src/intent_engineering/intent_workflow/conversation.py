@@ -1,0 +1,185 @@
+"""Immutable, attributed conversation-turn evidence capture."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import re
+from datetime import UTC, datetime
+from typing import Literal, cast
+
+from intent_engineering.core.models import EvidenceRecord, JsonValue
+from intent_engineering.storage.jsonl.evidence_store import JsonlEvidenceStore
+
+_CONTROL = re.compile(r"[\x00-\x1f\x7f]")
+_MAX_IDENTITY_BYTES = 2 * 1024
+_MAX_CONTENT_BYTES = 4 * 1024 * 1024
+_MAX_ACL_ENTRIES = 256
+
+
+class ConversationCaptureError(ValueError):
+    """Fixed public failure for invalid or unavailable conversation evidence."""
+
+    def __init__(self) -> None:
+        super().__init__("conversation capture unavailable")
+
+
+def _canonical_json(value: object) -> bytes:
+    return json.dumps(
+        value,
+        allow_nan=False,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+
+
+def _normalize_json(value: object) -> JsonValue:
+    if type(value) is dict:
+        normalized: dict[str, JsonValue] = {}
+        for key, item in cast(dict[object, object], value).items():
+            if type(key) is not str:
+                raise ValueError("invalid conversation content")
+            normalized[key] = _normalize_json(item)
+        return normalized
+    if type(value) in {list, tuple}:
+        return [_normalize_json(item) for item in cast(tuple[object, ...] | list[object], value)]
+    if value is None or type(value) in {str, bool, int, float}:
+        _canonical_json(value)
+        return cast(JsonValue, value)
+    raise ValueError("invalid conversation content")
+
+
+def _identity(value: str) -> str:
+    if not value or _CONTROL.search(value) or len(value.encode("utf-8")) > _MAX_IDENTITY_BYTES:
+        raise ValueError("invalid conversation identity")
+    return value
+
+
+def _utc(value: datetime) -> datetime:
+    offset = value.utcoffset() if type(value) is datetime and value.tzinfo is not None else None
+    if (
+        type(value) is not datetime
+        or value.tzinfo is None
+        or offset is None
+        or offset.total_seconds() != 0
+    ):
+        raise ValueError("conversation timestamp must use UTC")
+    return value.astimezone(UTC)
+
+
+def _raise_signal(signal: BaseException) -> None:
+    raise signal.with_traceback(None)
+
+
+class ConversationCapture:
+    """Record exact human and agent turns through the production evidence ledger."""
+
+    def __init__(
+        self,
+        evidence_store: JsonlEvidenceStore,
+        *,
+        connector_id: str = "conversation:agent",
+    ) -> None:
+        self._store = evidence_store
+        self.connector_id = _identity(connector_id)
+
+    def _record_turn(
+        self,
+        *,
+        conversation_ref: str,
+        role: Literal["human", "agent"],
+        author: str,
+        content: JsonValue,
+        captured_at: datetime,
+        acl: tuple[str, ...],
+    ) -> EvidenceRecord:
+        if role not in {"human", "agent"}:
+            raise ValueError("invalid conversation role")
+        locator = _identity(conversation_ref)
+        principal = _identity(author)
+        observed_at = _utc(captured_at)
+        if (
+            type(acl) is not tuple
+            or not acl
+            or len(acl) > _MAX_ACL_ENTRIES
+            or any(type(item) is not str for item in acl)
+        ):
+            raise ValueError("invalid conversation ACL")
+        normalized_acl = tuple(sorted(_identity(item) for item in acl))
+        if len(normalized_acl) != len(set(normalized_acl)):
+            raise ValueError("invalid conversation ACL")
+        normalized_content = _normalize_json(content)
+        encoded_content = _canonical_json(normalized_content)
+        if len(encoded_content) > _MAX_CONTENT_BYTES:
+            raise ValueError("conversation content exceeds maximum size")
+        content_digest = hashlib.sha256(encoded_content).hexdigest()
+        version_material = {
+            "acl": list(normalized_acl),
+            "author": principal,
+            "captured_at": observed_at.isoformat().replace("+00:00", "Z"),
+            "content_hash": f"sha256:{content_digest}",
+            "conversation_ref": locator,
+            "role": role,
+        }
+        version = f"sha256:{hashlib.sha256(_canonical_json(version_material)).hexdigest()}"
+        record = EvidenceRecord(
+            id=f"evidence:conversation:{version.removeprefix('sha256:')}",
+            connector_type="conversation",
+            external_object_id=locator,
+            external_version=version,
+            author=principal,
+            observed_at=observed_at,
+            source_locator=locator,
+            content_hash=f"sha256:{content_digest}",
+            payload={"role": role, "content": normalized_content},
+            acl=normalized_acl,
+        )
+        self._store.associate(self.connector_id, record)
+        return record
+
+    def record_turn(
+        self,
+        *,
+        conversation_ref: str,
+        role: Literal["human", "agent"],
+        author: str,
+        content: JsonValue,
+        captured_at: datetime,
+        acl: tuple[str, ...],
+    ) -> EvidenceRecord:
+        """Persist one canonical turn, returning the same record for exact replay."""
+        result: EvidenceRecord | None = None
+        signal: BaseException | None = None
+        failed = False
+        try:
+            result = self._record_turn(
+                conversation_ref=conversation_ref,
+                role=role,
+                author=author,
+                content=content,
+                captured_at=captured_at,
+                acl=acl,
+            )
+        except Exception:  # noqa: BLE001 - expose one fixed evidence boundary
+            failed = True
+        except BaseException as caught:  # noqa: BLE001 - preserve cancellation identity
+            caught.__traceback__ = None
+            signal = caught
+        finally:
+            conversation_ref = ""
+            role = "human"
+            author = ""
+            content = cast(JsonValue, None)
+            captured_at = cast(datetime, None)
+            acl = ()
+        if signal is not None:
+            caught_signal = signal
+            signal = None
+            _raise_signal(caught_signal)
+        if failed or result is None:
+            raise ConversationCaptureError() from None
+        return result
+
+
+__all__ = ["ConversationCapture", "ConversationCaptureError"]
