@@ -45,8 +45,13 @@ class GitConnector:
 
     connector_id = "git"
 
-    def __init__(self, repo: Path) -> None:
+    def __init__(self, repo: Path, *, repository_id: str | None = None) -> None:
+        if repository_id is not None and (
+            type(repository_id) is not str or not repository_id.strip()
+        ):
+            raise ValueError("invalid Git repository identity")
         self.repo = repo.resolve()
+        self.repository_id = repository_id
 
     @staticmethod
     def _source_object(sha: str) -> SourceObject:
@@ -116,6 +121,8 @@ class GitConnector:
                 "body": fields[5].rstrip("\n"),
                 "changed_paths": cast(JsonValue, changed_paths),
             }
+            if self.repository_id is not None:
+                payload["repository_id"] = self.repository_id
             content = json.dumps(payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode(
                 "utf-8"
             )

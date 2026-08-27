@@ -355,8 +355,25 @@ _DETECTOR_ORDER = {
     "code_lag": 2,
     "test_lag": 3,
     "undocumented_code": 4,
-    "ambiguous_divergence": 5,
+    "intent_without_requirement": 5,
+    "requirement_without_intent": 6,
+    "relevant_provisional_intent": 7,
+    "stale_source_evidence": 8,
+    "ambiguous_divergence": 9,
 }
+
+
+def select_drift_observations(
+    candidates: Sequence[DriftObservation],
+) -> tuple[DriftObservation, ...]:
+    """Apply the established precedence and stable one-case-per-subject rule."""
+    selected: dict[str, DriftObservation] = {}
+    for observation in sorted(
+        candidates,
+        key=lambda item: (_DETECTOR_ORDER.get(item.detector_id, 100), item.fingerprint),
+    ):
+        selected.setdefault(observation.subject_ref, observation)
+    return tuple(sorted(selected.values(), key=lambda item: item.fingerprint))
 
 
 def detect_evidence_drift(
@@ -384,10 +401,4 @@ def detect_evidence_drift(
         )
         if detection_input is not None:
             candidates.extend(detect_drift(detection_input))
-    selected: dict[str, DriftObservation] = {}
-    for observation in sorted(
-        candidates,
-        key=lambda item: (_DETECTOR_ORDER[item.detector_id], item.fingerprint),
-    ):
-        selected.setdefault(observation.subject_ref, observation)
-    return tuple(sorted(selected.values(), key=lambda item: item.fingerprint))
+    return select_drift_observations(candidates)

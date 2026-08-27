@@ -1,5 +1,10 @@
 """Intent-aware coding-agent workflow records."""
 
+from intent_engineering.intent_workflow.assurance import (
+    AssuranceReasoner,
+    AssuranceService,
+    AssuranceSnapshot,
+)
 from intent_engineering.intent_workflow.bootstrap import (
     BootstrapError,
     BootstrapReview,
@@ -31,6 +36,13 @@ from intent_engineering.intent_workflow.models import (
     TaskClassification,
     TaskEnvelope,
 )
+from intent_engineering.intent_workflow.post_task import (
+    PostTaskReason,
+    PostTaskResult,
+    PostTaskService,
+    PostTaskStatus,
+    PostTaskSubmission,
+)
 from intent_engineering.intent_workflow.preflight import (
     AgentClassificationSubmission,
     PreflightError,
@@ -41,6 +53,9 @@ from intent_engineering.intent_workflow.preflight import (
 
 __all__ = [
     "AgentClassificationSubmission",
+    "AssuranceReasoner",
+    "AssuranceService",
+    "AssuranceSnapshot",
     "BootstrapError",
     "BootstrapReview",
     "BootstrapService",
@@ -56,6 +71,11 @@ __all__ = [
     "ConversationCapture",
     "ConversationCaptureError",
     "IntentProposal",
+    "PostTaskReason",
+    "PostTaskResult",
+    "PostTaskService",
+    "PostTaskStatus",
+    "PostTaskSubmission",
     "PreflightError",
     "PreflightResult",
     "PreflightService",

@@ -56,7 +56,7 @@ async def test_git_connector_captures_stable_commit_evidence_without_diffs(tmp_p
     git(repo, "init")
     first_sha = commit(repo, "README.md", "# Intent\n", "Add intent", "First body")
     second_sha = commit(repo, "notes/design.md", "# Design\n", "Add design", "Second body")
-    connector = GitConnector(repo)
+    connector = GitConnector(repo, repository_id="demo")
 
     sources = await assert_connector_is_stable(connector)
 
@@ -71,6 +71,7 @@ async def test_git_connector_captures_stable_commit_evidence_without_diffs(tmp_p
     assert latest.payload["body"] == "Second body"
     assert latest.payload["parents"] == (first_sha,)
     assert latest.payload["changed_paths"] == ("notes/design.md",)
+    assert latest.payload["repository_id"] == "demo"
     assert "diff" not in latest.payload
     assert connector.next_checkpoint(sources) == second_sha
 

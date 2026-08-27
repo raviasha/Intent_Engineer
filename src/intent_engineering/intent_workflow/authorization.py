@@ -8,9 +8,10 @@ import re
 import secrets
 import threading
 from collections import OrderedDict
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import PurePosixPath, PureWindowsPath
-from typing import Annotated, Literal, cast
+from typing import Annotated, Literal, TypeVar, cast
 
 from pydantic import ConfigDict, Field, field_validator, model_validator
 
@@ -34,6 +35,7 @@ _MAX_PATH_BYTES = 2 * 1024
 _MAX_SCOPE_ENTRIES = 256
 _MAX_LIVE_GRANTS = 1_024
 _DEFAULT_TTL = timedelta(minutes=5)
+_T = TypeVar("_T")
 
 type AuthorizationReason = Literal[
     "authorized",
@@ -42,6 +44,7 @@ type AuthorizationReason = Literal[
     "actor_mismatch",
     "repository_mismatch",
     "task_mismatch",
+    "request_mismatch",
     "graph_mismatch",
     "scope_mismatch",
 ]
@@ -143,6 +146,18 @@ def _token_digest(token: str) -> str:
         encoded = None
 
 
+def _request_digest(request: str) -> str:
+    encoded: bytes | None = None
+    try:
+        if type(request) is not str:
+            raise ValueError("invalid authorization request")
+        encoded = request.encode("utf-8")
+        return f"sha256:{hashlib.sha256(encoded).hexdigest()}"
+    finally:
+        request = ""
+        encoded = None
+
+
 def canonical_graph_digest(content: bytes) -> str:
     """Derive one digest from validated canonical graph semantics, never caller text."""
     if type(content) is not bytes:
@@ -164,6 +179,7 @@ class AuthorizationGrant(_AuthorizationModel):
     actor: str
     repository_id: str
     task_id: str
+    request_digest: Annotated[str, Field(pattern=r"^sha256:[0-9a-f]{64}$")]
     classification: AuthorizedClassification
     graph_version: Annotated[int, Field(ge=0)]
     graph_digest: Annotated[str, Field(pattern=r"^sha256:[0-9a-f]{64}$")]
@@ -292,6 +308,7 @@ class AuthorizationIssuer:
         PreflightResult,
         datetime,
         str,
+        str,
         tuple[str, ...],
         tuple[str, ...],
     ]:
@@ -309,6 +326,7 @@ class AuthorizationIssuer:
         relevant_node_ids = _identities(detached_result.relevant_node_ids)
         graph = parse_graph(graph_content)
         graph_digest = canonical_graph_digest(graph_content)
+        request_digest = _request_digest(detached_envelope.request)
         if (
             actor != detached_envelope.actor
             or repository_id != detached_envelope.repository_id
@@ -343,6 +361,7 @@ class AuthorizationIssuer:
             detached_result,
             issued_at,
             graph_digest,
+            request_digest,
             scope,
             relevant_node_ids,
         )
@@ -373,9 +392,15 @@ class AuthorizationIssuer:
         signal: BaseException | None = None
         failed = False
         try:
-            detached_envelope, detached_result, issued_at, graph_digest, scope, relevant = (
-                self._validated_issue(envelope, result, graph_content, now)
-            )
+            (
+                detached_envelope,
+                detached_result,
+                issued_at,
+                graph_digest,
+                request_digest,
+                scope,
+                relevant,
+            ) = self._validated_issue(envelope, result, graph_content, now)
             with self._lock:
                 self._evict_expired(self._grants, issued_at)
                 if len(self._grants) >= self._max_live_grants:
@@ -396,6 +421,7 @@ class AuthorizationIssuer:
                     actor=detached_envelope.actor,
                     repository_id=detached_envelope.repository_id,
                     task_id=detached_envelope.id,
+                    request_digest=request_digest,
                     classification=cast(
                         AuthorizedClassification,
                         detached_result.classification,
@@ -437,6 +463,7 @@ class AuthorizationIssuer:
                 detached_result = cast(PreflightResult, None)
                 issued_at = cast(datetime, None)
                 graph_digest = ""
+                request_digest = ""
                 scope = ()
                 relevant = ()
         if signal is not None:
@@ -458,6 +485,7 @@ class AuthorizationIssuer:
         graph_content: bytes,
         requested_paths: tuple[str, ...],
         now: datetime,
+        request_digest: str | None = None,
     ) -> AuthorizationVerification:
         """Verify every exact operation binding without returning registry material."""
         digest: str | None = None
@@ -476,6 +504,11 @@ class AuthorizationIssuer:
             checked_actor = _identity(actor)
             checked_repository = _identity(repository_id)
             checked_task = _identity(task_id, task=True)
+            checked_request_digest = (
+                None
+                if request_digest is None
+                else _identity(request_digest)
+            )
             if type(graph_version) is not int or graph_version < 0:
                 raise ValueError("invalid graph version")
             checked_graph_digest = canonical_graph_digest(graph_content)
@@ -497,6 +530,14 @@ class AuthorizationIssuer:
                     return _denied("repository_mismatch")
                 if checked_task != grant.task_id:
                     return _denied("task_mismatch")
+                if (
+                    checked_request_digest is not None
+                    and (
+                        _DIGEST.fullmatch(checked_request_digest) is None
+                        or not hmac.compare_digest(checked_request_digest, grant.request_digest)
+                    )
+                ):
+                    return _denied("request_mismatch")
                 if (
                     graph_version != grant.graph_version
                     or checked_graph_digest != grant.graph_digest
@@ -527,6 +568,7 @@ class AuthorizationIssuer:
             graph_version = -1
             graph_content = b""
             requested_paths = ()
+            request_digest = None
             now = cast(datetime, None)
             digest = matched_digest = None
             grant = None
@@ -542,6 +584,74 @@ class AuthorizationIssuer:
         """Atomically invalidate every capability owned by this process."""
         with self._lock:
             self._grants.clear()
+
+    def consume(
+        self,
+        token: str,
+        *,
+        actor: str,
+        repository_id: str,
+        task_id: str,
+        graph_version: int,
+        graph_content: bytes,
+        requested_paths: tuple[str, ...],
+        now: datetime,
+        action: Callable[[AuthorizationVerification], _T],
+        request_digest: str | None = None,
+    ) -> _T | None:
+        """Verify and consume one capability while its authorized action commits."""
+        digest: str | None = None
+        verification: AuthorizationVerification | None = None
+        result: _T | None = None
+        signal: BaseException | None = None
+        try:
+            if not callable(action):
+                return None
+            with self._lock:
+                verification = self.verify(
+                    token,
+                    actor=actor,
+                    repository_id=repository_id,
+                    task_id=task_id,
+                    graph_version=graph_version,
+                    graph_content=graph_content,
+                    requested_paths=requested_paths,
+                    now=now,
+                    request_digest=request_digest,
+                )
+                if not verification.authorized:
+                    return None
+                digest = _token_digest(token)
+                grant = self._grants.get(digest)
+                if grant is None:
+                    return None
+                self._grants.pop(digest, None)
+                result = action(verification)
+                return result
+        except BaseException as caught:  # noqa: BLE001 - preserve cancellation identity
+            caught.__traceback__ = None
+            caught.__cause__ = None
+            caught.__context__ = None
+            signal = caught
+        finally:
+            token = actor = repository_id = task_id = ""
+            graph_version = -1
+            graph_content = b""
+            requested_paths = ()
+            request_digest = None
+            now = cast(datetime, None)
+            action = cast(Callable[[AuthorizationVerification], _T], None)
+            digest = None
+            verification = None
+            result = None
+            if "grant" in locals():
+                grant = None
+            self = cast(AuthorizationIssuer, None)  # noqa: PLW0642 - scrub traceback state
+        if signal is not None:
+            caught_signal = signal
+            signal = None
+            _raise_signal(caught_signal)
+        return None
 
     def revoke(self, token: str) -> None:
         """Remove only the exact capability when a post-issue live check fails."""

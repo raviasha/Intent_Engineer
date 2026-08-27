@@ -154,6 +154,8 @@ class SyncHarness:
         self.evidence_path = root / "evidence.jsonl"
         self.checkpoint_path = root / "checkpoints.yaml"
         self.case_path = root / "cases.jsonl"
+        self.config_file = directory.file("config.yaml")
+        self.config_file.atomic_write(b"project_id: fixture\n")
         raw_case_store = case_store or JsonlCaseStore(directory.file("cases.jsonl"))
         executor_case_store = (
             raw_case_store
@@ -166,6 +168,7 @@ class SyncHarness:
                 "graph": directory.file("graph.yaml"),
                 "history": directory.file("history.jsonl"),
                 "cases": executor_case_store._file,
+                "evidence": directory.file("evidence.jsonl"),
             },
             fault_hook=transaction_fault_hook,
         )
@@ -175,7 +178,9 @@ class SyncHarness:
             transactions=transactions,
         )
         self.graph_store.initialize(Graph(id="fixture-graph", version=0, nodes=(), edges=()))
-        self.evidence_store = JsonlEvidenceStore(directory.file("evidence.jsonl"))
+        self.evidence_store = JsonlEvidenceStore(
+            directory.file("evidence.jsonl"), transactions=transactions
+        )
         self.checkpoint_store = checkpoint_store or YamlCheckpointStore(self.checkpoint_path)
         self.case_store = raw_case_store
         executor = LocalChangeSetExecutor(
@@ -193,8 +198,11 @@ class SyncHarness:
             case_store=self.case_store,
             reasoner=reasoner or DeterministicReasoner(actor="fixture"),
             changeset_executor=executor,
+            transactions=transactions,
+            snapshot_files={"config": self.config_file},
             **orchestrator_options,
         )
+        self.transactions = transactions
         self.connectors = connectors
 
     async def run(self) -> SyncRunResult:

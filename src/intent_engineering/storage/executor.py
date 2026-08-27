@@ -81,7 +81,10 @@ class LocalChangeSetExecutor:
         resolved_cases: Sequence[ReconciliationCase] = (),
         intent_proposal_preimage: bytes | None = None,
         intent_proposal_append: bytes | None = None,
+        graph_preimage: bytes | None = None,
         evidence_preimage: bytes | None = None,
+        case_preimage: bytes | None = None,
+        bind_case_preimage: bool = False,
         rollback_base_exceptions: bool = False,
         read_only_extras: Mapping[str, SecureFile] | None = None,
         extra_preimages: Mapping[str, bytes | None] | None = None,
@@ -96,6 +99,8 @@ class LocalChangeSetExecutor:
             raise ValueError("intent proposal transaction target is unavailable")
         if evidence_preimage is not None and "evidence" not in self._transactions.target_names:
             raise ValueError("evidence transaction target is unavailable")
+        if case_preimage is not None and not bind_case_preimage:
+            raise ValueError("case preimage requires an explicit binding")
         if (read_only_extras is None) != (extra_preimages is None) or (
             read_only_extras is not None and set(read_only_extras) != set(extra_preimages or {})
         ):
@@ -120,6 +125,8 @@ class LocalChangeSetExecutor:
                     for name, content in extra_preimages.items()
                 ):
                     raise ValueError("read-only transaction binding changed")
+                if graph_preimage is not None and transaction.read("graph") != graph_preimage:
+                    raise ValueError("graph authorization changed")
                 graph = parse_graph(transaction.read("graph"))
                 next_graph = apply_changeset_with_case_effects(graph, validated)
                 known_nodes = {node.id for node in next_graph.nodes}
@@ -142,6 +149,8 @@ class LocalChangeSetExecutor:
                     and transaction.read_optional("evidence") != evidence_preimage
                 ):
                     raise ValueError("evidence authorization changed")
+                if bind_case_preimage and transaction.read_optional("cases") != case_preimage:
+                    raise ValueError("case authorization changed")
                 transaction.write("graph", serialize_graph(next_graph))
                 transaction.append("history", serialize_changeset(validated))
                 if case_bytes:
@@ -158,7 +167,10 @@ class LocalChangeSetExecutor:
             resolved_cases = ()
             intent_proposal_preimage = None
             intent_proposal_append = None
+            graph_preimage = None
             evidence_preimage = None
+            case_preimage = None
+            bind_case_preimage = False
             rollback_base_exceptions = False
             read_only_extras = None
             extra_preimages = None

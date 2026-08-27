@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from asyncio import CancelledError
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from hashlib import sha256
@@ -18,13 +18,16 @@ from intent_engineering.core.models import (
     ChangeSet,
     DriftObservation,
     EvidenceDelta,
+    EvidenceIngestion,
     EvidenceRecord,
     Graph,
+    NodeType,
     ReconciliationCase,
     SyncCheckpoint,
     is_exact_consumed_prefix,
 )
 from intent_engineering.extract.base import SemanticReasoner
+from intent_engineering.intent_workflow.assurance import AssuranceService
 from intent_engineering.storage.executor import LocalChangeSetExecutor
 from intent_engineering.storage.interfaces import (
     CaseStore,
@@ -32,9 +35,26 @@ from intent_engineering.storage.interfaces import (
     EvidenceStore,
     GraphStore,
 )
+from intent_engineering.storage.jsonl.case_store import parse_case_versions
+from intent_engineering.storage.jsonl.evidence_store import parse_evidence_lines
+from intent_engineering.storage.secure import SecureFile
+from intent_engineering.storage.transaction import LocalTransactionCoordinator
+from intent_engineering.storage.yaml.graph_store import parse_graph
 from intent_engineering.sync.models import ConnectorRunResult, SyncRunResult
 
 logger = structlog.get_logger(__name__)
+
+_INTENT_BASELINE_TYPES = frozenset(
+    {
+        NodeType.CONTEXT,
+        NodeType.NEED,
+        NodeType.PRODUCT_INTENT,
+        NodeType.DESIRED_OUTCOME,
+        NodeType.ASSUMPTION,
+        NodeType.PRINCIPLE,
+        NodeType.CONSTRAINT,
+    }
+)
 
 
 def _utc_now() -> datetime:
@@ -74,6 +94,20 @@ class _PendingConnector:
     progress: _ConnectorProgress
 
 
+@dataclass(frozen=True)
+class _ScheduledSnapshot:
+    """One immutable transaction-bound input and its exact commit preimages."""
+
+    graph: Graph
+    records: tuple[EvidenceRecord, ...]
+    ingestions: tuple[EvidenceIngestion, ...]
+    cases: tuple[ReconciliationCase, ...]
+    graph_preimage: bytes
+    evidence_preimage: bytes | None
+    case_preimage: bytes | None
+    extra_preimages: Mapping[str, bytes | None]
+
+
 class SyncOrchestrator:
     """Advance each connector only after all of its durable work has completed."""
 
@@ -88,8 +122,18 @@ class SyncOrchestrator:
         case_detector: CaseDetector
         | Callable[[EvidenceDelta, Graph], Sequence[DriftObservation]] = _no_cases,
         changeset_executor: LocalChangeSetExecutor | None = None,
+        assurance_service: AssuranceService | None = None,
+        transactions: LocalTransactionCoordinator | None = None,
+        snapshot_files: Mapping[str, SecureFile] | None = None,
         clock: Callable[[], datetime] = _utc_now,
     ) -> None:
+        extras = dict(snapshot_files or {})
+        if transactions is None and extras:
+            raise ValueError("assurance snapshot files require transactions")
+        if transactions is not None and not {"graph", "evidence", "cases"}.issubset(
+            transactions.target_names
+        ):
+            raise ValueError("assurance transaction targets are incomplete")
         self._graph_store = graph_store
         self._evidence_store = evidence_store
         self._checkpoint_store = checkpoint_store
@@ -97,6 +141,11 @@ class SyncOrchestrator:
         self._reasoner = reasoner
         self._case_detector = case_detector
         self._changeset_executor = changeset_executor
+        self._assurance_service = assurance_service
+        self._transactions = transactions
+        self._snapshot_files = {
+            name: file.duplicate() for name, file in sorted(extras.items())
+        }
         self._clock = clock
 
     async def run(self, run_id: str, connectors: Sequence[Connector]) -> SyncRunResult:
@@ -223,7 +272,15 @@ class SyncOrchestrator:
         if semantic_successes:
             try:
                 combined = self._combined_delta(semantic_successes)
-                case_count, change_count = self._apply_detected_cases(combined)
+                assurance_snapshot = (
+                    self._combined_snapshot()
+                    if self._assurance_service is not None
+                    else None
+                )
+                case_count, change_count = self._apply_detected_cases(
+                    combined,
+                    assurance_snapshot=assurance_snapshot,
+                )
                 if case_count:
                     semantic_successes[0].progress.cases_created += case_count
                     semantic_successes[0].progress.changes_applied += change_count
@@ -389,19 +446,83 @@ class SyncOrchestrator:
             ingestions=ingestions,
         )
 
+    def _combined_snapshot(self) -> _ScheduledSnapshot:
+        """Parse every durable assurance input from one descriptor-held transaction snapshot."""
+        if self._transactions is None:
+            raise ValueError("assurance transaction snapshot is unavailable")
+        snapshot = self._transactions.snapshot(self._snapshot_files)
+        graph_content = snapshot.content.get("graph")
+        if graph_content is None:
+            raise ValueError("assurance graph snapshot is unavailable")
+        evidence_content = snapshot.content.get("evidence")
+        records, ingestions, _legacy_ids = parse_evidence_lines(evidence_content)
+        versions = parse_case_versions(snapshot.content.get("cases"))
+        latest_cases = {case.id: case for case in versions}
+        return _ScheduledSnapshot(
+            graph=parse_graph(graph_content),
+            records=tuple(sorted(records, key=lambda item: item.id)),
+            ingestions=tuple(
+                sorted(ingestions, key=lambda item: (item.connector_id, item.sequence))
+            ),
+            cases=tuple(latest_cases[key] for key in sorted(latest_cases)),
+            graph_preimage=graph_content,
+            evidence_preimage=evidence_content,
+            case_preimage=snapshot.content.get("cases"),
+            extra_preimages={
+                name: snapshot.content.get(name) for name in self._snapshot_files
+            },
+        )
+
     def _apply_detected_cases(
         self,
         delta: EvidenceDelta,
+        *,
+        assurance_snapshot: _ScheduledSnapshot | None = None,
     ) -> tuple[int, int]:
         """Commit all new combined-run cases through one complete ChangeSet."""
-        if not delta.added:
-            return 0, 0
-        graph = self._graph_store.load()
-        cases: list[ReconciliationCase] = []
-        for observation in sorted(
-            self._case_detector(delta, graph), key=lambda item: item.fingerprint
+        if not delta.added and (
+            self._assurance_service is None
+            or assurance_snapshot is None
+            or not assurance_snapshot.records
         ):
-            if self._case_store.find_by_fingerprint(observation.fingerprint) is not None:
+            return 0, 0
+        graph = (
+            assurance_snapshot.graph
+            if assurance_snapshot is not None
+            else self._graph_store.load()
+        )
+        cases: list[ReconciliationCase] = []
+        observations = list(self._case_detector(delta, graph))
+        if (
+            self._assurance_service is not None
+            and assurance_snapshot is not None
+            and any(
+                node.status in {"active", "provisional"}
+                and node.type in _INTENT_BASELINE_TYPES
+                for node in graph.nodes
+            )
+        ):
+            legacy_subjects = {observation.subject_ref for observation in observations}
+            observations.extend(
+                observation
+                for observation in self._assurance_service.detect(
+                    graph=graph,
+                    records=assurance_snapshot.records,
+                    ingestions=assurance_snapshot.ingestions,
+                    existing_cases=assurance_snapshot.cases,
+                )
+                if observation.subject_ref not in legacy_subjects
+            )
+        known_fingerprints = {
+            case.fingerprint
+            for case in (
+                assurance_snapshot.cases
+                if assurance_snapshot is not None
+                else self._case_store.list()
+            )
+        }
+        for observation in sorted(observations, key=lambda item: item.fingerprint):
+            if observation.fingerprint in known_fingerprints:
                 continue
             cases.append(
                 ReconciliationCase(
@@ -417,6 +538,7 @@ class SyncOrchestrator:
                     requires_human=observation.requires_human,
                 )
             )
+            known_fingerprints.add(observation.fingerprint)
         if not cases:
             return 0, 0
         if self._changeset_executor is None:
@@ -442,7 +564,19 @@ class SyncOrchestrator:
             reconciliation_cases_resolved=(),
             validation_status="validated",
         )
-        self._changeset_executor.apply(changeset, created_cases=tuple(cases))
+        if assurance_snapshot is not None:
+            self._changeset_executor.apply(
+                changeset,
+                created_cases=tuple(cases),
+                graph_preimage=assurance_snapshot.graph_preimage,
+                evidence_preimage=assurance_snapshot.evidence_preimage,
+                case_preimage=assurance_snapshot.case_preimage,
+                bind_case_preimage=True,
+                read_only_extras=self._snapshot_files,
+                extra_preimages=assurance_snapshot.extra_preimages,
+            )
+        else:
+            self._changeset_executor.apply(changeset, created_cases=tuple(cases))
         return len(cases), 1
 
     @staticmethod

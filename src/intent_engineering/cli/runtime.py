@@ -37,6 +37,7 @@ from intent_engineering.core.models import (
 from intent_engineering.core.policy.access import refs_allowed
 from intent_engineering.core.policy.project import ProjectNotInitialized, workspace_path
 from intent_engineering.extract.deterministic import DeterministicReasoner
+from intent_engineering.intent_workflow.assurance import AssuranceService
 from intent_engineering.intent_workflow.proposal_store import IntentProposalStore
 from intent_engineering.reconcile import LocalResolutionService
 from intent_engineering.reconcile.evidence_detection import detect_evidence_drift
@@ -260,6 +261,9 @@ def load_runtime(root: Path) -> Runtime:
         reasoner=_FrontMatterReasoner(actor=config.local_actor),
         case_detector=lambda delta, graph: _detect_cases(delta, graph, config.local_actor),
         changeset_executor=changeset_executor,
+        assurance_service=AssuranceService(actor=config.local_actor),
+        transactions=transactions,
+        snapshot_files={"config": config_file},
     )
     resolution = LocalResolutionService(
         graph_store,
@@ -301,7 +305,9 @@ def resolve_connectors(
         if source == "markdown":
             connectors.append(MarkdownConnector(runtime.project_directory, runtime.config))
         elif source == "git":
-            connectors.append(GitConnector(runtime.root))
+            connectors.append(
+                GitConnector(runtime.root, repository_id=runtime.config.project_id)
+            )
         elif source == "github":
             if github_client is None or github_repository is None:
                 raise GitHubConfigurationError()

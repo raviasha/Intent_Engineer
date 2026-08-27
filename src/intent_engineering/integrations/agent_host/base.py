@@ -15,6 +15,10 @@ from pydantic import ConfigDict, Field, ValidationInfo, field_validator, model_v
 from intent_engineering.core.models._base import StrictModel
 from intent_engineering.intent_workflow.authorization import AuthorizationVerification
 from intent_engineering.intent_workflow.models import PreflightResult, TaskEnvelope
+from intent_engineering.intent_workflow.post_task import (
+    PostTaskResult,
+    PostTaskSubmission,
+)
 
 _CONTROL = re.compile(r"[\x00-\x1f\x7f]")
 _DIGEST = r"^sha256:[0-9a-f]{64}$"
@@ -233,8 +237,13 @@ class HostTaskResult(_HostModel):
     status: Literal["completed", "blocked", "failed", "cancelled"]
     response_evidence_ref: str
     changed_paths: Annotated[tuple[str, ...], Field(max_length=_MAX_ITEMS)] = ()
+    base_revision: Annotated[str, Field(pattern=_COMMIT)] | None = None
     commit_sha: Annotated[str, Field(pattern=_COMMIT)] | None = None
+    requirement_ids: Annotated[tuple[str, ...], Field(max_length=_MAX_ITEMS)] = ()
+    code_refs: Annotated[tuple[str, ...], Field(max_length=_MAX_ITEMS)] = ()
     test_refs: Annotated[tuple[str, ...], Field(max_length=_MAX_ITEMS)] = ()
+    git_evidence_refs: Annotated[tuple[str, ...], Field(max_length=_MAX_ITEMS)] = ()
+    test_evidence_refs: Annotated[tuple[str, ...], Field(max_length=_MAX_ITEMS)] = ()
     completed_at: datetime
 
     @field_validator("response_evidence_ref")
@@ -256,7 +265,14 @@ class HostTaskResult(_HostModel):
     def validate_paths(cls, values: tuple[str, ...]) -> tuple[str, ...]:
         return _paths(values)
 
-    @field_validator("test_refs", mode="before")
+    @field_validator(
+        "requirement_ids",
+        "code_refs",
+        "test_refs",
+        "git_evidence_refs",
+        "test_evidence_refs",
+        mode="before",
+    )
     @classmethod
     def require_exact_test_refs(cls, value: object, info: ValidationInfo) -> object:
         if info.mode == "python" and type(value) is not tuple:
@@ -265,7 +281,9 @@ class HostTaskResult(_HostModel):
             return tuple(value)
         return value
 
-    @field_validator("test_refs")
+    @field_validator(
+        "requirement_ids", "code_refs", "test_refs", "git_evidence_refs", "test_evidence_refs"
+    )
     @classmethod
     def validate_test_refs(cls, values: tuple[str, ...]) -> tuple[str, ...]:
         return _identities(values)
@@ -337,6 +355,15 @@ class IntentWorkflowPort(Protocol):
         requested_paths: tuple[str, ...],
     ) -> AuthorizationVerification: ...
 
+    async def post_task_evaluate(
+        self,
+        submission: PostTaskSubmission,
+        *,
+        token: str,
+    ) -> PostTaskResult: ...
+
+    def authorization_revoke(self, token: str) -> None: ...
+
 
 class AgentHostAdapter(Protocol):
     @property
@@ -353,7 +380,9 @@ class AgentHostAdapter(Protocol):
         token: str | None,
     ) -> MutationDecision: ...
 
-    async def after_task(self, task: HostTask, result: HostTaskResult) -> None: ...
+    async def after_task(
+        self, task: HostTask, result: HostTaskResult
+    ) -> PostTaskResult | None: ...
 
 
 def _raise_signal(signal: BaseException) -> None:
@@ -562,20 +591,96 @@ class IntentAgentHostAdapter:
             _raise_signal(caught_signal)
         raise RuntimeError("intent host adapter unavailable") from None
 
-    async def after_task(self, task: HostTask, result: HostTaskResult) -> None:
+    async def after_task(
+        self, task: HostTask, result: HostTaskResult
+    ) -> PostTaskResult | None:
         if not self._enabled:
-            return
+            return None
         task_id: str | None = None
+        capability: str | None = None
+        signal: BaseException | None = None
         try:
+            if type(task) is not HostTask or type(result) is not HostTaskResult:
+                raise ValueError("invalid host completion")
             checked_task = HostTask.model_validate_json(task.model_dump_json())
             task_id = checked_task.id
             checked_result = HostTaskResult.model_validate_json(result.model_dump_json())
-            if checked_result.task_id != checked_task.id:
+            issued_task = self._tasks.get(task_id)
+            capability = self._tokens.get(task_id)
+            if issued_task != checked_task or checked_result.task_id != checked_task.id:
                 raise ValueError("host task result mismatch")
+            if checked_result.status != "completed":
+                if checked_result.changed_paths:
+                    raise ValueError("host task result mismatch")
+                return None
+            if (
+                capability is None
+                or checked_result.base_revision is None
+                or checked_result.commit_sha is None
+                or not checked_result.changed_paths
+                or not checked_result.requirement_ids
+                or not checked_result.code_refs
+                or not checked_result.git_evidence_refs
+            ):
+                raise ValueError("host post-task evidence incomplete")
+            submission = PostTaskSubmission(
+                repository_id=checked_task.repository_id,
+                task_id=checked_task.id,
+                actor=checked_task.actor,
+                request_digest=checked_task.request_digest,
+                graph_version=checked_task.graph_version,
+                base_revision=checked_result.base_revision,
+                final_revision=checked_result.commit_sha,
+                changed_paths=checked_result.changed_paths,
+                requirement_ids=checked_result.requirement_ids,
+                code_refs=checked_result.code_refs,
+                test_refs=checked_result.test_refs,
+                git_evidence_refs=checked_result.git_evidence_refs,
+                test_evidence_refs=checked_result.test_evidence_refs,
+                completed_at=checked_result.completed_at,
+            )
+            completion = await self._workflow.post_task_evaluate(
+                submission,
+                token=capability,
+            )
+            if (
+                type(completion) is not PostTaskResult
+                or completion.task_id != checked_task.id
+                or completion.graph_version < checked_task.graph_version
+            ):
+                raise ValueError("invalid host post-task result")
+            detached_completion = PostTaskResult.model_validate_json(completion.model_dump_json())
+        except BaseException as caught:  # noqa: BLE001 - preserve cancellation identity
+            caught.__traceback__ = None
+            caught.__cause__ = None
+            caught.__context__ = None
+            signal = caught
         finally:
             if task_id is not None:
                 self._tokens.pop(task_id, None)
                 self._tasks.pop(task_id, None)
+            revoker = getattr(self._workflow, "authorization_revoke", None)
+            if capability is not None and callable(revoker):
+                try:
+                    revoker(capability)
+                except (RuntimeError, ValueError):
+                    if signal is None:
+                        signal = RuntimeError("intent host adapter unavailable")
+            task = cast(HostTask, None)
+            result = cast(HostTaskResult, None)
+            checked_task = cast(HostTask, None)
+            checked_result = cast(HostTaskResult, None)
+            issued_task = cast(HostTask, None)
+            submission = cast(PostTaskSubmission, None)
+            completion = cast(PostTaskResult, None)
+            capability = None
+            revoker = None
+            self = cast(IntentAgentHostAdapter, None)  # noqa: PLW0642 - scrub traceback state
+        if signal is not None:
+            caught_signal = signal
+            signal = None
+            _raise_signal(caught_signal)
+        return detached_completion
 
 
 __all__ = [

@@ -264,7 +264,7 @@
   approved the fast-but-safe final cadence: one precommit full suite followed by postcommit focused
   Task 7, Ruff, mypy, base-to-HEAD diff, index, and protected-name verification. Authorized for the
   exact Task 7 commit.
-- Task 8: PRECOMMIT_REVIEW_READY at exact base
+- Task 8: COMMITTED as `c0b7631c93c2e5ba5ea432bbc936b2a32c743639` after READY review at exact base
   `d91beef4b0ab0b2caba8bbfebd1f4999f1b8b2a2` (implementer
   `/root/intent_workflow_task8`, unsupported mandatory-mode branch, no staging/commit). Installed
   `codex-cli 0.148.0-alpha.9` has stable enabled hooks/plugins/unified execution, but the official
@@ -282,6 +282,27 @@
   post-fix full offline warnings-as-errors is `1464 passed in 50.57s`; and `git diff --check` is
   clean. Final finding-only independent review is `0 Critical / 0 Important / 0 Minor`, Ready;
   its exact selector is `7 passed`. Detailed evidence:
-  `task-8-report.md`; controlling scope: `task-8-brief.md`.
-- Task 9: pending
+  `task-8-report.md`; controlling scope: `task-8-brief.md`. Postcommit focused Task 8 was `42
+  passed`; Ruff and mypy remained clean; base-to-HEAD diff-check was clean; the index and tracked
+  worktree were clean; exactly the five protected artifacts remained untracked and untouched.
+- Task 9: READY, final same-reviewer verdict `0C/0I/0M` (implementer
+  `/root/intent_workflow_task9`, exact base `c0b7631c93c2e5ba5ea432bbc936b2a32c743639`;
+  exact allowlisted commit authorized). The first review returned `0C/4I/0M`; its finding selector witnessed
+  `15 failed, 1 error, 47 deselected in 0.59s`. A final reviewer disclosure regression then proved
+  that the optional reasoner received an ACL-hidden snapshot sentinel (`1 failed, 25 deselected in
+  0.17s`); the complete selector now passes `19 passed, 47 deselected in 0.32s`.
+  Post-task now requires immutable current ACL-visible passing test-run evidence (a touched test file
+  is not execution), authenticates preserved Git authors through live aliases, binds exact config/
+  policy/repository/binding/graph/evidence preimages, and returns detached withheld `after_task`
+  results. Scheduled assurance now snapshots all durable sources plus graph/cases/config in one
+  transaction, binds exact commit preimages, and filters unrelated hidden/incomplete nodes without
+  erasing visible conclusions. The optional reasoner receives only a detached ACL-visible graph/
+  evidence/ingestion/case snapshot, and obscured endpoints remain ineligible for grounded output.
+  Legacy detectors and checkpoint semantics remain compatible. The complete Task 9 pair is `66
+  passed in 1.24s`; expanded compatibility remains `510 passed in 4.27s`; Ruff is clean; mypy is
+  clean across 117 source files; and the accepted fresh full offline warnings-as-errors suite remains
+  `1529 passed in 51.12s`. The final reviewer selector is `4 passed`, Ready. Codex automatic
+  invocation remains unsupported; only the reusable
+  provider-neutral `after_task` seam is implemented. Detailed evidence: `task-9-report.md`;
+  controlling scope: `task-9-brief.md`.
 - Task 10: pending
