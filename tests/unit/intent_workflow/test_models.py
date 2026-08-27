@@ -60,6 +60,25 @@ def _identity(prefix: str, material: dict[str, object]) -> str:
     return f"{prefix}:sha256:{sha256(encoded).hexdigest()}"
 
 
+def _proposal_material(source_roles: list[dict[str, object]]) -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "kind": "bootstrap",
+        "proposed_by": "local:asha",
+        "proposed_at": "2026-08-26T00:00:00Z",
+        "baseline_graph_version": 0,
+        "evidence_refs": ["evidence:prd:v1"],
+        "source_roles": source_roles,
+        "changeset": _changeset().model_dump(mode="json"),
+        "core_node_ids": [],
+        "provisional_node_ids": [],
+        "assumptions": [],
+        "unanswered_questions": [],
+        "conflicting_authors": [],
+        "destructive": False,
+    }
+
+
 def test_source_role_assignment_is_granular_strict_and_frozen() -> None:
     """Rejects invalid roles and undeclared fields rather than discarding authority metadata."""
     assignment = _assignment()
@@ -196,6 +215,81 @@ def test_proposal_and_decision_are_independent_content_addressed_append_records(
     assert decision.id.startswith("proposal-decision:sha256:")
     with pytest.raises(ValidationError, match="identifier does not match"):
         ProposalDecision.model_validate({**decision.model_dump(), "id": "proposal-decision:sha256:bad"})
+
+
+def test_intent_proposal_canonicalizes_permuted_source_roles_before_hashing() -> None:
+    """Catches semantically identical role assignments receiving different proposal identities."""
+    markdown_role = SourceRoleAssignment(
+        connector_id="markdown",
+        scope="docs/prd.md",
+        role=SourceRole.DECLARED_INTENT,
+        inherited=False,
+    )
+    slack_role = _assignment()
+    sorted_material = _proposal_material(
+        [
+            {
+                "connector_id": "markdown",
+                "scope": "docs/prd.md",
+                "role": "declared_intent",
+                "inherited": False,
+            },
+            {
+                "connector_id": "mcp:slack-product",
+                "scope": "channel:C123",
+                "role": "proposed_intent",
+                "inherited": False,
+            },
+        ]
+    )
+    expected_id = _identity("proposal", sorted_material)
+
+    proposal = IntentProposal(
+        id=expected_id,
+        kind=ProposalKind.BOOTSTRAP,
+        proposed_by="local:asha",
+        proposed_at=NOW,
+        baseline_graph_version=0,
+        evidence_refs=("evidence:prd:v1",),
+        source_roles=(slack_role, markdown_role),
+        changeset=_changeset(),
+    )
+
+    assert proposal.id == expected_id
+    assert proposal.source_roles == (markdown_role, slack_role)
+
+
+def test_intent_proposal_rejects_duplicate_source_role_scopes() -> None:
+    """Catches proposals that ambiguously assign more than one role to one source scope."""
+    role = _assignment()
+    duplicate_material = _proposal_material(
+        [
+            {
+                "connector_id": "mcp:slack-product",
+                "scope": "channel:C123",
+                "role": "proposed_intent",
+                "inherited": False,
+            },
+            {
+                "connector_id": "mcp:slack-product",
+                "scope": "channel:C123",
+                "role": "proposed_intent",
+                "inherited": False,
+            },
+        ]
+    )
+
+    with pytest.raises(ValidationError, match="duplicate source role"):
+        IntentProposal(
+            id=_identity("proposal", duplicate_material),
+            kind=ProposalKind.BOOTSTRAP,
+            proposed_by="local:asha",
+            proposed_at=NOW,
+            baseline_graph_version=0,
+            evidence_refs=("evidence:prd:v1",),
+            source_roles=(role, role),
+            changeset=_changeset(),
+        )
 
 
 def test_preflight_context_is_detached_strict_json_and_serializes_to_plain_containers() -> None:

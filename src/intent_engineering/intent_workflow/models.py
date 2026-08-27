@@ -114,6 +114,17 @@ class IntentProposal(_WorkflowModel):
     conflicting_authors: tuple[str, ...] = ()
     destructive: bool = False
 
+    @field_validator("source_roles")
+    @classmethod
+    def normalize_source_roles(
+        cls, source_roles: tuple[SourceRoleAssignment, ...]
+    ) -> tuple[SourceRoleAssignment, ...]:
+        normalized = tuple(sorted(source_roles, key=lambda item: (item.connector_id, item.scope)))
+        pairs = tuple((item.connector_id, item.scope) for item in normalized)
+        if len(pairs) != len(set(pairs)):
+            raise ValueError("duplicate source role assignment")
+        return normalized
+
     @property
     def digest(self) -> str:
         return _canonical_digest(self.model_dump(mode="json", exclude={"id"}))
