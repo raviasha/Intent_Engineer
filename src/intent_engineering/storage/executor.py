@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from typing import cast
 
 from intent_engineering.core.graph.applier import apply_changeset_with_case_effects
 from intent_engineering.core.models import (
@@ -16,7 +17,7 @@ from intent_engineering.storage.jsonl.case_store import (
     validate_case_appends,
 )
 from intent_engineering.storage.jsonl.history_store import serialize_changeset
-from intent_engineering.storage.transaction import LocalTransactionCoordinator
+from intent_engineering.storage.transaction import LocalTransaction, LocalTransactionCoordinator
 from intent_engineering.storage.yaml.graph_store import (
     YamlGraphStore,
     parse_graph,
@@ -77,26 +78,78 @@ class LocalChangeSetExecutor:
         *,
         created_cases: Sequence[ReconciliationCase] = (),
         resolved_cases: Sequence[ReconciliationCase] = (),
+        intent_proposal_preimage: bytes | None = None,
+        intent_proposal_append: bytes | None = None,
+        rollback_base_exceptions: bool = False,
     ) -> Graph:
         """Prevalidate all groups, then durably commit every declared local effect."""
-        validated = ChangeSet.model_validate(changeset.model_dump())
-        effects = self._ordered_effects(validated, created_cases, resolved_cases)
-        with self._transactions.transaction() as transaction:
-            graph = parse_graph(transaction.read("graph"))
-            next_graph = apply_changeset_with_case_effects(graph, validated)
-            known_nodes = {node.id for node in next_graph.nodes}
-            if any(
-                case.subject_ref not in known_nodes
-                or any(reference not in known_nodes for reference in case.affected_refs)
-                for case in effects
-            ):
-                raise CaseEffectMismatch()
-            case_bytes = validate_case_appends(
-                transaction.read_optional("cases"),
-                effects,
-            )
-            transaction.write("graph", serialize_graph(next_graph))
-            transaction.append("history", serialize_changeset(validated))
-            if case_bytes:
-                transaction.append("cases", case_bytes)
-            return next_graph
+        if (intent_proposal_preimage is None) != (intent_proposal_append is None) or (
+            intent_proposal_append is not None
+            and (type(intent_proposal_append) is not bytes or not intent_proposal_append)
+        ):
+            raise ValueError("invalid intent proposal transaction effect")
+        if intent_proposal_append is not None and "intent_proposals" not in self._transactions.target_names:
+            raise ValueError("intent proposal transaction target is unavailable")
+        validated: ChangeSet | None = None
+        effects: tuple[ReconciliationCase, ...] = ()
+        graph: Graph | None = None
+        next_graph: Graph | None = None
+        known_nodes: set[str] = set()
+        case_bytes = b""
+        transaction: LocalTransaction | None = None
+        cancellation: BaseException | None = None
+        try:
+            validated = ChangeSet.model_validate(changeset.model_dump())
+            effects = self._ordered_effects(validated, created_cases, resolved_cases)
+            with self._transactions.transaction(
+                rollback_base_exceptions=rollback_base_exceptions
+            ) as transaction:
+                graph = parse_graph(transaction.read("graph"))
+                next_graph = apply_changeset_with_case_effects(graph, validated)
+                known_nodes = {node.id for node in next_graph.nodes}
+                if any(
+                    case.subject_ref not in known_nodes
+                    or any(reference not in known_nodes for reference in case.affected_refs)
+                    for case in effects
+                ):
+                    raise CaseEffectMismatch()
+                case_bytes = validate_case_appends(
+                    transaction.read_optional("cases"),
+                    effects,
+                )
+                if intent_proposal_append is not None:
+                    if transaction.read_optional("intent_proposals") != intent_proposal_preimage:
+                        raise ValueError("intent proposal ledger changed")
+                    transaction.append("intent_proposals", intent_proposal_append)
+                transaction.write("graph", serialize_graph(next_graph))
+                transaction.append("history", serialize_changeset(validated))
+                if case_bytes:
+                    transaction.append("cases", case_bytes)
+        except BaseException as caught:
+            if isinstance(caught, Exception) or not rollback_base_exceptions:
+                raise
+            caught.__traceback__ = None
+            cancellation = caught
+            self._transactions.recover()
+        finally:
+            changeset = cast(ChangeSet, None)
+            created_cases = ()
+            resolved_cases = ()
+            intent_proposal_preimage = None
+            intent_proposal_append = None
+            rollback_base_exceptions = False
+            validated = None
+            effects = ()
+            graph = None
+            known_nodes.clear()
+            case_bytes = b""
+            transaction = None
+            if cancellation is not None:
+                next_graph = None
+        if cancellation is not None:
+            caught_cancellation = cancellation
+            cancellation = None
+            raise caught_cancellation.with_traceback(None)
+        if next_graph is None:
+            raise RuntimeError("changeset execution failed")
+        return next_graph

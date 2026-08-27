@@ -22,6 +22,7 @@ _MAX_REQUEST_BYTES = 16 * 1024
 _MAX_SCOPE_BYTES = 2 * 1024
 _MAX_SCOPE_ENTRIES = 256
 _MAX_CONVERSATION_REF_LENGTH = 512
+_MAX_DECISION_NODE_IDS = 10_000
 
 
 def _canonical_digest(material: object) -> str:
@@ -160,6 +161,44 @@ class ProposalDecision(_WorkflowModel):
         return self
 
 
+class ProposalDecisionV2(_WorkflowModel):
+    """Exact human confirmation of one proposal activation mutation."""
+
+    schema_version: Literal[2] = 2
+    id: str
+    proposal_id: str
+    proposal_digest: str
+    actor: str
+    actor_aliases: tuple[str, ...]
+    decided_at: datetime
+    action: Literal["confirm"]
+    baseline_graph_version: int
+    confirmed_node_ids: Annotated[
+        tuple[str, ...], Field(min_length=1, max_length=_MAX_DECISION_NODE_IDS)
+    ]
+    activation_changeset_id: Annotated[str, Field(min_length=1)]
+
+    @field_validator("confirmed_node_ids")
+    @classmethod
+    def require_unique_confirmed_nodes(cls, values: tuple[str, ...]) -> tuple[str, ...]:
+        if len(values) != len(set(values)):
+            raise ValueError("confirmed node identifiers must be unique")
+        return values
+
+    @property
+    def digest(self) -> str:
+        return _canonical_digest(self.model_dump(mode="json", exclude={"id"}))
+
+    @model_validator(mode="after")
+    def validate_identity(self) -> ProposalDecisionV2:
+        if self.id != f"proposal-decision:{self.digest}":
+            raise ValueError("proposal decision identifier does not match canonical hash")
+        return self
+
+
+ProposalDecisionRecord = ProposalDecision | ProposalDecisionV2
+
+
 class TaskEnvelope(_WorkflowModel):
     """Bounded, canonical preflight input built from a single human message."""
 
@@ -250,6 +289,8 @@ __all__ = [
     "IntentProposal",
     "PreflightResult",
     "ProposalDecision",
+    "ProposalDecisionRecord",
+    "ProposalDecisionV2",
     "ProposalKind",
     "SourceRole",
     "SourceRoleAssignment",

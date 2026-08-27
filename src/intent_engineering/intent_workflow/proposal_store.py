@@ -12,7 +12,12 @@ from typing import Annotated, Literal, Self, cast
 from pydantic import ConfigDict, Field, ValidationError, model_validator
 
 from intent_engineering.core.models._base import StrictModel
-from intent_engineering.intent_workflow.models import IntentProposal, ProposalDecision
+from intent_engineering.intent_workflow.models import (
+    IntentProposal,
+    ProposalDecision,
+    ProposalDecisionRecord,
+    ProposalDecisionV2,
+)
 from intent_engineering.storage._atomic import append_durable_line, same_path_lock
 from intent_engineering.storage.jsonl.strict import loads_strict_object
 from intent_engineering.storage.secure import SecureFile, UnsafePathError, coerce_secure_file
@@ -34,7 +39,7 @@ class IntentLedgerRecord(StrictModel):
     schema_version: Literal[1] = 1
     sequence: Annotated[int, Field(ge=0)]
     proposal: IntentProposal | None = None
-    decision: ProposalDecision | None = None
+    decision: ProposalDecisionRecord | None = None
 
     @model_validator(mode="after")
     def require_exactly_one_payload(self) -> Self:
@@ -47,7 +52,7 @@ class IntentLedgerRecord(StrictModel):
 class _LedgerState:
     content: bytes
     proposals: dict[str, IntentProposal]
-    decisions: dict[str, ProposalDecision]
+    decisions: dict[str, ProposalDecisionRecord]
 
 
 def _canonical_json(value: object) -> bytes:
@@ -75,15 +80,18 @@ def _validated_proposal(value: IntentProposal) -> IntentProposal | None:
         validated = None
 
 
-def _validated_decision(value: ProposalDecision) -> ProposalDecision | None:
-    validated: ProposalDecision | None = None
+def _validated_decision(value: ProposalDecisionRecord) -> ProposalDecisionRecord | None:
+    validated: ProposalDecisionRecord | None = None
     try:
-        validated = ProposalDecision.model_validate_json(value.model_dump_json())
+        if isinstance(value, ProposalDecision):
+            validated = ProposalDecision.model_validate_json(value.model_dump_json())
+        elif isinstance(value, ProposalDecisionV2):
+            validated = ProposalDecisionV2.model_validate_json(value.model_dump_json())
         return validated
     except (AttributeError, TypeError, ValidationError, ValueError):
         return None
     finally:
-        value = cast(ProposalDecision, None)
+        value = cast(ProposalDecisionRecord, None)
         validated = None
 
 
@@ -133,9 +141,9 @@ class IntentProposalStore:
         canonical: bytes | None = None
         record: IntentLedgerRecord | None = None
         proposal: IntentProposal | None = None
-        decision: ProposalDecision | None = None
+        decision: ProposalDecisionRecord | None = None
         proposals: dict[str, IntentProposal] = {}
-        decisions: dict[str, ProposalDecision] = {}
+        decisions: dict[str, ProposalDecisionRecord] = {}
         result: _LedgerState | None = None
         try:
             content = self._read_content_unlocked()
@@ -234,18 +242,18 @@ class IntentProposalStore:
 
     def _decide_result(
         self,
-        decision: ProposalDecision,
+        decision: ProposalDecisionRecord,
     ) -> Literal["added", "duplicate", "invalid"]:
-        validated: ProposalDecision | None = None
+        validated: ProposalDecisionRecord | None = None
         state: _LedgerState | None = None
         proposal: IntentProposal | None = None
-        existing: ProposalDecision | None = None
+        existing: ProposalDecisionRecord | None = None
         record: IntentLedgerRecord | None = None
         encoded: bytes | None = None
         outcome: Literal["added", "duplicate", "invalid"] = "invalid"
         try:
             validated = _validated_decision(decision)
-            decision = cast(ProposalDecision, None)
+            decision = cast(ProposalDecisionRecord, None)
             if validated is None:
                 return "invalid"
             with self._locked():
@@ -273,7 +281,7 @@ class IntentProposalStore:
         except Exception:  # noqa: BLE001 - convert storage and hostile-model failures later
             return "invalid"
         finally:
-            decision = cast(ProposalDecision, None)
+            decision = cast(ProposalDecisionRecord, None)
             validated = None
             state = None
             proposal = None
@@ -281,12 +289,12 @@ class IntentProposalStore:
             record = None
             encoded = None
 
-    def decide(self, decision: ProposalDecision) -> bool:
+    def decide(self, decision: ProposalDecisionRecord) -> bool:
         outcome: Literal["added", "duplicate", "invalid"] | None = None
         try:
             outcome = self._decide_result(decision)
         finally:
-            decision = cast(ProposalDecision, None)
+            decision = cast(ProposalDecisionRecord, None)
         if outcome == "invalid":
             raise IntentProposalStoreError() from None
         return outcome == "added"
@@ -334,9 +342,9 @@ class IntentProposalStore:
             raise IntentProposalStoreError() from None
         return result
 
-    def decision_for(self, proposal_id: str) -> ProposalDecision | None:
+    def decision_for(self, proposal_id: str) -> ProposalDecisionRecord | None:
         state: _LedgerState | None = None
-        result: ProposalDecision | None = None
+        result: ProposalDecisionRecord | None = None
         valid = False
         completed = False
         try:

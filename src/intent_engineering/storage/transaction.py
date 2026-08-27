@@ -313,7 +313,11 @@ class LocalTransactionCoordinator:
         return LocalTransactionSnapshot(MappingProxyType(content), recovered)
 
     @contextmanager
-    def transaction(self) -> Iterator[LocalTransaction]:
+    def transaction(
+        self,
+        *,
+        rollback_base_exceptions: bool = False,
+    ) -> Iterator[LocalTransaction]:
         """Yield a locked mutation scope with durable preimages and crash recovery."""
         with self._locks():
             self._recover_unlocked()
@@ -335,6 +339,14 @@ class LocalTransactionCoordinator:
                     self._journal.unlink(missing_ok=True)
                 except Exception as recovery_error:
                     raise TransactionRecoveryError() from recovery_error
+                raise
+            except BaseException:
+                if rollback_base_exceptions:
+                    try:
+                        self._restore(preimages)
+                        self._journal.unlink(missing_ok=True)
+                    except Exception as recovery_error:
+                        raise TransactionRecoveryError() from recovery_error
                 raise
             finally:
                 transaction._finish()
