@@ -240,6 +240,48 @@ nodes:
   evidence_refs:
   - spec:25
   - spec:31
+- id: cap-mandatory-intent-preflight
+  type: CAPABILITY
+  label: Require intent preflight before enabled agents mutate repository state
+  status: active
+  created_by: approved-workflow-design
+  created_at: '2026-08-26'
+  last_modified_by: approved-workflow-design
+  last_modified_at: '2026-08-26'
+  source_mode: derived
+  intent_fidelity_confidence: 0.95
+  confidence_basis: Approved intent-aware workflow design
+  evidence_refs:
+  - spec:8
+  - spec:10
+- id: cap-prd-bootstrap
+  type: CAPABILITY
+  label: Bootstrap an evidence-backed intent baseline from an existing PRD
+  status: active
+  created_by: approved-workflow-design
+  created_at: '2026-08-26'
+  last_modified_by: approved-workflow-design
+  last_modified_at: '2026-08-26'
+  source_mode: derived
+  intent_fidelity_confidence: 0.94
+  confidence_basis: Approved intent-aware workflow design
+  evidence_refs:
+  - spec:8
+  - spec:9
+- id: decision-agent-proposals-deterministic-authority
+  type: DECISION
+  label: Agents submit typed proposals while deterministic validation and ChangeSets govern canonical graph mutation
+  status: active
+  created_by: approved-workflow-design
+  created_at: '2026-08-26'
+  last_modified_by: approved-workflow-design
+  last_modified_at: '2026-08-26'
+  source_mode: derived
+  intent_fidelity_confidence: 0.98
+  confidence_basis: Approved intent-aware workflow design and foundational authority boundary
+  evidence_refs:
+  - spec:4
+  - spec:10
 edges:
 - id: e1
   from: ctx-fragmented-intent
@@ -349,3 +391,39 @@ edges:
   created_at: '2026-08-25'
   last_modified_by: founding-spec
   last_modified_at: '2026-08-25'
+- id: e13
+  from: cap-mandatory-intent-preflight
+  relation: MOTIVATES
+  to: intent-preserve-fidelity
+  status: active
+  created_by: approved-workflow-design
+  created_at: '2026-08-26'
+  last_modified_by: approved-workflow-design
+  last_modified_at: '2026-08-26'
+- id: e14
+  from: cap-mandatory-intent-preflight
+  relation: DEPENDS_ON
+  to: cap-sync
+  status: active
+  created_by: approved-workflow-design
+  created_at: '2026-08-26'
+  last_modified_by: approved-workflow-design
+  last_modified_at: '2026-08-26'
+- id: e15
+  from: cap-prd-bootstrap
+  relation: REFINES
+  to: cap-manage
+  status: active
+  created_by: approved-workflow-design
+  created_at: '2026-08-26'
+  last_modified_by: approved-workflow-design
+  last_modified_at: '2026-08-26'
+- id: e16
+  from: decision-agent-proposals-deterministic-authority
+  relation: REFINES
+  to: decision-agent-agnostic
+  status: active
+  created_by: approved-workflow-design
+  created_at: '2026-08-26'
+  last_modified_by: approved-workflow-design
+  last_modified_at: '2026-08-26'

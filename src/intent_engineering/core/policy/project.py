@@ -190,6 +190,7 @@ def initialize_project(root: Path, *, force: bool = False) -> InitializedProject
                     project_id=root.name or "project",
                     local_actor="local",
                     source_exclusions=(".intent/**", ".git/**"),
+                    source_roles=(),
                 )
                 graph = _initial_graph(config.project_id)
                 _replace_regular(

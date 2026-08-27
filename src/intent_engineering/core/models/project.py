@@ -9,6 +9,7 @@ from types import MappingProxyType
 from pydantic import ConfigDict, Field, field_serializer, field_validator
 
 from intent_engineering.core.models._base import StrictModel
+from intent_engineering.core.models.source_roles import SourceRoleAssignment
 
 _DEFAULT_CONTEXT_LIMITS = {
     "relevant_intent": 10,
@@ -53,7 +54,25 @@ class ProjectConfig(StrictModel):
     source_exclusions: tuple[str, ...] = ()
     auto_apply_metadata: bool = True
     auto_apply_semantic: bool = False
+    source_roles: tuple[SourceRoleAssignment, ...] = ()
     context_limits: Mapping[str, int] = Field(default_factory=lambda: dict(_DEFAULT_CONTEXT_LIMITS))
+
+    @field_validator("source_roles")
+    @classmethod
+    def normalize_source_roles(
+        cls, source_roles: tuple[SourceRoleAssignment, ...]
+    ) -> tuple[SourceRoleAssignment, ...]:
+        normalized = tuple(sorted(source_roles, key=lambda item: (item.connector_id, item.scope)))
+        pairs = tuple((item.connector_id, item.scope) for item in normalized)
+        if len(pairs) != len(set(pairs)):
+            raise ValueError("duplicate source role assignment")
+        return normalized
+
+    @field_serializer("source_roles")
+    def serialize_source_roles(
+        self, source_roles: tuple[SourceRoleAssignment, ...]
+    ) -> list[dict[str, object]]:
+        return [assignment.model_dump(mode="json") for assignment in source_roles]
 
     @field_validator("context_limits")
     @classmethod

@@ -27,6 +27,29 @@ def test_framework_graph_is_valid_and_provenance_backed() -> None:
     graph.assert_invariants()
 
 
+def test_framework_graph_dogfoods_intent_aware_agent_workflow_vocabulary() -> None:
+    """The framework graph preserves preflight, bootstrap, and deterministic authority intent."""
+    graph = YamlGraphStore(Path("graph/framework-intent-graph.yaml")).load()
+    node_ids = {node.id for node in graph.nodes}
+    edges = {(edge.from_id, edge.relation.value, edge.to_id) for edge in graph.edges}
+
+    assert {
+        "cap-mandatory-intent-preflight",
+        "cap-prd-bootstrap",
+        "decision-agent-proposals-deterministic-authority",
+    } <= node_ids
+    assert {
+        ("cap-mandatory-intent-preflight", "MOTIVATES", "intent-preserve-fidelity"),
+        ("cap-prd-bootstrap", "REFINES", "cap-manage"),
+        (
+            "decision-agent-proposals-deterministic-authority",
+            "REFINES",
+            "decision-agent-agnostic",
+        ),
+        ("cap-mandatory-intent-preflight", "DEPENDS_ON", "cap-sync"),
+    } <= edges
+
+
 def test_framework_graph_spec_references_import_as_section_backed_versioned_evidence(
     tmp_path: Path,
 ) -> None:

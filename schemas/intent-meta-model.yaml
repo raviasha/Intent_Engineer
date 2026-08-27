@@ -9,6 +9,7 @@ meta_model:
   - Material divergence creates a reconciliation case rather than assuming one source is correct.
   - Cross-author incompatible positions remain explicit until resolved.
   - Stable node and edge IDs are preserved when semantic identity remains unchanged.
+  - Agent task mutation requires intent preflight when the project policy enables it.
 node_types:
   evidence:
   - SOURCE_ARTIFACT

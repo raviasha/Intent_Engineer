@@ -30,6 +30,7 @@ from intent_engineering.core.models.evidence import (
 from intent_engineering.core.models.graph import Confidence, Edge, Graph, Node, TypeRegistry
 from intent_engineering.core.models.implementation import ImplementationClaim
 from intent_engineering.core.models.project import ProjectConfig, SyncCheckpoint
+from intent_engineering.core.models.source_roles import SourceRole, SourceRoleAssignment
 from intent_engineering.core.models.reconciliation import (
     ClassificationEvent,
     DriftObservation,
@@ -73,6 +74,8 @@ __all__ = [
     "RelationType",
     "ResolutionAction",
     "SourceMode",
+    "SourceRole",
+    "SourceRoleAssignment",
     "SyncCheckpoint",
     "TypeRegistry",
     "is_exact_consumed_prefix",
