@@ -972,7 +972,9 @@ intent_engineering:
     assert {
         entry.name for entry in workspace.iterdir() if entry.is_dir() and not entry.is_symlink()
     } == initialized_directories
-    assert all(not any((workspace / name).iterdir()) for name in initialized_directories)
+    assert all(not any((workspace / name).iterdir()) for name in initialized_directories - {"history"})
+    assert {entry.name for entry in (workspace / "history").iterdir()} == {"intent-proposals.jsonl"}
+    assert (workspace / "history/intent-proposals.jsonl").read_bytes() == b""
     assert not (workspace / "history/.local-transaction.json").exists()
     assert (workspace / "config.yaml").stat().st_size > 0
     assert (workspace / "graph.yaml").stat().st_size > 0

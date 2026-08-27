@@ -36,6 +36,7 @@ from intent_engineering.core.models import (
 from intent_engineering.core.policy.access import refs_allowed
 from intent_engineering.core.policy.project import ProjectNotInitialized, workspace_path
 from intent_engineering.extract.deterministic import DeterministicReasoner
+from intent_engineering.intent_workflow.proposal_store import IntentProposalStore
 from intent_engineering.reconcile import LocalResolutionService
 from intent_engineering.reconcile.evidence_detection import detect_evidence_drift
 from intent_engineering.storage.executor import LocalChangeSetExecutor
@@ -169,6 +170,7 @@ class Runtime:
     graph_store: YamlGraphStore
     evidence_store: JsonlEvidenceStore
     case_store: JsonlCaseStore
+    intent_proposals: IntentProposalStore
     checkpoint_store: YamlCheckpointStore
     sync: SyncOrchestrator
     resolution: LocalResolutionService
@@ -212,6 +214,7 @@ def load_runtime(root: Path) -> Runtime:
     case_file = workspace_directory.file("reconciliation/cases.jsonl")
     evidence_file = workspace_directory.file("evidence/evidence.jsonl")
     receipts_file = workspace_directory.file("approvals/receipts.jsonl")
+    intent_proposals_file = workspace_directory.file("history/intent-proposals.jsonl")
     transactions = LocalTransactionCoordinator(
         workspace_directory.file("history/.local-transaction.json"),
         {
@@ -220,8 +223,12 @@ def load_runtime(root: Path) -> Runtime:
             "cases": case_file,
             "evidence": evidence_file,
             "receipts": receipts_file,
+            "intent_proposals": intent_proposals_file,
         },
-        legacy_target_sets=(frozenset({"graph", "history", "cases"}),),
+        legacy_target_sets=(
+            frozenset({"graph", "history", "cases"}),
+            frozenset({"graph", "history", "cases", "evidence", "receipts"}),
+        ),
     )
     # Raw preimages must be restored before a torn YAML or JSONL file reaches a parser.
     transactions.recover()
@@ -232,6 +239,14 @@ def load_runtime(root: Path) -> Runtime:
     )
     evidence_store = JsonlEvidenceStore(evidence_file, transactions=transactions)
     case_store = JsonlCaseStore(case_file)
+    intent_proposals_target = transactions.target_file("intent_proposals")
+    try:
+        intent_proposals = IntentProposalStore(
+            intent_proposals_target,
+            transactions=transactions,
+        )
+    finally:
+        intent_proposals_target.close()
     checkpoint_store = YamlCheckpointStore(workspace_directory.file("cache/checkpoints.yaml"))
     changeset_executor = LocalChangeSetExecutor(graph_store, case_store, transactions)
     sync = SyncOrchestrator(
@@ -258,6 +273,7 @@ def load_runtime(root: Path) -> Runtime:
         graph_store=graph_store,
         evidence_store=evidence_store,
         case_store=case_store,
+        intent_proposals=intent_proposals,
         checkpoint_store=checkpoint_store,
         sync=sync,
         resolution=resolution,

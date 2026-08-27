@@ -164,6 +164,7 @@ def test_sync_and_write_share_one_complete_crash_recovery_domain(tmp_path: Path)
         "cases": workspace.file("reconciliation/cases.jsonl"),
         "evidence": workspace.file("evidence/evidence.jsonl"),
         "receipts": workspace.file("approvals/receipts.jsonl"),
+        "intent_proposals": workspace.file("history/intent-proposals.jsonl"),
     }
 
     def crash(stage: str) -> None:

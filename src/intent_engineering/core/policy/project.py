@@ -24,8 +24,22 @@ _STATE_FILES = (
     ("approvals", "approvals.jsonl"),
     ("approvals", "receipts.jsonl"),
     ("approvals", "policy.yaml"),
+    ("history", "intent-proposals.jsonl"),
 )
 _DIRECTORY_FLAGS = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+_FILE_CREATE_FLAGS = (
+    os.O_WRONLY
+    | os.O_CREAT
+    | os.O_EXCL
+    | getattr(os, "O_NOFOLLOW", 0)
+    | getattr(os, "O_CLOEXEC", 0)
+)
+_FILE_READ_FLAGS = (
+    os.O_RDONLY
+    | getattr(os, "O_NOFOLLOW", 0)
+    | getattr(os, "O_NONBLOCK", 0)
+    | getattr(os, "O_CLOEXEC", 0)
+)
 
 
 class ProjectNotInitialized(RuntimeError):
@@ -112,6 +126,29 @@ def _replace_regular(parent_fd: int, name: str, content: bytes) -> None:
         raise
 
 
+def _ensure_regular_file(parent_fd: int, name: str) -> None:
+    """Create one empty single-link file or authenticate an existing durable ledger."""
+    descriptor = -1
+    created = False
+    try:
+        try:
+            descriptor = os.open(name, _FILE_CREATE_FLAGS, 0o644, dir_fd=parent_fd)
+            created = True
+        except FileExistsError:
+            descriptor = os.open(name, _FILE_READ_FLAGS, dir_fd=parent_fd)
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+            raise ProjectAlreadyInitialized("local workspace has an unsafe path")
+        if created:
+            os.fsync(descriptor)
+            os.fsync(parent_fd)
+    except OSError as error:
+        raise ProjectAlreadyInitialized("local workspace has an unsafe path") from error
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
 def _is_complete_valid(workspace_fd: int) -> bool:
     descriptors: tuple[int, ...] = ()
     try:
@@ -173,6 +210,11 @@ def initialize_project(root: Path, *, force: bool = False) -> InitializedProject
             raise ProjectAlreadyInitialized("local workspace has an unsafe path") from error
         try:
             if existed and _is_complete_valid(workspace_fd):
+                history_fd = _open_or_create_directory(workspace_fd, "history")
+                try:
+                    _ensure_regular_file(history_fd, "intent-proposals.jsonl")
+                finally:
+                    os.close(history_fd)
                 connector_fd = _open_or_create_directory(workspace_fd, "connectors")
                 os.close(connector_fd)
                 return InitializedProject(
@@ -182,9 +224,9 @@ def initialize_project(root: Path, *, force: bool = False) -> InitializedProject
                 raise ProjectAlreadyInitialized("local workspace is incomplete or conflicting")
             if existed and force and not _state_is_empty(workspace_fd):
                 raise ProjectAlreadyInitialized("local workspace contains durable state")
-            directory_fds = tuple(
-                _open_or_create_directory(workspace_fd, name) for name in _DIRECTORIES
-            )
+            directory_fds = {
+                name: _open_or_create_directory(workspace_fd, name) for name in _DIRECTORIES
+            }
             try:
                 config = ProjectConfig(
                     project_id=root.name or "project",
@@ -201,8 +243,12 @@ def initialize_project(root: Path, *, force: bool = False) -> InitializedProject
                     "graph.yaml",
                     _yaml_bytes(graph.model_dump(mode="json", by_alias=True)),
                 )
+                _ensure_regular_file(
+                    directory_fds["history"],
+                    "intent-proposals.jsonl",
+                )
             finally:
-                for descriptor in directory_fds:
+                for descriptor in directory_fds.values():
                     os.close(descriptor)
         finally:
             os.close(workspace_fd)
