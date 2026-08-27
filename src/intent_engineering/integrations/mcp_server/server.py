@@ -31,6 +31,7 @@ from intent_engineering.integrations.mcp_server.intent_workflow import (
     IntentWorkflowPort,
     load_intent_workflow_services,
     register_intent_workflow_tools,
+    validate_intent_workflow_call,
 )
 from intent_engineering.integrations.mcp_server.mutations import (
     MutationPort,
@@ -55,12 +56,16 @@ class _IntentMCPServer(MCPServer[Any]):
             "intent_bootstrap_propose",
             "intent_proposal_show",
             "intent_proposal_confirm",
+            "intent_preflight",
+            "intent_authorization_verify",
         }
         failed = False
         response: CallToolResult | InputRequiredResult | None = None
         try:
+            if workflow_tool:
+                validate_intent_workflow_call(name, arguments)
             response = await super().call_tool(name, arguments, context)
-        except ToolError:
+        except (ToolError, ValueError):
             failed = True
         except MCPError:
             if not workflow_tool:

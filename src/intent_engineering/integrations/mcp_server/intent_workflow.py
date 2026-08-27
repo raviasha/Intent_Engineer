@@ -6,6 +6,7 @@ import json
 import re
 from collections.abc import Callable
 from datetime import UTC, datetime
+from pathlib import PurePosixPath, PureWindowsPath
 from typing import Annotated, Never, Protocol, cast
 
 from mcp import MCPError
@@ -20,8 +21,21 @@ from intent_engineering.cli.intent_workflow import (
     proposal_payload,
 )
 from intent_engineering.cli.runtime import Runtime
+from intent_engineering.core.models import ProjectConfig
 from intent_engineering.core.models._base import StrictModel
+from intent_engineering.intent_workflow.authorization import (
+    AuthorizationIssuer,
+    AuthorizationVerification,
+    canonical_graph_digest,
+)
 from intent_engineering.intent_workflow.bootstrap import BootstrapSubmission
+from intent_engineering.intent_workflow.models import PreflightResult, TaskEnvelope
+from intent_engineering.intent_workflow.preflight import (
+    AgentClassificationSubmission,
+    AuthenticatedPreflightResult,
+    PreflightService,
+)
+from intent_engineering.storage.yaml.graph_store import parse_graph
 
 _PROPOSE = ToolAnnotations(
     read_only_hint=False,
@@ -41,10 +55,32 @@ _CONFIRM = ToolAnnotations(
     idempotent_hint=True,
     open_world_hint=False,
 )
+_PREFLIGHT = ToolAnnotations(
+    read_only_hint=False,
+    destructive_hint=False,
+    idempotent_hint=False,
+    open_world_hint=False,
+)
+_VERIFY = ToolAnnotations(
+    read_only_hint=True,
+    destructive_hint=False,
+    idempotent_hint=True,
+    open_world_hint=False,
+)
 _MAX_REQUEST_BYTES = 1_048_576
 _MAX_CONFIRMED_NODES = 10_000
+_MAX_AUTHORIZATION_ITEMS = 256
+_MAX_AUTHORIZATION_FIELD_BYTES = 2_048
+_MAX_TOKEN_BYTES = 256
+_MAX_JSON_DEPTH = 128
+_MAX_JSON_NODES = 65_536
 _PROPOSAL_ID = r"^proposal:sha256:[0-9a-f]{64}$"
 _DIGEST = r"^sha256:[0-9a-f]{64}$"
+_TASK_ID = r"^task:sha256:[0-9a-f]{64}$"
+_CONTROL = re.compile(r"[\x00-\x1f\x7f]")
+_WINDOWS_DEVICE = re.compile(
+    r"^(?:CON|PRN|AUX|NUL|CLOCK\$|COM[1-9]|LPT[1-9])$", re.IGNORECASE
+)
 type _ProposalIdInput = Annotated[str, Field(pattern=_PROPOSAL_ID)]
 type _DigestInput = Annotated[str, Field(pattern=_DIGEST)]
 type _NodeIdsInput = Annotated[
@@ -53,14 +89,89 @@ type _NodeIdsInput = Annotated[
 ]
 
 
+def _task_envelope_input(value: object) -> TaskEnvelope:
+    encoded: bytes | None = None
+    envelope: TaskEnvelope | None = None
+    raw_created_at: object = None
+    serialized_created_at: object = None
+    try:
+        if type(value) is TaskEnvelope:
+            encoded = _canonical_json(value.model_dump(mode="json"))
+        elif type(value) is dict:
+            encoded = _canonical_json(value)
+        else:
+            raise ValueError("invalid workflow request")
+        envelope = TaskEnvelope.model_validate_json(encoded)
+        if type(value) is dict:
+            raw_created_at = cast(dict[str, object], value).get("created_at")
+            serialized_created_at = envelope.model_dump(mode="json")["created_at"]
+            if (
+                type(raw_created_at) is not str
+                or not raw_created_at.endswith("Z")
+                or raw_created_at != serialized_created_at
+            ):
+                raise ValueError("invalid workflow request")
+        return envelope
+    finally:
+        value = raw_created_at = serialized_created_at = None
+        encoded = None
+        envelope = None
+
+
+def _classification_input(value: object) -> AgentClassificationSubmission:
+    encoded: bytes | None = None
+    submission: AgentClassificationSubmission | None = None
+    try:
+        if type(value) is AgentClassificationSubmission:
+            encoded = _canonical_json(value.model_dump(mode="json"))
+        elif type(value) is dict:
+            encoded = _canonical_json(value)
+        else:
+            raise ValueError("invalid workflow request")
+        submission = AgentClassificationSubmission.model_validate_json(encoded)
+        return submission
+    finally:
+        value = None
+        encoded = None
+        submission = None
+
+
+type _TaskEnvelopeInput = Annotated[TaskEnvelope, BeforeValidator(_task_envelope_input)]
+type _AgentClassificationInput = Annotated[
+    AgentClassificationSubmission,
+    BeforeValidator(_classification_input),
+]
+type _TokenInput = Annotated[str, Field(min_length=1, max_length=_MAX_TOKEN_BYTES)]
+type _AuthorizationIdentityInput = Annotated[
+    str,
+    Field(min_length=1, max_length=_MAX_AUTHORIZATION_FIELD_BYTES),
+]
+type _AuthorizationTaskInput = Annotated[
+    str,
+    Field(pattern=_TASK_ID, max_length=_MAX_AUTHORIZATION_FIELD_BYTES),
+]
+type _AuthorizationPathsInput = Annotated[
+    list[Annotated[str, Field(min_length=1, max_length=_MAX_AUTHORIZATION_FIELD_BYTES)]],
+    Field(max_length=_MAX_AUTHORIZATION_ITEMS),
+]
+
+
 def _submission_input(value: object) -> BootstrapSubmission:
-    if isinstance(value, BootstrapSubmission):
-        encoded = _canonical_json(value.model_dump(mode="json"))
-    elif type(value) is dict:
-        encoded = _canonical_json(value)
-    else:
-        raise ValueError("invalid workflow request")
-    return BootstrapSubmission.model_validate_json(encoded)
+    encoded: bytes | None = None
+    submission: BootstrapSubmission | None = None
+    try:
+        if type(value) is BootstrapSubmission:
+            encoded = _canonical_json(value.model_dump(mode="json"))
+        elif type(value) is dict:
+            encoded = _canonical_json(value)
+        else:
+            raise ValueError("invalid workflow request")
+        submission = BootstrapSubmission.model_validate_json(encoded)
+        return submission
+    finally:
+        value = None
+        encoded = None
+        submission = None
 
 
 type _BootstrapSubmissionInput = Annotated[
@@ -70,16 +181,94 @@ type _BootstrapSubmissionInput = Annotated[
 
 
 def _canonical_json(value: object) -> bytes:
-    encoded = json.dumps(
-        value,
-        allow_nan=False,
-        ensure_ascii=False,
-        separators=(",", ":"),
-        sort_keys=True,
-    ).encode("utf-8")
-    if len(encoded) > _MAX_REQUEST_BYTES:
-        raise ValueError("workflow request is too large")
-    return encoded
+    encoded: bytes | None = None
+    try:
+        _require_exact_json(value)
+        encoded = json.dumps(
+            value,
+            allow_nan=False,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        if len(encoded) > _MAX_REQUEST_BYTES:
+            raise ValueError("workflow request is too large")
+        return encoded
+    finally:
+        value = None
+        encoded = None
+
+
+def _require_exact_json(value: object) -> None:
+    """Require one bounded, unaliased tree of exact JSON-compatible built-ins."""
+    pending: list[tuple[object, int, bool]] = [(value, 0, False)]
+    active: set[int] = set()
+    seen: set[int] = set()
+    item: object = None
+    key: object = None
+    nested: object = None
+    mapping: dict[object, object] | None = None
+    sequence: list[object] | None = None
+    identity: int | None = None
+    encoded: bytes | None = None
+    depth = 0
+    leaving = False
+    node_count = 0
+    utf8_bytes = 0
+    try:
+        while pending:
+            item, depth, leaving = pending.pop()
+            if leaving:
+                active.remove(id(item))
+                item = None
+                continue
+            node_count += 1
+            if depth > _MAX_JSON_DEPTH or node_count > _MAX_JSON_NODES:
+                raise ValueError("invalid workflow request")
+            if type(item) is dict:
+                mapping = cast(dict[object, object], item)
+                identity = id(mapping)
+                if identity in active or identity in seen:
+                    raise ValueError("invalid workflow request")
+                active.add(identity)
+                seen.add(identity)
+                pending.append((mapping, depth, True))
+                for key, nested in dict.items(mapping):
+                    if type(key) is not str:
+                        raise ValueError("invalid workflow request")
+                    node_count += 1
+                    encoded = key.encode("utf-8")
+                    utf8_bytes += len(encoded)
+                    if node_count > _MAX_JSON_NODES or utf8_bytes > _MAX_REQUEST_BYTES:
+                        raise ValueError("invalid workflow request")
+                    pending.append((nested, depth + 1, False))
+            elif type(item) is list:
+                sequence = cast(list[object], item)
+                identity = id(sequence)
+                if identity in active or identity in seen:
+                    raise ValueError("invalid workflow request")
+                active.add(identity)
+                seen.add(identity)
+                pending.append((sequence, depth, True))
+                pending.extend(
+                    (nested, depth + 1, False) for nested in list.__iter__(sequence)
+                )
+            elif type(item) is str:
+                encoded = item.encode("utf-8")
+                utf8_bytes += len(encoded)
+                if utf8_bytes > _MAX_REQUEST_BYTES:
+                    raise ValueError("invalid workflow request")
+            elif item is not None and type(item) not in {str, bool, int, float}:
+                raise ValueError("invalid workflow request")
+    finally:
+        value = item = key = nested = None
+        mapping = None
+        sequence = None
+        identity = None
+        encoded = None
+        pending.clear()
+        active.clear()
+        seen.clear()
 
 
 class _Request(StrictModel):
@@ -119,6 +308,109 @@ class ProposalConfirmRequest(_Request):
         return values
 
 
+def _bounded_identity(value: str) -> str:
+    if (
+        type(value) is not str
+        or not value
+        or _CONTROL.search(value)
+        or len(value.encode("utf-8")) > _MAX_AUTHORIZATION_FIELD_BYTES
+    ):
+        raise ValueError("invalid workflow request")
+    return value
+
+
+def _bounded_token(value: str) -> str:
+    value = _bounded_identity(value)
+    if len(value.encode("utf-8")) > _MAX_TOKEN_BYTES:
+        raise ValueError("invalid workflow request")
+    return value
+
+
+def _has_reserved_windows_segment(path: PureWindowsPath) -> bool:
+    for part in path.parts:
+        normalized = part.rstrip(" .")
+        stem = normalized.split(".", 1)[0].rstrip(" ")
+        if PureWindowsPath(part).is_reserved() or _WINDOWS_DEVICE.fullmatch(stem):
+            return True
+    return False
+
+
+def _bounded_path(value: str) -> str:
+    value = _bounded_identity(value)
+    relative = PurePosixPath(value)
+    windows = PureWindowsPath(value)
+    if (
+        "\\" in value
+        or windows.drive
+        or windows.is_absolute()
+        or _has_reserved_windows_segment(windows)
+        or ":" in value
+        or relative.is_absolute()
+        or relative.as_posix() != value
+        or value == "."
+        or any(part in {"", ".", ".."} for part in relative.parts)
+    ):
+        raise ValueError("invalid workflow request")
+    return value
+
+
+class IntentPreflightRequest(_Request):
+    envelope: TaskEnvelope
+    submission: AgentClassificationSubmission
+
+    @field_validator("envelope")
+    @classmethod
+    def require_bounded_envelope(cls, value: TaskEnvelope) -> TaskEnvelope:
+        _canonical_json(value.model_dump(mode="json"))
+        return value
+
+    @field_validator("submission")
+    @classmethod
+    def require_bounded_submission(
+        cls, value: AgentClassificationSubmission
+    ) -> AgentClassificationSubmission:
+        _canonical_json(value.model_dump(mode="json"))
+        return value
+
+
+class AuthorizationVerifyRequest(_Request):
+    token: Annotated[str, Field(min_length=1, max_length=_MAX_TOKEN_BYTES)]
+    actor: Annotated[str, Field(min_length=1, max_length=_MAX_AUTHORIZATION_FIELD_BYTES)]
+    repository_id: Annotated[
+        str, Field(min_length=1, max_length=_MAX_AUTHORIZATION_FIELD_BYTES)
+    ]
+    task_id: Annotated[
+        str,
+        Field(pattern=_TASK_ID, max_length=_MAX_AUTHORIZATION_FIELD_BYTES),
+    ]
+    graph_version: Annotated[int, Field(ge=0)]
+    requested_paths: Annotated[
+        tuple[
+            Annotated[str, Field(min_length=1, max_length=_MAX_AUTHORIZATION_FIELD_BYTES)],
+            ...,
+        ],
+        Field(max_length=_MAX_AUTHORIZATION_ITEMS),
+    ] = ()
+
+    @field_validator("token")
+    @classmethod
+    def require_bounded_token(cls, value: str) -> str:
+        return _bounded_token(value)
+
+    @field_validator("actor", "repository_id", "task_id")
+    @classmethod
+    def require_bounded_identity(cls, value: str) -> str:
+        return _bounded_identity(value)
+
+    @field_validator("requested_paths")
+    @classmethod
+    def require_canonical_unique_paths(cls, values: tuple[str, ...]) -> tuple[str, ...]:
+        checked = tuple(_bounded_path(value) for value in values)
+        if len(checked) != len(set(checked)):
+            raise ValueError("invalid workflow request")
+        return tuple(sorted(checked))
+
+
 class IntentWorkflowPort(Protocol):
     """Narrow workflow contract exposed to MCP registration."""
 
@@ -135,9 +427,94 @@ class IntentWorkflowPort(Protocol):
         confirmed_node_ids: object,
     ) -> dict[str, object]: ...
 
+    async def preflight(
+        self,
+        envelope: TaskEnvelope,
+        submission: AgentClassificationSubmission,
+    ) -> dict[str, object]: ...
+
+    async def authorization_verify(
+        self,
+        token: str,
+        actor: str,
+        repository_id: str,
+        task_id: str,
+        graph_version: int,
+        requested_paths: tuple[str, ...],
+    ) -> dict[str, object]: ...
+
 
 def _fixed_arguments() -> Never:
     raise MCPError(INVALID_PARAMS, "invalid intent workflow arguments") from None
+
+
+def validate_intent_workflow_call(name: str, arguments: dict[str, object]) -> None:
+    """Validate raw JSON containers before the SDK can coerce or discard input."""
+    paths: object = None
+    confirmed_node_ids: object = None
+    try:
+        if type(arguments) is not dict:
+            raise ValueError("invalid workflow request")
+        _require_exact_json(arguments)
+        if type(name) is not str:
+            raise ValueError("invalid workflow request")
+        if name == "intent_bootstrap_propose":
+            if set(arguments) != {"submission"}:
+                raise ValueError("invalid workflow request")
+            _submission_input(dict.__getitem__(arguments, "submission"))
+        elif name == "intent_proposal_show":
+            if set(arguments) != {"proposal_id"}:
+                raise ValueError("invalid workflow request")
+            ProposalShowRequest.model_validate(arguments)
+        elif name == "intent_proposal_confirm":
+            expected = {"proposal_id", "proposal_digest", "confirmed_node_ids"}
+            if set(arguments) != expected:
+                raise ValueError("invalid workflow request")
+            confirmed_node_ids = dict.__getitem__(arguments, "confirmed_node_ids")
+            if type(confirmed_node_ids) is not list:
+                raise ValueError("invalid workflow request")
+            ProposalConfirmRequest.model_validate(
+                {
+                    "proposal_id": dict.__getitem__(arguments, "proposal_id"),
+                    "proposal_digest": dict.__getitem__(arguments, "proposal_digest"),
+                    "confirmed_node_ids": tuple(
+                        cast(list[object], confirmed_node_ids)
+                    ),
+                }
+            )
+        if name == "intent_preflight":
+            if set(arguments) != {"envelope", "submission"}:
+                raise ValueError("invalid workflow request")
+            _task_envelope_input(dict.__getitem__(arguments, "envelope"))
+            _classification_input(dict.__getitem__(arguments, "submission"))
+        elif name == "intent_authorization_verify":
+            expected = {
+                "token",
+                "actor",
+                "repository_id",
+                "task_id",
+                "graph_version",
+                "requested_paths",
+            }
+            paths = dict.get(arguments, "requested_paths")
+            if set(arguments) != expected or type(paths) is not list:
+                raise ValueError("invalid workflow request")
+            AuthorizationVerifyRequest.model_validate(
+                {**arguments, "requested_paths": tuple(cast(list[object], paths))}
+            )
+        elif name not in {
+            "intent_bootstrap_propose",
+            "intent_proposal_show",
+            "intent_proposal_confirm",
+        }:
+            raise ValueError("invalid workflow request")
+    except Exception:  # noqa: BLE001 - one fixed raw-request validation boundary
+        raise ValueError("invalid intent workflow arguments") from None
+    finally:
+        name = ""
+        arguments = {}
+        paths = None
+        confirmed_node_ids = None
 
 
 class McpIntentWorkflowServices:
@@ -146,6 +523,19 @@ class McpIntentWorkflowServices:
     def __init__(self, runtime: Runtime, *, clock: Callable[[], datetime]) -> None:
         self.runtime = runtime
         self._clock = clock
+        self._issuer = AuthorizationIssuer()
+        config_file = runtime.workspace_directory.file("config.yaml")
+        self._config_file = config_file.duplicate()
+        try:
+            self._preflight = PreflightService(
+                transactions=runtime.transactions,
+                config_file=config_file,
+                agent_principal="agent:codex",
+                conversation_connector_id="conversation:codex",
+                principal_resolver=lambda config, _snapshot: _principals(runtime, config),
+            )
+        finally:
+            config_file.close()
 
     @staticmethod
     def _rejected() -> dict[str, object]:
@@ -250,6 +640,199 @@ class McpIntentWorkflowServices:
         finally:
             proposal_id = proposal_digest = confirmed_node_ids = None
 
+    @staticmethod
+    def _denied_verification() -> dict[str, object]:
+        return {
+            "schema_version": 1,
+            "authorized": False,
+            "classification": None,
+            "relevant_node_ids": [],
+            "expires_at": None,
+        }
+
+    @staticmethod
+    def _verification_payload(
+        verification: AuthorizationVerification,
+    ) -> dict[str, object]:
+        return {
+            "schema_version": 1,
+            "authorized": verification.authorized,
+            "classification": (
+                None
+                if verification.classification is None
+                else verification.classification.value
+            ),
+            "relevant_node_ids": list(verification.relevant_node_ids),
+            "expires_at": (
+                None
+                if verification.expires_at is None
+                else verification.expires_at.isoformat().replace("+00:00", "Z")
+            ),
+        }
+
+    async def preflight(
+        self,
+        envelope: TaskEnvelope,
+        submission: AgentClassificationSubmission,
+    ) -> dict[str, object]:
+        token: str | None = None
+        result: PreflightResult | None = None
+        detached_envelope: TaskEnvelope | None = None
+        detached_submission: AgentClassificationSubmission | None = None
+        authenticated: AuthenticatedPreflightResult | None = None
+        minted_token: str | None = None
+        try:
+            if type(envelope) is not TaskEnvelope or type(submission) is not AgentClassificationSubmission:
+                return self._rejected()
+            detached_envelope = TaskEnvelope.model_validate_json(envelope.model_dump_json())
+            detached_submission = AgentClassificationSubmission.model_validate_json(
+                submission.model_dump_json()
+            )
+            config, config_bytes = _snapshot_config(self.runtime)
+            principals = _principals(self.runtime, config)
+            authenticated = self._preflight.evaluate_authenticated(
+                detached_envelope,
+                detached_submission,
+                principals=principals,
+            )
+            result = authenticated.result
+            payload = cast(dict[str, object], result.model_dump(mode="json"))
+            if result.authorized:
+                with self.runtime.transactions.read_transaction(
+                    {"config": self._config_file}
+                ) as transaction:
+                    graph_content = transaction.read("graph")
+                    graph = parse_graph(graph_content)
+                    if (
+                        transaction.read("config") != config_bytes
+                        or graph.version != result.graph_version
+                        or canonical_graph_digest(graph_content)
+                        != authenticated.graph_digest
+                        or config.project_id != detached_envelope.repository_id
+                        or config.local_actor != detached_envelope.actor
+                        or _principals(self.runtime, config) != principals
+                    ):
+                        return self._rejected()
+                    minted_token = self._issuer.issue(
+                        detached_envelope,
+                        result,
+                        graph_content=graph_content,
+                        now=self._clock(),
+                    )
+                    if (
+                        canonical_graph_digest(transaction.read("graph"))
+                        != authenticated.graph_digest
+                    ):
+                        return self._rejected()
+                payload["authorization_token"] = minted_token
+                token = minted_token
+                minted_token = None
+            return payload
+        except Exception:  # noqa: BLE001 - one fixed workflow result
+            return self._rejected()
+        except BaseException as error:
+            error.__traceback__ = None
+            error.__cause__ = None
+            error.__context__ = None
+            raise
+        finally:
+            envelope = cast(TaskEnvelope, None)
+            submission = cast(AgentClassificationSubmission, None)
+            detached_envelope = None
+            detached_submission = None
+            result = None
+            token = None
+            if minted_token is not None:
+                self._issuer.revoke(minted_token)
+            minted_token = None
+            if "payload" in locals():
+                payload = {}
+            authenticated = None
+            if "graph_content" in locals():
+                graph_content = b""
+            if "principals" in locals():
+                principals = frozenset()
+            if "config" in locals():
+                config = cast(ProjectConfig, None)
+                config_bytes = b""
+
+    async def authorization_verify(
+        self,
+        token: str,
+        actor: str,
+        repository_id: str,
+        task_id: str,
+        graph_version: int,
+        requested_paths: tuple[str, ...],
+    ) -> dict[str, object]:
+        verification: AuthorizationVerification | None = None
+        try:
+            request = AuthorizationVerifyRequest.model_validate(
+                {
+                    "token": token,
+                    "actor": actor,
+                    "repository_id": repository_id,
+                    "task_id": task_id,
+                    "graph_version": graph_version,
+                    "requested_paths": requested_paths,
+                }
+            )
+            config, config_bytes = _snapshot_config(self.runtime)
+            principals = _principals(self.runtime, config)
+            with self.runtime.transactions.read_transaction(
+                {"config": self._config_file}
+            ) as transaction:
+                graph_content = transaction.read("graph")
+                graph = parse_graph(graph_content)
+                graph_digest = canonical_graph_digest(graph_content)
+                if (
+                    transaction.read("config") != config_bytes
+                    or request.actor != config.local_actor
+                    or request.repository_id != config.project_id
+                    or request.graph_version != graph.version
+                    or config.local_actor not in principals
+                    or _principals(self.runtime, config) != principals
+                ):
+                    return self._denied_verification()
+                verification = self._issuer.verify(
+                    request.token,
+                    actor=config.local_actor,
+                    repository_id=config.project_id,
+                    task_id=request.task_id,
+                    graph_version=graph.version,
+                    graph_content=graph_content,
+                    requested_paths=request.requested_paths,
+                    now=self._clock(),
+                )
+                if (
+                    canonical_graph_digest(transaction.read("graph"))
+                    != graph_digest
+                ):
+                    return self._denied_verification()
+            return self._verification_payload(verification)
+        except Exception:  # noqa: BLE001 - all denials have one reduced public shape
+            return self._denied_verification()
+        except BaseException as error:
+            error.__traceback__ = None
+            error.__cause__ = None
+            error.__context__ = None
+            raise
+        finally:
+            token = actor = repository_id = task_id = ""
+            graph_version = -1
+            requested_paths = ()
+            verification = None
+            if "graph_content" in locals():
+                graph_content = b""
+                graph_digest = ""
+            if "request" in locals():
+                request = cast(AuthorizationVerifyRequest, None)
+            if "principals" in locals():
+                principals = frozenset()
+            if "config" in locals():
+                config = cast(ProjectConfig, None)
+                config_bytes = b""
+
 
 def load_intent_workflow_services(
     runtime: Runtime,
@@ -346,10 +929,93 @@ def register_intent_workflow_tools(
             confirmed_node_ids.clear()
             request = cast(ProposalConfirmRequest, None)
 
+    @server.tool(
+        name="intent_preflight",
+        annotations=_PREFLIGHT,
+        structured_output=True,
+    )
+    async def intent_preflight(
+        envelope: _TaskEnvelopeInput,
+        submission: _AgentClassificationInput,
+    ) -> dict[str, object]:
+        detached_envelope: TaskEnvelope | None = None
+        detached_submission: AgentClassificationSubmission | None = None
+        try:
+            request = IntentPreflightRequest.model_validate(
+                {"envelope": envelope, "submission": submission}
+            )
+        except Exception:  # noqa: BLE001 - one fixed pre-handler boundary
+            envelope = cast(TaskEnvelope, None)
+            submission = cast(AgentClassificationSubmission, None)
+            _fixed_arguments()
+        try:
+            detached_envelope = TaskEnvelope.model_validate_json(
+                request.envelope.model_dump_json()
+            )
+            detached_submission = AgentClassificationSubmission.model_validate_json(
+                request.submission.model_dump_json()
+            )
+            return await services.preflight(detached_envelope, detached_submission)
+        except Exception:  # noqa: BLE001 - one fixed handler boundary
+            _fixed_arguments()
+        finally:
+            envelope = cast(TaskEnvelope, None)
+            submission = cast(AgentClassificationSubmission, None)
+            detached_envelope = None
+            detached_submission = None
+            request = cast(IntentPreflightRequest, None)
+
+    @server.tool(
+        name="intent_authorization_verify",
+        annotations=_VERIFY,
+        structured_output=True,
+    )
+    async def intent_authorization_verify(
+        token: _TokenInput,
+        actor: _AuthorizationIdentityInput,
+        repository_id: _AuthorizationIdentityInput,
+        task_id: _AuthorizationTaskInput,
+        graph_version: Annotated[int, Field(ge=0)],
+        requested_paths: _AuthorizationPathsInput,
+    ) -> dict[str, object]:
+        try:
+            request = AuthorizationVerifyRequest.model_validate(
+                {
+                    "token": token,
+                    "actor": actor,
+                    "repository_id": repository_id,
+                    "task_id": task_id,
+                    "graph_version": graph_version,
+                    "requested_paths": tuple(requested_paths),
+                }
+            )
+        except Exception:  # noqa: BLE001 - one fixed pre-handler boundary
+            token = actor = repository_id = task_id = ""
+            graph_version = -1
+            requested_paths.clear()
+            _fixed_arguments()
+        try:
+            return await services.authorization_verify(
+                request.token,
+                request.actor,
+                request.repository_id,
+                request.task_id,
+                request.graph_version,
+                request.requested_paths,
+            )
+        except Exception:  # noqa: BLE001 - one fixed handler boundary
+            _fixed_arguments()
+        finally:
+            token = actor = repository_id = task_id = ""
+            graph_version = -1
+            requested_paths.clear()
+            request = cast(AuthorizationVerifyRequest, None)
+
 
 __all__ = [
     "IntentWorkflowPort",
     "McpIntentWorkflowServices",
     "load_intent_workflow_services",
     "register_intent_workflow_tools",
+    "validate_intent_workflow_call",
 ]

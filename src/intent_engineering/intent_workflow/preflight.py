@@ -29,6 +29,7 @@ from intent_engineering.core.models import (
 )
 from intent_engineering.core.models._base import StrictModel
 from intent_engineering.core.policy.access import evidence_allowed, refs_allowed
+from intent_engineering.intent_workflow.authorization import canonical_graph_digest
 from intent_engineering.intent_workflow.models import (
     IntentProposal,
     PreflightResult,
@@ -172,6 +173,21 @@ class AgentClassificationSubmission(_PreflightModel):
         return _canonical_collection(values, maximum=_MAX_TEXT_ITEMS, text=True)
 
 
+class AuthenticatedPreflightResult(_PreflightModel):
+    """Internal Task 5 result bound to its authenticated canonical graph snapshot."""
+
+    schema_version: Literal[1] = 1
+    result: PreflightResult
+    graph_digest: Annotated[str, Field(pattern=r"^sha256:[0-9a-f]{64}$")]
+
+    @field_validator("result")
+    @classmethod
+    def require_exact_result(cls, value: PreflightResult) -> PreflightResult:
+        if type(value) is not PreflightResult:
+            raise ValueError("invalid authenticated preflight result")
+        return PreflightResult.model_validate_json(value.model_dump_json())
+
+
 def classification_evidence_content(
     *,
     task_id: str,
@@ -268,13 +284,7 @@ def _snapshot_state(
     evidence_content = snapshot.content.get("evidence")
     cases_content = snapshot.content.get("cases")
     proposals_content = snapshot.content.get("intent_proposals")
-    if (
-        config_content is None
-        or graph_content is None
-        or evidence_content is None
-        or cases_content is None
-        or proposals_content is None
-    ):
+    if config_content is None or graph_content is None:
         raise ValueError("missing preflight snapshot")
     loaded_config = yaml.safe_load(config_content.decode("utf-8"))
     if not isinstance(loaded_config, dict):
@@ -287,11 +297,11 @@ def _snapshot_state(
         )
     )
     graph = parse_graph(graph_content)
-    evidence, ingestions, _ = parse_evidence_lines(evidence_content)
-    case_versions = parse_case_versions(cases_content)
+    evidence, ingestions, _ = parse_evidence_lines(evidence_content or b"")
+    case_versions = parse_case_versions(cases_content or b"")
     latest_cases = {case.id: case for case in case_versions}
     cases = tuple(latest_cases[case_id] for case_id in sorted(latest_cases))
-    proposals = _parse_proposals(proposals_content)
+    proposals = _parse_proposals(proposals_content or b"")
     return config, graph, evidence, ingestions, cases, proposals
 
 
@@ -720,9 +730,7 @@ class PreflightService:
         reusable = self._reusable_case(cases, candidate, evidence, principals)
         if reusable is not None:
             return reusable
-        cases_content = snapshot.content.get("cases")
-        if cases_content is None:
-            raise ValueError("case snapshot unavailable")
+        cases_content = snapshot.content.get("cases") or b""
         append = validate_case_appends(cases_content, (candidate,))
         try:
             with self._transactions.transaction(
@@ -791,7 +799,7 @@ class PreflightService:
         envelope: TaskEnvelope,
         submission: AgentClassificationSubmission,
         principals: frozenset[str],
-    ) -> PreflightResult:
+    ) -> AuthenticatedPreflightResult:
         if type(envelope) is not TaskEnvelope or type(submission) is not AgentClassificationSubmission:
             raise ValueError("invalid preflight input")
         envelope = TaskEnvelope.model_validate_json(envelope.model_dump_json())
@@ -799,6 +807,10 @@ class PreflightService:
         principals = _principals(principals)
         snapshot = self._transactions.snapshot({"config": self._config_file})
         config, graph, evidence, ingestions, cases, proposals = _snapshot_state(snapshot)
+        graph_content = snapshot.content.get("graph")
+        if graph_content is None:
+            raise ValueError("missing preflight graph snapshot")
+        graph_digest = canonical_graph_digest(graph_content)
         authenticated_principals = _principals(self._principal_resolver(config, snapshot))
         if (
             config.project_id != envelope.repository_id
@@ -903,17 +915,20 @@ class PreflightService:
         )
         if result.authorized:
             self._authenticate_snapshot(snapshot)
-        return result
+        return AuthenticatedPreflightResult(
+            result=result,
+            graph_digest=graph_digest,
+        )
 
-    def evaluate(
+    def evaluate_authenticated(
         self,
         envelope: TaskEnvelope,
         submission: AgentClassificationSubmission,
         *,
         principals: frozenset[str],
-    ) -> PreflightResult:
-        """Return one validated result or the fixed fail-closed public error."""
-        result: PreflightResult | None = None
+    ) -> AuthenticatedPreflightResult:
+        """Return one result plus its authenticated graph identity or fail closed."""
+        result: AuthenticatedPreflightResult | None = None
         signal: BaseException | None = None
         failed = False
         try:
@@ -938,9 +953,32 @@ class PreflightService:
             raise PreflightError() from None
         return result
 
+    def evaluate(
+        self,
+        envelope: TaskEnvelope,
+        submission: AgentClassificationSubmission,
+        *,
+        principals: frozenset[str],
+    ) -> PreflightResult:
+        """Return the compatible detached Task 5 result without authorization metadata."""
+        authenticated: AuthenticatedPreflightResult | None = None
+        try:
+            authenticated = self.evaluate_authenticated(
+                envelope,
+                submission,
+                principals=principals,
+            )
+            return authenticated.result
+        finally:
+            envelope = cast(TaskEnvelope, None)
+            submission = cast(AgentClassificationSubmission, None)
+            principals = frozenset()
+            authenticated = None
+
 
 __all__ = [
     "AgentClassificationSubmission",
+    "AuthenticatedPreflightResult",
     "PreflightError",
     "PreflightService",
     "PrincipalResolver",

@@ -61,6 +61,17 @@ async def test_intent_mcp_stdio_is_protocol_clean_and_read_only(tmp_path: Path) 
                 "intent_bootstrap_propose",
                 {"submission": {"private": "PRIVATE-WORKFLOW-WIRE-" + "x" * 1_100_000}},
             )
+            denied_capability = await client.call_tool(
+                "intent_authorization_verify",
+                {
+                    "token": "PRIVATE_WIRE_CAPABILITY_" + "x" * 19,
+                    "actor": "local",
+                    "repository_id": "project",
+                    "task_id": "task:sha256:" + "1" * 64,
+                    "graph_version": 0,
+                    "requested_paths": ["README.md"],
+                },
+            )
             prompts = await client.list_prompts()
             prepared = await client.get_prompt("prepare_task", {"task": "implement local export"})
             with pytest.raises(MCPError, match="not found"):
@@ -103,6 +114,8 @@ async def test_intent_mcp_stdio_is_protocol_clean_and_read_only(tmp_path: Path) 
         "intent_bootstrap_propose",
         "intent_proposal_show",
         "intent_proposal_confirm",
+        "intent_preflight",
+        "intent_authorization_verify",
     }
     assert status.structured_content["schema_version"] == "1"
     assert invalid.is_error is True
@@ -111,6 +124,14 @@ async def test_intent_mcp_stdio_is_protocol_clean_and_read_only(tmp_path: Path) 
     assert invalid_workflow.is_error is True
     assert "invalid intent workflow arguments" in repr(invalid_workflow.content)
     assert "PRIVATE-WORKFLOW-WIRE" not in repr(invalid_workflow)
+    assert denied_capability.structured_content == {
+        "schema_version": 1,
+        "authorized": False,
+        "classification": None,
+        "relevant_node_ids": [],
+        "expires_at": None,
+    }
+    assert "PRIVATE_WIRE_CAPABILITY" not in repr(denied_capability)
     assert {prompt.name for prompt in prompts.prompts} == {
         "prepare_task",
         "review_reconciliation",

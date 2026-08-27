@@ -207,7 +207,63 @@
   The reviewer accepted the complete focused, replay/concurrency/tamper, compatibility, static, and
   fresh full-suite evidence recorded in `task-6-report.md`; no further implementation change was
   requested. Authorized for the exact Task 6 commit.
-- Task 7: pending
+- Task 7: PRECOMMIT_REVIEW_READY (implementer `/root/intent_workflow_task7`, exact base
+  `493572b8b9c89b156bceb6bcc8b049e250a8f1d7`; no commit/staging). Required tests-first RED was the
+  missing authorization module (`1 error in 0.17s`); MCP integration RED was `4 failed, 9 passed`.
+  Final authorization-only GREEN is `36 passed in 0.75s`; authorization/MCP/wire GREEN is
+  `58 passed in 1.87s`; broadened Task 4–7 compatibility is `295 passed in 11.40s`; Ruff is clean
+  on every changed Python path; mypy is clean across 112 source files; and `git diff --check` is clean.
+  The first final full run hit the known unchanged
+  receipt-store fork wait after `1288 passed`; its exact isolated test passed, and the authoritative
+  fresh full offline warnings-as-errors rerun is `1342 passed in 47.00s`. The implementation adds a
+  bounded digest-only process-local grant registry, exact five-minute actor/repository/task/graph/
+  classification/path bindings, live MCP preflight and reduced verification, descriptor-held live
+  reauthentication, strict pre-coercion request validation, and token/cancellation secrecy. It does
+  not add or claim Task 8 host enforcement. Detailed evidence: `task-7-report.md`; controlling
+  strengthened scope: `task-7-brief.md`.
+- Task 7: Fix Round 1/3 PRECOMMIT_REVIEW_READY after independent review reported `0 Critical / 3
+  Important / 0 Minor`, Not Ready. The authoritative tests-only review RED was `15 failed, 36 passed
+  in 2.19s`; the exact prior review selection is now `51 passed in 0.98s`. Final authorization-only
+  GREEN is `47 passed in 0.28s`; authorization/MCP/wire GREEN is `90 passed in 2.25s`; broadened
+  Task 4–7 compatibility is `327 passed in 12.10s`; Ruff is clean; mypy is clean across 112 source
+  files; fresh full offline warnings-as-errors is `1374 passed in 46.13s`; and `git diff --check` is
+  clean. Grants now bind a canonical digest
+  derived from descriptor-held graph bytes and an authenticated Task 5 snapshot/result handoff;
+  final issue/verify re-reads close same-version replacement and both tested race windows. Recursive
+  exact-JSON validation precedes all traversal/serialization/coercion, timestamps require canonical
+  UTC `Z` roundtrip, token bounds use UTF-8 bytes, and cancellation frames are scrubbed. POSIX path
+  validation now also rejects Windows drives, UNC/device forms, drive-relative syntax, and colon
+  ambiguity. A final tests-first targeted-revoke cancellation RED was also fixed. All changes remain
+  unstaged for the same scoped reviewer. Detailed evidence: `task-7-report.md`.
+- Task 7: Fix Round 2/3 PRECOMMIT_REVIEW_READY after independent re-review reported `0 Critical / 2
+  Important / 0 Minor`, Not Ready. With production untouched, the exact tests-only RED was `30
+  failed, 46 passed in 4.16s`; the same selection is now `76 passed in 1.09s`. Authorization-only is
+  `63 passed in 0.28s`; authorization/MCP/wire is `128 passed in 2.54s`; broadened Task 4–7
+  compatibility is `413 passed in 27.72s`; Ruff and mypy (112 source files) are clean; fresh full
+  offline warnings-as-errors is `1412 passed in 47.11s`; and `git diff --check` is clean. Issuer and
+  raw MCP path validation now reject Windows reserved device names and their case, extension, and
+  trailing-dot/space variants in every segment while preserving nearby valid POSIX names. The raw
+  exact-JSON boundary now rejects cycles, shared aliases, excessive depth/node count, and aggregate
+  UTF-8 content deterministically before serialization or typed validation and scrubs all traversal
+  state on exit. All changes remain unstaged for the same scoped reviewer. Detailed evidence:
+  `task-7-report.md`.
+- Task 7: Fix Round 3/3 PRECOMMIT_REVIEW_READY after the narrow re-review reported `0 Critical / 1
+  Important / 0 Minor`, Not Ready. With production untouched, the exact hostile key/scalar raw-
+  boundary matrix was `7 failed, 3 passed in 0.89s`; it is now `10 passed in 1.59s`. Required
+  authorization/MCP/wire is `138 passed in 3.18s`; broadened Task 4–7 compatibility is `423 passed
+  in 32.95s`; Ruff and mypy (112 source files) are clean; fresh full offline warnings-as-errors is
+  `1422 passed in 53.34s`; and `git diff --check` is clean. Recursive exact-tree validation is now
+  the absolute first raw-argument operation after the exact root dictionary check for all five
+  workflow tools. Exact key sets and strict typed inputs are processed only afterward, so hostile
+  key or scalar subclasses execute no overridden behavior and never reach handlers; bootstrap raw
+  conversion also scrubs all request/model locals on exit. All changes remain unstaged for the same
+  narrow reviewer. Detailed evidence: `task-7-report.md`.
+- Task 7: READY. Final scoped Round 3 review verdict is `0 Critical / 0 Important / 0 Minor`, Ready.
+  The reviewer accepted the absolute-first exact-tree raw boundary and the complete focused,
+  compatibility, static, and fresh full-suite evidence recorded in `task-7-report.md`. The user
+  approved the fast-but-safe final cadence: one precommit full suite followed by postcommit focused
+  Task 7, Ruff, mypy, base-to-HEAD diff, index, and protected-name verification. Authorized for the
+  exact Task 7 commit.
 - Task 8: pending
 - Task 9: pending
 - Task 10: pending
