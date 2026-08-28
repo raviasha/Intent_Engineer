@@ -1,0 +1,7 @@
+{
+  "raw": {
+    "messages": [{"id": "workspace-1:C111:1700000000.000100"}],
+    "next_cursor": "slack-message-cursor-2",
+    "_transport": {"request_id": "slack-discover-1"}
+  }
+}

@@ -1,0 +1,14 @@
+{
+  "update_page": {
+    "target": {"id": "confluence-page-1", "version": {"number": 7}},
+    "fields": {"title": "Approved export architecture", "body": "<p>Local by default; centralized only after approval.</p>"},
+    "result": {"version": {"number": 8}},
+    "expected_arguments": {"page_id": "confluence-page-1", "expected_version": "7", "title": "Approved export architecture", "body": "<p>Local by default; centralized only after approval.</p>"}
+  },
+  "add_comment": {
+    "target": {"id": "confluence-page-1", "version": {"number": 7}},
+    "fields": {"body": "<p>Independent approval recorded.</p>"},
+    "result": {"version": {"number": 8}},
+    "expected_arguments": {"page_id": "confluence-page-1", "expected_version": "7", "body": "<p>Independent approval recorded.</p>"}
+  }
+}

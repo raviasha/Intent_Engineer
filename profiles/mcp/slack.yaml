@@ -1,0 +1,121 @@
+id: slack
+version: "1"
+display_name: Slack
+operations:
+  discover_messages:
+    semantic_name: discover_messages
+    kind: tool
+    pagination: cursor
+    arguments:
+      cursor: {source: cursor}
+      scope: {source: scope}
+    item_selector: {path: "$.messages"}
+    next_cursor_selector: {path: "$.next_cursor", required: false}
+  fetch_message:
+    semantic_name: fetch_message
+    kind: tool
+    pagination: none
+    arguments:
+      message_id: {source: object_id}
+    item_selector: {path: "$"}
+  discover_threads:
+    semantic_name: discover_threads
+    kind: tool
+    pagination: cursor
+    arguments:
+      cursor: {source: cursor}
+      scope: {source: scope}
+    item_selector: {path: "$.threads"}
+    next_cursor_selector: {path: "$.next_cursor", required: false}
+  fetch_thread:
+    semantic_name: fetch_thread
+    kind: tool
+    pagination: none
+    arguments:
+      thread_id: {source: object_id}
+    item_selector: {path: "$"}
+objects:
+  message:
+    discover_operation: discover_messages
+    fetch_operation: fetch_message
+    external_id: {path: "$.id", transforms: [string]}
+    external_version: {path: "$.updated", transforms: [string]}
+    author: {path: "$.last_modified_by.id", transforms: [string]}
+    observed_at: {path: "$.updated_at", transforms: [iso_datetime]}
+    locator: {path: "$.permalink", transforms: [string]}
+    parent_ref: {path: "$.thread_id", transforms: [string], required: false}
+    acl: {path: "$.allowed_principals", transforms: [string_list]}
+    content:
+      original_author_id: {path: "$.user.id", transforms: [string]}
+      channel_id: {path: "$.channel.id", transforms: [string]}
+      text: {path: "$.text", transforms: [string]}
+  thread:
+    discover_operation: discover_threads
+    fetch_operation: fetch_thread
+    external_id: {path: "$.id", transforms: [string]}
+    external_version: {path: "$.updated", transforms: [string]}
+    author: {path: "$.last_modified_by.id", transforms: [string]}
+    observed_at: {path: "$.updated_at", transforms: [iso_datetime]}
+    locator: {path: "$.permalink", transforms: [string]}
+    parent_ref: {path: "$.channel.id", transforms: [string]}
+    acl: {path: "$.allowed_principals", transforms: [string_list]}
+    content:
+      original_author_id: {path: "$.root.user.id", transforms: [string]}
+      channel_id: {path: "$.channel.id", transforms: [string]}
+      root_text: {path: "$.root.text", transforms: [string]}
+      title: {path: "$.title", transforms: [string]}
+writes:
+  post_message:
+    semantic_name: post_message
+    target_object: channel
+    target_id: {path: "$.id", transforms: [string]}
+    before_version: {path: "$.updated", transforms: [string]}
+    allowed_fields: [text]
+    arguments:
+      channel_id: {source: target_id}
+      text: {source: field, field: text}
+      expected_channel_version: {source: before_version}
+    input_schema:
+      type: object
+      required: [text]
+      additionalProperties: false
+      properties:
+        text: {type: string, minLength: 1}
+    result_version: {path: "$.updated", transforms: [string]}
+  reply:
+    semantic_name: reply
+    target_object: thread
+    target_id: {path: "$.id", transforms: [string]}
+    before_version: {path: "$.updated", transforms: [string]}
+    allowed_fields: [text]
+    arguments:
+      thread_ref: {source: target_id}
+      text: {source: field, field: text}
+      expected_thread_version: {source: before_version}
+    input_schema:
+      type: object
+      required: [text]
+      additionalProperties: false
+      properties:
+        text: {type: string, minLength: 1}
+    result_version: {path: "$.updated", transforms: [string]}
+  update_message:
+    semantic_name: update_message
+    target_object: message
+    target_id: {path: "$.id", transforms: [string]}
+    before_version: {path: "$.updated", transforms: [string]}
+    allowed_fields: [text]
+    arguments:
+      message_ref: {source: target_id}
+      text: {source: field, field: text}
+      expected_version: {source: before_version}
+    input_schema:
+      type: object
+      required: [text]
+      additionalProperties: false
+      properties:
+        text: {type: string, minLength: 1}
+    result_version: {path: "$.updated", transforms: [string]}
+redacted_paths:
+  - "$.token"
+  - "$.authorization"

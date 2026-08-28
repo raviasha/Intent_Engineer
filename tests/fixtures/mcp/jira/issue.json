@@ -1,0 +1,24 @@
+{
+  "raw": {
+    "id": "jira-issue-1001",
+    "key": "INTENT-42",
+    "updated": "2026-08-20T12:00:00Z",
+    "author": {"account_id": "jira-account-101", "display_name": "Asha"},
+    "last_modified_by": {"account_id": "jira-account-101"},
+    "self": "https://jira.example.test/rest/api/3/issue/jira-issue-1001",
+    "project": {"id": "jira-project-1"},
+    "security": {"allowed_principals": ["jira-account-101", "jira-group:engineering"]},
+    "fields": {"summary": "Keep exports local", "description": "Exports remain local unless approved.", "status": "In Review"},
+    "_transport": {"request_id": "jira-request-1"}
+  },
+  "expected": {
+    "external_id": "jira-issue-1001",
+    "external_version": "2026-08-20T12:00:00Z",
+    "author": "jira-account-101",
+    "observed_at": "2026-08-20T12:00:00Z",
+    "locator": "https://jira.example.test/rest/api/3/issue/jira-issue-1001",
+    "parent_ref": "jira-project-1",
+    "acl": ["jira-account-101", "jira-group:engineering"],
+    "content": {"description": "Exports remain local unless approved.", "issue_key": "INTENT-42", "original_author_id": "jira-account-101", "status": "In Review", "summary": "Keep exports local"}
+  }
+}

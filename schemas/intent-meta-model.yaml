@@ -1,0 +1,236 @@
+meta_model:
+  name: Intent Engineering Meta-Model
+  version: 0.1.0
+  principles:
+  - Evidence is preserved independently from interpreted graph state.
+  - Intent, requirement, implementation status, and outcome are semantically distinct.
+  - Every material assertion is provenance-backed.
+  - Intent fidelity confidence is epistemic and never means implementation completeness.
+  - Material divergence creates a reconciliation case rather than assuming one source is correct.
+  - Cross-author incompatible positions remain explicit until resolved.
+  - Stable node and edge IDs are preserved when semantic identity remains unchanged.
+  - Agent task mutation requires intent preflight when the project policy enables it.
+node_types:
+  evidence:
+  - SOURCE_ARTIFACT
+  - SOURCE_REVISION
+  - EVIDENCE_SPAN
+  - ACTOR
+  - SOURCE_SYSTEM
+  intent:
+  - CONTEXT
+  - NEED
+  - PRODUCT_INTENT
+  - DESIRED_OUTCOME
+  - ASSUMPTION
+  - PRINCIPLE
+  - CONSTRAINT
+  specification:
+  - REQUIREMENT
+  - CAPABILITY
+  - ACCEPTANCE_CRITERION
+  - DECISION
+  - ARCHITECTURE
+  - INTERFACE
+  - DATA_CONTRACT
+  - POLICY
+  implementation:
+  - REPOSITORY
+  - MODULE
+  - FILE
+  - SYMBOL
+  - ENDPOINT
+  - SCHEMA
+  - TEST
+  - BUILD_ARTIFACT
+  - DEPLOYMENT
+  outcome:
+  - METRIC
+  - OBSERVED_OUTCOME
+  - INCIDENT
+  - USER_FEEDBACK
+  - EXPERIMENT_RESULT
+  governance:
+  - CHANGESET
+  - RECONCILIATION_CASE
+  - REVIEW_DECISION
+  - OWNER
+  - MILESTONE
+common_node_required:
+- id
+- type
+- label
+- status
+- created_by
+- created_at
+- last_modified_by
+- last_modified_at
+assertion_fields:
+  source_mode_allowed:
+  - explicit
+  - inferred
+  - derived
+  epistemic_optional:
+  - intent_fidelity_confidence
+  - confidence_basis
+  - last_reassessed_at
+  - evidence_refs
+  confidence_range:
+    min: 0.0
+    max: 1.0
+edge_required:
+- id
+- from
+- relation
+- to
+- status
+- created_by
+- created_at
+- last_modified_by
+- last_modified_at
+relations:
+  evidence_and_provenance:
+  - AUTHORED_BY
+  - OBSERVED_IN
+  - REVISION_OF
+  - CONTAINS_EVIDENCE
+  - EVIDENCES
+  - DERIVED_FROM
+  - MENTIONS
+  intent_trace:
+  - CREATES_NEED
+  - MOTIVATES
+  - SEEKS_OUTCOME
+  - CONSTRAINS
+  - ASSUMES
+  - JUSTIFIES
+  - REFINES
+  - SUPERSEDES
+  - CONTRADICTS
+  specification_trace:
+  - REALIZED_BY
+  - SPECIFIED_BY
+  - HAS_ACCEPTANCE_CRITERION
+  - DECIDED_BY
+  - DEPENDS_ON
+  - IMPLEMENTS_CAPABILITY
+  implementation_trace:
+  - IMPLEMENTED_BY
+  - VERIFIED_BY
+  - LOCATED_IN
+  - CALLS
+  - DEPENDS_ON_CODE
+  - CHANGED_BY
+  - DEPLOYED_AS
+  outcome_trace:
+  - MEASURED_BY
+  - OBSERVED_AS
+  - VALIDATES_OUTCOME
+  - INVALIDATES_ASSUMPTION
+  governance:
+  - AFFECTS
+  - OWNED_BY
+  - CREATED_CASE
+  - RESOLVED_BY
+  - PROPOSES_CHANGE_TO
+  - PART_OF_MILESTONE
+implementation_status:
+  allowed:
+  - implemented_baseline
+  - partial
+  - not_started
+  - requirements_incomplete
+  - unknown
+  - stale_evidence
+  required_for_claim:
+  - requirement_refs
+  - current_behavior
+  - code_evidence
+  - verified_commit
+  - verified_at
+  test_evidence_required_when_applicable: true
+reconciliation:
+  case_types:
+  - CODE_LAG
+  - REQUIREMENT_LAG
+  - INTENT_LAG
+  - TEST_LAG
+  - DOC_LAG
+  - UNDOCUMENTED_CODE
+  - ORPHAN_REQUIREMENT
+  - CONFLICTING_SOURCES
+  - AMBIGUOUS_DIVERGENCE
+  - POSSIBLE_INTENT_CHANGE
+  statuses:
+  - open
+  - needs_human
+  - proposed
+  - resolved
+  - deferred
+  - false_positive
+  required:
+  - id
+  - case_type
+  - status
+  - subject
+  - affected_refs
+  - evidence_sides
+  - created_at
+  - created_by
+  resolution_actions:
+  - update_implementation
+  - update_requirement
+  - update_intent
+  - update_tests
+  - update_documentation
+  - backfill_design_decision
+  - supersede_requirement
+  - merge_interpretations
+  - preserve_disagreement
+  - defer
+  - mark_false_positive
+changeset:
+  required:
+  - id
+  - actor
+  - timestamp
+  - baseline_graph_version
+  - evidence_refs
+  - validation_status
+  mutation_groups:
+  - nodes_added
+  - nodes_updated
+  - nodes_superseded
+  - edges_added
+  - edges_updated
+  - edges_superseded
+  - confidence_changes
+  - implementation_status_changes
+  - reconciliation_cases_created
+  - reconciliation_cases_resolved
+confidence_change:
+  required:
+  - change_id
+  - timestamp
+  - actor
+  - subject_ref
+  - change_kind
+  - prior_confidence
+  - new_confidence
+  - evidence_refs
+  - reason
+  change_kind_allowed:
+  - initialize
+  - confirm
+  - refine
+  - contradict
+  - supersede
+  - decay_or_ambiguity
+invariants:
+- No implemented_baseline claim without dated repository evidence.
+- Intent overlay cannot silently supersede explicit requirements.
+- Cross-author conflict cannot be resolved by averaging confidence.
+- A semantic graph mutation must be represented by a validated ChangeSet.
+- Evidence objects are immutable or version-addressed.
+- Generated Mermaid is never canonical.
+- Reconciliation classification is advisory unless a project policy explicitly permits auto-apply.

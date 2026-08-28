@@ -1,0 +1,7 @@
+{
+  "raw": {
+    "threads": [{"id": "workspace-1:C111:1699999999.000100"}],
+    "next_cursor": null,
+    "_transport": {"request_id": "slack-discover-2"}
+  }
+}

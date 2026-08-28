@@ -1,0 +1,15 @@
+id: slack-local
+profile_path: profiles/mcp/slack.yaml
+server:
+  id: slack-server
+  transport: stdio
+  command: slack-mcp-server
+  args: []
+  environment_refs: {SLACK_TOKEN: "env:SLACK_TOKEN"}
+binding:
+  profile_id: slack
+  profile_version: "1"
+  tools: {discover_messages: search_messages, fetch_message: get_message, discover_threads: search_threads, fetch_thread: get_thread, post_message: post_message, reply: reply_to_thread, update_message: update_message}
+  resources: {}
+  actor_principals: {local-asha: [U123], local-ben: [U456]}
+scope: {workspace_id: workspace-1}

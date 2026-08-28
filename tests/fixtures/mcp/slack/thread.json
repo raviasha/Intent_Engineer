@@ -1,0 +1,24 @@
+{
+  "raw": {
+    "id": "workspace-1:C111:1699999999.000100",
+    "updated": "1700000100.000300",
+    "updated_at": "2026-08-20T10:17:00Z",
+    "root": {"user": {"id": "U456", "display_name": "Ben"}, "text": "Decide export storage semantics."},
+    "last_modified_by": {"id": "U456"},
+    "channel": {"id": "C111"},
+    "title": "Local export decision",
+    "permalink": "https://example.slack.com/archives/C111/p1699999999000100",
+    "allowed_principals": ["U456", "slack-group:ENG"],
+    "_transport": {"request_id": "slack-request-2"}
+  },
+  "expected": {
+    "external_id": "workspace-1:C111:1699999999.000100",
+    "external_version": "1700000100.000300",
+    "author": "U456",
+    "observed_at": "2026-08-20T10:17:00Z",
+    "locator": "https://example.slack.com/archives/C111/p1699999999000100",
+    "parent_ref": "C111",
+    "acl": ["U456", "slack-group:ENG"],
+    "content": {"original_author_id": "U456", "channel_id": "C111", "root_text": "Decide export storage semantics.", "title": "Local export decision"}
+  }
+}

@@ -1,0 +1,15 @@
+id: jira-local
+profile_path: profiles/mcp/jira.yaml
+server:
+  id: jira-server
+  transport: stdio
+  command: jira-mcp-server
+  args: []
+  environment_refs: {JIRA_TOKEN: "env:JIRA_TOKEN"}
+binding:
+  profile_id: jira
+  profile_version: "1"
+  tools: {discover_issues: search_issues, fetch_issue: get_issue, discover_comments: search_comments, fetch_comment: get_comment, update_issue: update_issue, add_comment: add_comment}
+  resources: {}
+  actor_principals: {local-asha: [jira-account-101], local-ben: [jira-account-202]}
+scope: {site_id: jira-site-1, project_key: INTENT}

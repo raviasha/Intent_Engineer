@@ -1,0 +1,414 @@
+{
+  "$defs": {
+    "Edge": {
+      "additionalProperties": false,
+      "description": "A directed relationship between graph nodes.",
+      "properties": {
+        "created_at": {
+          "format": "date-time",
+          "title": "Created At",
+          "type": "string"
+        },
+        "created_by": {
+          "title": "Created By",
+          "type": "string"
+        },
+        "external": {
+          "default": false,
+          "title": "External",
+          "type": "boolean"
+        },
+        "from": {
+          "title": "From",
+          "type": "string"
+        },
+        "id": {
+          "title": "Id",
+          "type": "string"
+        },
+        "last_modified_at": {
+          "format": "date-time",
+          "title": "Last Modified At",
+          "type": "string"
+        },
+        "last_modified_by": {
+          "title": "Last Modified By",
+          "type": "string"
+        },
+        "relation": {
+          "$ref": "#/$defs/RelationType"
+        },
+        "status": {
+          "title": "Status",
+          "type": "string"
+        },
+        "to": {
+          "title": "To",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "from",
+        "relation",
+        "to",
+        "status",
+        "created_by",
+        "created_at",
+        "last_modified_by",
+        "last_modified_at"
+      ],
+      "title": "Edge",
+      "type": "object"
+    },
+    "ImplementationStatus": {
+      "enum": [
+        "implemented_baseline",
+        "partial",
+        "not_started",
+        "requirements_incomplete",
+        "unknown",
+        "stale_evidence"
+      ],
+      "title": "ImplementationStatus",
+      "type": "string"
+    },
+    "Node": {
+      "additionalProperties": false,
+      "description": "A typed assertion in the canonical intent graph.",
+      "properties": {
+        "confidence_basis": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Confidence Basis"
+        },
+        "created_at": {
+          "format": "date-time",
+          "title": "Created At",
+          "type": "string"
+        },
+        "created_by": {
+          "title": "Created By",
+          "type": "string"
+        },
+        "evidence_refs": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "title": "Evidence Refs",
+          "type": "array"
+        },
+        "id": {
+          "title": "Id",
+          "type": "string"
+        },
+        "implementation_status": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ImplementationStatus"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "intent_fidelity_confidence": {
+          "anyOf": [
+            {
+              "maximum": 1.0,
+              "minimum": 0.0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Intent Fidelity Confidence"
+        },
+        "label": {
+          "title": "Label",
+          "type": "string"
+        },
+        "last_modified_at": {
+          "format": "date-time",
+          "title": "Last Modified At",
+          "type": "string"
+        },
+        "last_modified_by": {
+          "title": "Last Modified By",
+          "type": "string"
+        },
+        "last_reassessed_at": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Last Reassessed At"
+        },
+        "source_mode": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SourceMode"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "status": {
+          "title": "Status",
+          "type": "string"
+        },
+        "type": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/NodeType"
+            },
+            {
+              "type": "string"
+            }
+          ],
+          "title": "Type"
+        }
+      },
+      "required": [
+        "id",
+        "type",
+        "label",
+        "status",
+        "created_by",
+        "created_at",
+        "last_modified_by",
+        "last_modified_at"
+      ],
+      "title": "Node",
+      "type": "object"
+    },
+    "NodeType": {
+      "description": "Built-in semantic node types.",
+      "enum": [
+        "SOURCE_ARTIFACT",
+        "SOURCE_REVISION",
+        "EVIDENCE_SPAN",
+        "ACTOR",
+        "SOURCE_SYSTEM",
+        "CONTEXT",
+        "NEED",
+        "PRODUCT_INTENT",
+        "DESIRED_OUTCOME",
+        "ASSUMPTION",
+        "PRINCIPLE",
+        "CONSTRAINT",
+        "REQUIREMENT",
+        "CAPABILITY",
+        "ACCEPTANCE_CRITERION",
+        "DECISION",
+        "ARCHITECTURE",
+        "INTERFACE",
+        "DATA_CONTRACT",
+        "POLICY",
+        "REPOSITORY",
+        "MODULE",
+        "FILE",
+        "SYMBOL",
+        "ENDPOINT",
+        "SCHEMA",
+        "TEST",
+        "BUILD_ARTIFACT",
+        "DEPLOYMENT",
+        "METRIC",
+        "OBSERVED_OUTCOME",
+        "INCIDENT",
+        "USER_FEEDBACK",
+        "EXPERIMENT_RESULT",
+        "CHANGESET",
+        "RECONCILIATION_CASE",
+        "REVIEW_DECISION",
+        "OWNER",
+        "MILESTONE"
+      ],
+      "title": "NodeType",
+      "type": "string"
+    },
+    "RelationType": {
+      "description": "Built-in semantic edge relations.",
+      "enum": [
+        "AUTHORED_BY",
+        "OBSERVED_IN",
+        "REVISION_OF",
+        "CONTAINS_EVIDENCE",
+        "EVIDENCES",
+        "DERIVED_FROM",
+        "MENTIONS",
+        "CREATES_NEED",
+        "MOTIVATES",
+        "SEEKS_OUTCOME",
+        "CONSTRAINS",
+        "ASSUMES",
+        "JUSTIFIES",
+        "REFINES",
+        "SUPERSEDES",
+        "CONTRADICTS",
+        "REALIZED_BY",
+        "SPECIFIED_BY",
+        "HAS_ACCEPTANCE_CRITERION",
+        "DECIDED_BY",
+        "DEPENDS_ON",
+        "IMPLEMENTS_CAPABILITY",
+        "IMPLEMENTED_BY",
+        "VERIFIED_BY",
+        "LOCATED_IN",
+        "CALLS",
+        "DEPENDS_ON_CODE",
+        "CHANGED_BY",
+        "DEPLOYED_AS",
+        "MEASURED_BY",
+        "OBSERVED_AS",
+        "VALIDATES_OUTCOME",
+        "INVALIDATES_ASSUMPTION",
+        "AFFECTS",
+        "OWNED_BY",
+        "CREATED_CASE",
+        "RESOLVED_BY",
+        "PROPOSES_CHANGE_TO",
+        "PART_OF_MILESTONE"
+      ],
+      "title": "RelationType",
+      "type": "string"
+    },
+    "SourceMode": {
+      "enum": [
+        "explicit",
+        "inferred",
+        "derived"
+      ],
+      "title": "SourceMode",
+      "type": "string"
+    },
+    "TypeRegistry": {
+      "additionalProperties": false,
+      "description": "Project-approved namespaced node-type extensions.",
+      "properties": {
+        "extensions": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Extensions",
+          "type": "array",
+          "uniqueItems": true
+        }
+      },
+      "title": "TypeRegistry",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "description": "Canonical graph state, validated whenever it is constructed.",
+  "properties": {
+    "created_at": {
+      "anyOf": [
+        {
+          "format": "date",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Created At"
+    },
+    "edges": {
+      "items": {
+        "$ref": "#/$defs/Edge"
+      },
+      "title": "Edges",
+      "type": "array"
+    },
+    "id": {
+      "title": "Id",
+      "type": "string"
+    },
+    "name": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Name"
+    },
+    "nodes": {
+      "items": {
+        "$ref": "#/$defs/Node"
+      },
+      "title": "Nodes",
+      "type": "array"
+    },
+    "purpose": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Purpose"
+    },
+    "schema_version": {
+      "default": "0.1.0",
+      "title": "Schema Version",
+      "type": "string"
+    },
+    "source_spec": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Source Spec"
+    },
+    "type_registry": {
+      "$ref": "#/$defs/TypeRegistry"
+    },
+    "version": {
+      "minimum": 0,
+      "title": "Version",
+      "type": "integer"
+    }
+  },
+  "required": [
+    "id",
+    "version",
+    "nodes",
+    "edges"
+  ],
+  "title": "Graph",
+  "type": "object"
+}

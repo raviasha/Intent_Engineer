@@ -1,0 +1,23 @@
+{
+  "raw": {
+    "id": "jira-comment-2001",
+    "issue_id": "jira-issue-1001",
+    "updated": "2026-08-20T12:10:00Z",
+    "author": {"account_id": "jira-account-202", "display_name": "Ben"},
+    "last_modified_by": {"account_id": "jira-account-202"},
+    "self": "https://jira.example.test/rest/api/3/issue/jira-issue-1001/comment/jira-comment-2001",
+    "security": {"allowed_principals": ["jira-account-202", "jira-group:engineering"]},
+    "body": "A centralized export needs a separate approval.",
+    "_transport": {"request_id": "jira-request-2"}
+  },
+  "expected": {
+    "external_id": "jira-comment-2001",
+    "external_version": "2026-08-20T12:10:00Z",
+    "author": "jira-account-202",
+    "observed_at": "2026-08-20T12:10:00Z",
+    "locator": "https://jira.example.test/rest/api/3/issue/jira-issue-1001/comment/jira-comment-2001",
+    "parent_ref": "jira-issue-1001",
+    "acl": ["jira-account-202", "jira-group:engineering"],
+    "content": {"body": "A centralized export needs a separate approval.", "original_author_id": "jira-account-202"}
+  }
+}

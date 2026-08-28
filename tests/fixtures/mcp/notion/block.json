@@ -1,0 +1,23 @@
+{
+  "raw": {
+    "id": "notion-block-1",
+    "last_edited_time": "2026-08-20T11:05:00Z",
+    "last_edited_by": {"id": "notion-user-202", "name": "Ben"},
+    "url": "https://www.notion.so/notion-page-1#notion-block-1",
+    "parent": {"page_id": "notion-page-1"},
+    "allowed_principals": ["notion-user-202", "notion-group:engineering"],
+    "type": "paragraph",
+    "content": {"text": "Cloud export may be enabled after independent approval."},
+    "_transport": {"request_id": "notion-request-2"}
+  },
+  "expected": {
+    "external_id": "notion-block-1",
+    "external_version": "2026-08-20T11:05:00Z",
+    "author": "notion-user-202",
+    "observed_at": "2026-08-20T11:05:00Z",
+    "locator": "https://www.notion.so/notion-page-1#notion-block-1",
+    "parent_ref": "notion-page-1",
+    "acl": ["notion-user-202", "notion-group:engineering"],
+    "content": {"block_type": "paragraph", "text": "Cloud export may be enabled after independent approval."}
+  }
+}

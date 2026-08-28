@@ -1,0 +1,25 @@
+{
+  "raw": {
+    "id": "workspace-1:C111:1700000000.000100",
+    "updated": "1700000000.000200",
+    "updated_at": "2026-08-20T10:15:30Z",
+    "user": {"id": "U123", "display_name": "Asha"},
+    "last_modified_by": {"id": "U123"},
+    "channel": {"id": "C111"},
+    "thread_id": "workspace-1:C111:1699999999.000100",
+    "permalink": "https://example.slack.com/archives/C111/p1700000000000100",
+    "allowed_principals": ["U123", "slack-group:ENG"],
+    "text": "The export must remain local by default.",
+    "_transport": {"request_id": "slack-request-1"}
+  },
+  "expected": {
+    "external_id": "workspace-1:C111:1700000000.000100",
+    "external_version": "1700000000.000200",
+    "author": "U123",
+    "observed_at": "2026-08-20T10:15:30Z",
+    "locator": "https://example.slack.com/archives/C111/p1700000000000100",
+    "parent_ref": "workspace-1:C111:1699999999.000100",
+    "acl": ["U123", "slack-group:ENG"],
+    "content": {"original_author_id": "U123", "channel_id": "C111", "text": "The export must remain local by default."}
+  }
+}

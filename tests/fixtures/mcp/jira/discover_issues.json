@@ -1,0 +1,7 @@
+{
+  "raw": {
+    "issues": [{"id": "jira-issue-1001"}],
+    "next_cursor": "jira-issue-cursor-2",
+    "_transport": {"request_id": "jira-discover-1"}
+  }
+}

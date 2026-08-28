@@ -1,0 +1,516 @@
+{
+  "$defs": {
+    "ArgumentBinding": {
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "source": {
+                "const": "constant"
+              }
+            }
+          },
+          "then": {
+            "not": {
+              "required": [
+                "field"
+              ]
+            },
+            "required": [
+              "value"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "source": {
+                "const": "field"
+              }
+            }
+          },
+          "then": {
+            "not": {
+              "required": [
+                "value"
+              ]
+            },
+            "required": [
+              "field"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "source": {
+                "enum": [
+                  "scope",
+                  "cursor",
+                  "object_id",
+                  "object_version",
+                  "target_id",
+                  "before_version"
+                ]
+              }
+            }
+          },
+          "then": {
+            "not": {
+              "anyOf": [
+                {
+                  "required": [
+                    "value"
+                  ]
+                },
+                {
+                  "required": [
+                    "field"
+                  ]
+                }
+              ]
+            }
+          }
+        }
+      ],
+      "description": "One explicitly enumerated argument source for a semantic operation.",
+      "properties": {
+        "field": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ProfileText"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "source": {
+          "enum": [
+            "constant",
+            "scope",
+            "cursor",
+            "object_id",
+            "object_version",
+            "target_id",
+            "before_version",
+            "field"
+          ],
+          "title": "Source",
+          "type": "string"
+        },
+        "value": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/JsonValue"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      },
+      "required": [
+        "source"
+      ],
+      "title": "ArgumentBinding",
+      "type": "object"
+    },
+    "JsonValue": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "integer"
+        },
+        {
+          "type": "number"
+        },
+        {
+          "type": "boolean"
+        },
+        {
+          "items": {
+            "$ref": "#/$defs/JsonValue"
+          },
+          "type": "array"
+        },
+        {
+          "additionalProperties": {
+            "$ref": "#/$defs/JsonValue"
+          },
+          "type": "object"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "ObjectProfile": {
+      "additionalProperties": false,
+      "description": "Provider fields needed to normalize one externally versioned object.",
+      "properties": {
+        "acl": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Selector"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "author": {
+          "$ref": "#/$defs/Selector"
+        },
+        "content": {
+          "additionalProperties": {
+            "$ref": "#/$defs/Selector"
+          },
+          "minProperties": 1,
+          "propertyNames": {
+            "$ref": "#/$defs/ProfileText"
+          },
+          "title": "Content",
+          "type": "object"
+        },
+        "discover_operation": {
+          "$ref": "#/$defs/ProfileText"
+        },
+        "external_id": {
+          "$ref": "#/$defs/Selector"
+        },
+        "external_version": {
+          "$ref": "#/$defs/Selector"
+        },
+        "fetch_operation": {
+          "$ref": "#/$defs/ProfileText"
+        },
+        "locator": {
+          "$ref": "#/$defs/Selector"
+        },
+        "observed_at": {
+          "$ref": "#/$defs/Selector"
+        },
+        "parent_ref": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Selector"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      },
+      "required": [
+        "discover_operation",
+        "fetch_operation",
+        "external_id",
+        "external_version",
+        "author",
+        "observed_at",
+        "locator",
+        "content"
+      ],
+      "title": "ObjectProfile",
+      "type": "object"
+    },
+    "ProfileText": {
+      "maxLength": 256,
+      "minLength": 1,
+      "pattern": "^[^\\x00-\\x1f\\x7f]*\\S[^\\x00-\\x1f\\x7f]*$",
+      "type": "string"
+    },
+    "ReadOperation": {
+      "additionalProperties": false,
+      "description": "A discover or fetch capability backed by one tool or resource.",
+      "properties": {
+        "arguments": {
+          "additionalProperties": {
+            "$ref": "#/$defs/ArgumentBinding"
+          },
+          "propertyNames": {
+            "$ref": "#/$defs/ProfileText"
+          },
+          "title": "Arguments",
+          "type": "object"
+        },
+        "item_selector": {
+          "$ref": "#/$defs/Selector"
+        },
+        "kind": {
+          "enum": [
+            "tool",
+            "resource"
+          ],
+          "title": "Kind",
+          "type": "string"
+        },
+        "next_cursor_selector": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Selector"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "pagination": {
+          "enum": [
+            "none",
+            "cursor",
+            "page"
+          ],
+          "title": "Pagination",
+          "type": "string"
+        },
+        "semantic_name": {
+          "$ref": "#/$defs/ProfileText"
+        }
+      },
+      "required": [
+        "semantic_name",
+        "kind",
+        "pagination",
+        "item_selector"
+      ],
+      "title": "ReadOperation",
+      "type": "object"
+    },
+    "Selector": {
+      "additionalProperties": false,
+      "description": "One pure, bounded extraction path and optional normalization chain.",
+      "properties": {
+        "path": {
+          "$ref": "#/$defs/SelectorPath"
+        },
+        "required": {
+          "default": true,
+          "title": "Required",
+          "type": "boolean"
+        },
+        "transforms": {
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/TransformName"
+          },
+          "maxItems": 8,
+          "title": "Transforms",
+          "type": "array"
+        }
+      },
+      "required": [
+        "path"
+      ],
+      "title": "Selector",
+      "type": "object"
+    },
+    "SelectorPath": {
+      "allOf": [
+        {
+          "not": {
+            "pattern": "(?:^|\\.)__"
+          }
+        }
+      ],
+      "maxLength": 256,
+      "minLength": 1,
+      "pattern": "^\\$(?:\\.(?:[A-Za-z_][A-Za-z0-9_-]*|0|[1-9][0-9]*)){0,32}$",
+      "type": "string"
+    },
+    "TransformName": {
+      "enum": [
+        "string",
+        "integer",
+        "iso_datetime",
+        "string_list",
+        "canonical_json",
+        "sha256"
+      ],
+      "type": "string"
+    },
+    "WriteOperationProfile": {
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "properties": {
+            "target_id": {
+              "not": {
+                "properties": {
+                  "required": {
+                    "const": false
+                  }
+                },
+                "required": [
+                  "required"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "properties": {
+            "before_version": {
+              "not": {
+                "properties": {
+                  "required": {
+                    "const": false
+                  }
+                },
+                "required": [
+                  "required"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "properties": {
+            "result_version": {
+              "not": {
+                "properties": {
+                  "required": {
+                    "const": false
+                  }
+                },
+                "required": [
+                  "required"
+                ]
+              }
+            }
+          }
+        }
+      ],
+      "description": "One allowlisted, version-preconditioned external mutation contract.",
+      "properties": {
+        "allowed_fields": {
+          "items": {
+            "$ref": "#/$defs/ProfileText"
+          },
+          "minItems": 1,
+          "title": "Allowed Fields",
+          "type": "array",
+          "uniqueItems": true
+        },
+        "arguments": {
+          "additionalProperties": {
+            "$ref": "#/$defs/ArgumentBinding"
+          },
+          "minProperties": 1,
+          "propertyNames": {
+            "$ref": "#/$defs/ProfileText"
+          },
+          "title": "Arguments",
+          "type": "object"
+        },
+        "before_version": {
+          "$ref": "#/$defs/Selector"
+        },
+        "input_schema": {
+          "additionalProperties": {
+            "$ref": "#/$defs/JsonValue"
+          },
+          "title": "Input Schema",
+          "type": "object"
+        },
+        "result_version": {
+          "$ref": "#/$defs/Selector"
+        },
+        "semantic_name": {
+          "$ref": "#/$defs/ProfileText"
+        },
+        "target_id": {
+          "$ref": "#/$defs/Selector"
+        },
+        "target_object": {
+          "$ref": "#/$defs/ProfileText"
+        }
+      },
+      "required": [
+        "semantic_name",
+        "target_object",
+        "target_id",
+        "before_version",
+        "allowed_fields",
+        "arguments",
+        "input_schema",
+        "result_version"
+      ],
+      "title": "WriteOperationProfile",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "description": "A versioned, transport-independent semantic provider profile.",
+  "properties": {
+    "display_name": {
+      "$ref": "#/$defs/ProfileText"
+    },
+    "id": {
+      "$ref": "#/$defs/ProfileText"
+    },
+    "objects": {
+      "additionalProperties": {
+        "$ref": "#/$defs/ObjectProfile"
+      },
+      "minProperties": 1,
+      "propertyNames": {
+        "$ref": "#/$defs/ProfileText"
+      },
+      "title": "Objects",
+      "type": "object"
+    },
+    "operations": {
+      "additionalProperties": {
+        "$ref": "#/$defs/ReadOperation"
+      },
+      "minProperties": 1,
+      "propertyNames": {
+        "$ref": "#/$defs/ProfileText"
+      },
+      "title": "Operations",
+      "type": "object"
+    },
+    "redacted_paths": {
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/SelectorPath"
+      },
+      "title": "Redacted Paths",
+      "type": "array",
+      "uniqueItems": true
+    },
+    "version": {
+      "$ref": "#/$defs/ProfileText"
+    },
+    "writes": {
+      "additionalProperties": {
+        "$ref": "#/$defs/WriteOperationProfile"
+      },
+      "propertyNames": {
+        "$ref": "#/$defs/ProfileText"
+      },
+      "title": "Writes",
+      "type": "object"
+    }
+  },
+  "required": [
+    "id",
+    "version",
+    "display_name",
+    "operations",
+    "objects",
+    "writes"
+  ],
+  "title": "ProviderProfile",
+  "type": "object"
+}

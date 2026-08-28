@@ -1,0 +1,117 @@
+id: notion
+version: "1"
+display_name: Notion
+operations:
+  discover_pages:
+    semantic_name: discover_pages
+    kind: tool
+    pagination: cursor
+    arguments:
+      cursor: {source: cursor}
+      scope: {source: scope}
+    item_selector: {path: "$.results"}
+    next_cursor_selector: {path: "$.next_cursor", required: false}
+  fetch_page:
+    semantic_name: fetch_page
+    kind: tool
+    pagination: none
+    arguments:
+      page_id: {source: object_id}
+    item_selector: {path: "$"}
+  discover_blocks:
+    semantic_name: discover_blocks
+    kind: tool
+    pagination: cursor
+    arguments:
+      cursor: {source: cursor}
+      scope: {source: scope}
+    item_selector: {path: "$.results"}
+    next_cursor_selector: {path: "$.next_cursor", required: false}
+  fetch_block:
+    semantic_name: fetch_block
+    kind: tool
+    pagination: none
+    arguments:
+      block_id: {source: object_id}
+    item_selector: {path: "$"}
+objects:
+  page:
+    discover_operation: discover_pages
+    fetch_operation: fetch_page
+    external_id: {path: "$.id", transforms: [string]}
+    external_version: {path: "$.last_edited_time", transforms: [string]}
+    author: {path: "$.last_edited_by.id", transforms: [string]}
+    observed_at: {path: "$.last_edited_time", transforms: [iso_datetime]}
+    locator: {path: "$.url", transforms: [string]}
+    parent_ref: {path: "$.parent.id", transforms: [string]}
+    acl: {path: "$.allowed_principals", transforms: [string_list]}
+    content:
+      summary: {path: "$.properties.summary", transforms: [string]}
+      title: {path: "$.properties.title", transforms: [string]}
+  block:
+    discover_operation: discover_blocks
+    fetch_operation: fetch_block
+    external_id: {path: "$.id", transforms: [string]}
+    external_version: {path: "$.last_edited_time", transforms: [string]}
+    author: {path: "$.last_edited_by.id", transforms: [string]}
+    observed_at: {path: "$.last_edited_time", transforms: [iso_datetime]}
+    locator: {path: "$.url", transforms: [string]}
+    parent_ref: {path: "$.parent.page_id", transforms: [string]}
+    acl: {path: "$.allowed_principals", transforms: [string_list]}
+    content:
+      block_type: {path: "$.type", transforms: [string]}
+      text: {path: "$.content.text", transforms: [string]}
+writes:
+  update_page:
+    semantic_name: update_page
+    target_object: page
+    target_id: {path: "$.id", transforms: [string]}
+    before_version: {path: "$.last_edited_time", transforms: [string]}
+    allowed_fields: [title, properties]
+    arguments:
+      page_id: {source: target_id}
+      expected_version: {source: before_version}
+      title: {source: field, field: title}
+      properties: {source: field, field: properties}
+    input_schema:
+      type: object
+      required: [title, properties]
+      additionalProperties: false
+      properties:
+        title: {type: string, minLength: 1}
+        properties:
+          type: object
+          required: [status]
+          additionalProperties: false
+          properties:
+            status: {type: string, minLength: 1}
+    result_version: {path: "$.last_edited_time", transforms: [string]}
+  append_blocks:
+    semantic_name: append_blocks
+    target_object: page
+    target_id: {path: "$.id", transforms: [string]}
+    before_version: {path: "$.last_edited_time", transforms: [string]}
+    allowed_fields: [children]
+    arguments:
+      page_id: {source: target_id}
+      expected_version: {source: before_version}
+      children: {source: field, field: children}
+    input_schema:
+      type: object
+      required: [children]
+      additionalProperties: false
+      properties:
+        children:
+          type: array
+          minItems: 1
+          items:
+            type: object
+            required: [type, text]
+            additionalProperties: false
+            properties:
+              type: {type: string, enum: [paragraph, heading, bullet]}
+              text: {type: string, minLength: 1}
+    result_version: {path: "$.last_edited_time", transforms: [string]}
+redacted_paths:
+  - "$.token"
+  - "$.authorization"
