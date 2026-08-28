@@ -10,14 +10,16 @@ import re
 import sys
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from enum import StrEnum
 from fnmatch import fnmatchcase
 from hashlib import sha256
 from pathlib import Path, PurePosixPath
-from typing import Protocol, cast
+from typing import Literal, Protocol, cast
 from urllib.parse import unquote, urlsplit, urlunsplit
 
 import typer
 import yaml  # type: ignore[import-untyped]
+from pydantic import ConfigDict
 
 from intent_engineering.capture.base import RawSourceObject
 from intent_engineering.capture.github.connector import GitHubCheckpoint
@@ -28,11 +30,19 @@ from intent_engineering.cli.output import OutputFormat, emit
 from intent_engineering.cli.runtime import Runtime, github_repository_scope, load_runtime
 from intent_engineering.cli.writes import policy_actor_aliases
 from intent_engineering.core.models import (
+    JsonValue,
     ProjectConfig,
     SourceRole,
     SourceRoleAssignment,
 )
+from intent_engineering.core.models._base import StrictModel
 from intent_engineering.intent_workflow.bootstrap import BootstrapService
+from intent_engineering.intent_workflow.onboarding import (
+    OnboardingRuntime,
+    OnboardingState,
+    OnboardingStatus,
+    inspect_onboarding,
+)
 from intent_engineering.storage._atomic import same_path_lock
 from intent_engineering.storage.executor import LocalChangeSetExecutor
 from intent_engineering.storage.secure import SecureRead
@@ -45,6 +55,32 @@ _MAX_PATH_CHARS = 2048
 _MAX_PROPOSALS = 256
 _PROPOSAL_ID = re.compile(r"proposal:sha256:[0-9a-f]{64}\Z")
 _URI_SCHEME = re.compile(r"[a-z][a-z0-9+.-]{0,31}\Z")
+
+
+class OnboardState(StrEnum):
+    """Stable public states emitted by the guided onboarding command."""
+
+    CONFIRMATION_REQUIRED = "confirmation_required"
+    PROPOSAL_REQUIRED = "proposal_required"
+    REVIEW_REQUIRED = "review_required"
+    READY = "ready"
+
+
+class OnboardingCommandResult(StrictModel):
+    """Frozen, capability-free projection of one guided onboarding decision."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    schema_version: Literal[1] = 1
+    state: OnboardState
+    graph_version: int
+    active_node_count: int
+    pending_proposal_ids: tuple[str, ...]
+    source_role: SourceRoleAssignment | None = None
+    proposal: dict[str, JsonValue] | None = None
+    next_action: str | None = None
+    message: str | None = None
+    authorization_issued: Literal[False] = False
 
 
 class ProposalTerminal(Protocol):
@@ -422,6 +458,149 @@ def sources_add_command(
     emit(payload, output_format)
 
 
+def _onboarding_result(
+    status: OnboardingStatus,
+    *,
+    state: OnboardState,
+    source_role: SourceRoleAssignment | None = None,
+    proposal: dict[str, JsonValue] | None = None,
+    next_action: str | None = None,
+    message: str | None = None,
+) -> OnboardingCommandResult:
+    """Project detached inspection data into the public guided-command envelope."""
+    return OnboardingCommandResult(
+        state=state,
+        graph_version=status.graph_version,
+        active_node_count=status.active_node_count,
+        pending_proposal_ids=status.pending_proposal_ids,
+        source_role=source_role,
+        proposal=proposal,
+        next_action=next_action,
+        message=message,
+    )
+
+
+def _existing_onboarding_result(
+    runtime: Runtime,
+    status: OnboardingStatus,
+) -> OnboardingCommandResult:
+    """Return a byte-noop review or ready projection from fresh inspected state."""
+    if status.state is OnboardingState.READY:
+        return _onboarding_result(status, state=OnboardState.READY)
+    if status.state is not OnboardingState.REVIEW_REQUIRED or not status.pending_proposal_ids:
+        raise ValueError("onboarding state changed")
+    config, _ = _snapshot_config(runtime)
+    preview = proposal_payload(runtime, config, status.pending_proposal_ids[0])
+    return _onboarding_result(
+        status,
+        state=OnboardState.REVIEW_REQUIRED,
+        proposal=cast(dict[str, JsonValue], preview),
+        next_action="intent_proposals_confirm",
+    )
+
+
+def _inspect_onboarding(runtime: Runtime) -> OnboardingStatus:
+    """Adapt the CLI's immutable runtime to the read-only onboarding protocol."""
+    return inspect_onboarding(cast(OnboardingRuntime, runtime))
+
+
+def _onboard_result(
+    project: Path,
+    prd: str,
+    yes: bool,
+) -> tuple[bool, OnboardingCommandResult | None, BaseException | None]:
+    """Compose existing capture and source-role paths around read-only onboarding state."""
+    runtime: Runtime | None = None
+    payload: OnboardingCommandResult | None = None
+    try:
+        runtime = load_runtime(project)
+        status = _inspect_onboarding(runtime)
+        if status.state is not OnboardingState.REQUIRED:
+            return True, _existing_onboarding_result(runtime, status), None
+        if not yes:
+            return (
+                True,
+                _onboarding_result(
+                    status,
+                    state=OnboardState.CONFIRMATION_REQUIRED,
+                    next_action="intent_onboard_confirm",
+                    message="Start guided onboarding now?",
+                ),
+                None,
+            )
+
+        # Inspect immediately before each existing operation that can write durable state.
+        status = _inspect_onboarding(runtime)
+        if status.state is not OnboardingState.REQUIRED:
+            return True, _existing_onboarding_result(runtime, status), None
+        captured, bootstrap_payload, abort = _bootstrap_result(project, prd)
+        if abort is not None:
+            return False, None, abort
+        if not captured or bootstrap_payload is None:
+            return False, None, None
+
+        status = _inspect_onboarding(runtime)
+        if status.state is not OnboardingState.REQUIRED:
+            return True, _existing_onboarding_result(runtime, status), None
+        configured, source_payload, abort = _source_role_result(
+            project,
+            "markdown",
+            prd,
+            SourceRole.DECLARED_INTENT,
+            False,
+        )
+        if abort is not None:
+            return False, None, abort
+        if not configured or source_payload is None:
+            return False, None, None
+        role_payload = source_payload.get("source_role")
+        if type(role_payload) is not dict:
+            return False, None, None
+        source_role = SourceRoleAssignment.model_validate_json(
+            json.dumps(role_payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+        )
+        evidence_refs = bootstrap_payload.get("evidence_refs")
+        if type(evidence_refs) is not list or not all(type(item) is str for item in evidence_refs):
+            return False, None, None
+        payload = _onboarding_result(
+            _inspect_onboarding(runtime),
+            state=OnboardState.PROPOSAL_REQUIRED,
+            source_role=source_role,
+            next_action="intent_bootstrap_propose",
+        )
+        return True, payload, None
+    except Exception:  # noqa: BLE001 - public CLI receives one fixed failure
+        return False, None, None
+    except BaseException as error:  # noqa: BLE001 - preserve detached control flow
+        error.__traceback__ = None
+        error.__cause__ = None
+        error.__context__ = None
+        return False, None, error
+    finally:
+        project = Path()
+        prd = ""
+        runtime = None
+
+
+def onboard_command(
+    prd: str = typer.Option(..., "--prd"),
+    project: Path = typer.Option(Path("."), "--project"),
+    output_format: OutputFormat = typer.Option(OutputFormat.TEXT, "--format"),
+    yes: bool = typer.Option(False, "--yes"),
+) -> None:
+    """Guide source capture and proposal review without approving a baseline."""
+    ok, payload, abort = _onboard_result(project, prd, yes)
+    del project, prd, yes
+    if abort is not None:
+        raise abort
+    if not ok or payload is None:
+        _fixed_error()
+    assert payload is not None
+    emit(payload, output_format)
+    if payload.state is OnboardState.CONFIRMATION_REQUIRED:
+        raise typer.Exit(1)
+
+
 def proposal_payload(
     runtime: Runtime,
     config: ProjectConfig,
@@ -599,8 +778,11 @@ def proposals_confirm_command(
 
 __all__ = [
     "ConsoleProposalTerminal",
+    "OnboardState",
+    "OnboardingCommandResult",
     "ProposalTerminal",
     "bootstrap_command",
+    "onboard_command",
     "proposal_payload",
     "proposals_app",
     "sources_app",

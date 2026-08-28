@@ -21,6 +21,7 @@ from intent_engineering.cli.connectors import (
 from intent_engineering.cli.github import GitHubDoctorResult, check_github
 from intent_engineering.cli.intent_workflow import (
     bootstrap_command,
+    onboard_command,
     proposals_app,
     sources_app,
 )
@@ -74,6 +75,7 @@ app.add_typer(write_app, name="write")
 app.add_typer(sources_app, name="sources")
 app.add_typer(proposals_app, name="proposals")
 app.command("bootstrap")(bootstrap_command)
+app.command("onboard")(onboard_command)
 
 
 def _configure_logging() -> None:
