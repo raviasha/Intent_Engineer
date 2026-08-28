@@ -29,22 +29,29 @@ FALLBACK = (
     "Intent advisory prompt routing is unavailable. Do not mutate the intent graph, "
     "infer authorization, or treat this advisory as enforcement."
 )
+TURN_7_CONVERSATION_REF = (
+    "codex-prompt:v1:"
+    "ee992e532c89c226e193af5b2cfe3c40dbd3596b37804968fa1548be18a0437d:"
+    "75bb37228f98a1e72918a0dcc06aadebf6e602b29ef2447e366303dba85beea1"
+)
 
 
 def _official_event(
     project: Path,
     *,
     prompt: str = "Add team sharing",
+    session_id: str = "codex:thread-3",
+    turn_id: str = "turn-7",
     agent_id: str | None = None,
     agent_type: str | None = None,
 ) -> dict[str, object]:
     event: dict[str, object] = {
-        "session_id": "codex:thread-3",
+        "session_id": session_id,
         "transcript_path": None,
         "cwd": str(project),
         "hook_event_name": "UserPromptSubmit",
         "model": "gpt-5.6-sol",
-        "turn_id": "turn-7",
+        "turn_id": turn_id,
         "permission_mode": "default",
         "prompt": prompt,
     }
@@ -253,13 +260,50 @@ def test_real_hook_routes_ready_prompt_to_preflight_without_secret_or_echo(
     context = _additional_context(completed)
     assert "intent_advisory_preflight" in context
     assert "intent_context" in context
-    assert 'conversation_ref="codex:thread-3"' in context
+    assert f'conversation_ref="{TURN_7_CONVERSATION_REF}"' in context
     lowered = completed.stdout.decode().casefold()
     assert marker.casefold() not in lowered
     assert "authorization" not in lowered
     assert "capability" not in lowered
     assert "token" not in lowered
     assert _durable_bytes(project) == before
+
+
+def test_real_hook_uses_retry_stable_turn_specific_ref_without_host_id_leakage(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    _ready_project(project)
+    session_marker = "PRIVATE:SESSION:8197"
+    turn_marker = "PRIVATE:TURN:8197"
+    first = _official_event(
+        project,
+        session_id=session_marker,
+        turn_id=turn_marker,
+    )
+    next_turn = _official_event(
+        project,
+        session_id=session_marker,
+        turn_id="PRIVATE:TURN:8198",
+    )
+
+    first_context = _additional_context(
+        _run_hook(project, json.dumps(first, separators=(",", ":")).encode())
+    )
+    retry_context = _additional_context(
+        _run_hook(project, json.dumps(first, separators=(",", ":")).encode())
+    )
+    next_context = _additional_context(
+        _run_hook(project, json.dumps(next_turn, separators=(",", ":")).encode())
+    )
+
+    assert first_context == retry_context
+    assert first_context != next_context
+    combined = first_context + retry_context + next_context
+    assert session_marker not in combined
+    assert turn_marker not in combined
+    assert "PRIVATE:TURN:8198" not in combined
 
 
 def test_real_hook_accepts_installed_official_optional_identity_and_multiline_prompt(

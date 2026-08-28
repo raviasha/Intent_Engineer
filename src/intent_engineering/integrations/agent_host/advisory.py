@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -34,6 +35,7 @@ from .base import _HostModel
 
 _CONTROL = re.compile(r"[\x00-\x1f\x7f]")
 _PROMPT_CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+_CODEX_CONVERSATION_REF = re.compile(r"\Acodex-prompt:v1:([0-9a-f]{64}):([0-9a-f]{64})\Z")
 _MAX_ID_BYTES = 2 * 1024
 _MAX_PROMPT_BYTES = 16 * 1024
 _MAX_REPOSITORY_BYTES = 4 * 1024
@@ -76,6 +78,35 @@ def _prompt(value: str) -> str:
     ):
         raise ValueError("invalid advisory prompt event")
     return value
+
+
+def _codex_identity_digest(label: str, *values: str) -> str:
+    material = json.dumps(
+        [label, *values],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(material).hexdigest()
+
+
+def codex_conversation_ref(session_id: str, turn_id: str) -> str:
+    """Return one bounded retry identity with a separately matchable session lineage."""
+    checked_session = _identity(session_id)
+    checked_turn = _identity(turn_id)
+    session_digest = _codex_identity_digest("codex-session-v1", checked_session)
+    turn_digest = _codex_identity_digest("codex-turn-v1", checked_session, checked_turn)
+    return f"codex-prompt:v1:{session_digest}:{turn_digest}"
+
+
+def _codex_session_lineage(conversation_ref: object) -> str | None:
+    if type(conversation_ref) is not str:
+        raise ValueError("invalid advisory clarification reference")
+    matched = _CODEX_CONVERSATION_REF.fullmatch(conversation_ref)
+    if matched is None:
+        if conversation_ref.startswith("codex-prompt:"):
+            raise ValueError("invalid advisory clarification reference")
+        return None
+    return matched.group(1)
 
 
 def _repository(value: str) -> str:
@@ -492,15 +523,24 @@ class AdvisoryPromptRouter:
         for item in events:
             session = item.session
             latest[session.id] = session
-        active = tuple(
-            session
-            for session in latest.values()
-            if session.conversation_ref == checked.session_id and session.status == "open"
-        )
+        conversation_ref = codex_conversation_ref(checked.session_id, checked.turn_id)
+        lineage = _codex_session_lineage(conversation_ref)
+        open_codex: list[tuple[ClarificationSession, str]] = []
+        for session in latest.values():
+            if session.status != "open":
+                continue
+            session_lineage = _codex_session_lineage(session.conversation_ref)
+            if session_lineage is not None:
+                open_codex.append((session, session_lineage))
+        active = tuple(session for session, item in open_codex if item == lineage)
         if len(active) > 1:
             raise ValueError("ambiguous advisory clarification")
+        if not active and open_codex:
+            raise ValueError("cross-session advisory clarification")
         if active:
             session = active[0]
+            if session.opened_by != "agent:codex":
+                raise ValueError("advisory clarification actor mismatch")
             answered = {item.question_id for item in session.answers}
             question = next(
                 (item for item in session.questions if item.id not in answered),
@@ -529,7 +569,7 @@ class AdvisoryPromptRouter:
             action="classify",
             message="Classify this prompt through Intent Engineering before implementation.",
             mcp_tool="intent_advisory_preflight",
-            arguments={"conversation_ref": checked.session_id},
+            arguments={"conversation_ref": conversation_ref},
         )
 
     def route(self, event: PromptEvent) -> PromptRoute:
@@ -564,6 +604,7 @@ __all__ = [
     "CodexUserPromptSubmitEvent",
     "PromptEvent",
     "PromptRoute",
+    "codex_conversation_ref",
     "codex_prompt_context",
     "codex_prompt_output",
     "parse_codex_prompt_event",
