@@ -7,6 +7,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import cast
 
@@ -56,9 +57,14 @@ from intent_engineering.core.policy import (
     refs_allowed,
 )
 from intent_engineering.integrations.agent_host.advisory import (
+    CODEX_ADVISORY_FALLBACK,
     AdvisoryPromptRouter,
+    CodexUserPromptSubmitEvent,
     PromptEvent,
     PromptRoute,
+    codex_prompt_context,
+    codex_prompt_output,
+    parse_codex_prompt_event,
     parse_prompt_event,
     repository_matches,
     unavailable_prompt_route,
@@ -113,38 +119,86 @@ def agent_prompt_hook_command() -> None:
     """Route exactly one bounded advisory prompt event over stdin/stdout."""
     raw: bytes | None = None
     parsed: object = None
+    codex_event: CodexUserPromptSubmitEvent | None = None
     event: PromptEvent | None = None
     runtime: Runtime | None = None
     current: SecureDirectory | None = None
     route: PromptRoute | None = None
+    output: dict[str, object] | None = None
     signal: BaseException | None = None
+    official = False
     ok = False
     try:
         raw = sys.stdin.buffer.read(_MAX_PROMPT_HOOK_BYTES + 1)
         if not raw or len(raw) > _MAX_PROMPT_HOOK_BYTES:
             raise ValueError("invalid advisory prompt event")
         parsed = json.loads(raw, object_pairs_hook=_prompt_hook_object)
-        event = parse_prompt_event(parsed)
-        current = SecureDirectory.open(Path.cwd())
-        if not repository_matches(current, event.repository):
-            raise ValueError("advisory repository mismatch")
-        try:
-            runtime = load_runtime(Path.cwd())
-        except ProjectNotInitialized:
-            route = PromptRoute(
-                action="offer_onboarding",
-                message=(
-                    "This repository has not been onboarded into Intent Engineering. "
-                    "Start guided onboarding now?"
-                ),
-                mcp_tool=None,
-                arguments={},
+        official = type(parsed) is dict and any(
+            key in parsed
+            for key in (
+                "hook_event_name",
+                "cwd",
+                "permission_mode",
+                "transcript_path",
             )
+        )
+        current = SecureDirectory.open(Path.cwd())
+        if official:
+            codex_event = parse_codex_prompt_event(parsed)
+            if not repository_matches(current, codex_event.cwd):
+                raise ValueError("advisory repository mismatch")
+            try:
+                runtime = load_runtime(Path.cwd())
+            except ProjectNotInitialized:
+                if (Path.cwd() / ".intent").exists():
+                    raise
+                route = PromptRoute(
+                    action="offer_onboarding",
+                    message=(
+                        "This repository has not been onboarded into Intent Engineering. "
+                        "Start guided onboarding now?"
+                    ),
+                    mcp_tool=None,
+                    arguments={},
+                )
+            else:
+                event = PromptEvent(
+                    session_id=codex_event.session_id,
+                    turn_id=codex_event.turn_id,
+                    repository=codex_event.cwd,
+                    actor=runtime.config.local_actor,
+                    prompt=codex_event.prompt,
+                    created_at=datetime.now(UTC),
+                )
+                route = AdvisoryPromptRouter(runtime).route(event)
+            output = codex_prompt_output(codex_prompt_context(route))
         else:
-            route = AdvisoryPromptRouter(runtime).route(event)
+            event = parse_prompt_event(parsed)
+            if not repository_matches(current, event.repository):
+                raise ValueError("advisory repository mismatch")
+            try:
+                runtime = load_runtime(Path.cwd())
+            except ProjectNotInitialized:
+                if (Path.cwd() / ".intent").exists():
+                    raise
+                route = PromptRoute(
+                    action="offer_onboarding",
+                    message=(
+                        "This repository has not been onboarded into Intent Engineering. "
+                        "Start guided onboarding now?"
+                    ),
+                    mcp_tool=None,
+                    arguments={},
+                )
+            else:
+                route = AdvisoryPromptRouter(runtime).route(event)
         ok = True
     except Exception:  # noqa: BLE001 - one fixed prompt-hook denial
-        route = unavailable_prompt_route()
+        if official:
+            output = codex_prompt_output(CODEX_ADVISORY_FALLBACK)
+            ok = True
+        else:
+            route = unavailable_prompt_route()
     except BaseException as caught:  # noqa: BLE001 - preserve cancellation identity
         caught.__traceback__ = None
         caught.__cause__ = None
@@ -155,6 +209,7 @@ def agent_prompt_hook_command() -> None:
             current.close()
         raw = None
         parsed = None
+        codex_event = None
         event = None
         runtime = None
         current = None
@@ -163,7 +218,11 @@ def agent_prompt_hook_command() -> None:
         signal = None
         route = None
         raise detached_signal.with_traceback(None)
-    typer.echo(cast(PromptRoute, route).model_dump_json())
+    if official:
+        typer.echo(json.dumps(output, ensure_ascii=False, separators=(",", ":")))
+    else:
+        typer.echo(cast(PromptRoute, route).model_dump_json())
+    output = None
     route = None
     if not ok:
         raise typer.Exit(1)

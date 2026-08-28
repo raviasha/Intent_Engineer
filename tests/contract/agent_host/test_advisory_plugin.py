@@ -1,0 +1,413 @@
+"""Offline contract tests for the advisory Codex plugin bundle."""
+
+from __future__ import annotations
+
+import json
+import os
+import signal
+import stat
+import subprocess
+import sys
+import time
+from collections.abc import Callable
+from datetime import UTC, datetime
+from pathlib import Path
+
+import pytest
+
+from intent_engineering.cli.runtime import load_runtime
+from intent_engineering.core.models import Graph, Node, NodeType
+from intent_engineering.core.policy.project import initialize_project
+
+REPO_ROOT = Path(__file__).parents[3]
+PLUGIN_ROOT = REPO_ROOT / "plugins" / "intent-advisor"
+HOOK = PLUGIN_ROOT / "scripts" / "prompt-hook"
+NOW = datetime(2026, 8, 28, 12, 0, tzinfo=UTC)
+FALLBACK = (
+    "Intent advisory prompt routing is unavailable. Do not mutate the intent graph, "
+    "infer authorization, or treat this advisory as enforcement."
+)
+
+
+def _official_event(project: Path, *, prompt: str = "Add team sharing") -> dict[str, object]:
+    return {
+        "session_id": "codex:thread-3",
+        "transcript_path": None,
+        "cwd": str(project),
+        "hook_event_name": "UserPromptSubmit",
+        "model": "gpt-5.6-sol",
+        "turn_id": "turn-7",
+        "permission_mode": "default",
+        "prompt": prompt,
+    }
+
+
+def _run_hook(
+    project: Path,
+    payload: bytes,
+    *,
+    path: str | None = None,
+    timeout: float = 5,
+) -> subprocess.CompletedProcess[bytes]:
+    environment = os.environ.copy()
+    environment["PATH"] = path or f"{REPO_ROOT / '.venv' / 'bin'}:/usr/bin:/bin"
+    return subprocess.run(
+        [sys.executable, str(HOOK)],
+        cwd=project,
+        env=environment,
+        input=payload,
+        capture_output=True,
+        check=False,
+        timeout=timeout,
+    )
+
+
+def _run_official_hook(
+    project: Path,
+    *,
+    event_project: Path | None = None,
+    prompt: str = "Add team sharing",
+    path: str | None = None,
+    timeout: float = 5,
+) -> subprocess.CompletedProcess[bytes]:
+    payload = _official_event(event_project or project, prompt=prompt)
+    return _run_hook(
+        project,
+        json.dumps(payload, separators=(",", ":")).encode(),
+        path=path,
+        timeout=timeout,
+    )
+
+
+def _output(completed: subprocess.CompletedProcess[bytes]) -> dict[str, object]:
+    assert completed.returncode == 0
+    assert completed.stderr == b""
+    return json.loads(completed.stdout)
+
+
+def _additional_context(completed: subprocess.CompletedProcess[bytes]) -> str:
+    output = _output(completed)
+    assert set(output) == {"hookSpecificOutput"}
+    specific = output["hookSpecificOutput"]
+    assert type(specific) is dict
+    assert set(specific) == {"hookEventName", "additionalContext"}
+    assert specific["hookEventName"] == "UserPromptSubmit"
+    context = specific["additionalContext"]
+    assert type(context) is str
+    return context
+
+
+def _durable_bytes(project: Path) -> dict[str, bytes]:
+    workspace = project / ".intent"
+    if not workspace.exists():
+        return {}
+    return {
+        str(path.relative_to(workspace)): path.read_bytes()
+        for path in sorted(workspace.rglob("*"))
+        if path.is_file() and not path.is_symlink()
+    }
+
+
+def _ready_project(project: Path) -> None:
+    initialize_project(project)
+    runtime = load_runtime(project)
+    runtime.graph_store.initialize(
+        Graph(
+            id="graph:plugin-test",
+            version=1,
+            name="Plugin test",
+            nodes=(
+                Node(
+                    id="intent:sharing",
+                    type=NodeType.PRODUCT_INTENT,
+                    label="Share reports safely",
+                    status="active",
+                    created_by="local",
+                    created_at=NOW,
+                    last_modified_by="local",
+                    last_modified_at=NOW,
+                ),
+            ),
+            edges=(),
+        )
+    )
+
+
+def _fake_intent(directory: Path, source: str) -> Path:
+    executable = directory / "intent"
+    executable.write_text(f"#!/usr/bin/python3\n{source}\n", encoding="utf-8")
+    executable.chmod(executable.stat().st_mode | stat.S_IXUSR)
+    return executable
+
+
+def test_advisory_plugin_declares_official_prompt_hook_and_repository_mcp() -> None:
+    manifest = json.loads((PLUGIN_ROOT / ".codex-plugin" / "plugin.json").read_bytes())
+    hooks = json.loads((PLUGIN_ROOT / "hooks" / "hooks.json").read_bytes())
+    mcp = json.loads((PLUGIN_ROOT / ".mcp.json").read_bytes())
+
+    assert manifest == {
+        "name": "intent-advisor",
+        "version": "0.1.0",
+        "description": "Route Codex prompts through advisory Intent Engineering workflows.",
+        "author": {"name": "Intent Engineering"},
+        "skills": "./skills/",
+        "interface": {
+            "displayName": "Intent Advisor",
+            "shortDescription": "Route work through repository intent.",
+            "longDescription": (
+                "Adds advisory onboarding, preflight, and clarification guidance backed by "
+                "local Intent Engineering workflows."
+            ),
+            "developerName": "Intent Engineering",
+            "category": "Developer Tools",
+            "capabilities": [],
+            "defaultPrompt": "Check this task against the repository intent workflow.",
+        },
+        "mcpServers": "./.mcp.json",
+    }
+    assert hooks == {
+        "hooks": {
+            "UserPromptSubmit": [
+                {
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": "${PLUGIN_ROOT}/scripts/prompt-hook",
+                            "timeout": 5,
+                            "statusMessage": "Checking repository intent",
+                            "additionalContextLimit": 2048,
+                        }
+                    ]
+                }
+            ]
+        }
+    }
+    assert mcp == {
+        "mcpServers": {
+            "intent_advisor": {
+                "command": "intent",
+                "args": ["mcp", "--project", "."],
+            }
+        }
+    }
+    assert "cwd" not in mcp["mcpServers"]["intent_advisor"]
+    assert stat.S_IMODE(HOOK.stat().st_mode) & stat.S_IXUSR
+
+
+def test_real_hook_offers_onboarding_without_writes_or_prompt_echo(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    before = _durable_bytes(project)
+    marker = "PRIVATE-UNINITIALIZED-PROMPT-8197"
+
+    completed = _run_official_hook(project, prompt=marker)
+
+    context = _additional_context(completed)
+    assert "Start guided onboarding now?" in context
+    assert marker not in completed.stdout.decode()
+    assert _durable_bytes(project) == before
+
+
+def test_real_hook_routes_ready_prompt_to_preflight_without_secret_or_echo(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    _ready_project(project)
+    before = _durable_bytes(project)
+    marker = "PRIVATE-READY-PROMPT-8197"
+
+    completed = _run_official_hook(project, prompt=marker)
+
+    context = _additional_context(completed)
+    assert "intent_preflight" in context
+    lowered = completed.stdout.decode().casefold()
+    assert marker.casefold() not in lowered
+    assert "authorization" not in lowered
+    assert "capability" not in lowered
+    assert "token" not in lowered
+    assert _durable_bytes(project) == before
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        lambda payload: payload.pop("turn_id"),
+        lambda payload: payload.update({"unknown": True}),
+        lambda payload: payload.update({"hook_event_name": "PreToolUse"}),
+        lambda payload: payload.update({"permission_mode": "root"}),
+    ],
+)
+def test_malformed_official_event_returns_one_fixed_advisory_fallback(
+    tmp_path: Path,
+    mutation: Callable[[dict[str, object]], object],
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    payload = _official_event(project, prompt="PRIVATE-MALFORMED-PROMPT-8197")
+    mutation(payload)
+
+    completed = _run_hook(project, json.dumps(payload).encode())
+
+    assert _additional_context(completed) == FALLBACK
+    assert b"PRIVATE-MALFORMED-PROMPT-8197" not in completed.stdout
+
+
+def test_missing_cli_returns_fixed_fallback_with_strict_streams(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    empty_path = tmp_path / "empty-bin"
+    project.mkdir()
+    empty_path.mkdir()
+
+    completed = _run_official_hook(project, path=str(empty_path))
+
+    assert _additional_context(completed) == FALLBACK
+
+
+def test_unbounded_child_output_returns_bounded_fallback(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    fake_bin = tmp_path / "fake-bin"
+    project.mkdir()
+    fake_bin.mkdir()
+    marker = "PRIVATE-CHILD-OUTPUT-8197"
+    _fake_intent(
+        fake_bin,
+        "import sys, time\n"
+        f"sys.stderr.write('{marker}')\n"
+        "sys.stdout.write('x' * 131072)\n"
+        "sys.stdout.flush()\n"
+        "time.sleep(30)",
+    )
+
+    started = time.monotonic()
+    completed = _run_official_hook(project, path=f"{fake_bin}:/usr/bin:/bin", timeout=5)
+
+    assert time.monotonic() - started < 4
+    assert _additional_context(completed) == FALLBACK
+    assert len(completed.stdout) <= 4096
+    assert marker.encode() not in completed.stdout + completed.stderr
+
+
+def test_child_timeout_returns_fixed_fallback_promptly(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    fake_bin = tmp_path / "fake-bin"
+    project.mkdir()
+    fake_bin.mkdir()
+    marker = "PRIVATE-TIMED-OUT-CHILD-8197"
+    _fake_intent(
+        fake_bin,
+        f"import sys, time\nsys.stderr.write('{marker}')\nsys.stderr.flush()\ntime.sleep(30)",
+    )
+
+    started = time.monotonic()
+    completed = _run_official_hook(project, path=f"{fake_bin}:/usr/bin:/bin", timeout=5)
+
+    assert 1.5 < time.monotonic() - started < 4
+    assert _additional_context(completed) == FALLBACK
+    assert marker.encode() not in completed.stdout + completed.stderr
+
+
+def test_cross_project_session_reuse_returns_fallback_without_writes(tmp_path: Path) -> None:
+    selected = tmp_path / "selected"
+    attacker = tmp_path / "attacker"
+    selected.mkdir()
+    attacker.mkdir()
+    _ready_project(selected)
+    _ready_project(attacker)
+    selected_before = _durable_bytes(selected)
+    attacker_before = _durable_bytes(attacker)
+
+    completed = _run_official_hook(selected, event_project=attacker)
+
+    assert _additional_context(completed) == FALLBACK
+    assert _durable_bytes(selected) == selected_before
+    assert _durable_bytes(attacker) == attacker_before
+
+
+@pytest.mark.parametrize("attack", ["fifo", "symlink"])
+def test_special_project_files_fail_promptly_without_replacement(
+    tmp_path: Path,
+    attack: str,
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    initialize_project(project)
+    config = project / ".intent" / "config.yaml"
+    config.unlink()
+    if attack == "fifo":
+        os.mkfifo(config)
+    else:
+        outside = tmp_path / "outside.yaml"
+        outside.write_text("PRIVATE-SPECIAL-FILE-8197", encoding="utf-8")
+        config.symlink_to(outside)
+    before = os.lstat(config)
+
+    completed = _run_official_hook(project, timeout=3)
+
+    assert _additional_context(completed) == FALLBACK
+    after = os.lstat(config)
+    assert stat.S_IFMT(after.st_mode) == stat.S_IFMT(before.st_mode)
+
+
+def test_hook_cancellation_terminates_owned_cli_and_emits_no_child_output(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    fake_bin = tmp_path / "fake-bin"
+    pid_file = tmp_path / "child.pid"
+    project.mkdir()
+    fake_bin.mkdir()
+    marker = "PRIVATE-CANCELLED-CHILD-8197"
+    _fake_intent(
+        fake_bin,
+        "import os, pathlib, sys, time\n"
+        f"pathlib.Path({str(pid_file)!r}).write_text(str(os.getpid()))\n"
+        f"sys.stderr.write('{marker}')\n"
+        "sys.stderr.flush()\n"
+        "time.sleep(30)",
+    )
+    environment = os.environ.copy()
+    environment["PATH"] = f"{fake_bin}:/usr/bin:/bin"
+    process = subprocess.Popen(
+        [sys.executable, str(HOOK)],
+        cwd=project,
+        env=environment,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    assert process.stdin is not None
+    process.stdin.write(json.dumps(_official_event(project)).encode())
+    process.stdin.close()
+    process.stdin = None
+    deadline = time.monotonic() + 2
+    while not pid_file.exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert pid_file.exists()
+
+    process.send_signal(signal.SIGTERM)
+    stdout, stderr = process.communicate(timeout=3)
+
+    assert process.returncode == 0
+    assert stderr == b""
+    assert marker.encode() not in stdout
+    assert (
+        _additional_context(
+            subprocess.CompletedProcess(process.args, process.returncode, stdout, stderr)
+        )
+        == FALLBACK
+    )
+    child_pid = int(pid_file.read_text())
+    with pytest.raises(ProcessLookupError):
+        os.kill(child_pid, 0)
+
+
+def test_skill_routes_clarifications_and_states_advisory_mcp_failure_boundary() -> None:
+    skill = (PLUGIN_ROOT / "skills" / "intent-advisor" / "SKILL.md").read_text(encoding="utf-8")
+
+    assert "action=answer_clarification" in skill
+    assert "intent_clarification_answer" in skill
+    assert "Do not classify the answer again" in skill
+    assert "intent onboard --project ." in skill
+    assert "MCP tools are unavailable" in skill
+    assert "MandatoryHookUnavailable" in skill
+    assert "capability token" in skill
+    assert "advisory" in skill.casefold()

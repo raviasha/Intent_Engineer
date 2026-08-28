@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "intent_advisor": {
+      "command": "intent",
+      "args": ["mcp", "--project", "."]
+    }
+  }
+}

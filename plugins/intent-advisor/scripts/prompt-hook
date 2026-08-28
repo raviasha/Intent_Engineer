@@ -1,0 +1,160 @@
+#!/usr/bin/env python3
+"""Bounded transport between a Codex prompt hook and the Intent CLI."""
+
+from __future__ import annotations
+
+import json
+import os
+import selectors
+import signal
+import subprocess
+import sys
+import time
+from typing import Any
+
+MAX_INPUT_BYTES = 64 * 1024
+MAX_OUTPUT_BYTES = 4096
+CHILD_TIMEOUT_SECONDS = 2.0
+FALLBACK = (
+    "Intent advisory prompt routing is unavailable. Do not mutate the intent graph, "
+    "infer authorization, or treat this advisory as enforcement."
+)
+
+_cancelled = False
+
+
+def _signal_cancel(_signum: int, _frame: Any) -> None:
+    global _cancelled
+    _cancelled = True
+
+
+def _object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError
+        result[key] = value
+    return result
+
+
+def _wrapper(context: str) -> dict[str, object]:
+    return {
+        "hookSpecificOutput": {
+            "hookEventName": "UserPromptSubmit",
+            "additionalContext": context,
+        }
+    }
+
+
+def _encoded_fallback() -> bytes:
+    return json.dumps(_wrapper(FALLBACK), separators=(",", ":")).encode() + b"\n"
+
+
+def _validated_output(raw: bytes) -> bytes:
+    if not raw or len(raw) > MAX_OUTPUT_BYTES:
+        raise ValueError
+    parsed = json.loads(raw, object_pairs_hook=_object)
+    if type(parsed) is not dict or set(parsed) != {"hookSpecificOutput"}:
+        raise ValueError
+    specific = parsed["hookSpecificOutput"]
+    if type(specific) is not dict or set(specific) != {
+        "hookEventName",
+        "additionalContext",
+    }:
+        raise ValueError
+    if specific["hookEventName"] != "UserPromptSubmit":
+        raise ValueError
+    context = specific["additionalContext"]
+    if type(context) is not str or not context or len(context) > 2048:
+        raise ValueError
+    return json.dumps(parsed, ensure_ascii=False, separators=(",", ":")).encode() + b"\n"
+
+
+def _terminate(process: subprocess.Popen[bytes]) -> None:
+    if process.poll() is not None:
+        process.wait()
+        return
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    try:
+        process.wait(timeout=0.2)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        process.wait()
+
+
+def _invoke(raw: bytes) -> bytes:
+    process: subprocess.Popen[bytes] | None = None
+    selector = selectors.DefaultSelector()
+    try:
+        process = subprocess.Popen(
+            ["intent", "agent-prompt-hook"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        if process.stdin is None or process.stdout is None:
+            raise RuntimeError
+        os.set_blocking(process.stdin.fileno(), False)
+        os.set_blocking(process.stdout.fileno(), False)
+        selector.register(process.stdin, selectors.EVENT_WRITE)
+        selector.register(process.stdout, selectors.EVENT_READ)
+        sent = 0
+        output = bytearray()
+        stdout_open = True
+        deadline = time.monotonic() + CHILD_TIMEOUT_SECONDS
+        while stdout_open or process.poll() is None:
+            if _cancelled or time.monotonic() >= deadline:
+                raise TimeoutError
+            for key, _events in selector.select(timeout=0.05):
+                if key.fileobj is process.stdin:
+                    try:
+                        written = os.write(process.stdin.fileno(), raw[sent:])
+                    except BrokenPipeError:
+                        written = 0
+                    sent += written
+                    if written == 0 or sent == len(raw):
+                        selector.unregister(process.stdin)
+                        process.stdin.close()
+                else:
+                    chunk = os.read(process.stdout.fileno(), MAX_OUTPUT_BYTES + 1 - len(output))
+                    if not chunk:
+                        selector.unregister(process.stdout)
+                        process.stdout.close()
+                        stdout_open = False
+                    else:
+                        output.extend(chunk)
+                        if len(output) > MAX_OUTPUT_BYTES:
+                            raise ValueError
+        if process.wait() != 0:
+            raise ValueError
+        return _validated_output(bytes(output))
+    except (Exception, KeyboardInterrupt):  # noqa: BLE001 - fixed advisory boundary
+        if process is not None:
+            _terminate(process)
+        return _encoded_fallback()
+    finally:
+        selector.close()
+
+
+def main() -> int:
+    signal.signal(signal.SIGINT, _signal_cancel)
+    signal.signal(signal.SIGTERM, _signal_cancel)
+    raw = sys.stdin.buffer.read(MAX_INPUT_BYTES + 1)
+    if not raw or len(raw) > MAX_INPUT_BYTES or _cancelled:
+        output = _encoded_fallback()
+    else:
+        output = _invoke(raw)
+    sys.stdout.buffer.write(output)
+    sys.stdout.buffer.flush()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

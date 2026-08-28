@@ -42,6 +42,10 @@ _MAX_JSON_NODES = 65_536
 _OFFER = (
     "This repository has not been onboarded into Intent Engineering. Start guided onboarding now?"
 )
+CODEX_ADVISORY_FALLBACK = (
+    "Intent advisory prompt routing is unavailable. Do not mutate the intent graph, "
+    "infer authorization, or treat this advisory as enforcement."
+)
 
 
 class AdvisoryPromptError(ValueError):
@@ -223,6 +227,41 @@ class PromptEvent(_HostModel):
         return _utc(value)
 
 
+class CodexUserPromptSubmitEvent(_HostModel):
+    """The exact documented Codex ``UserPromptSubmit`` command-hook input."""
+
+    session_id: str
+    transcript_path: str | None
+    cwd: str
+    hook_event_name: Literal["UserPromptSubmit"]
+    model: str
+    turn_id: str
+    permission_mode: Literal["default", "acceptEdits", "plan", "dontAsk", "bypassPermissions"]
+    prompt: str
+
+    @field_validator("session_id", "turn_id", "model")
+    @classmethod
+    def validate_identity(cls, value: str) -> str:
+        return _identity(value)
+
+    @field_validator("cwd")
+    @classmethod
+    def validate_cwd(cls, value: str) -> str:
+        return _repository(value)
+
+    @field_validator("transcript_path")
+    @classmethod
+    def validate_transcript_path(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return _repository(value)
+
+    @field_validator("prompt")
+    @classmethod
+    def validate_prompt(cls, value: str) -> str:
+        return _prompt(value)
+
+
 class PromptRoute(_HostModel):
     """Detached advisory instruction containing no authorization capability."""
 
@@ -300,6 +339,80 @@ def parse_prompt_event(value: object) -> PromptEvent:
     if failed or event is None:
         raise ValueError("invalid advisory prompt event") from None
     return event
+
+
+def parse_codex_prompt_event(value: object) -> CodexUserPromptSubmitEvent:
+    """Parse one bounded, exact Codex prompt-hook object."""
+    encoded: bytes | None = None
+    event: CodexUserPromptSubmitEvent | None = None
+    failed = False
+    try:
+        _require_exact_json(value)
+        if type(value) is not dict:
+            raise ValueError("invalid Codex prompt event")
+        encoded = json.dumps(
+            value,
+            allow_nan=False,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        if len(encoded) > _MAX_EVENT_BYTES:
+            raise ValueError("invalid Codex prompt event")
+        event = CodexUserPromptSubmitEvent.model_validate_json(encoded)
+    except (TypeError, ValueError):
+        failed = True
+    finally:
+        value = None
+        encoded = None
+    if failed or event is None:
+        raise ValueError("invalid Codex prompt event") from None
+    return event
+
+
+def codex_prompt_context(route: PromptRoute) -> str:
+    """Render a bounded prompt-free instruction for the Codex hook response."""
+    if route.action == "offer_onboarding":
+        return _OFFER
+    if route.action == "classify":
+        return (
+            "action=classify. Call public MCP tool intent_preflight with the current human "
+            "prompt as task before implementation. Ask returned questions and show exact graph "
+            "proposals for human confirmation."
+        )
+    if route.action == "answer_clarification":
+        safe_arguments = {
+            key: route.arguments[key]
+            for key in ("session_id", "question_id", "actor", "answered_at")
+        }
+        encoded = json.dumps(
+            safe_arguments,
+            allow_nan=False,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        context = (
+            "action=answer_clarification. Call public MCP tool "
+            f"intent_clarification_answer with {encoded} and the current human prompt as answer. "
+            "Do not classify the answer again."
+        )
+        if len(context) > 2048:
+            raise ValueError("invalid advisory prompt route")
+        return context
+    return route.message
+
+
+def codex_prompt_output(context: str) -> dict[str, object]:
+    """Build the documented Codex prompt-hook output wrapper."""
+    if type(context) is not str or not context or len(context) > 2048 or _CONTROL.search(context):
+        raise ValueError("invalid Codex prompt context")
+    return {
+        "hookSpecificOutput": {
+            "hookEventName": "UserPromptSubmit",
+            "additionalContext": context,
+        }
+    }
 
 
 def repository_matches(directory: SecureDirectory, repository: str) -> bool:
@@ -420,10 +533,15 @@ class AdvisoryPromptRouter:
 
 
 __all__ = [
+    "CODEX_ADVISORY_FALLBACK",
     "AdvisoryPromptError",
     "AdvisoryPromptRouter",
+    "CodexUserPromptSubmitEvent",
     "PromptEvent",
     "PromptRoute",
+    "codex_prompt_context",
+    "codex_prompt_output",
+    "parse_codex_prompt_event",
     "parse_prompt_event",
     "repository_matches",
     "unavailable_prompt_route",

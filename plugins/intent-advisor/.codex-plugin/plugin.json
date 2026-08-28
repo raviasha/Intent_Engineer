@@ -1,0 +1,19 @@
+{
+  "name": "intent-advisor",
+  "version": "0.1.0",
+  "description": "Route Codex prompts through advisory Intent Engineering workflows.",
+  "author": {
+    "name": "Intent Engineering"
+  },
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Intent Advisor",
+    "shortDescription": "Route work through repository intent.",
+    "longDescription": "Adds advisory onboarding, preflight, and clarification guidance backed by local Intent Engineering workflows.",
+    "developerName": "Intent Engineering",
+    "category": "Developer Tools",
+    "capabilities": [],
+    "defaultPrompt": "Check this task against the repository intent workflow."
+  },
+  "mcpServers": "./.mcp.json"
+}
