@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -315,6 +315,8 @@ class ClarificationCoordinator:
         capture: ConversationCapture | None = None,
         authority_files: Mapping[str, SecureFile] | None = None,
         authority_preimages: Mapping[str, bytes | None] | None = None,
+        authority_membership_digest: str | None = None,
+        authority_membership_resolver: Callable[[], str] | None = None,
     ) -> None:
         required = {"graph", "evidence", "intent_proposals"}
         if not required.issubset(transactions.target_names):
@@ -325,12 +327,24 @@ class ClarificationCoordinator:
         self._transactions = transactions
         self._config = ProjectConfig.model_validate_json(config.model_dump_json())
         self._capture = capture or ConversationCapture(evidence_store)
-        if (authority_files is None) != (authority_preimages is None) or (
-            authority_files is not None and set(authority_files) != set(authority_preimages or {})
+        if (
+            (authority_files is None) != (authority_preimages is None)
+            or (
+                authority_files is not None
+                and set(authority_files) != set(authority_preimages or {})
+            )
+            or (authority_membership_digest is None) != (authority_membership_resolver is None)
         ):
             raise ValueError("invalid clarification authority binding")
         self._authority_files = dict(authority_files or {})
         self._authority_preimages = dict(authority_preimages or {})
+        self._authority_membership_digest = authority_membership_digest
+        self._authority_membership_resolver = authority_membership_resolver
+
+    def _authority_membership_matches(self) -> bool:
+        if self._authority_membership_resolver is None:
+            return True
+        return self._authority_membership_resolver() == self._authority_membership_digest
 
     @contextmanager
     def _authority_transaction(self) -> Iterator[None]:
@@ -341,13 +355,13 @@ class ClarificationCoordinator:
             rollback_base_exceptions=True,
             extras=self._authority_files,
         ) as transaction:
-            if any(
+            if not self._authority_membership_matches() or any(
                 transaction.read_optional(name) != content
                 for name, content in self._authority_preimages.items()
             ):
                 raise ValueError("clarification authority changed")
             yield
-            if any(
+            if not self._authority_membership_matches() or any(
                 transaction.read_optional(name) != content
                 for name, content in self._authority_preimages.items()
             ):

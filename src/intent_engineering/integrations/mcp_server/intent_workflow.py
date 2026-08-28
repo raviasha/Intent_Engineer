@@ -6,6 +6,7 @@ import json
 import re
 from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
+from hashlib import sha256
 from pathlib import PurePosixPath, PureWindowsPath
 from typing import Annotated, Never, Protocol, cast
 
@@ -49,6 +50,7 @@ from intent_engineering.intent_workflow.preflight import (
     PreflightService,
 )
 from intent_engineering.storage.executor import LocalChangeSetExecutor
+from intent_engineering.storage.secure import SecureDirectory, SecureFile, SecureRead
 from intent_engineering.storage.yaml.graph_store import parse_graph
 
 _PROPOSE = ToolAnnotations(
@@ -322,6 +324,28 @@ def _canonical_json(value: object) -> bytes:
     finally:
         value = None
         encoded = None
+
+
+def _connector_membership_snapshot(
+    directory: SecureDirectory,
+) -> tuple[str, tuple[tuple[PurePosixPath, SecureRead], ...]]:
+    records = directory.walk_regular_files(".yaml", reject_symlinks=True)
+    material = [
+        [relative.as_posix(), [list(identity) for identity in source.identities]]
+        for relative, source in records
+    ]
+    encoded = json.dumps(
+        material,
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("ascii")
+    return f"sha256:{sha256(encoded).hexdigest()}", records
+
+
+def _connector_membership_digest(directory: SecureDirectory) -> str:
+    digest, _records = _connector_membership_snapshot(directory)
+    return digest
 
 
 def _require_exact_json(value: object) -> None:
@@ -864,14 +888,11 @@ class McpIntentWorkflowServices:
                 policy_file=confirmation_policy,
                 binding_files=binding_files,
             )
-            self._clarification_authority_files = {
+            self._clarification_authority_base_files = {
                 "authority_config": confirmation_config.duplicate(),
                 "authority_policy": confirmation_policy.duplicate(),
-                **{
-                    f"authority_binding_{index}": file.duplicate()
-                    for index, (_name, file) in enumerate(sorted(binding_files.items()))
-                },
             }
+            self._clarification_connector_directory = connector_directory.duplicate()
         finally:
             confirmation_config.close()
             confirmation_policy.close()
@@ -1172,28 +1193,64 @@ class McpIntentWorkflowServices:
 
     def _clarification_authority(
         self,
-    ) -> tuple[ProjectConfig, frozenset[str], dict[str, bytes | None]]:
-        snapshot = self.runtime.transactions.snapshot(self._clarification_authority_files)
-        config, policy, provider_principals = ProposalConfirmationService._authority(snapshot)
-        if config != self.runtime.config:
-            raise ValueError("clarification authority unavailable")
-        aliases = ProposalConfirmationService._aliases(
-            config.local_actor,
-            policy,
-            provider_principals,
-        )
-        principals = frozenset({"agent:codex", *aliases})
-        if config.local_actor not in principals:
-            raise ValueError("clarification authority unavailable")
-        preimages = {
-            name: snapshot.content.get(name) for name in self._clarification_authority_files
+    ) -> tuple[
+        ProjectConfig,
+        frozenset[str],
+        dict[str, SecureFile],
+        dict[str, bytes | None],
+        str,
+    ]:
+        authority_files = {
+            name: file.duplicate()
+            for name, file in self._clarification_authority_base_files.items()
         }
-        return config, principals, preimages
+        try:
+            membership_digest, bindings = _connector_membership_snapshot(
+                self._clarification_connector_directory
+            )
+            for index, (relative, _source) in enumerate(bindings):
+                authority_files[f"authority_binding_{index}"] = (
+                    self._clarification_connector_directory.file(relative)
+                )
+            snapshot = self.runtime.transactions.snapshot(authority_files)
+            if _connector_membership_digest(
+                self._clarification_connector_directory
+            ) != membership_digest or any(
+                snapshot.content.get(f"authority_binding_{index}") != source.content
+                for index, (_relative, source) in enumerate(bindings)
+            ):
+                raise ValueError("clarification authority unavailable")
+            config, policy, provider_principals = ProposalConfirmationService._authority(snapshot)
+            if config != self.runtime.config:
+                raise ValueError("clarification authority unavailable")
+            aliases = ProposalConfirmationService._aliases(
+                config.local_actor,
+                policy,
+                provider_principals,
+            )
+            principals = frozenset({"agent:codex", *aliases})
+            if config.local_actor not in principals:
+                raise ValueError("clarification authority unavailable")
+            preimages = {name: snapshot.content.get(name) for name in authority_files}
+            return config, principals, authority_files, preimages, membership_digest
+        except BaseException:
+            for file in authority_files.values():
+                file.close()
+            authority_files.clear()
+            raise
+
+    @staticmethod
+    def _close_clarification_authority(authority_files: dict[str, SecureFile]) -> None:
+        for file in authority_files.values():
+            file.close()
+        authority_files.clear()
 
     def _clarification_coordinator(
         self,
         config: ProjectConfig,
+        authority_files: Mapping[str, SecureFile],
         authority_preimages: Mapping[str, bytes | None],
+        authority_membership_digest: str,
     ) -> ClarificationCoordinator:
         return ClarificationCoordinator(
             graph_store=self.runtime.graph_store,
@@ -1205,8 +1262,12 @@ class McpIntentWorkflowServices:
                 self.runtime.evidence_store,
                 connector_id="conversation:codex",
             ),
-            authority_files=self._clarification_authority_files,
+            authority_files=authority_files,
             authority_preimages=authority_preimages,
+            authority_membership_digest=authority_membership_digest,
+            authority_membership_resolver=lambda: _connector_membership_digest(
+                self._clarification_connector_directory
+            ),
         )
 
     async def clarification_open(
@@ -1219,6 +1280,7 @@ class McpIntentWorkflowServices:
     ) -> dict[str, object]:
         detached_envelope: TaskEnvelope | None = None
         detached_questions: tuple[ClarificationQuestionInput, ...] = ()
+        authority_files: dict[str, SecureFile] = {}
         try:
             request = ClarificationOpenRequest.model_validate(
                 {
@@ -1229,7 +1291,13 @@ class McpIntentWorkflowServices:
                     "opened_at": opened_at,
                 }
             )
-            config, principals, authority_preimages = self._clarification_authority()
+            (
+                config,
+                principals,
+                authority_files,
+                authority_preimages,
+                authority_membership_digest,
+            ) = self._clarification_authority()
             if request.envelope.actor != config.local_actor or request.opened_by != "agent:codex":
                 return self._rejected()
             detached_envelope = TaskEnvelope.model_validate_json(request.envelope.model_dump_json())
@@ -1237,7 +1305,12 @@ class McpIntentWorkflowServices:
                 ClarificationQuestionInput.model_validate_json(item.model_dump_json())
                 for item in request.questions
             )
-            session = self._clarification_coordinator(config, authority_preimages).open(
+            session = self._clarification_coordinator(
+                config,
+                authority_files,
+                authority_preimages,
+                authority_membership_digest,
+            ).open(
                 detached_envelope,
                 classification_evidence_ref=request.classification_evidence_ref,
                 questions=detached_questions,
@@ -1264,6 +1337,7 @@ class McpIntentWorkflowServices:
             opened_at = cast(datetime, None)
             detached_envelope = None
             detached_questions = ()
+            self._close_clarification_authority(authority_files)
             if "request" in locals():
                 request = cast(ClarificationOpenRequest, None)
             if "session" in locals():
@@ -1279,6 +1353,7 @@ class McpIntentWorkflowServices:
         actor: str,
         answered_at: datetime,
     ) -> dict[str, object]:
+        authority_files: dict[str, SecureFile] = {}
         try:
             request = ClarificationAnswerRequest.model_validate(
                 {
@@ -1289,10 +1364,21 @@ class McpIntentWorkflowServices:
                     "answered_at": answered_at,
                 }
             )
-            config, principals, authority_preimages = self._clarification_authority()
+            (
+                config,
+                principals,
+                authority_files,
+                authority_preimages,
+                authority_membership_digest,
+            ) = self._clarification_authority()
             if request.actor != config.local_actor:
                 return self._rejected()
-            session = self._clarification_coordinator(config, authority_preimages).answer(
+            session = self._clarification_coordinator(
+                config,
+                authority_files,
+                authority_preimages,
+                authority_membership_digest,
+            ).answer(
                 request.session_id,
                 actor=request.actor,
                 question_id=request.question_id,
@@ -1316,6 +1402,7 @@ class McpIntentWorkflowServices:
         finally:
             session_id = question_id = answer = actor = ""
             answered_at = cast(datetime, None)
+            self._close_clarification_authority(authority_files)
             if "request" in locals():
                 request = cast(ClarificationAnswerRequest, None)
             if "session" in locals():
@@ -1328,15 +1415,27 @@ class McpIntentWorkflowServices:
         submission: ClarificationProposalSubmission,
     ) -> dict[str, object]:
         detached: ClarificationProposalSubmission | None = None
+        authority_files: dict[str, SecureFile] = {}
         try:
             request = ClarificationProposeRequest.model_validate({"submission": submission})
-            config, principals, authority_preimages = self._clarification_authority()
+            (
+                config,
+                principals,
+                authority_files,
+                authority_preimages,
+                authority_membership_digest,
+            ) = self._clarification_authority()
             if request.submission.actor != config.local_actor:
                 return self._rejected()
             detached = ClarificationProposalSubmission.model_validate_json(
                 request.submission.model_dump_json()
             )
-            proposal = self._clarification_coordinator(config, authority_preimages).propose(
+            proposal = self._clarification_coordinator(
+                config,
+                authority_files,
+                authority_preimages,
+                authority_membership_digest,
+            ).propose(
                 detached,
                 principals=principals,
             )
@@ -1359,6 +1458,7 @@ class McpIntentWorkflowServices:
         finally:
             submission = cast(ClarificationProposalSubmission, None)
             detached = None
+            self._close_clarification_authority(authority_files)
             if "request" in locals():
                 request = cast(ClarificationProposeRequest, None)
             if "proposal" in locals():
@@ -1373,6 +1473,7 @@ class McpIntentWorkflowServices:
         at: datetime,
         selected_node_ids: tuple[str, ...],
     ) -> dict[str, object]:
+        authority_files: dict[str, SecureFile] = {}
         try:
             request = ClarificationConfirmRequest.model_validate(
                 {
@@ -1382,7 +1483,13 @@ class McpIntentWorkflowServices:
                     "selected_node_ids": selected_node_ids,
                 }
             )
-            config, _principals_live, _authority_preimages = self._clarification_authority()
+            (
+                config,
+                _principals_live,
+                authority_files,
+                _authority_preimages,
+                _authority_membership_digest,
+            ) = self._clarification_authority()
             if request.actor != config.local_actor:
                 return self._rejected()
             result = self._confirmation.confirm(
@@ -1403,6 +1510,7 @@ class McpIntentWorkflowServices:
             proposal_id = actor = ""
             at = cast(datetime, None)
             selected_node_ids = ()
+            self._close_clarification_authority(authority_files)
             if "request" in locals():
                 request = cast(ClarificationConfirmRequest, None)
             if "result" in locals():

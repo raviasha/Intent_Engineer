@@ -864,7 +864,25 @@ def _proposal_submission_for_session(
     )
 
 
-async def _production_clarification_server(tmp_path: Path):
+def _write_test_connector_binding(
+    project: Path,
+    name: str,
+    *,
+    principal: str = "local:connector-authority-unregistered",
+) -> Path:
+    source = Path(__file__).resolve().parents[3] / "profiles/mcp/example-bindings/jira.yaml"
+    binding = yaml.safe_load(source.read_text(encoding="utf-8"))
+    binding["binding"]["actor_principals"] = {"local": [principal]}
+    path = project / ".intent/connectors" / name
+    path.write_text(yaml.safe_dump(binding, sort_keys=True), encoding="utf-8")
+    return path
+
+
+async def _production_clarification_server(
+    tmp_path: Path,
+    *,
+    initial_binding: bool = False,
+):
     from intent_engineering.integrations.mcp_server.intent_workflow import (
         load_intent_workflow_services,
     )
@@ -875,11 +893,23 @@ async def _production_clarification_server(tmp_path: Path):
         "contributors": ["local"],
         "approvers": ["local"],
         "executors": ["local"],
-        "identities": {"local": ["local", "local:authority-before"]},
+        "identities": {
+            "local": [
+                "local",
+                "local:authority-before",
+                "local:connector-authority",
+            ]
+        },
     }
     (project / ".intent/approvals/policy.yaml").write_text(
         yaml.safe_dump(policy, sort_keys=True), encoding="utf-8"
     )
+    if initial_binding:
+        _write_test_connector_binding(
+            project,
+            "authority.yaml",
+            principal="local:connector-authority",
+        )
     runtime = load_runtime(project)
     workflow = load_intent_workflow_services(runtime)
     server = build_server(McpReadServices(runtime), intent_workflow_services=workflow)
@@ -919,20 +949,13 @@ def _open_arguments(
     }
 
 
-@pytest.mark.parametrize("operation", ["open", "answer", "propose"])
-async def test_clarification_authority_change_before_each_write_is_an_exact_noop(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
+async def _clarification_operation_arguments(
+    runtime,
+    server,
+    envelope: TaskEnvelope,
+    classification: AgentClassificationSubmission,
     operation: str,
-) -> None:
-    (
-        project,
-        runtime,
-        _workflow,
-        server,
-        envelope,
-        classification,
-    ) = await _production_clarification_server(tmp_path)
+) -> dict[str, object]:
     opened = None
     if operation in {"answer", "propose"}:
         opened = await server.call_tool(
@@ -957,10 +980,11 @@ async def test_clarification_authority_change_before_each_write_is_an_exact_noop
         if opened is None
         else runtime.intent_proposals.session(opened.structured_content["session"]["id"])
     )
-    arguments = (
-        _open_arguments(envelope, classification)
-        if operation == "open"
-        else {
+    if operation == "open":
+        return _open_arguments(envelope, classification)
+    if operation == "answer":
+        assert session is not None
+        return {
             "session_id": session.id,
             "question_id": "audience",
             "answer": "Workspace administrators",
@@ -969,8 +993,30 @@ async def test_clarification_authority_change_before_each_write_is_an_exact_noop
             .isoformat()
             .replace("+00:00", "Z"),
         }
-        if operation == "answer"
-        else {"submission": _proposal_submission_for_session(session).model_dump(mode="json")}
+    assert session is not None
+    return {"submission": _proposal_submission_for_session(session).model_dump(mode="json")}
+
+
+@pytest.mark.parametrize("operation", ["open", "answer", "propose"])
+async def test_clarification_authority_change_before_each_write_is_an_exact_noop(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+) -> None:
+    (
+        project,
+        runtime,
+        _workflow,
+        server,
+        envelope,
+        classification,
+    ) = await _production_clarification_server(tmp_path)
+    arguments = await _clarification_operation_arguments(
+        runtime,
+        server,
+        envelope,
+        classification,
+        operation,
     )
     tool_name = f"intent_clarification_{operation}"
     before = _transaction_bytes(runtime)
@@ -1018,6 +1064,99 @@ async def test_clarification_authority_change_before_each_write_is_an_exact_noop
         "reason": "intent_workflow_unavailable",
     }
     assert _transaction_bytes(runtime) == before
+
+
+@pytest.mark.parametrize("operation", ["open", "answer", "propose"])
+@pytest.mark.parametrize("membership_change", ["create", "rename", "delete"])
+async def test_clarification_binding_membership_change_before_each_write_is_an_exact_noop(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+    membership_change: str,
+) -> None:
+    initial_binding = membership_change == "delete"
+    (
+        project,
+        runtime,
+        _workflow,
+        server,
+        envelope,
+        classification,
+    ) = await _production_clarification_server(
+        tmp_path,
+        initial_binding=initial_binding,
+    )
+    arguments = await _clarification_operation_arguments(
+        runtime,
+        server,
+        envelope,
+        classification,
+        operation,
+    )
+    before = _transaction_bytes(runtime)
+    connector_directory = project / ".intent/connectors"
+    if membership_change == "rename":
+        ignored = _write_test_connector_binding(project, "authority.pending")
+
+    raced = False
+
+    def change_membership() -> None:
+        nonlocal raced
+        if raced:
+            return
+        raced = True
+        if membership_change == "create":
+            _write_test_connector_binding(project, "authority-added.yaml")
+        elif membership_change == "rename":
+            ignored.rename(connector_directory / "authority-renamed.yaml")
+        else:
+            (connector_directory / "authority.yaml").unlink()
+
+    if operation in {"open", "answer"}:
+        original_record_turn = ConversationCapture.record_turn
+
+        def race_evidence(self, **kwargs: object):
+            change_membership()
+            return original_record_turn(self, **kwargs)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(ConversationCapture, "record_turn", race_evidence)
+    else:
+        original_ledger_bytes = runtime.intent_proposals.bytes
+
+        def race_proposal_ledger() -> bytes:
+            change_membership()
+            return original_ledger_bytes()
+
+        monkeypatch.setattr(runtime.intent_proposals, "bytes", race_proposal_ledger)
+
+    response = await server.call_tool(f"intent_clarification_{operation}", arguments)
+
+    assert raced is True
+    assert response.structured_content == {
+        "schema_version": "1",
+        "status": "rejected",
+        "reason": "intent_workflow_unavailable",
+    }
+    assert _transaction_bytes(runtime) == before
+    if membership_change in {"create", "rename"}:
+        from intent_engineering.integrations.mcp_server.intent_workflow import (
+            load_intent_workflow_services,
+        )
+
+        fresh_workflow = load_intent_workflow_services(runtime)
+        fresh_server = build_server(
+            McpReadServices(runtime),
+            intent_workflow_services=fresh_workflow,
+        )
+        fresh = await fresh_server.call_tool(
+            "intent_clarification_open",
+            _open_arguments(envelope, classification),
+        )
+        assert fresh.structured_content == {
+            "schema_version": "1",
+            "status": "rejected",
+            "reason": "intent_workflow_unavailable",
+        }
 
 
 @pytest.mark.parametrize(
