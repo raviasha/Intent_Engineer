@@ -89,9 +89,7 @@ def _read_descriptor(descriptor: int, *, max_bytes: int | None = None) -> bytes:
     total = 0
     try:
         while True:
-            request_size = (
-                65536 if max_bytes is None else min(65536, max_bytes + 1 - total)
-            )
+            request_size = 65536 if max_bytes is None else min(65536, max_bytes + 1 - total)
             if request_size <= 0:
                 raise UnsafePathError()
             chunk = os.read(descriptor, request_size)
@@ -139,6 +137,20 @@ def _read_named_nonblocking(
         metadata = os.fstat(descriptor)
         _require_regular(metadata)
         return _read_descriptor(descriptor, max_bytes=max_bytes), metadata
+    finally:
+        os.close(descriptor)
+
+
+def _stat_named_nonblocking(parent_fd: int, name: str) -> os.stat_result:
+    """Authenticate one final descriptor without reading or blocking on its content."""
+    try:
+        descriptor = os.open(name, _READ_FLAGS | _NONBLOCK, dir_fd=parent_fd)
+    except OSError as error:
+        raise UnsafePathError() from error
+    try:
+        metadata = os.fstat(descriptor)
+        _require_regular(metadata)
+        return metadata
     finally:
         os.close(descriptor)
 
@@ -403,70 +415,178 @@ class SecureDirectory:
         reject_symlinks: bool = False,
     ) -> tuple[tuple[PurePosixPath, SecureRead], ...]:
         """Return a stable no-follow recursive snapshot of regular single-link files."""
+        return self._walk_regular_files(
+            suffix,
+            excluded=excluded,
+            reject_symlinks=reject_symlinks,
+            max_files=None,
+            max_depth=None,
+            max_file_bytes=None,
+            max_total_bytes=None,
+            read_content=True,
+        )
+
+    def walk_regular_files_bounded(
+        self,
+        suffix: str,
+        *,
+        max_files: int,
+        max_depth: int,
+        max_file_bytes: int,
+        max_total_bytes: int,
+        excluded: Callable[[PurePosixPath], bool] | None = None,
+        reject_symlinks: bool = False,
+        read_content: bool = True,
+    ) -> tuple[tuple[PurePosixPath, SecureRead], ...]:
+        """Return one nonblocking bounded regular-file snapshot."""
+        if (
+            type(max_files) is not int
+            or max_files < 1
+            or type(max_depth) is not int
+            or max_depth < 0
+            or type(max_file_bytes) is not int
+            or max_file_bytes < 0
+            or type(max_total_bytes) is not int
+            or max_total_bytes < 0
+            or type(read_content) is not bool
+        ):
+            raise UnsafePathError()
+        return self._walk_regular_files(
+            suffix,
+            excluded=excluded,
+            reject_symlinks=reject_symlinks,
+            max_files=max_files,
+            max_depth=max_depth,
+            max_file_bytes=max_file_bytes,
+            max_total_bytes=max_total_bytes,
+            read_content=read_content,
+        )
+
+    def _walk_regular_files(
+        self,
+        suffix: str,
+        *,
+        excluded: Callable[[PurePosixPath], bool] | None,
+        reject_symlinks: bool,
+        max_files: int | None,
+        max_depth: int | None,
+        max_file_bytes: int | None,
+        max_total_bytes: int | None,
+        read_content: bool,
+    ) -> tuple[tuple[PurePosixPath, SecureRead], ...]:
         results: list[tuple[PurePosixPath, SecureRead]] = []
+        file_count = 0
+        total_bytes = 0
 
         def walk(
             directory_fd: int,
             prefix: tuple[str, ...],
             directory_identities: tuple[FileIdentity, ...],
         ) -> None:
+            nonlocal file_count, total_bytes
+            names: list[str] = []
             try:
                 names = sorted(os.listdir(directory_fd))
             except OSError as error:
                 raise UnsafePathError() from error
-            for name in names:
-                if name in {"", ".", ".."} or "\x00" in name:
-                    raise UnsafePathError()
-                relative = PurePosixPath(*prefix, name)
-                try:
-                    metadata = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
-                except OSError as error:
-                    raise UnsafePathError() from error
-                if stat.S_ISLNK(metadata.st_mode):
-                    if reject_symlinks and name.endswith(suffix):
+            try:
+                for name in names:
+                    if name in {"", ".", ".."} or "\x00" in name:
                         raise UnsafePathError()
-                    continue
-                if reject_symlinks and name.endswith(suffix) and not stat.S_ISREG(metadata.st_mode):
-                    raise UnsafePathError()
-                if stat.S_ISDIR(metadata.st_mode):
+                    relative = PurePosixPath(*prefix, name)
                     try:
-                        child_fd = os.open(name, _DIRECTORY_FLAGS, dir_fd=directory_fd)
+                        metadata = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
                     except OSError as error:
                         raise UnsafePathError() from error
-                    try:
-                        child_metadata = os.fstat(child_fd)
-                        _require_directory(child_metadata)
-                        if _identity(child_metadata) != _identity(metadata):
+                    if stat.S_ISLNK(metadata.st_mode):
+                        if reject_symlinks and name.endswith(suffix):
                             raise UnsafePathError()
-                        walk(
-                            child_fd,
-                            (*prefix, name),
-                            (*directory_identities, _identity(child_metadata)),
+                        continue
+                    if (
+                        reject_symlinks
+                        and name.endswith(suffix)
+                        and not stat.S_ISREG(metadata.st_mode)
+                    ):
+                        raise UnsafePathError()
+                    if stat.S_ISDIR(metadata.st_mode):
+                        if max_depth is not None and len(prefix) >= max_depth:
+                            raise UnsafePathError()
+                        try:
+                            child_fd = os.open(name, _DIRECTORY_FLAGS, dir_fd=directory_fd)
+                        except OSError as error:
+                            raise UnsafePathError() from error
+                        try:
+                            child_metadata = os.fstat(child_fd)
+                            _require_directory(child_metadata)
+                            if _identity(child_metadata) != _identity(metadata):
+                                raise UnsafePathError()
+                            walk(
+                                child_fd,
+                                (*prefix, name),
+                                (*directory_identities, _identity(child_metadata)),
+                            )
+                        finally:
+                            os.close(child_fd)
+                        continue
+                    if not stat.S_ISREG(metadata.st_mode) or not name.endswith(suffix):
+                        continue
+                    if excluded is not None and excluded(relative):
+                        continue
+                    file_count += 1
+                    if (
+                        (max_files is not None and file_count > max_files)
+                        or (max_file_bytes is not None and metadata.st_size > max_file_bytes)
+                        or (
+                            max_total_bytes is not None
+                            and total_bytes + metadata.st_size > max_total_bytes
                         )
-                    finally:
-                        os.close(child_fd)
-                    continue
-                if not stat.S_ISREG(metadata.st_mode) or not name.endswith(suffix):
-                    continue
-                if excluded is not None and excluded(relative):
-                    continue
-                content, opened_metadata = _read_named(directory_fd, name)
-                if _identity(opened_metadata) != _identity(metadata):
-                    raise UnsafePathError()
-                results.append(
-                    (
-                        relative,
-                        SecureRead(
+                    ):
+                        raise UnsafePathError()
+                    content = b""
+                    opened_metadata: os.stat_result | None = None
+                    source: SecureRead | None = None
+                    try:
+                        if read_content:
+                            content, opened_metadata = _read_named_nonblocking(
+                                directory_fd,
+                                name,
+                                max_bytes=max_file_bytes,
+                            )
+                            retained_bytes = len(content)
+                        else:
+                            opened_metadata = _stat_named_nonblocking(directory_fd, name)
+                            retained_bytes = opened_metadata.st_size
+                        if _identity(opened_metadata) != _identity(metadata):
+                            raise UnsafePathError()
+                        if (max_file_bytes is not None and retained_bytes > max_file_bytes) or (
+                            max_total_bytes is not None
+                            and total_bytes + retained_bytes > max_total_bytes
+                        ):
+                            raise UnsafePathError()
+                        source = SecureRead(
                             content,
                             opened_metadata.st_mtime_ns,
                             (*directory_identities, _identity(opened_metadata)),
-                        ),
-                    )
-                )
+                        )
+                        results.append((relative, source))
+                        total_bytes += retained_bytes
+                    finally:
+                        content = b""
+                        opened_metadata = None
+                        source = None
+            finally:
+                names.clear()
 
-        root_identity = self.identity
-        walk(self.descriptor, (), (root_identity,))
-        return tuple(results)
+        succeeded = False
+        try:
+            root_identity = self.identity
+            walk(self.descriptor, (), (root_identity,))
+            snapshot = tuple(results)
+            succeeded = True
+            return snapshot
+        finally:
+            if not succeeded:
+                results.clear()
 
 
 class SecureFile:
@@ -1109,12 +1229,7 @@ class SecureFile:
             try:
                 descriptor = os.open(
                     self.name,
-                    os.O_WRONLY
-                    | os.O_APPEND
-                    | os.O_CREAT
-                    | _NOFOLLOW
-                    | _CLOEXEC
-                    | _NONBLOCK,
+                    os.O_WRONLY | os.O_APPEND | os.O_CREAT | _NOFOLLOW | _CLOEXEC | _NONBLOCK,
                     0o644,
                     dir_fd=self.parent_fd,
                 )

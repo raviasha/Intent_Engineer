@@ -878,6 +878,14 @@ def _write_test_connector_binding(
     return path
 
 
+def _pad_test_connector_binding(path: Path, size: int) -> None:
+    content = path.read_bytes()
+    padding = size - len(content) - 2
+    assert padding >= 0
+    path.write_bytes(b"#" + b"x" * padding + b"\n" + content)
+    assert path.stat().st_size == size
+
+
 async def _production_clarification_server(
     tmp_path: Path,
     *,
@@ -1157,6 +1165,66 @@ async def test_clarification_binding_membership_change_before_each_write_is_an_e
             "status": "rejected",
             "reason": "intent_workflow_unavailable",
         }
+
+
+@pytest.mark.parametrize("boundary", ["count", "depth", "per-file", "aggregate"])
+async def test_clarification_binding_scan_bounds_fail_before_canonical_mutation(
+    tmp_path: Path,
+    boundary: str,
+) -> None:
+    (
+        project,
+        runtime,
+        _workflow,
+        server,
+        envelope,
+        classification,
+    ) = await _production_clarification_server(tmp_path)
+    connector_directory = project / ".intent/connectors"
+    if boundary == "count":
+        for index in range(257):
+            _write_test_connector_binding(
+                project,
+                f"binding-{index:03}.yaml",
+                principal="local:connector-authority",
+            )
+    elif boundary == "depth":
+        binding = _write_test_connector_binding(
+            project,
+            "too-deep.yaml",
+            principal="local:connector-authority",
+        )
+        nested = connector_directory.joinpath(*(f"level-{index}" for index in range(9)))
+        nested.mkdir(parents=True)
+        binding.rename(nested / "binding.yaml")
+    elif boundary == "per-file":
+        binding = _write_test_connector_binding(
+            project,
+            "oversized.yaml",
+            principal="local:connector-authority",
+        )
+        _pad_test_connector_binding(binding, 1_048_577)
+    else:
+        for index in range(9):
+            binding = _write_test_connector_binding(
+                project,
+                f"aggregate-{index}.yaml",
+                principal="local:connector-authority",
+            )
+            _pad_test_connector_binding(binding, 1_000_000)
+    before = _transaction_bytes(runtime)
+
+    response = await server.call_tool(
+        "intent_clarification_open",
+        _open_arguments(envelope, classification),
+    )
+
+    assert response.structured_content == {
+        "schema_version": "1",
+        "status": "rejected",
+        "reason": "intent_workflow_unavailable",
+    }
+    assert _transaction_bytes(runtime) == before
 
 
 @pytest.mark.parametrize(

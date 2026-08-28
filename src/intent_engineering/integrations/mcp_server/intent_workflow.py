@@ -102,6 +102,10 @@ _MAX_AUTHORIZATION_FIELD_BYTES = 2_048
 _MAX_TOKEN_BYTES = 256
 _MAX_JSON_DEPTH = 128
 _MAX_JSON_NODES = 65_536
+_MAX_CONNECTOR_BINDING_FILES = 256
+_MAX_CONNECTOR_BINDING_DEPTH = 8
+_MAX_CONNECTOR_BINDING_FILE_BYTES = 1_048_576
+_MAX_CONNECTOR_BINDING_TOTAL_BYTES = 8_388_608
 _PROPOSAL_ID = r"^proposal:sha256:[0-9a-f]{64}$"
 _DIGEST = r"^sha256:[0-9a-f]{64}$"
 _TASK_ID = r"^task:sha256:[0-9a-f]{64}$"
@@ -326,26 +330,52 @@ def _canonical_json(value: object) -> bytes:
         encoded = None
 
 
+def _connector_membership_records(
+    directory: SecureDirectory,
+    *,
+    read_content: bool,
+) -> tuple[tuple[PurePosixPath, SecureRead], ...]:
+    return directory.walk_regular_files_bounded(
+        ".yaml",
+        max_files=_MAX_CONNECTOR_BINDING_FILES,
+        max_depth=_MAX_CONNECTOR_BINDING_DEPTH,
+        max_file_bytes=_MAX_CONNECTOR_BINDING_FILE_BYTES,
+        max_total_bytes=_MAX_CONNECTOR_BINDING_TOTAL_BYTES,
+        reject_symlinks=True,
+        read_content=read_content,
+    )
+
+
+def _connector_records_digest(
+    records: tuple[tuple[PurePosixPath, SecureRead], ...],
+) -> str:
+    digest = sha256(b"intent.connector-membership.v1\x00")
+    encoded = b""
+    try:
+        for relative, source in records:
+            encoded = json.dumps(
+                [relative.as_posix(), [list(identity) for identity in source.identities]],
+                ensure_ascii=True,
+                separators=(",", ":"),
+            ).encode("ascii")
+            digest.update(len(encoded).to_bytes(8, "big"))
+            digest.update(encoded)
+            encoded = b""
+        return f"sha256:{digest.hexdigest()}"
+    finally:
+        encoded = b""
+
+
 def _connector_membership_snapshot(
     directory: SecureDirectory,
 ) -> tuple[str, tuple[tuple[PurePosixPath, SecureRead], ...]]:
-    records = directory.walk_regular_files(".yaml", reject_symlinks=True)
-    material = [
-        [relative.as_posix(), [list(identity) for identity in source.identities]]
-        for relative, source in records
-    ]
-    encoded = json.dumps(
-        material,
-        ensure_ascii=True,
-        separators=(",", ":"),
-        sort_keys=True,
-    ).encode("ascii")
-    return f"sha256:{sha256(encoded).hexdigest()}", records
+    records = _connector_membership_records(directory, read_content=True)
+    return _connector_records_digest(records), records
 
 
 def _connector_membership_digest(directory: SecureDirectory) -> str:
-    digest, _records = _connector_membership_snapshot(directory)
-    return digest
+    records = _connector_membership_records(directory, read_content=False)
+    return _connector_records_digest(records)
 
 
 def _require_exact_json(value: object) -> None:
@@ -867,11 +897,13 @@ class McpIntentWorkflowServices:
         confirmation_policy = runtime.workspace_directory.file("approvals/policy.yaml")
         connector_directory = None
         binding_files = {}
+        connector_bindings: tuple[tuple[PurePosixPath, SecureRead], ...] = ()
         try:
             connector_directory = runtime.workspace_directory.subdirectory("connectors")
-            for relative, _snapshot in connector_directory.walk_regular_files(
-                ".yaml", reject_symlinks=True
-            ):
+            _membership_digest, connector_bindings = _connector_membership_snapshot(
+                connector_directory
+            )
+            for relative, _snapshot in connector_bindings:
                 binding_files[relative.as_posix()] = connector_directory.file(relative)
             self._confirmation = ProposalConfirmationService(
                 graph_store=runtime.graph_store,
@@ -898,6 +930,9 @@ class McpIntentWorkflowServices:
             confirmation_policy.close()
             for file in binding_files.values():
                 file.close()
+            connector_bindings = ()
+            if "_snapshot" in locals():
+                del _snapshot
             if connector_directory is not None:
                 connector_directory.close()
 
