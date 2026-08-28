@@ -13,8 +13,9 @@ request, display, persist, or infer a capability token. Do not weaken or work ar
 
 - For `action=offer_onboarding`, ask whether to start guided onboarding. Only after explicit human
   confirmation, ask the user for the PRD path. Confirm that exact path, then run
-  `intent onboard --project . --prd <confirmed path>` and follow its proposal/confirmation flow.
-  A decline leaves the repository unchanged.
+  `intent onboard --project . --prd <confirmed path> --yes` and follow its proposal/confirmation
+  flow. A decline leaves the repository unchanged. A call without `--yes` is only the offer/no-op
+  diagnostic and must not be treated as an advancing onboarding command.
 - For `action=classify`, first call public `intent_context` with the current human request for
   bounded repository context. Form an agent classification draft containing classification, basis,
   relevant node and evidence references, semantic effects, uncertainties, questions, conflicts,

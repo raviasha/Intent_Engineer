@@ -11,16 +11,18 @@ Python 3.12 or newer is required. From the repository root:
 
 ```bash
 python -m pip install intent-engineering
-intent onboard --project . --prd docs/PRD.md
+intent onboard --project . --prd docs/PRD.md --yes
 intent mcp --project .
 ```
 
-For a source checkout, use `python -m pip install -e .` instead. `intent onboard` offers guided
-onboarding and waits for explicit consent before it initializes `.intent/`, reads the PRD, captures
-immutable evidence, or assigns the `declared_intent` source role. A decline is a byte no-op and
-disables intent-aware classification only for that task. An accepted first run returns
-`proposal_required` and names `intent_bootstrap_propose`; it does not manufacture an agent proposal
-or human approval. Run `intent mcp` in a separate terminal for the agent-facing public tools.
+For a source checkout, use `python -m pip install -e .` instead. First obtain explicit human consent
+and confirm the exact PRD path; only then run the advancing `intent onboard ... --yes` command
+above. A decline leaves the repository byte-unchanged and disables intent-aware classification only
+for that task. Running onboarding without `--yes` is only an offer/no-op diagnostic: it does not
+initialize `.intent/`, read the PRD, capture evidence, or assign `declared_intent`. The consented
+first run returns `proposal_required` and names `intent_bootstrap_propose`; it does not manufacture
+an agent proposal or human approval. Run `intent mcp` in a separate terminal for the agent-facing
+public tools.
 
 ## 2. Approve the baseline
 
@@ -48,11 +50,23 @@ intent sources add markdown docs/prd.md --role declared_intent --project .
 
 ## 3. Install the advisor and use ordinary prompts
 
-The validated plugin bundle is `plugins/intent-advisor`. In a source checkout, add a repo or
-personal Codex marketplace entry whose `source.path` is exactly
-`"./plugins/intent-advisor"`, install `intent-advisor` from the Plugins Directory, enable it, and
-review/trust the bundled `UserPromptSubmit` hook. Codex loads the bundle's MCP configuration against
-the active repository, where it launches `intent mcp --project .`.
+The validated plugin bundle is `plugins/intent-advisor`. From this source checkout, register the
+shipped repository marketplace and install the bundle with the supported Codex CLI:
+
+```bash
+codex plugin marketplace add .
+codex plugin add intent-advisor@intent-engineering-local
+```
+
+Restart the ChatGPT desktop app, open **Plugins Directory**, select **Intent Engineering Local**,
+enable `intent-advisor`, and review/trust the bundled `UserPromptSubmit` hook. The shipped entry's
+`source.path` is exactly `"./plugins/intent-advisor"`.
+
+The bundle intentionally omits an MCP `cwd`. On a local Codex host, its
+`intent mcp --project .` process inherits the active repository working directory, binding the held
+runtime to that checkout. This is a local-host-only ruling: a remote executor must explicitly
+reproduce or configure the repository working directory and must not assume `.` is the user's
+checkout.
 
 For every new human prompt, the hook performs a read-only onboarding check. With an approved
 baseline it supplies an opaque conversation reference and instructs the agent to call
@@ -118,7 +132,7 @@ intent drift --project . --format markdown --output intent-drift.md --require-re
 
 The default CLI uses deterministic checks and optional configured connectors; it issues no
 authorization. Repeating the same capture is a semantic no-op. The repository's
-`.github/workflows/intent-engineering.yml` preserves the same clean-checkout sequence without
+`.github/workflows/intent-sync.yml` preserves the same clean-checkout sequence without
 installing or invoking `intent-advisor`.
 
 Scheduled semantic inference is optional and may only propose grounded review cases. Confidence is

@@ -25,14 +25,16 @@ Requires Python 3.12 or newer.
 
 ```bash
 python -m pip install intent-engineering
-intent onboard --project . --prd docs/PRD.md
+intent onboard --project . --prd docs/PRD.md --yes
 intent mcp --project .
 ```
 
-`intent onboard` first asks for consent, captures the explicit PRD as immutable declared-intent
-evidence, and returns the public `intent_bootstrap_propose` next action. It never invents or
-activates canonical intent by itself. Start `intent mcp` in a separate terminal so an active agent
-can submit the typed proposal through the held project runtime.
+First obtain explicit human consent and confirm the exact PRD path; only then run the advancing
+`intent onboard ... --yes` command above. It captures that PRD as immutable declared-intent evidence
+and returns the public `intent_bootstrap_propose` next action. Running the same command without
+`--yes` is only an offer/no-op diagnostic and does not advance onboarding. Onboarding never invents
+or activates canonical intent by itself. Start `intent mcp` in a separate terminal so an active
+agent can submit the typed proposal through the held project runtime.
 
 ### Approve the baseline
 
@@ -51,12 +53,24 @@ manufacture it. Existing automation may still use `intent init --project .`,
 
 ### Use ordinary prompts
 
-The validated advisory bundle is `plugins/intent-advisor`. From a source checkout, expose that
-exact directory through a repo or personal Codex marketplace with
-`source.path: "./plugins/intent-advisor"`, install `intent-advisor` from the Plugins Directory,
-enable it, and review/trust its `UserPromptSubmit` hook. The bundle automatically offers onboarding
-when no approved baseline exists. After approval it asks for `intent_context`, then routes the
-agent's bounded classification draft through token-free `intent_advisory_preflight`.
+The validated advisory bundle is `plugins/intent-advisor`. From this source checkout, install its
+repository marketplace entry with the supported Codex CLI:
+
+```bash
+codex plugin marketplace add .
+codex plugin add intent-advisor@intent-engineering-local
+```
+
+Restart the ChatGPT desktop app, open **Plugins Directory**, select **Intent Engineering Local**,
+enable `intent-advisor`, and review/trust its `UserPromptSubmit` hook. The marketplace keeps the
+bundle path explicit as `source.path: "./plugins/intent-advisor"`. The plugin MCP configuration
+intentionally omits `cwd`: on a local Codex host, `--project .` binds to the active repository's
+working directory. A remote executor must explicitly reproduce or configure that repository
+working directory; it must not assume `.` refers to the user's checkout.
+
+The bundle automatically offers onboarding when no approved baseline exists. After approval it
+asks for `intent_context`, then routes the agent's bounded classification draft through token-free
+`intent_advisory_preflight`.
 
 The advisory classifications are `no_semantic_impact`, `aligned`, `new_or_ambiguous`, and
 `conflicting`. Continue normal work for the first two. The plugin never receives a mutation
@@ -79,7 +93,7 @@ configured independent human review before any graph change.
 ### Scheduled CLI assurance
 
 The plugin is not needed for assurance. Run the deterministic CLI sequence locally, from cron, or
-through `.github/workflows/intent-engineering.yml`:
+through `.github/workflows/intent-sync.yml`:
 
 ```bash
 intent validate --project .

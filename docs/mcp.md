@@ -8,13 +8,15 @@ prompt guidance.
 
 ```bash
 python -m pip install intent-engineering
-intent onboard --project . --prd docs/PRD.md
+intent onboard --project . --prd docs/PRD.md --yes
 intent mcp --project .
 ```
 
-`intent onboard` obtains source consent, captures the PRD, assigns `declared_intent`, and returns
-`intent_bootstrap_propose`. It does not silently activate a graph. Existing scripted integrations
-may continue to use `intent init --project .` and `intent bootstrap`.
+First obtain explicit human consent and confirm the exact PRD path; only then run the advancing
+command with `--yes`. It captures the PRD, assigns `declared_intent`, and returns
+`intent_bootstrap_propose`. Without `--yes`, the call is only an offer/no-op diagnostic and does not
+advance onboarding. It does not silently activate a graph. Existing scripted integrations may
+continue to use `intent init --project .` and `intent bootstrap`.
 
 ## Approve the baseline
 
@@ -28,11 +30,23 @@ intent proposals confirm <proposal-id> --project . --format json
 
 ## Use ordinary prompts
 
-The validated source bundle is `plugins/intent-advisor`. Expose that exact directory through a
-Codex repo or personal marketplace using `source.path: "./plugins/intent-advisor"`, install and
-enable `intent-advisor`, and review/trust its `UserPromptSubmit` hook. The hook automatically offers
-onboarding when the baseline is absent. Otherwise it tells the agent to call read-only
-`intent_context` and token-free `intent_advisory_preflight`.
+The validated source bundle is `plugins/intent-advisor`. From this checkout, register its repository
+marketplace and install it with the supported Codex CLI:
+
+```bash
+codex plugin marketplace add .
+codex plugin add intent-advisor@intent-engineering-local
+```
+
+Restart the ChatGPT desktop app, open **Plugins Directory**, select **Intent Engineering Local**,
+enable `intent-advisor`, and review/trust its `UserPromptSubmit` hook. The shipped marketplace entry
+uses `source.path: "./plugins/intent-advisor"`. The bundle intentionally omits an MCP `cwd`: a local
+Codex host binds `intent mcp --project .` to the active repository working directory. A remote
+executor must explicitly reproduce or configure that working directory and must not assume `.` is
+the user's checkout.
+
+The hook automatically offers onboarding when the baseline is absent. Otherwise it tells the agent
+to call read-only `intent_context` and token-free `intent_advisory_preflight`.
 
 The possible classifications are `no_semantic_impact`, `aligned`, `new_or_ambiguous`, and
 `conflicting`. The advisory tool request contains only the opaque conversation reference, the
@@ -64,7 +78,7 @@ intent drift --project . --format markdown --output intent-drift.md
 ```
 
 These commands capture fresh source, code, and test evidence, validate the approved graph, and open
-review cases without issuing authorization. `.github/workflows/intent-engineering.yml` runs the
+review cases without issuing authorization. `.github/workflows/intent-sync.yml` runs the
 clean-checkout CLI sequence with no plugin install or hook dependency.
 
 ## Compatible MCP sources

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import shutil
 from pathlib import Path
 
@@ -315,11 +316,11 @@ def test_scheduled_workflow_is_read_only_and_orders_capture_before_assurance() -
     }
     commands = [step.get("run", "") for step in steps]
     assert commands[2] == "python -m pip install ."
-    assert commands[3] == "intent init"
+    assert commands[3] == "intent init --project ."
     assert "--force" not in commands[3]
-    assert commands[4] == "intent validate"
-    assert commands[5] == "intent sync --sources markdown,git,github"
-    assert commands[6] == "intent drift --format markdown --output intent-drift.md"
+    assert commands[4] == "intent validate --project ."
+    assert commands[5] == "intent sync --project . --sources markdown,git,github"
+    assert commands[6] == ("intent drift --project . --format markdown --output intent-drift.md")
     assert steps[5]["env"] == {
         "GH_TOKEN": "${{ secrets.GITHUB_TOKEN }}",
         "GITHUB_REPOSITORY": "${{ github.repository }}",
@@ -339,7 +340,7 @@ def test_scheduled_workflow_is_read_only_and_orders_capture_before_assurance() -
 def test_guided_adoption_docs_and_plugin_independent_assurance_are_ordered() -> None:
     journey_markers = (
         "python -m pip install intent-engineering",
-        "intent onboard --project . --prd docs/PRD.md",
+        "intent onboard --project . --prd docs/PRD.md --yes",
         "Approve the baseline",
         "ordinary prompts",
         "Clarification and review",
@@ -352,12 +353,27 @@ def test_guided_adoption_docs_and_plugin_independent_assurance_are_ordered() -> 
         assert "plugins/intent-advisor" in text
         assert "intent_advisory_preflight" in text
         assert "MandatoryHookUnavailable" in text
+        assert "codex plugin marketplace add ." in text
+        assert "codex plugin add intent-advisor@intent-engineering-local" in text
 
-    workflow_path = ROOT / ".github/workflows/intent-engineering.yml"
+    marketplace = json.loads(
+        (ROOT / ".agents/plugins/marketplace.json").read_text(encoding="utf-8")
+    )
+    assert marketplace["name"] == "intent-engineering-local"
+    assert marketplace["plugins"] == [
+        {
+            "name": "intent-advisor",
+            "source": {"source": "local", "path": "./plugins/intent-advisor"},
+            "policy": {"installation": "AVAILABLE", "authentication": "ON_INSTALL"},
+            "category": "Developer Tools",
+        }
+    ]
+
+    workflow_path = ROOT / ".github/workflows/intent-sync.yml"
     raw = workflow_path.read_text(encoding="utf-8")
     workflow = yaml.safe_load(raw)
     assert set(workflow["on"]) == {"schedule", "workflow_dispatch"}
-    steps = workflow["jobs"]["assurance"]["steps"]
+    steps = workflow["jobs"]["drift"]["steps"]
     assert steps[0] == {"uses": "actions/checkout@v4", "with": {"fetch-depth": 0}}
     assert steps[1] == {
         "uses": "actions/setup-python@v5",
@@ -373,3 +389,10 @@ def test_guided_adoption_docs_and_plugin_independent_assurance_are_ordered() -> 
     assert "intent-advisor" not in raw
     assert "plugins/" not in raw
     assert "codex" not in raw.casefold()
+    assert not (ROOT / ".github/workflows/intent-engineering.yml").exists()
+    scheduled = [
+        path
+        for path in (ROOT / ".github/workflows").glob("intent-*.yml")
+        if "schedule:" in path.read_text(encoding="utf-8")
+    ]
+    assert scheduled == [workflow_path]

@@ -256,6 +256,270 @@ class _ProductionWorkflowPort:
         self.harness.issuer.revoke(token)
 
 
+class GuidedOnboardingHarness:
+    """Hold an uninitialized repository until the public onboarding command succeeds."""
+
+    def __init__(self, root: Path) -> None:
+        self.project = init_git_repo(root)
+        self._now = NOW
+        self._runtime: Runtime | None = None
+        self.runtime_loads = 0
+        docs = self.project / "docs"
+        docs.mkdir()
+        (docs / "prd.md").write_text(
+            """# Local Report Export PRD
+
+## Purpose
+Analysts need a durable report copy without sending report data to a hosted service.
+
+## Requirements
+- The report page provides UTF-8 CSV export.
+- Raw source conversations stay local.
+
+## Open question
+Team sharing roles and expiry are not yet decided.
+""",
+            encoding="utf-8",
+        )
+        self.git("add", "docs/prd.md")
+        self.git_commit("Add product requirements", self.tick(seconds=1))
+
+    @property
+    def runtime(self) -> Runtime:
+        if self._runtime is None:
+            raise RuntimeError("guided runtime is not loaded")
+        return self._runtime
+
+    def bind_runtime(self) -> Runtime:
+        if self._runtime is not None or not (self.project / ".intent").is_dir():
+            raise RuntimeError("guided runtime binding is invalid")
+        self._runtime = load_runtime(self.project)
+        self.runtime_loads += 1
+        return self._runtime
+
+    def tick(self, *, seconds: int = 0, microseconds: int = 1) -> datetime:
+        self._now += timedelta(seconds=seconds, microseconds=microseconds)
+        return self._now
+
+    def git(self, *args: str) -> str:
+        completed = subprocess.run(
+            ["git", *args],
+            cwd=self.project,
+            check=True,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+        )
+        return completed.stdout.strip()
+
+    def git_commit(self, message: str, at: datetime) -> str:
+        environment = dict(os.environ)
+        timestamp = at.isoformat().replace("+00:00", "Z")
+        environment.update(
+            {
+                "GIT_AUTHOR_DATE": timestamp,
+                "GIT_COMMITTER_DATE": timestamp,
+                "GIT_AUTHOR_NAME": "Asha",
+                "GIT_AUTHOR_EMAIL": "asha@example.test",
+                "GIT_COMMITTER_NAME": "Asha",
+                "GIT_COMMITTER_EMAIL": "asha@example.test",
+            }
+        )
+        subprocess.run(
+            ["git", "commit", "--quiet", "-m", message],
+            cwd=self.project,
+            env=environment,
+            check=True,
+            capture_output=True,
+        )
+        return self.git("rev-parse", "HEAD")
+
+    @staticmethod
+    def _node(
+        node_id: str,
+        node_type: NodeType,
+        label: str,
+        evidence_id: str,
+        at: datetime,
+        *,
+        confidence: float = 0.84,
+    ) -> Node:
+        return Node(
+            id=node_id,
+            type=node_type,
+            label=label,
+            status="proposed",
+            created_by=AGENT,
+            created_at=at,
+            last_modified_by=AGENT,
+            last_modified_at=at,
+            source_mode=SourceMode.INFERRED,
+            intent_fidelity_confidence=confidence,
+            confidence_basis="Inferred by the active agent from captured PRD evidence",
+            last_reassessed_at=at,
+            evidence_refs=(evidence_id,),
+        )
+
+    @staticmethod
+    def _edge(
+        edge_id: str,
+        from_id: str,
+        relation: RelationType,
+        to_id: str,
+        at: datetime,
+    ) -> Edge:
+        return Edge(
+            id=edge_id,
+            **{"from": from_id, "to": to_id},
+            relation=relation,
+            status="proposed",
+            created_by=AGENT,
+            created_at=at,
+            last_modified_by=AGENT,
+            last_modified_at=at,
+        )
+
+    def bootstrap_submission(self, evidence_id: str) -> BootstrapSubmission:
+        at = self.tick(seconds=1)
+        nodes = (
+            self._node(
+                "intent:local-report-export",
+                NodeType.PRODUCT_INTENT,
+                "Keep report export local",
+                evidence_id,
+                at,
+            ),
+            self._node(
+                "requirement:csv-export",
+                NodeType.REQUIREMENT,
+                "Provide UTF-8 CSV report export",
+                evidence_id,
+                at,
+            ),
+            self._node(
+                "constraint:no-raw-cloud",
+                NodeType.CONSTRAINT,
+                "Do not send raw source conversations to a hosted service",
+                evidence_id,
+                at,
+            ),
+            self._node(
+                "file:csv-export",
+                NodeType.FILE,
+                "src/export.py",
+                evidence_id,
+                at,
+                confidence=0.58,
+            ),
+            self._node(
+                "test:csv-export",
+                NodeType.TEST,
+                "tests/test_export.py",
+                evidence_id,
+                at,
+                confidence=0.58,
+            ),
+        )
+        edges = (
+            self._edge(
+                "edge:intent-csv",
+                nodes[0].id,
+                RelationType.REALIZED_BY,
+                nodes[1].id,
+                at,
+            ),
+            self._edge(
+                "edge:local-constraint-csv",
+                nodes[2].id,
+                RelationType.CONSTRAINS,
+                nodes[1].id,
+                at,
+            ),
+        )
+        return BootstrapSubmission(
+            baseline_graph_version=0,
+            actor=AGENT,
+            timestamp=at,
+            evidence_refs=(evidence_id,),
+            source_roles=self.runtime.config.source_roles,
+            candidate_nodes=nodes,
+            candidate_edges=edges,
+            core_node_ids=tuple(node.id for node in nodes),
+            provisional_node_ids=(),
+        )
+
+    def test_evidence(self, revision: str, at: datetime) -> EvidenceRecord:
+        payload: dict[str, JsonValue] = {
+            "commit_sha": revision,
+            "outcome": "passed",
+            "test_refs": ["test:csv-export"],
+        }
+        encoded = json.dumps(
+            payload,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode()
+        digest = hashlib.sha256(encoded).hexdigest()
+        return normalize_raw_source(
+            RawSourceObject(
+                connector_type="test_result",
+                external_object_id=f"test-run:{revision}",
+                external_version=f"run:{digest}",
+                author="ci:test-runner",
+                observed_at=at,
+                source_locator=f"test:run:{revision}",
+                content_hash=f"sha256:{digest}",
+                payload=payload,
+                acl=(self.runtime.config.local_actor,),
+            )
+        )
+
+    def post_task_service(self, issuer: AuthorizationIssuer) -> PostTaskService:
+        files = {
+            "graph": self.runtime.workspace_directory.file("graph.yaml"),
+            "evidence": self.runtime.workspace_directory.file("evidence/evidence.jsonl"),
+            "config": self.runtime.workspace_directory.file("config.yaml"),
+            "policy": self.runtime.workspace_directory.file("approvals/policy.yaml"),
+            "repository": self.runtime.workspace_directory.file("repository.id"),
+            "binding": self.runtime.workspace_directory.file("connectors/release-post-task.yaml"),
+        }
+
+        def resolve_authority(
+            actor: str,
+            snapshot: Mapping[str, bytes | None],
+        ) -> tuple[str, frozenset[str]]:
+            if snapshot.get("repository") != f"{self.project.name}\n".encode():
+                return "invalid", frozenset()
+            return self.runtime.config.project_id, frozenset({actor, GIT_AUTHOR})
+
+        try:
+            return PostTaskService(
+                issuer=issuer,
+                changeset_executor=LocalChangeSetExecutor(
+                    self.runtime.graph_store,
+                    self.runtime.case_store,
+                    self.runtime.transactions,
+                ),
+                transactions=self.runtime.transactions,
+                graph_file=files["graph"],
+                evidence_file=files["evidence"],
+                authority_files={
+                    name: files[name] for name in ("config", "policy", "repository", "binding")
+                },
+                authority_resolver=resolve_authority,
+                clock=lambda: self._now,
+            )
+        finally:
+            for file in files.values():
+                file.close()
+
+    def close(self) -> None:
+        if self._runtime is not None:
+            self._runtime.workspace_directory.close()
+            self._runtime.project_directory.close()
+
+
 class IntentAwareAgentHarness:
     """Drive one existing repository through the complete production workflow."""
 

@@ -568,7 +568,7 @@ def test_skill_routes_clarifications_and_states_advisory_mcp_failure_boundary() 
     assert "intent_clarification_answer" in skill
     assert "Do not classify the answer again" in skill
     assert "ask the user for the PRD path" in skill
-    assert "intent onboard --project . --prd <confirmed path>" in skill
+    assert "intent onboard --project . --prd <confirmed path> --yes" in skill
     assert "intent_context" in skill
     assert "intent_advisory_preflight" in skill
     assert "intent_preflight" not in skill.replace("intent_advisory_preflight", "")

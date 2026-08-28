@@ -30,14 +30,16 @@ def test_intent_sync_workflow_is_nightly_manual_read_only_and_ordered() -> None:
         "with": {"python-version": "3.12"},
     }
     assert steps[2]["run"] == "python -m pip install ."
-    assert steps[3]["run"] == "intent init"
-    assert steps[4]["run"] == "intent validate"
-    assert steps[5]["run"] == "intent sync --sources markdown,git,github"
+    assert steps[3]["run"] == "intent init --project ."
+    assert steps[4]["run"] == "intent validate --project ."
+    assert steps[5]["run"] == "intent sync --project . --sources markdown,git,github"
     assert steps[5]["env"] == {
         "GH_TOKEN": "${{ secrets.GITHUB_TOKEN }}",
         "GITHUB_REPOSITORY": "${{ github.repository }}",
     }
-    assert steps[6]["run"] == "intent drift --format markdown --output intent-drift.md"
+    assert steps[6]["run"] == (
+        "intent drift --project . --format markdown --output intent-drift.md"
+    )
     assert steps[7] == {
         "uses": "actions/upload-artifact@v4",
         "with": {"name": "intent-drift", "path": "intent-drift.md"},
