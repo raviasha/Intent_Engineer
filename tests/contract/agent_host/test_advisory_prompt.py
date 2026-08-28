@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
+import structlog
 from pydantic import ValidationError
 from typer.testing import CliRunner
 
@@ -529,7 +530,11 @@ def test_router_fixed_failure_and_cancellation_tracebacks_drop_prompt(
 def test_hidden_cli_reads_one_bounded_object_and_emits_fixed_secret_free_denial(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
 ) -> None:
+    structlog.reset_defaults()
+    request.addfinalizer(structlog.reset_defaults)
+    monkeypatch.setattr("intent_engineering.cli.app._configure_logging", lambda: None)
     project = tmp_path / "project"
     project.mkdir()
     _ready_runtime(project)
@@ -557,3 +562,11 @@ def test_hidden_cli_reads_one_bounded_object_and_emits_fixed_secret_free_denial(
     oversized = runner.invoke(app, ["agent-prompt-hook"], input="x" * 70_000)
     assert oversized.exit_code == 1
     assert "x" * 64 not in oversized.stdout + oversized.stderr
+
+
+def test_hidden_cli_leaves_structlog_usable_for_later_library_calls(capsys) -> None:
+    structlog.get_logger("intent_engineering.sync.orchestrator").info(
+        "advisory_prompt_contract_logging_probe"
+    )
+
+    assert "advisory_prompt_contract_logging_probe" in capsys.readouterr().out

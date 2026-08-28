@@ -1,12 +1,73 @@
 # MCP and coding-agent workflow
 
 Intent Engineering can consume compatible MCP sources and expose its local intent graph to coding
-agents. Install and initialize once:
+agents. The public developer journey is ordered so canonical approval stays distinct from advisory
+prompt guidance.
+
+## Install and onboard
 
 ```bash
-python -m pip install -e '.[dev]'
-intent init --project .
+python -m pip install intent-engineering
+intent onboard --project . --prd docs/PRD.md
+intent mcp --project .
 ```
+
+`intent onboard` obtains source consent, captures the PRD, assigns `declared_intent`, and returns
+`intent_bootstrap_propose`. It does not silently activate a graph. Existing scripted integrations
+may continue to use `intent init --project .` and `intent bootstrap`.
+
+## Approve the baseline
+
+The agent submits its typed bootstrap proposal through the public MCP tool. The human then reviews
+and confirms the exact digest:
+
+```bash
+intent proposals show <proposal-id> --project . --format json
+intent proposals confirm <proposal-id> --project . --format json
+```
+
+## Use ordinary prompts
+
+The validated source bundle is `plugins/intent-advisor`. Expose that exact directory through a
+Codex repo or personal marketplace using `source.path: "./plugins/intent-advisor"`, install and
+enable `intent-advisor`, and review/trust its `UserPromptSubmit` hook. The hook automatically offers
+onboarding when the baseline is absent. Otherwise it tells the agent to call read-only
+`intent_context` and token-free `intent_advisory_preflight`.
+
+The possible classifications are `no_semantic_impact`, `aligned`, `new_or_ambiguous`, and
+`conflicting`. The advisory tool request contains only the opaque conversation reference, the
+current human request, and a bounded classification draft. Repository, graph, actor, principals,
+and persistence authority come from the held runtime. Neither the request nor response contains a
+mutation capability.
+
+The plugin is not mandatory enforcement. The audited Codex host still returns
+`MandatoryHookUnavailable` with `Codex mandatory mutation hook is unavailable`. To opt out, decline
+the onboarding offer or disable/uninstall the plugin; ordinary coding and the standalone CLI/MCP
+surfaces continue unchanged.
+
+## Clarification and review
+
+For `new_or_ambiguous`, the persisted session is continued with
+`intent_clarification_answer`, `intent_clarification_propose`, and
+`intent_clarification_confirm`. A clarification answer is routed directly to the active session and
+is not classified again. The agent shows the exact proposal for human confirmation. A `conflicting`
+request pauses implementation and follows configured independent review policy.
+
+## Scheduled CLI assurance
+
+Assurance is independent of the plugin and uses the same commands in cron or CI:
+
+```bash
+intent validate --project .
+intent sync --project . --sources markdown,git,github,mcp
+intent drift --project . --format markdown --output intent-drift.md
+```
+
+These commands capture fresh source, code, and test evidence, validate the approved graph, and open
+review cases without issuing authorization. `.github/workflows/intent-engineering.yml` runs the
+clean-checkout CLI sequence with no plugin install or hook dependency.
+
+## Compatible MCP sources
 
 Copy both the reviewed provider profile and its example binding into the project, set
 `local_actor` in `.intent/config.yaml`, and provide credentials only through named environment
@@ -74,9 +135,10 @@ Approval is interactive and binds the preview hash, actor identities, provider b
 version, and expiry. A changed target, role/configuration drift, missing approval, or same-person
 conflict rejects before mutation. Scheduled jobs and coding agents cannot manufacture approval.
 
-The audited Codex host cannot prove complete mandatory mutation interception, so no Codex plugin is
-shipped. A future supported host can compose the provider-neutral adapter. Disabled host mode is a
-no-op. See [the complete adoption guide](intent-aware-agent.md).
+The audited Codex host cannot prove complete mandatory mutation interception, so the shipped
+`intent-advisor` plugin remains advisory. A future supported host can compose the provider-neutral
+adapter only after proving complete synchronous coverage. Disabled plugin/host mode is a no-op. See
+[the complete adoption guide](intent-aware-agent.md).
 
 Not shipped: hosted ingestion, OAuth brokering, webhooks, a collaboration UI, universal MCP server
 compatibility, or unattended external writes.

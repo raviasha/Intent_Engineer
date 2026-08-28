@@ -1,0 +1,38 @@
+name: Intent Engineering assurance
+
+"on":
+  workflow_dispatch:
+  schedule:
+    - cron: "17 2 * * *"
+
+jobs:
+  assurance:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: read
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install Intent Engineering
+        run: python -m pip install .
+      - name: Initialize clean-checkout intent state
+        run: intent init --project .
+      - name: Validate local intent state
+        run: intent validate --project .
+      - name: Capture configured source versions
+        run: intent sync --project . --sources markdown,git,github
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+      - name: Render drift and assurance report
+        run: intent drift --project . --format markdown --output intent-drift.md
+      - uses: actions/upload-artifact@v4
+        with:
+          name: intent-drift
+          path: intent-drift.md

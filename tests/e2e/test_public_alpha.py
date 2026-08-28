@@ -120,12 +120,11 @@ def test_public_alpha_docs_and_bindings_match_the_shipped_operating_model(
         "new_or_ambiguous",
         "no_semantic_impact",
     }
-    assert adoption.index("intent sources add markdown") < adoption.index(
+    assert adoption.index("intent onboard --project . --prd docs/PRD.md") < adoption.index(
         "intent_bootstrap_propose"
     )
-    assert adoption.index("intent sources add '<source-role-connector-id>'") < adoption.index(
-        "intent_bootstrap_propose"
-    )
+    assert "intent sources add markdown" in adoption
+    assert "intent sources add '<source-role-connector-id>'" in adoption
     assert "polling" in guide
     assert "original author" in guide.lower()
     assert "--connector-id" in guide
@@ -335,3 +334,42 @@ def test_scheduled_workflow_is_read_only_and_orders_capture_before_assurance() -
         "echo $",
     )
     assert not any(value in raw for value in forbidden)
+
+
+def test_guided_adoption_docs_and_plugin_independent_assurance_are_ordered() -> None:
+    journey_markers = (
+        "python -m pip install intent-engineering",
+        "intent onboard --project . --prd docs/PRD.md",
+        "Approve the baseline",
+        "ordinary prompts",
+        "Clarification and review",
+        "Scheduled CLI assurance",
+    )
+    for path in (ROOT / "README.md", ROOT / "docs/intent-aware-agent.md", ROOT / "docs/mcp.md"):
+        text = path.read_text(encoding="utf-8")
+        positions = tuple(text.index(marker) for marker in journey_markers)
+        assert positions == tuple(sorted(positions)), path
+        assert "plugins/intent-advisor" in text
+        assert "intent_advisory_preflight" in text
+        assert "MandatoryHookUnavailable" in text
+
+    workflow_path = ROOT / ".github/workflows/intent-engineering.yml"
+    raw = workflow_path.read_text(encoding="utf-8")
+    workflow = yaml.safe_load(raw)
+    assert set(workflow["on"]) == {"schedule", "workflow_dispatch"}
+    steps = workflow["jobs"]["assurance"]["steps"]
+    assert steps[0] == {"uses": "actions/checkout@v4", "with": {"fetch-depth": 0}}
+    assert steps[1] == {
+        "uses": "actions/setup-python@v5",
+        "with": {"python-version": "3.12"},
+    }
+    assert [step.get("run") for step in steps[2:7]] == [
+        "python -m pip install .",
+        "intent init --project .",
+        "intent validate --project .",
+        "intent sync --project . --sources markdown,git,github",
+        "intent drift --project . --format markdown --output intent-drift.md",
+    ]
+    assert "intent-advisor" not in raw
+    assert "plugins/" not in raw
+    assert "codex" not in raw.casefold()

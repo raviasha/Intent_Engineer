@@ -5,33 +5,127 @@ source versions, builds a reviewed intent/requirements provenance graph, gives a
 task-specific context, and records disagreements for humans. It does not replace Git, your coding
 agent, or provider permissions.
 
-## 1. Initialize an existing repository
+## 1. Install and onboard an existing repository
 
 Python 3.12 or newer is required. From the repository root:
 
 ```bash
 python -m pip install intent-engineering
-intent init --project .
-intent validate --project .
+intent onboard --project . --prd docs/PRD.md
+intent mcp --project .
 ```
 
-For a source checkout, use `python -m pip install -e .` instead. Initialization creates the ignored
-`.intent/` workspace. Do not use `--force` to load an existing workspace.
+For a source checkout, use `python -m pip install -e .` instead. `intent onboard` offers guided
+onboarding and waits for explicit consent before it initializes `.intent/`, reads the PRD, captures
+immutable evidence, or assigns the `declared_intent` source role. A decline is a byte no-op and
+disables intent-aware classification only for that task. An accepted first run returns
+`proposal_required` and names `intent_bootstrap_propose`; it does not manufacture an agent proposal
+or human approval. Run `intent mcp` in a separate terminal for the agent-facing public tools.
 
-## 2. Capture a Markdown PRD and assign its authority
+## 2. Approve the baseline
 
-Point the capture command at an existing repository-relative Markdown file:
+The active agent reads the captured evidence and submits a typed `BootstrapSubmission` through
+`intent_bootstrap_propose`. Inspect and confirm the exact proposal locally:
 
 ```bash
+intent proposals list --project . --format json
+intent proposals show <proposal-id> --project . --format json
+intent proposals confirm <proposal-id> --project . --format json
+```
+
+Confirmation is interactive, shows the complete proposal, and requires its exact digest. The agent,
+`intent onboard --yes`, and the advisory plugin cannot manufacture that human act. Repeating
+onboarding after activation returns `ready` without changing canonical state.
+
+The compatible legacy path remains available and still returns `agent_submission_required` before
+an agent proposes graph content:
+
+```bash
+intent init --project .
 intent bootstrap --prd docs/prd.md --project . --format json
 intent sources add markdown docs/prd.md --role declared_intent --project .
 ```
 
-This command captures the PRD and returns `agent_submission_required` with evidence references. It
-does not invent or activate a graph. The second command marks that exact captured path as declared
-intent before an agent proposes any graph content.
+## 3. Install the advisor and use ordinary prompts
 
-## 3. Add compatible sources, then review the bootstrap proposal
+The validated plugin bundle is `plugins/intent-advisor`. In a source checkout, add a repo or
+personal Codex marketplace entry whose `source.path` is exactly
+`"./plugins/intent-advisor"`, install `intent-advisor` from the Plugins Directory, enable it, and
+review/trust the bundled `UserPromptSubmit` hook. Codex loads the bundle's MCP configuration against
+the active repository, where it launches `intent mcp --project .`.
+
+For every new human prompt, the hook performs a read-only onboarding check. With an approved
+baseline it supplies an opaque conversation reference and instructs the agent to call
+`intent_context` before submitting its bounded draft to token-free
+`intent_advisory_preflight`. The live held runtime, not caller fields, resolves repository, graph,
+actor, principals, and persistence authority.
+
+- `no_semantic_impact`: continue without graph ceremony.
+- `aligned`: continue with the relevant intent and requirement context.
+- `new_or_ambiguous`: pause implementation and ask every returned question.
+- `conflicting`: stop implementation and open or reuse a human-review case.
+
+The plugin never requests, receives, displays, persists, or infers a capability token. It is
+advisory guidance, not complete mutation interception. Mandatory construction continues to raise
+`MandatoryHookUnavailable` with `Codex mandatory mutation hook is unavailable`. Do not document or
+operate it as mandatory enforcement.
+
+Explicit opt-out is always available: decline the onboarding offer, or disable/uninstall the
+plugin. When disabled, ordinary coding behavior is unchanged and no prompt-time workflow call is
+made. The local CLI, MCP server, and scheduled assurance remain independent.
+
+Operators can still inspect the bounded diagnostic views manually:
+
+```bash
+intent context --task "add CSV export" --project . --format json
+intent preflight --task "add CSV export" --project . --format json
+```
+
+The CLI diagnostic does not classify the request and does not mint a capability; it reports
+`authorization_issued: false`.
+
+## 4. Clarification and review
+
+For `new_or_ambiguous`, the advisory preflight opens a persisted clarification session. Each later
+human answer is routed directly to `intent_clarification_answer`; it is not recursively classified
+as an unrelated requirement. Once required answers exist, the agent may call
+`intent_clarification_propose`, show the exact graph proposal, and call
+`intent_clarification_confirm` only after human confirmation. These public tools delegate to the
+existing `ClarificationCoordinator` and proposal-confirmation service, preserving author, ACL,
+timestamp, predecessor, prompt/answer evidence, and graph baseline.
+
+If there is insufficient evidence, the result remains `new_or_ambiguous` and asks focused
+questions. A `conflicting` request cannot be self-reviewed when policy requires an independent
+actor. Ordinary reconciliation remains two-phase:
+
+```bash
+intent reconcile show <case-id> --project . --format json
+intent reconcile resolve <case-id> --action update_requirement --project . --format json
+intent reconcile resolve <case-id> --action update_requirement --approve <review-hash> \
+  --project . --format json
+```
+
+## 5. Scheduled CLI assurance
+
+Prompt-time advice and assurance have separate lifecycles. Capture at the source cadence and run
+validation/drift at the review cadence, whether or not the plugin is installed or enabled:
+
+```bash
+intent validate --project .
+intent sync --project . --sources markdown,git,github,mcp
+intent drift --project . --format markdown --output intent-drift.md --require-review
+```
+
+The default CLI uses deterministic checks and optional configured connectors; it issues no
+authorization. Repeating the same capture is a semantic no-op. The repository's
+`.github/workflows/intent-engineering.yml` preserves the same clean-checkout sequence without
+installing or invoking `intent-advisor`.
+
+Scheduled semantic inference is optional and may only propose grounded review cases. Confidence is
+not a claim of truth and never approves a proposal, resolves a conflict, or authorizes a canonical
+or provider write.
+
+## 6. Add compatible sources
 
 Copy both the reviewed provider profile and one project binding. This Slack example is identical in
 shape for the shipped Jira, Confluence, and Notion profiles:
@@ -70,77 +164,6 @@ configured, an active agent inspects the captured evidence and submits a typed
 `BootstrapSubmission` through the public MCP tool `intent_bootstrap_propose`. Candidate nodes may
 start with lower confidence, assumptions, unanswered questions, and provisional status.
 
-Review the resulting proposal locally and confirm only the intended core:
-
-```bash
-intent proposals list --project . --format json
-intent proposals show <proposal-id> --project . --format json
-intent proposals confirm <proposal-id> --project . --format json
-```
-
-Confirmation is interactive and displays the complete proposal before asking for its exact digest.
-The agent cannot manufacture this human confirmation.
-
-## 4. Look through the graph before every task
-
-An operator can inspect the same bounded packet the agent should read:
-
-```bash
-intent context --task "add CSV export" --project . --format json
-intent preflight --task "add CSV export" --project . --format json
-```
-
-`intent preflight` is a manual diagnostic wrapper around context. It does not classify the request,
-does not mint an authorization, and returns `authorization_issued: false`.
-
-In a supported active-agent integration, the agent records the human request and its attributed
-classification submission, then calls the public MCP tool `intent_preflight`. The deterministic
-service rechecks that submission against current graph/evidence state:
-
-- `aligned` or `no_semantic_impact`: the long-lived MCP process may return a short-lived,
-  process-local capability bound to the exact repository, actor, task, graph version, and paths.
-- `new_or_ambiguous`: ask every returned question before proposing a requirement. When there is
-  insufficient evidence, the result remains `new_or_ambiguous` and explains the gap through those
-  questions; it is not a separate classification.
-- `conflicting`: do not mutate; open or reuse the evidence-backed review case.
-
-The capability is private to that process. It is never written to graph, history, evidence, cases,
-configuration, receipts, logs, or CLI output.
-
-## 5. Clarify and review new intent
-
-For `new_or_ambiguous`, the agent asks the returned questions in the same conversation. A supported
-host composes the public Python `ClarificationCoordinator.open`, `.answer`, and `.propose` methods to
-persist the human and agent turns, each answer's author and ACL, and the proposal chronology. It then
-uses `ProposalConfirmationService.confirm` with the authenticated contributor.
-
-There is currently no standalone clarification-answer CLI. Treating ordinary chat text as a silent
-canonical update would lose the provenance this workflow is designed to preserve.
-
-A conflict or high-risk replacement cannot be self-reviewed. A different actor listed in the local
-approval policy must inspect both evidence sides and confirm through
-`ProposalConfirmationService.confirm`. For ordinary reconciliation cases, the local two-phase CLI
-shows the exact review hash before applying anything:
-
-```bash
-intent reconcile show <case-id> --project . --format json
-intent reconcile resolve <case-id> --action update_requirement --project . --format json
-intent reconcile resolve <case-id> --action update_requirement --approve <review-hash> \
-  --project . --format json
-```
-
-## 6. Host enforcement and disabled mode
-
-The provider-neutral `IntentAgentHostAdapter` is the integration seam for a future host that can
-prove synchronous coverage before every file or command mutation and invoke post-task processing.
-For the currently audited Codex contract, mandatory construction raises
-`MandatoryHookUnavailable` with the fixed message `Codex mandatory mutation hook is unavailable`.
-No Codex plugin is shipped, and this project does not claim automatic Codex enforcement.
-
-When integration is disabled, the host adapter is a transparent no-op: ordinary coding behavior is
-unchanged, no preflight service is called, and no completion is recorded. Operators may still run
-the diagnostic CLI and MCP services manually.
-
 ## 7. Link completion evidence
 
 A supported host calls `IntentAgentHostAdapter.after_task`, which delegates to the public
@@ -150,32 +173,7 @@ evidence covers the claimed test references. It then adds only supported require
 links and an implementation claim. There is no standalone post-task CLI today; without a supported
 host, sync Git and test evidence and let assurance report the missing links.
 
-## 8. Run capture frequently and assurance separately
-
-Capture source versions at the cadence at which they change:
-
-```bash
-intent sync --project . --sources markdown,git,github,mcp
-```
-
-The default production sync uses deterministic checks with no model or network inference beyond
-configured source connectors. An application embedding `AssuranceService` may provide optional
-ACL-filtered semantic reasoning, but its output can only propose evidence-backed cases. A confidence
-score never authorizes a canonical intent/requirement change, approval, conflict resolution, or
-external write.
-
-At the human review cadence, validate and render drift/assurance separately:
-
-```bash
-intent validate --project .
-intent drift --project . --format markdown --output intent-drift.md --require-review
-```
-
-The repository workflow runs the same ordered read-only sequence manually or on a schedule. A
-second identical capture is a semantic no-op, while previously captured authors and revisions remain
-visible.
-
-## 9. Keep external writes three separate acts
+## 8. Keep external writes three separate acts
 
 External providers are never changed merely because a case exists. Preview as an authorized
 contributor, approve interactively as an independent reviewer, then execute the unchanged plan:

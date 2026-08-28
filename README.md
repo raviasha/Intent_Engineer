@@ -19,29 +19,79 @@ it becomes a reviewable reconciliation case with its supporting evidence.
 The supplied [framework graph](graph/framework-intent-graph.yaml) dogfoods the
 same graph model used for a project.
 
-## Quick start
+## Guided developer journey
 
 Requires Python 3.12 or newer.
 
 ```bash
-python -m pip install -e '.[dev]'
-intent init --project .
-intent bootstrap --prd docs/prd.md --format json
-intent sources add markdown docs/prd.md --role declared_intent
-intent proposals list --format json
-intent sync --sources markdown,git
-intent status
-intent context --task "add local export"
-intent preflight --task "add local export" --format json
-intent drift --require-review
+python -m pip install intent-engineering
+intent onboard --project . --prd docs/PRD.md
+intent mcp --project .
 ```
 
-Bootstrap first captures the PRD and asks an active agent for a typed proposal; it does not silently
-invent canonical intent. Review and confirm that proposal before treating its core as active. The CLI
-`preflight` command is diagnostic only and never mints a mutation capability. See the executable
+`intent onboard` first asks for consent, captures the explicit PRD as immutable declared-intent
+evidence, and returns the public `intent_bootstrap_propose` next action. It never invents or
+activates canonical intent by itself. Start `intent mcp` in a separate terminal so an active agent
+can submit the typed proposal through the held project runtime.
+
+### Approve the baseline
+
+Inspect the exact proposal before confirming it:
+
+```bash
+intent proposals list --project . --format json
+intent proposals show <proposal-id> --project . --format json
+intent proposals confirm <proposal-id> --project . --format json
+```
+
+Confirmation is interactive and digest-bound; neither `--yes` on onboarding nor the plugin can
+manufacture it. Existing automation may still use `intent init --project .`,
+`intent bootstrap --prd docs/prd.md --project . --format json`, and
+`intent sources add markdown docs/prd.md --role declared_intent --project .`.
+
+### Use ordinary prompts
+
+The validated advisory bundle is `plugins/intent-advisor`. From a source checkout, expose that
+exact directory through a repo or personal Codex marketplace with
+`source.path: "./plugins/intent-advisor"`, install `intent-advisor` from the Plugins Directory,
+enable it, and review/trust its `UserPromptSubmit` hook. The bundle automatically offers onboarding
+when no approved baseline exists. After approval it asks for `intent_context`, then routes the
+agent's bounded classification draft through token-free `intent_advisory_preflight`.
+
+The advisory classifications are `no_semantic_impact`, `aligned`, `new_or_ambiguous`, and
+`conflicting`. Continue normal work for the first two. The plugin never receives a mutation
+capability and does not provide mandatory mutation enforcement. Mandatory Codex mode remains
+truthfully unavailable through `MandatoryHookUnavailable` with the message
+`Codex mandatory mutation hook is unavailable`.
+
+To opt out, decline the onboarding offer or disable/uninstall `intent-advisor`. A decline leaves
+the repository unchanged for that task; disabling the plugin leaves ordinary coding behavior
+unchanged. The CLI and MCP services remain usable independently.
+
+### Clarification and review
+
+For `new_or_ambiguous`, answer every persisted question before the agent calls
+`intent_clarification_answer`, `intent_clarification_propose`, and
+`intent_clarification_confirm`. Answers stay attached to their active session and are not
+recursively classified as new requirements. For `conflicting`, stop implementation and require the
+configured independent human review before any graph change.
+
+### Scheduled CLI assurance
+
+The plugin is not needed for assurance. Run the deterministic CLI sequence locally, from cron, or
+through `.github/workflows/intent-engineering.yml`:
+
+```bash
+intent validate --project .
+intent sync --project . --sources markdown,git,github
+intent drift --project . --format markdown --output intent-drift.md
+```
+
+The sequence captures implementation and test-file evidence and opens review cases; it does not
+issue authorization or silently rewrite the approved graph. See the executable
 [intent-aware agent adoption guide](docs/intent-aware-agent.md) for source roles, compatible
-Slack/Jira/Confluence/Notion setup, clarification, independent review, host support, post-task
-evidence, and scheduling.
+Slack/Jira/Confluence/Notion setup, clarification, independent review, post-task evidence, and
+scheduling.
 
 For team conversations and external requirements, configure GitHub and/or a compatible MCP source,
 then schedule capture independently from reconciliation:
@@ -65,8 +115,9 @@ target. See [the MCP and agent guide](docs/mcp.md) and
 
 Active-agent reasoning may submit evidence-backed proposals. Scheduled semantic inference is
 optional and can only open grounded review cases; confidence is not a claim of truth and never
-authorizes canonical changes. Mandatory Codex mutation coverage is not currently available, so no
-Codex plugin is shipped. Disabling host integration leaves ordinary coding behavior unchanged.
+authorizes canonical changes. The shipped `intent-advisor` plugin is advisory only. Disabling it
+leaves ordinary coding behavior unchanged, while mandatory Codex mutation coverage remains
+unavailable.
 
 `intent reconcile resolve <case-id>` is deliberately two-phase. The first call
 records a deterministic preview and returns an approval hash with review-required
