@@ -725,6 +725,8 @@ class _ApprovalLookup:
 
 
 class _WorkflowPort:
+    actor = "local"
+
     def __init__(self) -> None:
         self.approvals = _ApprovalLookup()
         self.preview_calls: list[tuple[object, ...]] = []
