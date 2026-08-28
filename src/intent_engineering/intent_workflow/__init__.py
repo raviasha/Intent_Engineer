@@ -36,6 +36,13 @@ from intent_engineering.intent_workflow.models import (
     TaskClassification,
     TaskEnvelope,
 )
+from intent_engineering.intent_workflow.onboarding import (
+    OnboardingError,
+    OnboardingRuntime,
+    OnboardingState,
+    OnboardingStatus,
+    inspect_onboarding,
+)
 from intent_engineering.intent_workflow.post_task import (
     PostTaskReason,
     PostTaskResult,
@@ -71,6 +78,10 @@ __all__ = [
     "ConversationCapture",
     "ConversationCaptureError",
     "IntentProposal",
+    "OnboardingError",
+    "OnboardingRuntime",
+    "OnboardingState",
+    "OnboardingStatus",
     "PostTaskReason",
     "PostTaskResult",
     "PostTaskService",
@@ -90,4 +101,5 @@ __all__ = [
     "TaskClassification",
     "TaskEnvelope",
     "classification_evidence_content",
+    "inspect_onboarding",
 ]
