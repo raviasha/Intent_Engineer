@@ -11,6 +11,7 @@ from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from hashlib import sha256
 from pathlib import Path
+from threading import local
 from types import MappingProxyType
 from typing import Literal
 
@@ -140,6 +141,15 @@ class LocalTransaction:
         self._extras.clear()
 
 
+class _TransactionThreadState(local):
+    """Track same-coordinator nesting without creating a second lock domain."""
+
+    def __init__(self) -> None:
+        self.active = False
+        self.extras: dict[str, SecureFile] = {}
+        self.poisoned = False
+
+
 class LocalTransactionCoordinator:
     """Coordinate exact preimage recovery across a fixed local target set."""
 
@@ -170,6 +180,17 @@ class LocalTransactionCoordinator:
         self._targets = {name: target.duplicate() for name, target in targets.items()}
         self._fault_hook = fault_hook
         self._legacy_target_sets = frozenset(legacy_sets)
+        self._thread_state = _TransactionThreadState()
+
+    def _require_nested_extras(self, extras: Mapping[str, SecureFile]) -> None:
+        if not self._thread_state.active:
+            return
+        held = self._thread_state.extras
+        if any(
+            name not in held or held[name].lock_key != file.lock_key
+            for name, file in extras.items()
+        ):
+            raise ValueError("nested local transaction cannot expand targets")
 
     @property
     def target_names(self) -> frozenset[str]:
@@ -312,6 +333,9 @@ class LocalTransactionCoordinator:
     @contextmanager
     def coordinated(self) -> Iterator[None]:
         """Recover and serialize one non-transactional target operation."""
+        if self._thread_state.active:
+            yield
+            return
         with self._locks():
             self._recover_unlocked()
             yield
@@ -330,6 +354,10 @@ class LocalTransactionCoordinator:
         lock_keys = [self._journal.lock_key, *(item.lock_key for item in all_files.values())]
         if len(lock_keys) != len(set(lock_keys)):
             raise ValueError("duplicate local snapshot target")
+        if self._thread_state.active:
+            self._require_nested_extras(extra_files)
+            content = {name: all_files[name].read_optional() for name in sorted(all_files)}
+            return LocalTransactionSnapshot(MappingProxyType(content), False)
         with self._locks(extra_files):
             recovered = self._recover_unlocked()
             content = {name: all_files[name].read_optional() for name in sorted(all_files)}
@@ -350,6 +378,14 @@ class LocalTransactionCoordinator:
         lock_keys = [self._journal.lock_key, *(item.lock_key for item in all_files.values())]
         if len(lock_keys) != len(set(lock_keys)):
             raise ValueError("duplicate local transaction target")
+        if self._thread_state.active:
+            self._require_nested_extras(extra_files)
+            transaction = LocalTransaction(self, extra_files, read_only=True)
+            try:
+                yield transaction
+            finally:
+                transaction._finish()
+            return
         with self._locks(extra_files):
             self._recover_unlocked()
             transaction = LocalTransaction(self, extra_files, read_only=True)
@@ -375,6 +411,17 @@ class LocalTransactionCoordinator:
         lock_keys = [self._journal.lock_key, *(item.lock_key for item in all_files.values())]
         if len(lock_keys) != len(set(lock_keys)):
             raise ValueError("duplicate local transaction target")
+        if self._thread_state.active:
+            self._require_nested_extras(extra_files)
+            transaction = LocalTransaction(self, extra_files)
+            try:
+                yield transaction
+            except BaseException:
+                self._thread_state.poisoned = True
+                raise
+            finally:
+                transaction._finish()
+            return
         with self._locks(extra_files):
             self._recover_unlocked()
             preimages = self._snapshot()
@@ -382,9 +429,14 @@ class LocalTransactionCoordinator:
             prepared = self._journal_for(preimages, "prepared", transaction_id)
             self._write_journal(prepared)
             transaction = LocalTransaction(self, extra_files)
+            self._thread_state.active = True
+            self._thread_state.extras = extra_files
+            self._thread_state.poisoned = False
             try:
                 self._fault("journal_prepared")
                 yield transaction
+                if self._thread_state.poisoned:
+                    raise ValueError("nested local transaction failed")
                 committed = prepared.model_copy(update={"state": "committed"})
                 self._write_journal(committed)
                 self._fault("journal_committed")
@@ -406,3 +458,6 @@ class LocalTransactionCoordinator:
                 raise
             finally:
                 transaction._finish()
+                self._thread_state.active = False
+                self._thread_state.extras = {}
+                self._thread_state.poisoned = False

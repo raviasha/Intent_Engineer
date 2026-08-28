@@ -24,8 +24,7 @@ from intent_engineering.integrations.agent_host.advisory import (
 
 NOW = datetime(2026, 8, 28, 12, 0, tzinfo=UTC)
 OFFER = (
-    "This repository has not been onboarded into Intent Engineering. "
-    "Start guided onboarding now?"
+    "This repository has not been onboarded into Intent Engineering. Start guided onboarding now?"
 )
 
 
@@ -106,6 +105,38 @@ def test_initialized_repository_routes_once_to_public_preflight(tmp_path: Path) 
     assert route.mcp_tool == "intent_preflight"
     assert route.arguments == {"task": event.prompt}
     assert "token" not in json.dumps(route.model_dump(mode="json")).lower()
+
+
+def test_prompt_route_arguments_are_recursively_frozen_detached_and_token_safe(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    runtime = _ready_runtime(project)
+    route = AdvisoryPromptRouter(runtime).route(_event(project))
+
+    with pytest.raises(TypeError):
+        route.arguments["authorization_token"] = "PRIVATE-INJECTED-TOKEN"
+
+    source = {"context": {"items": ["safe"]}}
+    nested = PromptRoute(
+        action="continue",
+        message="Continue safely.",
+        mcp_tool=None,
+        arguments=source,
+    )
+    source["context"]["items"].append("source-mutated")
+    context = nested.arguments["context"]
+    with pytest.raises(TypeError):
+        context["authorization_token"] = "PRIVATE-NESTED-TOKEN"  # type: ignore[index]
+    items = context["items"]  # type: ignore[index]
+    with pytest.raises(AttributeError):
+        items.append("PRIVATE-NESTED-TOKEN")  # type: ignore[union-attr]
+
+    dumped = nested.model_dump(mode="json")
+    dumped["arguments"]["context"]["items"].append("detached")
+    assert nested.model_dump(mode="json")["arguments"] == {"context": {"items": ["safe"]}}
+    assert "token" not in json.dumps(route.model_dump(mode="json")).casefold()
 
 
 def test_active_clarification_answer_routes_without_reclassification(

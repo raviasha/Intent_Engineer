@@ -52,15 +52,87 @@ def test_ordinary_exception_restores_exact_bytes_and_existence(tmp_path: Path) -
     coordinator, paths, journal = _coordinator(tmp_path)
     before = _seed(paths)
 
-    with pytest.raises(
-        RuntimeError,
-        match="fixture failure",
-    ), coordinator.transaction() as transaction:
+    with (
+        pytest.raises(
+            RuntimeError,
+            match="fixture failure",
+        ),
+        coordinator.transaction() as transaction,
+    ):
         transaction.write("graph", b"changed\n")
         transaction.write("cases", b"created\n")
         raise RuntimeError("fixture failure")
 
-    assert {name: path.read_bytes() if path.exists() else None for name, path in paths.items()} == before
+    assert {
+        name: path.read_bytes() if path.exists() else None for name, path in paths.items()
+    } == before
+    assert not journal.exists()
+
+
+def test_nested_transaction_commits_through_one_outer_journal(tmp_path: Path) -> None:
+    stages: list[str] = []
+    coordinator, paths, journal = _coordinator(tmp_path, fault_hook=stages.append)
+    _seed(paths)
+
+    with coordinator.transaction() as outer:
+        outer.write("graph", b"graph-after\n")
+        with coordinator.transaction() as nested:
+            nested.append("history", b"nested-after\n")
+
+    assert stages.count("journal_prepared") == 1
+    assert stages.count("journal_committed") == 1
+    assert paths["graph"].read_bytes() == b"graph-after\n"
+    assert paths["history"].read_bytes() == b"history-before\nnested-after\n"
+    assert not journal.exists()
+
+
+def test_caught_nested_failure_poisons_and_rolls_back_outer_transaction(
+    tmp_path: Path,
+) -> None:
+    coordinator, paths, journal = _coordinator(tmp_path)
+    before = _seed(paths)
+
+    with (
+        pytest.raises(ValueError, match="nested local transaction failed"),
+        coordinator.transaction() as outer,
+    ):
+        outer.write("graph", b"graph-after\n")
+        try:
+            with coordinator.transaction() as nested:
+                nested.append("history", b"nested-after\n")
+                raise RuntimeError("caught nested failure")
+        except RuntimeError:
+            pass
+
+    assert {
+        name: path.read_bytes() if path.exists() else None for name, path in paths.items()
+    } == before
+    assert not journal.exists()
+
+
+def test_nested_cancellation_uses_outer_rollback_policy_and_preserves_identity(
+    tmp_path: Path,
+) -> None:
+    class Cancellation(BaseException):
+        pass
+
+    coordinator, paths, journal = _coordinator(tmp_path)
+    before = _seed(paths)
+    signal = Cancellation()
+
+    with (
+        pytest.raises(Cancellation) as caught,
+        coordinator.transaction(rollback_base_exceptions=True) as outer,
+    ):
+        outer.write("graph", b"graph-after\n")
+        with coordinator.transaction() as nested:
+            nested.append("history", b"nested-after\n")
+            raise signal
+
+    assert caught.value is signal
+    assert {
+        name: path.read_bytes() if path.exists() else None for name, path in paths.items()
+    } == before
     assert not journal.exists()
 
 
@@ -86,7 +158,9 @@ def test_crash_after_each_precommit_durable_stage_recovers_exact_preimages(
     recovery, _, _ = _coordinator(tmp_path)
     recovery.recover()
 
-    assert {name: path.read_bytes() if path.exists() else None for name, path in paths.items()} == before
+    assert {
+        name: path.read_bytes() if path.exists() else None for name, path in paths.items()
+    } == before
     assert not journal.exists()
     recovery.recover()
 
@@ -111,7 +185,9 @@ def test_stale_committed_journal_completes_without_replaying_preimages(tmp_path:
     recovery, _, _ = _coordinator(tmp_path)
     recovery.recover()
 
-    assert {name: path.read_bytes() if path.exists() else None for name, path in paths.items()} == after
+    assert {
+        name: path.read_bytes() if path.exists() else None for name, path in paths.items()
+    } == after
     assert not journal.exists()
 
 
@@ -184,5 +260,7 @@ def test_corrupt_or_untrusted_journal_is_rejected_without_target_mutation(
     with pytest.raises(TransactionRecoveryError, match="local transaction recovery failed"):
         coordinator.recover()
 
-    assert {name: path.read_bytes() if path.exists() else None for name, path in paths.items()} == before
+    assert {
+        name: path.read_bytes() if path.exists() else None for name, path in paths.items()
+    } == before
     assert journal.exists()

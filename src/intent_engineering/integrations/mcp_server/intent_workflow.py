@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
 from pathlib import PurePosixPath, PureWindowsPath
 from typing import Annotated, Never, Protocol, cast
@@ -87,6 +87,12 @@ _CLARIFY = ToolAnnotations(
     idempotent_hint=False,
     open_world_hint=False,
 )
+_CLARIFY_CONFIRM = ToolAnnotations(
+    read_only_hint=False,
+    destructive_hint=True,
+    idempotent_hint=False,
+    open_world_hint=False,
+)
 _MAX_REQUEST_BYTES = 1_048_576
 _MAX_CONFIRMED_NODES = 10_000
 _MAX_AUTHORIZATION_ITEMS = 256
@@ -99,9 +105,7 @@ _DIGEST = r"^sha256:[0-9a-f]{64}$"
 _TASK_ID = r"^task:sha256:[0-9a-f]{64}$"
 _CLARIFICATION_ID = r"^clarification:sha256:[0-9a-f]{64}$"
 _CONTROL = re.compile(r"[\x00-\x1f\x7f]")
-_WINDOWS_DEVICE = re.compile(
-    r"^(?:CON|PRN|AUX|NUL|CLOCK\$|COM[1-9]|LPT[1-9])$", re.IGNORECASE
-)
+_WINDOWS_DEVICE = re.compile(r"^(?:CON|PRN|AUX|NUL|CLOCK\$|COM[1-9]|LPT[1-9])$", re.IGNORECASE)
 type _ProposalIdInput = Annotated[str, Field(pattern=_PROPOSAL_ID)]
 type _DigestInput = Annotated[str, Field(pattern=_DIGEST)]
 type _NodeIdsInput = Annotated[
@@ -202,6 +206,7 @@ def _clarification_submission_input(value: object) -> ClarificationProposalSubmi
         if type(value) is ClarificationProposalSubmission:
             encoded = _canonical_json(value.model_dump(mode="json"))
         elif type(value) is dict:
+            _require_canonical_clarification_timestamps(value)
             encoded = _canonical_json(value)
         else:
             raise ValueError("invalid workflow request")
@@ -230,6 +235,50 @@ type _ClarificationNodeIdsInput = Annotated[
     list[Annotated[str, Field(min_length=1, max_length=512)]],
     Field(max_length=_MAX_CONFIRMED_NODES),
 ]
+
+
+_CLARIFICATION_TIMESTAMP_FIELDS = frozenset(
+    {"timestamp", "created_at", "last_modified_at", "last_reassessed_at"}
+)
+
+
+def _canonical_timestamp_spelling(value: object) -> datetime:
+    if type(value) is not str:
+        raise ValueError("invalid workflow request")
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        raise ValueError("invalid workflow request") from None
+    offset = parsed.utcoffset() if parsed.tzinfo is not None else None
+    canonical = parsed.isoformat()
+    if canonical.endswith("+00:00"):
+        canonical = canonical[:-6] + "Z"
+    if offset is None or offset.total_seconds() != 0 or value != canonical:
+        raise ValueError("invalid workflow request")
+    return parsed
+
+
+def _require_canonical_clarification_timestamps(value: dict[str, object]) -> None:
+    pending: list[object] = [value]
+    item: object = None
+    nested: object = None
+    key = ""
+    try:
+        while pending:
+            item = pending.pop()
+            if type(item) is dict:
+                for key, nested in dict.items(cast(dict[str, object], item)):
+                    if key in _CLARIFICATION_TIMESTAMP_FIELDS and nested is not None:
+                        _canonical_timestamp_spelling(nested)
+                    if type(nested) in {dict, list}:
+                        pending.append(nested)
+            elif type(item) is list:
+                pending.extend(list.__iter__(cast(list[object], item)))
+    finally:
+        value = {}
+        item = nested = None
+        key = ""
+        pending.clear()
 
 
 def _submission_input(value: object) -> BootstrapSubmission:
@@ -326,9 +375,7 @@ def _require_exact_json(value: object) -> None:
                 active.add(identity)
                 seen.add(identity)
                 pending.append((sequence, depth, True))
-                pending.extend(
-                    (nested, depth + 1, False) for nested in list.__iter__(sequence)
-                )
+                pending.extend((nested, depth + 1, False) for nested in list.__iter__(sequence))
             elif type(item) is str:
                 encoded = item.encode("utf-8")
                 utf8_bytes += len(encoded)
@@ -452,9 +499,7 @@ class IntentPreflightRequest(_Request):
 class AuthorizationVerifyRequest(_Request):
     token: Annotated[str, Field(min_length=1, max_length=_MAX_TOKEN_BYTES)]
     actor: Annotated[str, Field(min_length=1, max_length=_MAX_AUTHORIZATION_FIELD_BYTES)]
-    repository_id: Annotated[
-        str, Field(min_length=1, max_length=_MAX_AUTHORIZATION_FIELD_BYTES)
-    ]
+    repository_id: Annotated[str, Field(min_length=1, max_length=_MAX_AUTHORIZATION_FIELD_BYTES)]
     task_id: Annotated[
         str,
         Field(pattern=_TASK_ID, max_length=_MAX_AUTHORIZATION_FIELD_BYTES),
@@ -490,18 +535,7 @@ class AuthorizationVerifyRequest(_Request):
 def _workflow_timestamp(value: object, info: ValidationInfo) -> object:
     if info.mode != "json":
         return value
-    if type(value) is not str:
-        raise ValueError("invalid workflow request")
-    try:
-        parsed = datetime.fromisoformat(value)
-    except ValueError:
-        raise ValueError("invalid workflow request") from None
-    canonical = parsed.isoformat()
-    if canonical.endswith("+00:00"):
-        canonical = canonical[:-6] + "Z"
-    if value != canonical:
-        raise ValueError("invalid workflow request")
-    return parsed
+    return _canonical_timestamp_spelling(value)
 
 
 def _require_utc(value: datetime) -> datetime:
@@ -514,9 +548,7 @@ def _require_utc(value: datetime) -> datetime:
 class ClarificationOpenRequest(_Request):
     envelope: TaskEnvelope
     classification_evidence_ref: Annotated[str, Field(min_length=1, max_length=256)]
-    questions: Annotated[
-        tuple[ClarificationQuestionInput, ...], Field(min_length=1, max_length=16)
-    ]
+    questions: Annotated[tuple[ClarificationQuestionInput, ...], Field(min_length=1, max_length=16)]
     opened_by: Annotated[str, Field(min_length=1, max_length=256)]
     opened_at: datetime
 
@@ -534,6 +566,8 @@ class ClarificationOpenRequest(_Request):
             {item.id for item in values}
         ) != len(values):
             raise ValueError("invalid workflow request")
+        for item in values:
+            _bounded_identity(item.id)
         return values
 
     @field_validator("opened_at", mode="before")
@@ -624,9 +658,7 @@ class ClarificationConfirmRequest(_Request):
 class IntentWorkflowPort(Protocol):
     """Narrow workflow contract exposed to MCP registration."""
 
-    async def bootstrap_propose(
-        self, submission: BootstrapSubmission
-    ) -> dict[str, object]: ...
+    async def bootstrap_propose(self, submission: BootstrapSubmission) -> dict[str, object]: ...
 
     async def proposal_show(self, proposal_id: object) -> dict[str, object]: ...
 
@@ -718,9 +750,7 @@ def validate_intent_workflow_call(name: str, arguments: dict[str, object]) -> No
                 {
                     "proposal_id": dict.__getitem__(arguments, "proposal_id"),
                     "proposal_digest": dict.__getitem__(arguments, "proposal_digest"),
-                    "confirmed_node_ids": tuple(
-                        cast(list[object], confirmed_node_ids)
-                    ),
+                    "confirmed_node_ids": tuple(cast(list[object], confirmed_node_ids)),
                 }
             )
         if name == "intent_preflight":
@@ -834,6 +864,14 @@ class McpIntentWorkflowServices:
                 policy_file=confirmation_policy,
                 binding_files=binding_files,
             )
+            self._clarification_authority_files = {
+                "authority_config": confirmation_config.duplicate(),
+                "authority_policy": confirmation_policy.duplicate(),
+                **{
+                    f"authority_binding_{index}": file.duplicate()
+                    for index, (_name, file) in enumerate(sorted(binding_files.items()))
+                },
+            }
         finally:
             confirmation_config.close()
             confirmation_policy.close()
@@ -850,9 +888,7 @@ class McpIntentWorkflowServices:
             "reason": "intent_workflow_unavailable",
         }
 
-    async def bootstrap_propose(
-        self, submission: BootstrapSubmission
-    ) -> dict[str, object]:
+    async def bootstrap_propose(self, submission: BootstrapSubmission) -> dict[str, object]:
         encoded: bytes | None = None
         candidate: BootstrapSubmission | None = None
         try:
@@ -915,10 +951,9 @@ class McpIntentWorkflowServices:
                 }
             )
             preview = proposal_payload(self.runtime, config, request.proposal_id)
-            if (
-                preview["proposal_digest"] != request.proposal_digest
-                or _snapshot_config(self.runtime) != (config, config_bytes)
-            ):
+            if preview["proposal_digest"] != request.proposal_digest or _snapshot_config(
+                self.runtime
+            ) != (config, config_bytes):
                 return self._rejected()
             at = self._clock()
             if at.tzinfo is None or at.utcoffset() is None:
@@ -963,9 +998,7 @@ class McpIntentWorkflowServices:
             "schema_version": 1,
             "authorized": verification.authorized,
             "classification": (
-                None
-                if verification.classification is None
-                else verification.classification.value
+                None if verification.classification is None else verification.classification.value
             ),
             "relevant_node_ids": list(verification.relevant_node_ids),
             "expires_at": (
@@ -987,7 +1020,10 @@ class McpIntentWorkflowServices:
         authenticated: AuthenticatedPreflightResult | None = None
         minted_token: str | None = None
         try:
-            if type(envelope) is not TaskEnvelope or type(submission) is not AgentClassificationSubmission:
+            if (
+                type(envelope) is not TaskEnvelope
+                or type(submission) is not AgentClassificationSubmission
+            ):
                 return self._rejected()
             detached_envelope = TaskEnvelope.model_validate_json(envelope.model_dump_json())
             detached_submission = AgentClassificationSubmission.model_validate_json(
@@ -1011,8 +1047,7 @@ class McpIntentWorkflowServices:
                     if (
                         transaction.read("config") != config_bytes
                         or graph.version != result.graph_version
-                        or canonical_graph_digest(graph_content)
-                        != authenticated.graph_digest
+                        or canonical_graph_digest(graph_content) != authenticated.graph_digest
                         or config.project_id != detached_envelope.repository_id
                         or config.local_actor != detached_envelope.actor
                         or _principals(self.runtime, config) != principals
@@ -1109,10 +1144,7 @@ class McpIntentWorkflowServices:
                     requested_paths=request.requested_paths,
                     now=self._clock(),
                 )
-                if (
-                    canonical_graph_digest(transaction.read("graph"))
-                    != graph_digest
-                ):
+                if canonical_graph_digest(transaction.read("graph")) != graph_digest:
                     return self._denied_verification()
             return self._verification_payload(verification)
         except Exception:  # noqa: BLE001 - all denials have one reduced public shape
@@ -1138,14 +1170,31 @@ class McpIntentWorkflowServices:
                 config = cast(ProjectConfig, None)
                 config_bytes = b""
 
-    def _clarification_authority(self) -> tuple[ProjectConfig, frozenset[str]]:
-        config, _config_bytes = _snapshot_config(self.runtime)
-        principals = frozenset({"agent:codex", *_principals(self.runtime, config)})
+    def _clarification_authority(
+        self,
+    ) -> tuple[ProjectConfig, frozenset[str], dict[str, bytes | None]]:
+        snapshot = self.runtime.transactions.snapshot(self._clarification_authority_files)
+        config, policy, provider_principals = ProposalConfirmationService._authority(snapshot)
+        if config != self.runtime.config:
+            raise ValueError("clarification authority unavailable")
+        aliases = ProposalConfirmationService._aliases(
+            config.local_actor,
+            policy,
+            provider_principals,
+        )
+        principals = frozenset({"agent:codex", *aliases})
         if config.local_actor not in principals:
             raise ValueError("clarification authority unavailable")
-        return config, principals
+        preimages = {
+            name: snapshot.content.get(name) for name in self._clarification_authority_files
+        }
+        return config, principals, preimages
 
-    def _clarification_coordinator(self, config: ProjectConfig) -> ClarificationCoordinator:
+    def _clarification_coordinator(
+        self,
+        config: ProjectConfig,
+        authority_preimages: Mapping[str, bytes | None],
+    ) -> ClarificationCoordinator:
         return ClarificationCoordinator(
             graph_store=self.runtime.graph_store,
             evidence_store=self.runtime.evidence_store,
@@ -1156,6 +1205,8 @@ class McpIntentWorkflowServices:
                 self.runtime.evidence_store,
                 connector_id="conversation:codex",
             ),
+            authority_files=self._clarification_authority_files,
+            authority_preimages=authority_preimages,
         )
 
     async def clarification_open(
@@ -1178,7 +1229,7 @@ class McpIntentWorkflowServices:
                     "opened_at": opened_at,
                 }
             )
-            config, principals = self._clarification_authority()
+            config, principals, authority_preimages = self._clarification_authority()
             if request.envelope.actor != config.local_actor or request.opened_by != "agent:codex":
                 return self._rejected()
             detached_envelope = TaskEnvelope.model_validate_json(request.envelope.model_dump_json())
@@ -1186,7 +1237,7 @@ class McpIntentWorkflowServices:
                 ClarificationQuestionInput.model_validate_json(item.model_dump_json())
                 for item in request.questions
             )
-            session = self._clarification_coordinator(config).open(
+            session = self._clarification_coordinator(config, authority_preimages).open(
                 detached_envelope,
                 classification_evidence_ref=request.classification_evidence_ref,
                 questions=detached_questions,
@@ -1238,10 +1289,10 @@ class McpIntentWorkflowServices:
                     "answered_at": answered_at,
                 }
             )
-            config, principals = self._clarification_authority()
+            config, principals, authority_preimages = self._clarification_authority()
             if request.actor != config.local_actor:
                 return self._rejected()
-            session = self._clarification_coordinator(config).answer(
+            session = self._clarification_coordinator(config, authority_preimages).answer(
                 request.session_id,
                 actor=request.actor,
                 question_id=request.question_id,
@@ -1279,13 +1330,13 @@ class McpIntentWorkflowServices:
         detached: ClarificationProposalSubmission | None = None
         try:
             request = ClarificationProposeRequest.model_validate({"submission": submission})
-            config, principals = self._clarification_authority()
+            config, principals, authority_preimages = self._clarification_authority()
             if request.submission.actor != config.local_actor:
                 return self._rejected()
             detached = ClarificationProposalSubmission.model_validate_json(
                 request.submission.model_dump_json()
             )
-            proposal = self._clarification_coordinator(config).propose(
+            proposal = self._clarification_coordinator(config, authority_preimages).propose(
                 detached,
                 principals=principals,
             )
@@ -1331,7 +1382,7 @@ class McpIntentWorkflowServices:
                     "selected_node_ids": selected_node_ids,
                 }
             )
-            config, _principals_live = self._clarification_authority()
+            config, _principals_live, _authority_preimages = self._clarification_authority()
             if request.actor != config.local_actor:
                 return self._rejected()
             result = self._confirmation.confirm(
@@ -1390,9 +1441,7 @@ def register_intent_workflow_tools(
             submission = cast(BootstrapSubmission, None)
             _fixed_arguments()
         try:
-            detached = BootstrapSubmission.model_validate_json(
-                request.submission.model_dump_json()
-            )
+            detached = BootstrapSubmission.model_validate_json(request.submission.model_dump_json())
             return await services.bootstrap_propose(detached)
         except Exception:  # noqa: BLE001 - one fixed handler boundary
             _fixed_arguments()
@@ -1475,9 +1524,7 @@ def register_intent_workflow_tools(
             submission = cast(AgentClassificationSubmission, None)
             _fixed_arguments()
         try:
-            detached_envelope = TaskEnvelope.model_validate_json(
-                request.envelope.model_dump_json()
-            )
+            detached_envelope = TaskEnvelope.model_validate_json(request.envelope.model_dump_json())
             detached_submission = AgentClassificationSubmission.model_validate_json(
                 request.submission.model_dump_json()
             )
@@ -1561,9 +1608,7 @@ def register_intent_workflow_tools(
                     "opened_at": opened_at,
                 }
             )
-            detached_envelope = TaskEnvelope.model_validate_json(
-                request.envelope.model_dump_json()
-            )
+            detached_envelope = TaskEnvelope.model_validate_json(request.envelope.model_dump_json())
             detached_questions = tuple(
                 ClarificationQuestionInput.model_validate_json(item.model_dump_json())
                 for item in request.questions
@@ -1646,7 +1691,7 @@ def register_intent_workflow_tools(
 
     @server.tool(
         name="intent_clarification_confirm",
-        annotations=_CLARIFY,
+        annotations=_CLARIFY_CONFIRM,
         structured_output=True,
     )
     async def clarification_confirm(

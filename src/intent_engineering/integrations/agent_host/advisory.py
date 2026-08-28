@@ -5,11 +5,20 @@ from __future__ import annotations
 import json
 import os
 import re
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from pathlib import Path
+from types import MappingProxyType
 from typing import Annotated, Literal, cast
 
-from pydantic import ConfigDict, Field, ValidationInfo, field_validator, model_validator
+from pydantic import (
+    ConfigDict,
+    Field,
+    ValidationInfo,
+    field_serializer,
+    field_validator,
+    model_validator,
+)
 
 from intent_engineering.cli.intent_workflow import _snapshot_config
 from intent_engineering.cli.runtime import Runtime
@@ -31,8 +40,7 @@ _MAX_EVENT_BYTES = 64 * 1024
 _MAX_JSON_DEPTH = 128
 _MAX_JSON_NODES = 65_536
 _OFFER = (
-    "This repository has not been onboarded into Intent Engineering. "
-    "Start guided onboarding now?"
+    "This repository has not been onboarded into Intent Engineering. Start guided onboarding now?"
 )
 
 
@@ -145,8 +153,7 @@ def _require_exact_json(value: object) -> None:
                 seen.add(identity)
                 pending.append((item, depth, True))
                 pending.extend(
-                    (nested, depth + 1, False)
-                    for nested in list.__iter__(cast(list[object], item))
+                    (nested, depth + 1, False) for nested in list.__iter__(cast(list[object], item))
                 )
             elif type(item) is str:
                 utf8_bytes += len(item.encode("utf-8"))
@@ -159,6 +166,24 @@ def _require_exact_json(value: object) -> None:
         pending.clear()
         active.clear()
         seen.clear()
+
+
+def _freeze_json(value: object) -> object:
+    if type(value) is dict:
+        return MappingProxyType(
+            {key: _freeze_json(item) for key, item in dict.items(cast(dict[str, object], value))}
+        )
+    if type(value) is list:
+        return tuple(_freeze_json(item) for item in list.__iter__(cast(list[object], value)))
+    return value
+
+
+def _thaw_json(value: object) -> object:
+    if isinstance(value, Mapping):
+        return {str(key): _thaw_json(item) for key, item in value.items()}
+    if type(value) is tuple:
+        return [_thaw_json(item) for item in value]
+    return value
 
 
 class PromptEvent(_HostModel):
@@ -207,7 +232,7 @@ class PromptRoute(_HostModel):
     action: Literal["offer_onboarding", "classify", "answer_clarification", "continue"]
     message: Annotated[str, Field(min_length=1, max_length=2048)]
     mcp_tool: str | None
-    arguments: dict[str, object]
+    arguments: Mapping[str, object]
     advisory: Literal[True] = True
     authorization_issued: Literal[False] = False
 
@@ -225,6 +250,15 @@ class PromptRoute(_HostModel):
             sort_keys=True,
         )
         return json.loads(encoded)
+
+    @field_validator("arguments")
+    @classmethod
+    def freeze_arguments(cls, value: Mapping[str, object]) -> Mapping[str, object]:
+        return cast(Mapping[str, object], _freeze_json(dict(value)))
+
+    @field_serializer("arguments")
+    def serialize_arguments(self, value: Mapping[str, object]) -> dict[str, object]:
+        return cast(dict[str, object], _thaw_json(value))
 
     @model_validator(mode="after")
     def validate_route(self) -> PromptRoute:

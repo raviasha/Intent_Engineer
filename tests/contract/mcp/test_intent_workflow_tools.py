@@ -32,6 +32,7 @@ from intent_engineering.intent_workflow.conversation import ConversationCapture
 from intent_engineering.intent_workflow.models import (
     ClarificationProposalSubmission,
     ClarificationQuestionInput,
+    ClarificationSession,
     TaskClassification,
     TaskEnvelope,
 )
@@ -92,9 +93,7 @@ class _FakeWorkflow:
         proposal_digest: object,
         confirmed_node_ids: object,
     ) -> dict[str, object]:
-        self.calls.append(
-            ("confirm", (proposal_id, proposal_digest, confirmed_node_ids))
-        )
+        self.calls.append(("confirm", (proposal_id, proposal_digest, confirmed_node_ids)))
         return {
             "schema_version": "1",
             "status": "activated",
@@ -200,9 +199,7 @@ class _FakeWorkflow:
         at: datetime,
         selected_node_ids: tuple[str, ...],
     ) -> dict[str, object]:
-        self.calls.append(
-            ("clarification_confirm", (proposal_id, actor, at, selected_node_ids))
-        )
+        self.calls.append(("clarification_confirm", (proposal_id, actor, at, selected_node_ids)))
         return {
             "schema_version": 1,
             "status": "applied",
@@ -309,9 +306,7 @@ def _valid_raw_workflow_arguments(tool_name: str) -> dict[str, object]:
         return {
             "envelope": _raw_mechanical_preflight()["envelope"],
             "classification_evidence_ref": "evidence:conversation:" + "4" * 64,
-            "questions": [
-                {"id": "audience", "prompt": "Who may share reports?", "required": True}
-            ],
+            "questions": [{"id": "audience", "prompt": "Who may share reports?", "required": True}],
             "opened_by": "agent:codex",
             "opened_at": "2026-08-26T12:00:01Z",
         }
@@ -324,9 +319,7 @@ def _valid_raw_workflow_arguments(tool_name: str) -> dict[str, object]:
             "answered_at": "2026-08-26T12:00:02Z",
         }
     if tool_name == "intent_clarification_propose":
-        return {
-            "submission": _clarification_submission().model_dump(mode="json")
-        }
+        return {"submission": _clarification_submission().model_dump(mode="json")}
     if tool_name == "intent_clarification_confirm":
         return {
             "proposal_id": "proposal:sha256:" + "2" * 64,
@@ -445,9 +438,17 @@ async def test_workflow_registration_is_optional_additive_and_has_truthful_annot
             item.open_world_hint,
         )
         == (False, False, False, False)
-        for item in clarification_annotations
+        for item in clarification_annotations[:3]
         if item is not None
     )
+    clarification_confirm_annotations = clarification_annotations[3]
+    assert clarification_confirm_annotations is not None
+    assert (
+        clarification_confirm_annotations.read_only_hint,
+        clarification_confirm_annotations.destructive_hint,
+        clarification_confirm_annotations.idempotent_hint,
+        clarification_confirm_annotations.open_world_hint,
+    ) == (False, True, False, False)
     all_public_names = {
         *by_name,
         *(prompt.name for prompt in await with_workflow.list_prompts()),
@@ -475,16 +476,13 @@ async def test_workflow_registration_is_optional_additive_and_has_truthful_annot
         "provisional_node_ids",
     }
     preflight_schema = by_name["intent_preflight"].input_schema
-    assert preflight_schema["properties"]["envelope"] == {
-        "$ref": "#/$defs/_TaskEnvelopeInput"
-    }
+    assert preflight_schema["properties"]["envelope"] == {"$ref": "#/$defs/_TaskEnvelopeInput"}
     assert preflight_schema["properties"]["submission"] == {
         "$ref": "#/$defs/_AgentClassificationInput"
     }
     assert preflight_schema["$defs"]["TaskEnvelope"]["additionalProperties"] is False
     assert (
-        preflight_schema["$defs"]["AgentClassificationSubmission"]["additionalProperties"]
-        is False
+        preflight_schema["$defs"]["AgentClassificationSubmission"]["additionalProperties"] is False
     )
     for name in (
         "intent_clarification_open",
@@ -492,29 +490,32 @@ async def test_workflow_registration_is_optional_additive_and_has_truthful_annot
         "intent_clarification_propose",
         "intent_clarification_confirm",
     ):
-        assert set(by_name[name].input_schema["properties"]) == {
-            "intent_clarification_open": {
-                "envelope",
-                "classification_evidence_ref",
-                "questions",
-                "opened_by",
-                "opened_at",
-            },
-            "intent_clarification_answer": {
-                "session_id",
-                "question_id",
-                "answer",
-                "actor",
-                "answered_at",
-            },
-            "intent_clarification_propose": {"submission"},
-            "intent_clarification_confirm": {
-                "proposal_id",
-                "actor",
-                "at",
-                "selected_node_ids",
-            },
-        }[name]
+        assert (
+            set(by_name[name].input_schema["properties"])
+            == {
+                "intent_clarification_open": {
+                    "envelope",
+                    "classification_evidence_ref",
+                    "questions",
+                    "opened_by",
+                    "opened_at",
+                },
+                "intent_clarification_answer": {
+                    "session_id",
+                    "question_id",
+                    "answer",
+                    "actor",
+                    "answered_at",
+                },
+                "intent_clarification_propose": {"submission"},
+                "intent_clarification_confirm": {
+                    "proposal_id",
+                    "actor",
+                    "at",
+                    "selected_node_ids",
+                },
+            }[name]
+        )
 
 
 async def test_clarification_tools_delegate_strict_detached_typed_payloads(
@@ -602,14 +603,17 @@ async def test_clarification_tools_delegate_strict_detached_typed_payloads(
             ),
         ),
     ]
-    assert "authorization" not in json.dumps(
-        [
-            opened.structured_content,
-            answered.structured_content,
-            proposed.structured_content,
-            confirmed.structured_content,
-        ]
-    ).casefold()
+    assert (
+        "authorization"
+        not in json.dumps(
+            [
+                opened.structured_content,
+                answered.structured_content,
+                proposed.structured_content,
+                confirmed.structured_content,
+            ]
+        ).casefold()
+    )
 
 
 async def test_workflow_tools_delegate_detached_typed_payloads(tmp_path: Path) -> None:
@@ -789,6 +793,341 @@ def _preflight_inputs(
     )
 
 
+def _transaction_bytes(runtime) -> dict[str, bytes | None]:
+    content: dict[str, bytes | None] = {}
+    for name in runtime.transactions.target_names:
+        target = runtime.transactions.target_file(name)
+        try:
+            content[name] = target.read_optional()
+        finally:
+            target.close()
+    content["journal"] = (
+        runtime.transactions.journal_path.read_bytes()
+        if (runtime.transactions.journal_path.exists())
+        else None
+    )
+    return content
+
+
+def _proposal_submission_for_session(
+    session: ClarificationSession,
+) -> ClarificationProposalSubmission:
+    timestamp = session.opened_at + timedelta(microseconds=4)
+    evidence_refs = (
+        session.request_evidence_ref,
+        session.classification_evidence_ref,
+        *(item.evidence_ref for item in session.questions),
+        *(item.evidence_ref for item in session.answers),
+    )
+    node = Node(
+        id="requirement:authority-race",
+        type=NodeType.REQUIREMENT,
+        label="Authority-bound clarification",
+        status="proposed",
+        created_by="local",
+        created_at=timestamp,
+        last_modified_by="local",
+        last_modified_at=timestamp,
+        source_mode=SourceMode.INFERRED,
+        intent_fidelity_confidence=0.8,
+        confidence_basis="Clarified conversation",
+        last_reassessed_at=timestamp,
+        evidence_refs=evidence_refs,
+    )
+    changeset = ChangeSet(
+        id="",
+        actor="local",
+        timestamp=timestamp,
+        baseline_graph_version=session.baseline_graph_version,
+        evidence_refs=evidence_refs,
+        nodes_added=(node,),
+        nodes_updated=(),
+        nodes_superseded=(),
+        edges_added=(),
+        edges_updated=(),
+        edges_superseded=(),
+        confidence_changes=(),
+        implementation_status_changes=(),
+        reconciliation_cases_created=(),
+        reconciliation_cases_resolved=(),
+        validation_status="validated",
+    )
+    return ClarificationProposalSubmission(
+        session_id=session.id,
+        task_id=session.task_id,
+        baseline_graph_version=session.baseline_graph_version,
+        actor="local",
+        timestamp=timestamp,
+        evidence_refs=evidence_refs,
+        changeset=changeset,
+        core_node_ids=(node.id,),
+    )
+
+
+async def _production_clarification_server(tmp_path: Path):
+    from intent_engineering.integrations.mcp_server.intent_workflow import (
+        load_intent_workflow_services,
+    )
+
+    project, bootstrap = await anyio.to_thread.run_sync(_configured_project, tmp_path)
+    policy = {
+        "schema_version": 1,
+        "contributors": ["local"],
+        "approvers": ["local"],
+        "executors": ["local"],
+        "identities": {"local": ["local", "local:authority-before"]},
+    }
+    (project / ".intent/approvals/policy.yaml").write_text(
+        yaml.safe_dump(policy, sort_keys=True), encoding="utf-8"
+    )
+    runtime = load_runtime(project)
+    workflow = load_intent_workflow_services(runtime)
+    server = build_server(McpReadServices(runtime), intent_workflow_services=workflow)
+    proposed = await server.call_tool(
+        "intent_bootstrap_propose", {"submission": bootstrap.model_dump(mode="json")}
+    )
+    await server.call_tool(
+        "intent_proposal_confirm",
+        {
+            "proposal_id": proposed.structured_content["proposal_id"],
+            "proposal_digest": proposed.structured_content["proposal_digest"],
+            "confirmed_node_ids": ["intent:local-export", "requirement:csv-export"],
+        },
+    )
+    envelope, classification = _preflight_inputs(
+        runtime,
+        classification=TaskClassification.NEW_OR_AMBIGUOUS,
+        conversation_ref="codex:authority-race",
+        request="Add authority-bound sharing",
+        questions=("Who may share?",),
+    )
+    return project, runtime, workflow, server, envelope, classification
+
+
+def _open_arguments(
+    envelope: TaskEnvelope,
+    classification: AgentClassificationSubmission,
+) -> dict[str, object]:
+    return {
+        "envelope": envelope.model_dump(mode="json"),
+        "classification_evidence_ref": classification.agent_evidence_ref,
+        "questions": [{"id": "audience", "prompt": "Who may share?", "required": True}],
+        "opened_by": "agent:codex",
+        "opened_at": (envelope.created_at + timedelta(microseconds=2))
+        .isoformat()
+        .replace("+00:00", "Z"),
+    }
+
+
+@pytest.mark.parametrize("operation", ["open", "answer", "propose"])
+async def test_clarification_authority_change_before_each_write_is_an_exact_noop(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+) -> None:
+    (
+        project,
+        runtime,
+        _workflow,
+        server,
+        envelope,
+        classification,
+    ) = await _production_clarification_server(tmp_path)
+    opened = None
+    if operation in {"answer", "propose"}:
+        opened = await server.call_tool(
+            "intent_clarification_open", _open_arguments(envelope, classification)
+        )
+    if operation == "propose":
+        assert opened is not None
+        await server.call_tool(
+            "intent_clarification_answer",
+            {
+                "session_id": opened.structured_content["session"]["id"],
+                "question_id": "audience",
+                "answer": "Workspace administrators",
+                "actor": "local",
+                "answered_at": (envelope.created_at + timedelta(microseconds=5))
+                .isoformat()
+                .replace("+00:00", "Z"),
+            },
+        )
+    session = (
+        None
+        if opened is None
+        else runtime.intent_proposals.session(opened.structured_content["session"]["id"])
+    )
+    arguments = (
+        _open_arguments(envelope, classification)
+        if operation == "open"
+        else {
+            "session_id": session.id,
+            "question_id": "audience",
+            "answer": "Workspace administrators",
+            "actor": "local",
+            "answered_at": (envelope.created_at + timedelta(microseconds=5))
+            .isoformat()
+            .replace("+00:00", "Z"),
+        }
+        if operation == "answer"
+        else {"submission": _proposal_submission_for_session(session).model_dump(mode="json")}
+    )
+    tool_name = f"intent_clarification_{operation}"
+    before = _transaction_bytes(runtime)
+    raced_policy = {
+        "schema_version": 1,
+        "contributors": ["local"],
+        "approvers": ["local"],
+        "executors": ["local"],
+        "identities": {"local": ["local", "local:authority-after"]},
+    }
+
+    raced = False
+
+    def change_authority() -> None:
+        nonlocal raced
+        if raced:
+            return
+        raced = True
+        (project / ".intent/approvals/policy.yaml").write_text(
+            yaml.safe_dump(raced_policy, sort_keys=True), encoding="utf-8"
+        )
+
+    if operation in {"open", "answer"}:
+        original_record_turn = ConversationCapture.record_turn
+
+        def race_evidence(self, **kwargs: object):
+            change_authority()
+            return original_record_turn(self, **kwargs)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(ConversationCapture, "record_turn", race_evidence)
+    else:
+        original_ledger_bytes = runtime.intent_proposals.bytes
+
+        def race_proposal_ledger() -> bytes:
+            change_authority()
+            return original_ledger_bytes()
+
+        monkeypatch.setattr(runtime.intent_proposals, "bytes", race_proposal_ledger)
+    response = await server.call_tool(tool_name, arguments)
+
+    assert raced is True
+    assert response.structured_content == {
+        "schema_version": "1",
+        "status": "rejected",
+        "reason": "intent_workflow_unavailable",
+    }
+    assert _transaction_bytes(runtime) == before
+
+
+@pytest.mark.parametrize(
+    "question_id",
+    ["audience\x00private", "x" * 257],
+)
+async def test_clarification_question_id_bounds_fail_before_production_persistence(
+    tmp_path: Path,
+    question_id: str,
+) -> None:
+    (
+        _project,
+        runtime,
+        _workflow,
+        server,
+        envelope,
+        classification,
+    ) = await _production_clarification_server(tmp_path)
+    arguments = _open_arguments(envelope, classification)
+    arguments["questions"][0]["id"] = question_id
+    before = _transaction_bytes(runtime)
+
+    with pytest.raises(ToolError, match="invalid intent workflow arguments"):
+        await server.call_tool("intent_clarification_open", arguments)
+
+    assert _transaction_bytes(runtime) == before
+
+
+async def test_clarification_question_id_subclass_is_rejected_without_behavior(
+    tmp_path: Path,
+) -> None:
+    accessed: list[str] = []
+
+    class HostileQuestionId(str):
+        def encode(self, *args: object, **kwargs: object) -> bytes:
+            accessed.append("encode")
+            raise RuntimeError("PRIVATE-HOSTILE-QUESTION-ID")
+
+    workflow = _FakeWorkflow()
+    server = build_server(_services(tmp_path), intent_workflow_services=workflow)
+    arguments = _valid_raw_workflow_arguments("intent_clarification_open")
+    arguments["questions"][0]["id"] = HostileQuestionId("audience")
+
+    with pytest.raises(ToolError, match="invalid intent workflow arguments"):
+        await server.call_tool("intent_clarification_open", arguments)
+
+    assert accessed == []
+    assert workflow.calls == []
+
+
+@pytest.mark.parametrize(
+    "timestamp",
+    [
+        "2026-08-26T12:00:03+00:00",
+        "2026-08-26T17:30:03+05:30",
+        "2026-08-26 12:00:03Z",
+        "2026-08-26T12:00:03.000000Z",
+    ],
+)
+@pytest.mark.parametrize("location", ["submission", "changeset"])
+async def test_clarification_proposal_requires_canonical_nested_utc_z_timestamps(
+    tmp_path: Path,
+    timestamp: str,
+    location: str,
+) -> None:
+    workflow = _FakeWorkflow()
+    server = build_server(_services(tmp_path), intent_workflow_services=workflow)
+    arguments = _valid_raw_workflow_arguments("intent_clarification_propose")
+    submission = arguments["submission"]
+    assert type(submission) is dict
+    target = submission if location == "submission" else submission["changeset"]
+    assert type(target) is dict
+    target["timestamp"] = timestamp
+
+    with pytest.raises(ToolError, match="invalid intent workflow arguments"):
+        await server.call_tool("intent_clarification_propose", arguments)
+
+    assert workflow.calls == []
+
+
+async def test_nested_clarification_timestamp_subclass_never_executes_behavior(
+    tmp_path: Path,
+) -> None:
+    accessed: list[str] = []
+
+    class HostileTimestamp(str):
+        def encode(self, *args: object, **kwargs: object) -> bytes:
+            accessed.append("encode")
+            raise RuntimeError("PRIVATE-HOSTILE-TIMESTAMP")
+
+        def endswith(self, *args: object, **kwargs: object) -> bool:
+            accessed.append("endswith")
+            raise RuntimeError("PRIVATE-HOSTILE-TIMESTAMP")
+
+    workflow = _FakeWorkflow()
+    server = build_server(_services(tmp_path), intent_workflow_services=workflow)
+    arguments = _valid_raw_workflow_arguments("intent_clarification_propose")
+    submission = arguments["submission"]
+    assert type(submission) is dict
+    changeset = submission["changeset"]
+    assert type(changeset) is dict
+    changeset["timestamp"] = HostileTimestamp("2026-08-26T12:00:03Z")
+
+    with pytest.raises(ToolError, match="invalid intent workflow arguments"):
+        await server.call_tool("intent_clarification_propose", arguments)
+
+    assert accessed == []
+    assert workflow.calls == []
+
+
 async def test_production_preflight_issues_only_authorized_results_and_verifies_live_scope(
     tmp_path: Path,
 ) -> None:
@@ -929,9 +1268,7 @@ async def test_production_preflight_issues_only_authorized_results_and_verifies_
             clock=lambda: current[0],
         ),
     )
-    after_restart = await restarted.call_tool(
-        "intent_authorization_verify", base_verification
-    )
+    after_restart = await restarted.call_tool("intent_authorization_verify", base_verification)
     current[0] = datetime(2026, 8, 26, 12, 6, 1, tzinfo=UTC)
     expired = await server.call_tool("intent_authorization_verify", base_verification)
     assert accepted.structured_content == {
@@ -1034,17 +1371,16 @@ async def test_production_clarification_lifecycle_preserves_evidence_and_exact_c
             "question_id": "audience",
             "answer": answer_text,
             "actor": "local",
-            "answered_at": (base + timedelta(microseconds=5)).isoformat().replace(
-                "+00:00", "Z"
-            ),
+            "answered_at": (base + timedelta(microseconds=5)).isoformat().replace("+00:00", "Z"),
         },
     )
     session = runtime.intent_proposals.session(session_id)
     assert tuple(item.author for item in session.questions) == ("agent:codex",)
     assert tuple(item.actor for item in session.answers) == ("local",)
-    assert "local:authoritative-alias" in runtime.evidence_store.get(
-        session.answers[0].evidence_ref
-    ).acl
+    assert (
+        "local:authoritative-alias"
+        in runtime.evidence_store.get(session.answers[0].evidence_ref).acl
+    )
     evidence_refs = (
         session.request_evidence_ref,
         session.classification_evidence_ref,
@@ -1153,9 +1489,7 @@ async def test_production_clarification_lifecycle_preserves_evidence_and_exact_c
     durable_proposals = (project / ".intent/history/intent-proposals.jsonl").read_text(
         encoding="utf-8"
     )
-    durable_evidence = (project / ".intent/evidence/evidence.jsonl").read_text(
-        encoding="utf-8"
-    )
+    durable_evidence = (project / ".intent/evidence/evidence.jsonl").read_text(encoding="utf-8")
     assert question_text not in durable_proposals
     assert answer_text not in durable_proposals
     assert question_text in durable_evidence
@@ -1206,9 +1540,7 @@ async def test_production_verification_reauthenticates_live_graph_and_config(
     runtime.graph_store.initialize(
         graph.model_copy(update={"purpose": "PRIVATE-SAME-VERSION-REPLACEMENT"})
     )
-    same_version_denied = await server.call_tool(
-        "intent_authorization_verify", arguments
-    )
+    same_version_denied = await server.call_tool("intent_authorization_verify", arguments)
     runtime.graph_store.initialize(graph)
     config_path = project / ".intent/config.yaml"
     config = runtime.config.model_copy(update={"local_actor": "local:other"})
@@ -1307,9 +1639,7 @@ async def test_authorization_verify_denies_graph_swap_during_issuer_check(
     original_graph = runtime.graph_store.load()
     original_verify = workflow._issuer.verify
 
-    def swap_then_verify(
-        *args: object, **kwargs: object
-    ) -> AuthorizationVerification:
+    def swap_then_verify(*args: object, **kwargs: object) -> AuthorizationVerification:
         runtime.graph_store.initialize(
             original_graph.model_copy(update={"purpose": "PRIVATE-VERIFY-RACE"})
         )
@@ -1476,8 +1806,7 @@ def _cycle_validation_child(kind: str, connection: Connection) -> None:
         connection.send(
             (
                 error.args,
-                marker not in repr(error)
-                and marker not in _repository_traceback_values(error),
+                marker not in repr(error) and marker not in _repository_traceback_values(error),
             )
         )
     except BaseException as error:  # noqa: BLE001 - child reports exact boundary outcome
@@ -1806,11 +2135,7 @@ async def test_raw_workflow_tree_is_validated_before_hostile_key_or_scalar_behav
         first_key, first_value = next(iter(dict.items(arguments)))
         arguments = {
             HostileString(first_key): first_value,
-            **{
-                key: value
-                for key, value in dict.items(arguments)
-                if key != first_key
-            },
+            **{key: value for key, value in dict.items(arguments) if key != first_key},
         }
     elif tool_name == "intent_bootstrap_propose":
         submission = arguments["submission"]
@@ -2048,9 +2373,7 @@ async def test_raw_preflight_cancellation_preserves_identity_without_secret_repo
     envelope = arguments["envelope"]
     assert type(envelope) is dict
     envelope["request"] = "PRIVATE-RAW-PREFLIGHT-CANCELLATION"
-    server = build_server(
-        _services(tmp_path), intent_workflow_services=_FakeWorkflow()
-    )
+    server = build_server(_services(tmp_path), intent_workflow_services=_FakeWorkflow())
 
     def cancel(*_args: object, **_kwargs: object) -> str:
         raise signal
@@ -2060,9 +2383,7 @@ async def test_raw_preflight_cancellation_preserves_identity_without_secret_repo
         await server.call_tool("intent_preflight", arguments)
 
     assert caught.value is signal
-    assert "PRIVATE-RAW-PREFLIGHT-CANCELLATION" not in _repository_traceback_values(
-        caught.value
-    )
+    assert "PRIVATE-RAW-PREFLIGHT-CANCELLATION" not in _repository_traceback_values(caught.value)
 
 
 async def test_authorization_verify_rejects_dict_subclass_before_member_access(
@@ -2112,9 +2433,7 @@ async def test_handler_failure_is_fixed_and_cancellation_preserves_signal_withou
         "core_node_ids": [],
         "provisional_node_ids": [],
     }
-    failed = build_server(
-        _services(tmp_path), intent_workflow_services=_FailingWorkflow()
-    )
+    failed = build_server(_services(tmp_path), intent_workflow_services=_FailingWorkflow())
     with pytest.raises(ToolError) as caught:
         await failed.call_tool("intent_bootstrap_propose", {"submission": submission})
     assert caught.value.args == ("invalid intent workflow arguments",)
