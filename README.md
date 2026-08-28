@@ -11,7 +11,9 @@ it becomes a reviewable reconciliation case with its supporting evidence.
 2. **Manage** typed intent, requirement, decision, implementation, and test
    assertions in a provenance-backed graph.
 3. **Sync** fresh evidence through deterministic validation and mapping.
-4. **Reconcile** evidence-backed divergence with a human review step before a
+4. **Assure** that current code and tests remain aligned with current intent and
+   requirements, opening evidence-backed cases for detected gaps.
+5. **Reconcile** evidence-backed divergence with a human review step before a
    graph-changing resolution.
 
 The supplied [framework graph](graph/framework-intent-graph.yaml) dogfoods the
