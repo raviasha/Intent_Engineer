@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import Callable, Mapping
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from pathlib import PurePosixPath, PureWindowsPath
 from typing import Annotated, Never, Protocol, cast
@@ -22,7 +22,7 @@ from intent_engineering.cli.intent_workflow import (
     proposal_payload,
 )
 from intent_engineering.cli.runtime import Runtime
-from intent_engineering.core.models import ProjectConfig
+from intent_engineering.core.models import JsonValue, ProjectConfig
 from intent_engineering.core.models._base import StrictModel
 from intent_engineering.intent_workflow.authorization import (
     AuthorizationIssuer,
@@ -42,12 +42,14 @@ from intent_engineering.intent_workflow.models import (
     ClarificationQuestionInput,
     ClarificationSession,
     PreflightResult,
+    TaskClassification,
     TaskEnvelope,
 )
 from intent_engineering.intent_workflow.preflight import (
     AgentClassificationSubmission,
     AuthenticatedPreflightResult,
     PreflightService,
+    classification_evidence_content,
 )
 from intent_engineering.storage.executor import LocalChangeSetExecutor
 from intent_engineering.storage.secure import SecureDirectory, SecureFile, SecureRead
@@ -76,6 +78,12 @@ _PREFLIGHT = ToolAnnotations(
     read_only_hint=False,
     destructive_hint=False,
     idempotent_hint=False,
+    open_world_hint=False,
+)
+_ADVISORY_PREFLIGHT = ToolAnnotations(
+    read_only_hint=False,
+    destructive_hint=False,
+    idempotent_hint=True,
     open_world_hint=False,
 )
 _VERIFY = ToolAnnotations(
@@ -112,6 +120,7 @@ _DIGEST = r"^sha256:[0-9a-f]{64}$"
 _TASK_ID = r"^task:sha256:[0-9a-f]{64}$"
 _CLARIFICATION_ID = r"^clarification:sha256:[0-9a-f]{64}$"
 _CONTROL = re.compile(r"[\x00-\x1f\x7f]")
+_PROMPT_CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 _WINDOWS_DEVICE = re.compile(r"^(?:CON|PRN|AUX|NUL|CLOCK\$|COM[1-9]|LPT[1-9])$", re.IGNORECASE)
 type _ProposalIdInput = Annotated[str, Field(pattern=_PROPOSAL_ID)]
 type _DigestInput = Annotated[str, Field(pattern=_DIGEST)]
@@ -173,6 +182,8 @@ type _AgentClassificationInput = Annotated[
     AgentClassificationSubmission,
     BeforeValidator(_classification_input),
 ]
+
+
 type _TokenInput = Annotated[str, Field(min_length=1, max_length=_MAX_TOKEN_BYTES)]
 type _AuthorizationIdentityInput = Annotated[
     str,
@@ -571,6 +582,108 @@ class IntentPreflightRequest(_Request):
         return value
 
 
+class AdvisoryClassificationDraft(_Request):
+    """Bounded agent judgment without caller-supplied task or identity authority."""
+
+    classification: TaskClassification
+    basis: Annotated[str, Field(min_length=1, max_length=4096)]
+    relevant_node_ids: Annotated[tuple[str, ...], Field(max_length=256)] = ()
+    evidence_refs: Annotated[tuple[str, ...], Field(max_length=256)] = ()
+    semantic_effects: Annotated[tuple[str, ...], Field(max_length=64)] = ()
+    uncertainties: Annotated[tuple[str, ...], Field(max_length=64)] = ()
+    questions: Annotated[tuple[str, ...], Field(max_length=16)] = ()
+    conflict_claims: Annotated[tuple[str, ...], Field(max_length=64)] = ()
+    requested_scope: Annotated[tuple[str, ...], Field(max_length=256)] = ()
+
+    @field_validator("basis")
+    @classmethod
+    def require_basis(cls, value: str) -> str:
+        if type(value) is not str or _CONTROL.search(value) or len(value.encode("utf-8")) > 4096:
+            raise ValueError("invalid workflow request")
+        return value
+
+    @field_validator("relevant_node_ids", "evidence_refs", "requested_scope")
+    @classmethod
+    def require_identifiers(cls, values: tuple[str, ...]) -> tuple[str, ...]:
+        if any(
+            type(value) is not str
+            or not value
+            or _CONTROL.search(value)
+            or len(value.encode("utf-8")) > _MAX_AUTHORIZATION_FIELD_BYTES
+            for value in values
+        ) or len(values) != len(set(values)):
+            raise ValueError("invalid workflow request")
+        return tuple(sorted(values))
+
+    @field_validator("semantic_effects", "uncertainties", "questions", "conflict_claims")
+    @classmethod
+    def require_text(cls, values: tuple[str, ...]) -> tuple[str, ...]:
+        if any(
+            type(value) is not str
+            or not value
+            or _CONTROL.search(value)
+            or len(value.encode("utf-8")) > 4096
+            for value in values
+        ) or len(values) != len(set(values)):
+            raise ValueError("invalid workflow request")
+        return tuple(sorted(values))
+
+
+class IntentAdvisoryPreflightRequest(_Request):
+    conversation_ref: Annotated[str, Field(min_length=1, max_length=512)]
+    request: Annotated[str, Field(min_length=1, max_length=16 * 1024)]
+    draft: AdvisoryClassificationDraft
+
+    @field_validator("conversation_ref")
+    @classmethod
+    def require_conversation_ref(cls, value: str) -> str:
+        if type(value) is not str or _CONTROL.search(value) or len(value.encode("utf-8")) > 512:
+            raise ValueError("invalid workflow request")
+        return value
+
+    @field_validator("request")
+    @classmethod
+    def require_request(cls, value: str) -> str:
+        if (
+            type(value) is not str
+            or not value
+            or _PROMPT_CONTROL.search(value)
+            or len(value.encode("utf-8")) > 16 * 1024
+        ):
+            raise ValueError("invalid workflow request")
+        return value
+
+    @field_validator("draft")
+    @classmethod
+    def require_draft(cls, value: AdvisoryClassificationDraft) -> AdvisoryClassificationDraft:
+        _canonical_json(value.model_dump(mode="json"))
+        return value
+
+
+def _advisory_draft_input(value: object) -> AdvisoryClassificationDraft:
+    encoded: bytes | None = None
+    draft: AdvisoryClassificationDraft | None = None
+    try:
+        if type(value) is AdvisoryClassificationDraft:
+            encoded = _canonical_json(value.model_dump(mode="json"))
+        elif type(value) is dict:
+            encoded = _canonical_json(value)
+        else:
+            raise ValueError("invalid workflow request")
+        draft = AdvisoryClassificationDraft.model_validate_json(encoded)
+        return draft
+    finally:
+        value = None
+        encoded = None
+        draft = None
+
+
+type _AdvisoryDraftInput = Annotated[
+    AdvisoryClassificationDraft,
+    BeforeValidator(_advisory_draft_input),
+]
+
+
 class AuthorizationVerifyRequest(_Request):
     token: Annotated[str, Field(min_length=1, max_length=_MAX_TOKEN_BYTES)]
     actor: Annotated[str, Field(min_length=1, max_length=_MAX_AUTHORIZATION_FIELD_BYTES)]
@@ -750,6 +863,13 @@ class IntentWorkflowPort(Protocol):
         submission: AgentClassificationSubmission,
     ) -> dict[str, object]: ...
 
+    async def advisory_preflight(
+        self,
+        conversation_ref: str,
+        request: str,
+        draft: AdvisoryClassificationDraft,
+    ) -> dict[str, object]: ...
+
     async def authorization_verify(
         self,
         token: str,
@@ -833,6 +953,10 @@ def validate_intent_workflow_call(name: str, arguments: dict[str, object]) -> No
                 raise ValueError("invalid workflow request")
             _task_envelope_input(dict.__getitem__(arguments, "envelope"))
             _classification_input(dict.__getitem__(arguments, "submission"))
+        elif name == "intent_advisory_preflight":
+            if set(arguments) != {"conversation_ref", "request", "draft"}:
+                raise ValueError("invalid workflow request")
+            IntentAdvisoryPreflightRequest.model_validate_json(_canonical_json(arguments))
         elif name == "intent_authorization_verify":
             expected = {
                 "token",
@@ -880,6 +1004,7 @@ def validate_intent_workflow_call(name: str, arguments: dict[str, object]) -> No
             "intent_bootstrap_propose",
             "intent_proposal_show",
             "intent_proposal_confirm",
+            "intent_advisory_preflight",
         }:
             raise ValueError("invalid workflow request")
     except Exception:  # noqa: BLE001 - one fixed raw-request validation boundary
@@ -1181,6 +1306,256 @@ class McpIntentWorkflowServices:
             if "config" in locals():
                 config = cast(ProjectConfig, None)
                 config_bytes = b""
+
+    @staticmethod
+    def _advisory_submission(
+        envelope: TaskEnvelope,
+        draft: AdvisoryClassificationDraft,
+        agent_evidence_ref: str,
+    ) -> AgentClassificationSubmission:
+        return AgentClassificationSubmission(
+            task_id=envelope.id,
+            task_digest=envelope.digest,
+            graph_version=envelope.graph_version,
+            classification=draft.classification,
+            basis=draft.basis,
+            relevant_node_ids=draft.relevant_node_ids,
+            evidence_refs=draft.evidence_refs,
+            agent_evidence_ref=agent_evidence_ref,
+            semantic_effects=draft.semantic_effects,
+            uncertainties=draft.uncertainties,
+            questions=draft.questions,
+            conflict_claims=draft.conflict_claims,
+            requested_scope=draft.requested_scope,
+        )
+
+    @staticmethod
+    def _advisory_content(
+        envelope: TaskEnvelope,
+        draft: AdvisoryClassificationDraft,
+    ) -> dict[str, JsonValue]:
+        return classification_evidence_content(
+            task_id=envelope.id,
+            task_digest=envelope.digest,
+            graph_version=envelope.graph_version,
+            classification=draft.classification,
+            basis=draft.basis,
+            relevant_node_ids=draft.relevant_node_ids,
+            evidence_refs=draft.evidence_refs,
+            semantic_effects=draft.semantic_effects,
+            uncertainties=draft.uncertainties,
+            questions=draft.questions,
+            conflict_claims=draft.conflict_claims,
+            requested_scope=draft.requested_scope,
+        )
+
+    async def advisory_preflight(
+        self,
+        conversation_ref: str,
+        request: str,
+        draft: AdvisoryClassificationDraft,
+    ) -> dict[str, object]:
+        authority_files: dict[str, SecureFile] = {}
+        detached_draft: AdvisoryClassificationDraft | None = None
+        try:
+            validated = IntentAdvisoryPreflightRequest.model_validate(
+                {"conversation_ref": conversation_ref, "request": request, "draft": draft}
+            )
+            detached_draft = AdvisoryClassificationDraft.model_validate_json(
+                validated.draft.model_dump_json()
+            )
+            clarification_authority = True
+            try:
+                (
+                    config,
+                    clarification_principals,
+                    authority_files,
+                    authority_preimages,
+                    authority_membership_digest,
+                ) = self._clarification_authority()
+                authority_files["config"] = authority_files.pop("authority_config")
+                authority_preimages = dict(authority_preimages)
+                authority_preimages["config"] = authority_preimages.pop("authority_config")
+            except Exception:
+                policy_file = self._clarification_authority_base_files["authority_policy"]
+                if (
+                    policy_file.read_optional_nonblocking(
+                        max_bytes=_MAX_CONNECTOR_BINDING_FILE_BYTES
+                    )
+                    is not None
+                ):
+                    raise
+                clarification_authority = False
+                config, config_bytes = _snapshot_config(self.runtime)
+                clarification_principals = frozenset()
+                authority_files = {"config": self._config_file.duplicate()}
+                authority_preimages = {"config": config_bytes}
+                authority_membership_digest = ""
+            authority_policies = _clarification_authority_read_policies(authority_files)
+            policy_principals = _principals(self.runtime, config)
+            capture = ConversationCapture(
+                self.runtime.evidence_store,
+                connector_id="conversation:codex",
+            )
+            with self.runtime.transactions.transaction(
+                rollback_base_exceptions=True,
+                extras=authority_files,
+                extra_read_policies=authority_policies,
+            ) as transaction:
+
+                def authority_matches() -> bool:
+                    return (
+                        not clarification_authority
+                        or _connector_membership_digest(self._clarification_connector_directory)
+                        == authority_membership_digest
+                    ) and all(
+                        transaction.read_optional(name) == content
+                        for name, content in authority_preimages.items()
+                    )
+
+                if not authority_matches():
+                    raise ValueError("advisory authority changed")
+                graph = self.runtime.graph_store.load()
+                ledger = tuple(self.runtime.evidence_store.ledger("conversation:codex"))
+                human_candidates = tuple(
+                    item
+                    for item in ledger
+                    if item.evidence.external_object_id == validated.conversation_ref
+                    and item.evidence.payload.get("role") == "human"
+                    and item.evidence.payload.get("content") == validated.request
+                )
+                envelope: TaskEnvelope | None = None
+                agent_ref = ""
+                for human_entry in human_candidates:
+                    candidate = TaskEnvelope(
+                        repository_id=config.project_id,
+                        actor=human_entry.evidence.author or "",
+                        conversation_ref=validated.conversation_ref,
+                        request=validated.request,
+                        request_evidence_ref=human_entry.evidence.id,
+                        graph_version=graph.version,
+                        created_at=human_entry.evidence.observed_at,
+                        requested_scope=detached_draft.requested_scope,
+                    )
+                    expected_content = self._advisory_content(candidate, detached_draft)
+                    matching_agents = tuple(
+                        item
+                        for item in ledger
+                        if item.predecessor_id == human_entry.evidence.id
+                        and item.evidence.external_object_id == validated.conversation_ref
+                        and item.evidence.author == "agent:codex"
+                        and item.evidence.payload.get("role") == "agent"
+                    )
+                    if (
+                        len(matching_agents) == 1
+                        and human_entry.evidence.acl == tuple(sorted(policy_principals))
+                        and matching_agents[0].evidence.acl == tuple(sorted(policy_principals))
+                        and matching_agents[0].evidence.payload.get("content") is not None
+                        and cast(
+                            dict[str, object],
+                            matching_agents[0].evidence.model_dump(mode="json")["payload"],
+                        ).get("content")
+                        == expected_content
+                    ):
+                        envelope = candidate
+                        agent_ref = matching_agents[0].evidence.id
+                        break
+                if envelope is None:
+                    if human_candidates:
+                        raise ValueError("divergent advisory replay")
+                    captured_at = self._clock()
+                    if (
+                        type(captured_at) is not datetime
+                        or captured_at.tzinfo is None
+                        or captured_at.utcoffset() is None
+                    ):
+                        raise ValueError("invalid advisory clock")
+                    captured_at = captured_at.astimezone(UTC)
+                    human = capture.record_turn(
+                        conversation_ref=validated.conversation_ref,
+                        role="human",
+                        author=config.local_actor,
+                        content=validated.request,
+                        captured_at=captured_at,
+                        acl=tuple(sorted(policy_principals)),
+                    )
+                    envelope = TaskEnvelope(
+                        repository_id=config.project_id,
+                        actor=config.local_actor,
+                        conversation_ref=validated.conversation_ref,
+                        request=validated.request,
+                        request_evidence_ref=human.id,
+                        graph_version=graph.version,
+                        created_at=captured_at,
+                        requested_scope=detached_draft.requested_scope,
+                    )
+                    agent = capture.record_turn(
+                        conversation_ref=validated.conversation_ref,
+                        role="agent",
+                        author="agent:codex",
+                        content=self._advisory_content(envelope, detached_draft),
+                        captured_at=captured_at + timedelta(microseconds=1),
+                        acl=tuple(sorted(policy_principals)),
+                    )
+                    agent_ref = agent.id
+                submission = self._advisory_submission(envelope, detached_draft, agent_ref)
+                result = self._preflight.evaluate(
+                    envelope,
+                    submission,
+                    principals=policy_principals,
+                )
+                if result.classification is TaskClassification.NEW_OR_AMBIGUOUS:
+                    if not clarification_authority:
+                        raise ValueError("clarification authority unavailable")
+                    questions = tuple(
+                        ClarificationQuestionInput(
+                            id=f"question:sha256:{sha256(prompt.encode('utf-8')).hexdigest()}",
+                            prompt=prompt,
+                        )
+                        for prompt in result.questions
+                    )
+                    session = self._clarification_coordinator(
+                        config,
+                        authority_files,
+                        authority_preimages,
+                        authority_membership_digest,
+                    ).open(
+                        envelope,
+                        classification_evidence_ref=agent_ref,
+                        questions=questions,
+                        opened_by="agent:codex",
+                        opened_at=envelope.created_at + timedelta(microseconds=2),
+                        principals=clarification_principals,
+                    )
+                    context = dict(result.context)
+                    context["clarification_session"] = cast(
+                        JsonValue, session.model_dump(mode="json")
+                    )
+                    result_payload = result.model_dump(mode="json")
+                    result_payload["context"] = context
+                    result = PreflightResult.model_validate_json(_canonical_json(result_payload))
+                if not authority_matches():
+                    raise ValueError("advisory authority changed")
+                payload = cast(dict[str, object], result.model_dump(mode="json"))
+                if "authorization_token" in payload:
+                    raise ValueError("invalid advisory result")
+                return payload
+        except Exception:  # noqa: BLE001 - fixed token-free workflow boundary
+            return self._rejected()
+        except BaseException as error:
+            error.__traceback__ = None
+            error.__cause__ = None
+            error.__context__ = None
+            raise
+        finally:
+            conversation_ref = request = ""
+            draft = cast(AdvisoryClassificationDraft, None)
+            detached_draft = None
+            self._close_clarification_authority(authority_files)
+            if "validated" in locals():
+                validated = cast(IntentAdvisoryPreflightRequest, None)
+            if "payload" in locals():
+                payload = {}
 
     async def authorization_verify(
         self,
@@ -1714,6 +2089,37 @@ def register_intent_workflow_tools(
             detached_envelope = None
             detached_submission = None
             request = cast(IntentPreflightRequest, None)
+
+    @server.tool(
+        name="intent_advisory_preflight",
+        annotations=_ADVISORY_PREFLIGHT,
+        structured_output=True,
+    )
+    async def intent_advisory_preflight(
+        conversation_ref: Annotated[str, Field(min_length=1, max_length=512)],
+        request: Annotated[str, Field(min_length=1, max_length=16 * 1024)],
+        draft: _AdvisoryDraftInput,
+    ) -> dict[str, object]:
+        detached_draft: AdvisoryClassificationDraft | None = None
+        try:
+            checked = IntentAdvisoryPreflightRequest.model_validate(
+                {"conversation_ref": conversation_ref, "request": request, "draft": draft}
+            )
+            detached_draft = AdvisoryClassificationDraft.model_validate_json(
+                checked.draft.model_dump_json()
+            )
+            return await services.advisory_preflight(
+                checked.conversation_ref,
+                checked.request,
+                detached_draft,
+            )
+        except Exception:  # noqa: BLE001 - one fixed handler boundary
+            _fixed_arguments()
+        finally:
+            conversation_ref = request = ""
+            draft = cast(AdvisoryClassificationDraft, None)
+            detached_draft = None
+            checked = cast(IntentAdvisoryPreflightRequest, None)
 
     @server.tool(
         name="intent_authorization_verify",

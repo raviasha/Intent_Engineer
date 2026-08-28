@@ -72,6 +72,24 @@ async def test_intent_mcp_stdio_is_protocol_clean_and_read_only(tmp_path: Path) 
                     "requested_paths": ["README.md"],
                 },
             )
+            advisory = await client.call_tool(
+                "intent_advisory_preflight",
+                {
+                    "conversation_ref": "codex:stdio-advisory",
+                    "request": "Format README\nwithout changing semantics",
+                    "draft": {
+                        "classification": "no_semantic_impact",
+                        "basis": "Formatting only",
+                        "relevant_node_ids": [],
+                        "evidence_refs": [],
+                        "semantic_effects": [],
+                        "uncertainties": [],
+                        "questions": [],
+                        "conflict_claims": [],
+                        "requested_scope": ["README.md"],
+                    },
+                },
+            )
             prompts = await client.list_prompts()
             prepared = await client.get_prompt("prepare_task", {"task": "implement local export"})
             with pytest.raises(MCPError, match="not found"):
@@ -115,6 +133,7 @@ async def test_intent_mcp_stdio_is_protocol_clean_and_read_only(tmp_path: Path) 
         "intent_proposal_show",
         "intent_proposal_confirm",
         "intent_preflight",
+        "intent_advisory_preflight",
         "intent_authorization_verify",
         "intent_clarification_open",
         "intent_clarification_answer",
@@ -135,6 +154,9 @@ async def test_intent_mcp_stdio_is_protocol_clean_and_read_only(tmp_path: Path) 
         "relevant_node_ids": [],
         "expires_at": None,
     }
+    assert advisory.structured_content["authorized"] is True
+    assert advisory.structured_content["classification"] == "no_semantic_impact"
+    assert "authorization_token" not in repr(advisory)
     assert "PRIVATE_WIRE_CAPABILITY" not in repr(denied_capability)
     assert {prompt.name for prompt in prompts.prompts} == {
         "prepare_task",

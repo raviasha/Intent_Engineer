@@ -33,6 +33,7 @@ from intent_engineering.storage.secure import SecureDirectory
 from .base import _HostModel
 
 _CONTROL = re.compile(r"[\x00-\x1f\x7f]")
+_PROMPT_CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 _MAX_ID_BYTES = 2 * 1024
 _MAX_PROMPT_BYTES = 16 * 1024
 _MAX_REPOSITORY_BYTES = 4 * 1024
@@ -70,7 +71,7 @@ def _prompt(value: str) -> str:
     if (
         type(value) is not str
         or not value
-        or _CONTROL.search(value)
+        or _PROMPT_CONTROL.search(value)
         or len(value.encode("utf-8")) > _MAX_PROMPT_BYTES
     ):
         raise ValueError("invalid advisory prompt event")
@@ -238,6 +239,8 @@ class CodexUserPromptSubmitEvent(_HostModel):
     turn_id: str
     permission_mode: Literal["default", "acceptEdits", "plan", "dontAsk", "bypassPermissions"]
     prompt: str
+    agent_id: str | None = None
+    agent_type: str | None = None
 
     @field_validator("session_id", "turn_id", "model")
     @classmethod
@@ -260,6 +263,22 @@ class CodexUserPromptSubmitEvent(_HostModel):
     @classmethod
     def validate_prompt(cls, value: str) -> str:
         return _prompt(value)
+
+    @field_validator("agent_id", "agent_type")
+    @classmethod
+    def validate_optional_host_identity(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return _identity(value)
+
+    @model_validator(mode="after")
+    def reject_explicit_null_host_identity(self) -> CodexUserPromptSubmitEvent:
+        if any(
+            field in self.model_fields_set and getattr(self, field) is None
+            for field in ("agent_id", "agent_type")
+        ):
+            raise ValueError("invalid advisory prompt event")
+        return self
 
 
 class PromptRoute(_HostModel):
@@ -303,7 +322,7 @@ class PromptRoute(_HostModel):
     def validate_route(self) -> PromptRoute:
         expected_tool = {
             "offer_onboarding": None,
-            "classify": "intent_preflight",
+            "classify": "intent_advisory_preflight",
             "answer_clarification": "intent_clarification_answer",
             "continue": None,
         }[self.action]
@@ -375,10 +394,16 @@ def codex_prompt_context(route: PromptRoute) -> str:
     if route.action == "offer_onboarding":
         return _OFFER
     if route.action == "classify":
+        conversation_ref = route.arguments.get("conversation_ref")
+        if type(conversation_ref) is not str:
+            raise ValueError("invalid advisory prompt route")
+        encoded_ref = json.dumps(conversation_ref, ensure_ascii=False, separators=(",", ":"))
         return (
-            "action=classify. Call public MCP tool intent_preflight with the current human "
-            "prompt as task before implementation. Ask returned questions and show exact graph "
-            "proposals for human confirmation."
+            "action=classify. First call public MCP tool intent_context with the current human "
+            "request for bounded repository context. Form a classification draft, then call "
+            f"public MCP tool intent_advisory_preflight with conversation_ref={encoded_ref}, the "
+            "current human request, and that draft. Ask returned questions and follow only the "
+            "persisted clarification workflow before implementation."
         )
     if route.action == "answer_clarification":
         safe_arguments = {
@@ -503,8 +528,8 @@ class AdvisoryPromptRouter:
         return PromptRoute(
             action="classify",
             message="Classify this prompt through Intent Engineering before implementation.",
-            mcp_tool="intent_preflight",
-            arguments={"task": checked.prompt},
+            mcp_tool="intent_advisory_preflight",
+            arguments={"conversation_ref": checked.session_id},
         )
 
     def route(self, event: PromptEvent) -> PromptRoute:

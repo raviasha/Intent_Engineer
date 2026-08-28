@@ -71,21 +71,28 @@ def _validated_output(raw: bytes) -> bytes:
 
 
 def _terminate(process: subprocess.Popen[bytes]) -> None:
-    if process.poll() is not None:
-        process.wait()
-        return
     try:
         os.killpg(process.pid, signal.SIGTERM)
-    except ProcessLookupError:
+    except (ProcessLookupError, PermissionError):
+        pass
+    deadline = time.monotonic() + 0.2
+    while time.monotonic() < deadline:
+        try:
+            os.killpg(process.pid, 0)
+        except ProcessLookupError:
+            break
+        except PermissionError:
+            break
+        time.sleep(0.01)
+    try:
+        process.wait(timeout=0.05)
+    except subprocess.TimeoutExpired:
         pass
     try:
-        process.wait(timeout=0.2)
-    except subprocess.TimeoutExpired:
-        try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        process.wait()
+        os.killpg(process.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+    process.wait()
 
 
 def _invoke(raw: bytes) -> bytes:
@@ -136,10 +143,10 @@ def _invoke(raw: bytes) -> bytes:
             raise ValueError
         return _validated_output(bytes(output))
     except (Exception, KeyboardInterrupt):  # noqa: BLE001 - fixed advisory boundary
-        if process is not None:
-            _terminate(process)
         return _encoded_fallback()
     finally:
+        if process is not None:
+            _terminate(process)
         selector.close()
 
 

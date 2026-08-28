@@ -61,6 +61,7 @@ _WORKFLOW_TOOLS = {
     "intent_proposal_show",
     "intent_proposal_confirm",
     "intent_preflight",
+    "intent_advisory_preflight",
     "intent_authorization_verify",
     "intent_clarification_open",
     "intent_clarification_answer",
@@ -122,6 +123,28 @@ class _FakeWorkflow:
             "permitted_scope": list(envelope.requested_scope),
             "context": {},
             "authorization_token": "opaque-token",
+        }
+
+    async def advisory_preflight(
+        self,
+        conversation_ref: str,
+        request: str,
+        draft: object,
+    ) -> dict[str, object]:
+        self.calls.append(("advisory_preflight", (conversation_ref, request, draft)))
+        return {
+            "schema_version": 1,
+            "task_id": "task:sha256:" + "9" * 64,
+            "graph_version": 0,
+            "classification": "no_semantic_impact",
+            "authorized": True,
+            "basis": "validated",
+            "relevant_node_ids": [],
+            "evidence_refs": [],
+            "questions": [],
+            "review_case_id": None,
+            "permitted_scope": ["README.md"],
+            "context": {},
         }
 
     async def authorization_verify(
@@ -304,6 +327,22 @@ def _valid_raw_workflow_arguments(tool_name: str) -> dict[str, object]:
         }
     if tool_name == "intent_preflight":
         return _raw_mechanical_preflight()
+    if tool_name == "intent_advisory_preflight":
+        return {
+            "conversation_ref": "codex:thread-3",
+            "request": "Format README\nwithout changing semantics",
+            "draft": {
+                "classification": "no_semantic_impact",
+                "basis": "Formatting only",
+                "relevant_node_ids": [],
+                "evidence_refs": [],
+                "semantic_effects": [],
+                "uncertainties": [],
+                "questions": [],
+                "conflict_claims": [],
+                "requested_scope": ["README.md"],
+            },
+        }
     if tool_name == "intent_clarification_open":
         return {
             "envelope": _raw_mechanical_preflight()["envelope"],
@@ -386,6 +425,7 @@ async def test_workflow_registration_is_optional_additive_and_has_truthful_annot
     shown_annotations = by_name["intent_proposal_show"].annotations
     confirmed_annotations = by_name["intent_proposal_confirm"].annotations
     preflight_annotations = by_name["intent_preflight"].annotations
+    advisory_annotations = by_name["intent_advisory_preflight"].annotations
     verification_annotations = by_name["intent_authorization_verify"].annotations
     clarification_annotations = tuple(
         by_name[name].annotations
@@ -400,6 +440,7 @@ async def test_workflow_registration_is_optional_additive_and_has_truthful_annot
     assert shown_annotations is not None
     assert confirmed_annotations is not None
     assert preflight_annotations is not None
+    assert advisory_annotations is not None
     assert verification_annotations is not None
     assert all(item is not None for item in clarification_annotations)
     assert (
@@ -426,6 +467,12 @@ async def test_workflow_registration_is_optional_additive_and_has_truthful_annot
         preflight_annotations.idempotent_hint,
         preflight_annotations.open_world_hint,
     ) == (False, False, False, False)
+    assert (
+        advisory_annotations.read_only_hint,
+        advisory_annotations.destructive_hint,
+        advisory_annotations.idempotent_hint,
+        advisory_annotations.open_world_hint,
+    ) == (False, False, True, False)
     assert (
         verification_annotations.read_only_hint,
         verification_annotations.destructive_hint,
@@ -486,6 +533,13 @@ async def test_workflow_registration_is_optional_additive_and_has_truthful_annot
     assert (
         preflight_schema["$defs"]["AgentClassificationSubmission"]["additionalProperties"] is False
     )
+    advisory_schema = by_name["intent_advisory_preflight"].input_schema
+    assert set(advisory_schema["properties"]) == {"conversation_ref", "request", "draft"}
+    assert set(advisory_schema["required"]) == {"conversation_ref", "request", "draft"}
+    assert "actor" not in advisory_schema["properties"]
+    assert "authorization_token" not in json.dumps(advisory_schema)
+    assert advisory_schema["$defs"]["AdvisoryClassificationDraft"]["additionalProperties"] is False
+    assert "actor" not in advisory_schema["$defs"]["AdvisoryClassificationDraft"]["properties"]
     for name in (
         "intent_clarification_open",
         "intent_clarification_answer",
@@ -734,6 +788,275 @@ async def test_workflow_tools_delegate_detached_typed_payloads(tmp_path: Path) -
             ),
         ),
     ]
+
+
+async def test_advisory_preflight_delegates_exact_detached_draft(tmp_path: Path) -> None:
+    from intent_engineering.integrations.mcp_server.intent_workflow import (
+        AdvisoryClassificationDraft,
+    )
+
+    workflow = _FakeWorkflow()
+    server = build_server(_services(tmp_path), intent_workflow_services=workflow)
+    arguments = _valid_raw_workflow_arguments("intent_advisory_preflight")
+
+    response = await server.call_tool("intent_advisory_preflight", arguments)
+
+    assert response.structured_content["authorized"] is True
+    assert "authorization_token" not in response.structured_content
+    call = workflow.calls[-1]
+    assert call[0] == "advisory_preflight"
+    conversation_ref, request, draft = call[1]
+    assert conversation_ref == "codex:thread-3"
+    assert request == "Format README\nwithout changing semantics"
+    assert type(draft) is AdvisoryClassificationDraft
+    assert draft.requested_scope == ("README.md",)
+
+
+async def test_production_advisory_preflight_is_durable_idempotent_and_token_free(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    from intent_engineering.integrations.mcp_server.intent_workflow import (
+        load_intent_workflow_services,
+    )
+
+    project = tmp_path / "project"
+    project.mkdir()
+    initialize_project(project)
+    (project / ".intent/approvals/policy.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "schema_version": 1,
+                "contributors": ["local"],
+                "approvers": ["local"],
+                "executors": ["local"],
+                "identities": {"local": ["local", "local:advisory-alias"]},
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    runtime = load_runtime(project)
+    workflow = load_intent_workflow_services(
+        runtime, clock=lambda: datetime(2026, 8, 28, 12, 0, tzinfo=UTC)
+    )
+    server = build_server(McpReadServices(runtime), intent_workflow_services=workflow)
+    arguments = _valid_raw_workflow_arguments("intent_advisory_preflight")
+
+    first = await server.call_tool("intent_advisory_preflight", arguments)
+    durable = {
+        path.relative_to(project).as_posix(): path.read_bytes()
+        for path in sorted((project / ".intent").rglob("*"))
+        if path.is_file() and not path.is_symlink()
+    }
+    second = await server.call_tool("intent_advisory_preflight", arguments)
+    replayed = {
+        path.relative_to(project).as_posix(): path.read_bytes()
+        for path in sorted((project / ".intent").rglob("*"))
+        if path.is_file() and not path.is_symlink()
+    }
+
+    assert first.structured_content == second.structured_content
+    assert first.structured_content["classification"] == "no_semantic_impact"
+    assert first.structured_content["authorized"] is True
+    assert durable == replayed
+    wire_and_durable = json.dumps(first.structured_content).encode() + b"".join(durable.values())
+    assert b"authorization_token" not in wire_and_durable
+    assert b"capability" not in wire_and_durable.lower()
+    chain = runtime.evidence_store.chain("conversation:codex", "conversation", "codex:thread-3")
+    assert tuple(item.evidence.payload["role"] for item in chain) == ("human", "agent")
+    assert chain[0].evidence.author == "local"
+    assert chain[1].evidence.author == "agent:codex"
+    assert chain[1].predecessor_id == chain[0].evidence.id
+    assert "authorization_token" not in caplog.text
+    assert "capability" not in caplog.text.casefold()
+
+    divergent = json.loads(json.dumps(arguments))
+    divergent["draft"]["basis"] = "PRIVATE-DIVERGENT"
+    rejected = await server.call_tool("intent_advisory_preflight", divergent)
+    assert rejected.structured_content == {
+        "schema_version": "1",
+        "status": "rejected",
+        "reason": "intent_workflow_unavailable",
+    }
+    assert {
+        path.relative_to(project).as_posix(): path.read_bytes()
+        for path in sorted((project / ".intent").rglob("*"))
+        if path.is_file() and not path.is_symlink()
+    } == replayed
+    policy_path = project / ".intent/approvals/policy.yaml"
+    policy_path.write_text(
+        yaml.safe_dump(
+            {
+                "schema_version": 1,
+                "contributors": ["local"],
+                "approvers": ["local"],
+                "executors": ["local"],
+                "identities": {"local": ["local"]},
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    before_revocation = tuple(runtime.evidence_store.ledger("conversation:codex"))
+    revoked = await server.call_tool("intent_advisory_preflight", arguments)
+    assert revoked.structured_content == rejected.structured_content
+    assert tuple(runtime.evidence_store.ledger("conversation:codex")) == before_revocation
+
+
+async def test_production_advisory_ambiguity_opens_exact_persisted_session(
+    tmp_path: Path,
+) -> None:
+    from intent_engineering.integrations.mcp_server.intent_workflow import (
+        load_intent_workflow_services,
+    )
+
+    project = tmp_path / "project"
+    project.mkdir()
+    initialize_project(project)
+    (project / ".intent/approvals/policy.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "schema_version": 1,
+                "contributors": ["local"],
+                "approvers": ["local"],
+                "executors": ["local"],
+                "identities": {"local": ["local"]},
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    runtime = load_runtime(project)
+    workflow = load_intent_workflow_services(
+        runtime, clock=lambda: datetime(2026, 8, 28, 13, 0, tzinfo=UTC)
+    )
+    server = build_server(McpReadServices(runtime), intent_workflow_services=workflow)
+    arguments = _valid_raw_workflow_arguments("intent_advisory_preflight")
+    draft = arguments["draft"]
+    assert type(draft) is dict
+    draft.update(
+        {
+            "classification": "new_or_ambiguous",
+            "basis": "Audience is missing",
+            "uncertainties": ["Sharing audience"],
+            "questions": ["Who may share reports?"],
+            "requested_scope": [],
+        }
+    )
+
+    response = await server.call_tool("intent_advisory_preflight", arguments)
+
+    payload = response.structured_content
+    assert payload["authorized"] is False
+    assert payload["classification"] == "new_or_ambiguous"
+    assert payload["questions"] == ["Who may share reports?"]
+    session_payload = payload["context"]["clarification_session"]
+    session = runtime.intent_proposals.session(session_payload["id"])
+    assert session.model_dump(mode="json") == session_payload
+    assert session.conversation_ref == "codex:thread-3"
+    assert session.questions[0].prompt_digest.startswith("sha256:")
+    assert "Who may share reports?" not in json.dumps(session_payload)
+    assert "authorization_token" not in json.dumps(payload)
+    durable = {
+        path.relative_to(project).as_posix(): path.read_bytes()
+        for path in sorted((project / ".intent").rglob("*"))
+        if path.is_file() and not path.is_symlink()
+    }
+    replay = await server.call_tool("intent_advisory_preflight", arguments)
+    assert replay.structured_content == payload
+    assert {
+        path.relative_to(project).as_posix(): path.read_bytes()
+        for path in sorted((project / ".intent").rglob("*"))
+        if path.is_file() and not path.is_symlink()
+    } == durable
+
+
+async def test_advisory_replay_fixed_fails_after_graph_change_without_new_evidence(
+    tmp_path: Path,
+) -> None:
+    from intent_engineering.integrations.mcp_server.intent_workflow import (
+        load_intent_workflow_services,
+    )
+
+    project = tmp_path / "project"
+    project.mkdir()
+    initialize_project(project)
+    runtime = load_runtime(project)
+    server = build_server(
+        McpReadServices(runtime),
+        intent_workflow_services=load_intent_workflow_services(
+            runtime, clock=lambda: datetime(2026, 8, 28, 14, 0, tzinfo=UTC)
+        ),
+    )
+    arguments = _valid_raw_workflow_arguments("intent_advisory_preflight")
+    accepted = await server.call_tool("intent_advisory_preflight", arguments)
+    graph = runtime.graph_store.load()
+    runtime.graph_store.initialize(graph.model_copy(update={"version": graph.version + 1}))
+    before = tuple(runtime.evidence_store.ledger("conversation:codex"))
+
+    stale = await server.call_tool("intent_advisory_preflight", arguments)
+
+    assert accepted.structured_content["authorized"] is True
+    assert stale.structured_content == {
+        "schema_version": "1",
+        "status": "rejected",
+        "reason": "intent_workflow_unavailable",
+    }
+    assert tuple(runtime.evidence_store.ledger("conversation:codex")) == before
+
+
+async def test_advisory_authority_race_rolls_back_conversation_pair(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from intent_engineering.integrations.mcp_server.intent_workflow import (
+        load_intent_workflow_services,
+    )
+
+    project = tmp_path / "project"
+    project.mkdir()
+    initialize_project(project)
+    policy_path = project / ".intent/approvals/policy.yaml"
+    policy = {
+        "schema_version": 1,
+        "contributors": ["local"],
+        "approvers": ["local"],
+        "executors": ["local"],
+        "identities": {"local": ["local"]},
+    }
+    policy_path.write_text(yaml.safe_dump(policy, sort_keys=True), encoding="utf-8")
+    runtime = load_runtime(project)
+    service = load_intent_workflow_services(
+        runtime, clock=lambda: datetime(2026, 8, 28, 15, 0, tzinfo=UTC)
+    )
+    original = ConversationCapture.record_turn
+    raced = False
+
+    def race(self: ConversationCapture, **kwargs: object):
+        nonlocal raced
+        result = original(self, **kwargs)
+        if kwargs.get("role") == "human" and not raced:
+            raced = True
+            changed = {**policy, "identities": {"local": ["local", "local:changed"]}}
+            policy_path.write_text(yaml.safe_dump(changed, sort_keys=True), encoding="utf-8")
+        return result
+
+    monkeypatch.setattr(ConversationCapture, "record_turn", race)
+    server = build_server(McpReadServices(runtime), intent_workflow_services=service)
+
+    response = await server.call_tool(
+        "intent_advisory_preflight",
+        _valid_raw_workflow_arguments("intent_advisory_preflight"),
+    )
+
+    assert raced is True
+    assert response.structured_content == {
+        "schema_version": "1",
+        "status": "rejected",
+        "reason": "intent_workflow_unavailable",
+    }
+    assert tuple(runtime.evidence_store.ledger("conversation:codex")) == ()
 
 
 def _preflight_inputs(

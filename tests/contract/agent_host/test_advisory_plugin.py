@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import mmap
 import os
 import signal
 import stat
@@ -14,6 +15,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
+from jsonschema import Draft7Validator
 
 from intent_engineering.cli.runtime import load_runtime
 from intent_engineering.core.models import Graph, Node, NodeType
@@ -29,8 +31,14 @@ FALLBACK = (
 )
 
 
-def _official_event(project: Path, *, prompt: str = "Add team sharing") -> dict[str, object]:
-    return {
+def _official_event(
+    project: Path,
+    *,
+    prompt: str = "Add team sharing",
+    agent_id: str | None = None,
+    agent_type: str | None = None,
+) -> dict[str, object]:
+    event: dict[str, object] = {
         "session_id": "codex:thread-3",
         "transcript_path": None,
         "cwd": str(project),
@@ -40,6 +48,11 @@ def _official_event(project: Path, *, prompt: str = "Add team sharing") -> dict[
         "permission_mode": "default",
         "prompt": prompt,
     }
+    if agent_id is not None:
+        event["agent_id"] = agent_id
+    if agent_type is not None:
+        event["agent_type"] = agent_type
+    return event
 
 
 def _run_hook(
@@ -52,7 +65,7 @@ def _run_hook(
     environment = os.environ.copy()
     environment["PATH"] = path or f"{REPO_ROOT / '.venv' / 'bin'}:/usr/bin:/bin"
     return subprocess.run(
-        [sys.executable, str(HOOK)],
+        [str(HOOK)],
         cwd=project,
         env=environment,
         input=payload,
@@ -60,6 +73,24 @@ def _run_hook(
         check=False,
         timeout=timeout,
     )
+
+
+def _installed_hook_schema(kind: str) -> dict[str, object]:
+    binary = Path("/Applications/ChatGPT.app/Contents/Resources/codex")
+    marker = f'"title": "user-prompt-submit.command.{kind}"'.encode()
+    prefix = b'{\n  "$schema": "http://json-schema.org/draft-07/schema#"'
+    with (
+        binary.open("rb") as stream,
+        mmap.mmap(stream.fileno(), 0, access=mmap.ACCESS_READ) as data,
+    ):
+        marker_at = data.find(marker)
+        assert marker_at >= 0
+        start = data.rfind(prefix, max(0, marker_at - 65536), marker_at)
+        assert start >= 0
+        decoded = data[start : start + 65536].decode("utf-8", errors="ignore")
+    schema, _end = json.JSONDecoder().raw_decode(decoded)
+    assert type(schema) is dict
+    return schema
 
 
 def _run_official_hook(
@@ -220,13 +251,41 @@ def test_real_hook_routes_ready_prompt_to_preflight_without_secret_or_echo(
     completed = _run_official_hook(project, prompt=marker)
 
     context = _additional_context(completed)
-    assert "intent_preflight" in context
+    assert "intent_advisory_preflight" in context
+    assert "intent_context" in context
+    assert 'conversation_ref="codex:thread-3"' in context
     lowered = completed.stdout.decode().casefold()
     assert marker.casefold() not in lowered
     assert "authorization" not in lowered
     assert "capability" not in lowered
     assert "token" not in lowered
     assert _durable_bytes(project) == before
+
+
+def test_real_hook_accepts_installed_official_optional_identity_and_multiline_prompt(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    _ready_project(project)
+    event = _official_event(
+        project,
+        prompt="Add team sharing\n\tfor workspace admins",
+        agent_id="host-agent-7",
+        agent_type="reviewer",
+    )
+    input_schema = _installed_hook_schema("input")
+    Draft7Validator(input_schema).validate(event)
+
+    completed = _run_hook(project, json.dumps(event).encode())
+    output = _output(completed)
+
+    Draft7Validator(_installed_hook_schema("output")).validate(output)
+    context = _additional_context(completed)
+    assert "intent_advisory_preflight" in context
+    assert "host-agent-7" not in context
+    assert "reviewer" not in context
+    assert "workspace admins" not in context
 
 
 @pytest.mark.parametrize(
@@ -253,13 +312,21 @@ def test_malformed_official_event_returns_one_fixed_advisory_fallback(
     assert b"PRIVATE-MALFORMED-PROMPT-8197" not in completed.stdout
 
 
+def test_invalid_utf8_event_returns_fixed_advisory_fallback(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+
+    completed = _run_hook(project, b'{"prompt":"PRIVATE-UTF8-8197\xff"}')
+
+    assert _additional_context(completed) == FALLBACK
+    assert b"PRIVATE-UTF8-8197" not in completed.stdout + completed.stderr
+
+
 def test_missing_cli_returns_fixed_fallback_with_strict_streams(tmp_path: Path) -> None:
     project = tmp_path / "project"
-    empty_path = tmp_path / "empty-bin"
     project.mkdir()
-    empty_path.mkdir()
 
-    completed = _run_official_hook(project, path=str(empty_path))
+    completed = _run_official_hook(project, path="/usr/bin:/bin")
 
     assert _additional_context(completed) == FALLBACK
 
@@ -400,13 +467,67 @@ def test_hook_cancellation_terminates_owned_cli_and_emits_no_child_output(tmp_pa
         os.kill(child_pid, 0)
 
 
+def test_hook_reaps_process_group_when_cli_leader_exits_before_child(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    fake_bin = tmp_path / "fake-bin"
+    pid_file = tmp_path / "grandchild.pid"
+    project.mkdir()
+    fake_bin.mkdir()
+    _fake_intent(
+        fake_bin,
+        "import os, pathlib, signal, sys, time\n"
+        "child = os.fork()\n"
+        "if child:\n"
+        "    raise SystemExit(1)\n"
+        "sys.stdin.close(); sys.stdout.close(); sys.stderr.close()\n"
+        f"pathlib.Path({str(pid_file)!r}).write_text(str(os.getpid()))\n"
+        "signal.signal(signal.SIGTERM, signal.SIG_DFL)\n"
+        "time.sleep(30)",
+    )
+
+    completed = _run_official_hook(project, path=f"{fake_bin}:/usr/bin:/bin", timeout=5)
+
+    assert _additional_context(completed) == FALLBACK
+    deadline = time.monotonic() + 2
+    while not pid_file.exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert pid_file.exists()
+    child_pid = int(pid_file.read_text())
+    with pytest.raises(ProcessLookupError):
+        os.kill(child_pid, 0)
+
+
+def test_plugin_configured_mcp_missing_project_is_protocol_clean(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    mcp = json.loads((PLUGIN_ROOT / ".mcp.json").read_bytes())["mcpServers"]["intent_advisor"]
+    executable = REPO_ROOT / ".venv" / "bin" / mcp["command"]
+
+    completed = subprocess.run(
+        [str(executable), *mcp["args"]],
+        cwd=project,
+        env={"LANG": "C.UTF-8", "LC_ALL": "C.UTF-8", "PATH": "/usr/bin:/bin"},
+        capture_output=True,
+        check=False,
+        timeout=5,
+    )
+
+    assert completed.returncode == 1
+    assert completed.stdout == b""
+    assert completed.stderr == b"intent error: MCP server failed\n"
+
+
 def test_skill_routes_clarifications_and_states_advisory_mcp_failure_boundary() -> None:
     skill = (PLUGIN_ROOT / "skills" / "intent-advisor" / "SKILL.md").read_text(encoding="utf-8")
 
     assert "action=answer_clarification" in skill
     assert "intent_clarification_answer" in skill
     assert "Do not classify the answer again" in skill
-    assert "intent onboard --project ." in skill
+    assert "ask the user for the PRD path" in skill
+    assert "intent onboard --project . --prd <confirmed path>" in skill
+    assert "intent_context" in skill
+    assert "intent_advisory_preflight" in skill
+    assert "intent_preflight" not in skill.replace("intent_advisory_preflight", "")
     assert "MCP tools are unavailable" in skill
     assert "MandatoryHookUnavailable" in skill
     assert "capability token" in skill

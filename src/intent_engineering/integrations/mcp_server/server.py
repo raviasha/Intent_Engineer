@@ -57,6 +57,7 @@ class _IntentMCPServer(MCPServer[Any]):
             "intent_proposal_show",
             "intent_proposal_confirm",
             "intent_preflight",
+            "intent_advisory_preflight",
             "intent_authorization_verify",
             "intent_clarification_open",
             "intent_clarification_answer",

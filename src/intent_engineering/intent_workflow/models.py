@@ -18,6 +18,7 @@ from intent_engineering.core.models import ChangeSet, JsonValue, SourceRole, Sou
 from intent_engineering.core.models._base import StrictModel
 
 _CONTROL = re.compile(r"[\x00-\x1f\x7f]")
+_PROMPT_CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 _MAX_REQUEST_BYTES = 16 * 1024
 _MAX_SCOPE_BYTES = 2 * 1024
 _MAX_SCOPE_ENTRIES = 256
@@ -74,8 +75,8 @@ def _thaw_json(value: object) -> JsonValue:
     return cast(JsonValue, value)
 
 
-def _task_text(value: str, *, label: str, limit: int) -> str:
-    if _CONTROL.search(value):
+def _task_text(value: str, *, label: str, limit: int, prompt: bool = False) -> str:
+    if (prompt and _PROMPT_CONTROL.search(value)) or (not prompt and _CONTROL.search(value)):
         raise ValueError(f"invalid task text: {label}")
     if len(value.encode("utf-8")) > limit:
         raise ValueError(f"{label} exceeds maximum size")
@@ -501,7 +502,7 @@ class TaskEnvelope(_WorkflowModel):
     @field_validator("request")
     @classmethod
     def validate_request(cls, value: str) -> str:
-        return _task_text(value, label="request", limit=_MAX_REQUEST_BYTES)
+        return _task_text(value, label="request", limit=_MAX_REQUEST_BYTES, prompt=True)
 
     @field_validator("repository_id", "actor", "request_evidence_ref")
     @classmethod
@@ -515,7 +516,10 @@ class TaskEnvelope(_WorkflowModel):
     def validate_requested_scope(cls, values: tuple[str, ...]) -> tuple[str, ...]:
         if len(values) > _MAX_SCOPE_ENTRIES:
             raise ValueError("requested scope exceeds maximum entries")
-        return tuple(_task_text(value, label="requested scope entry", limit=_MAX_SCOPE_BYTES) for value in values)
+        return tuple(
+            _task_text(value, label="requested scope entry", limit=_MAX_SCOPE_BYTES)
+            for value in values
+        )
 
     @property
     def digest(self) -> str:

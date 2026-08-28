@@ -19,6 +19,7 @@ from intent_engineering.integrations.agent_host.advisory import (
     AdvisoryPromptRouter,
     PromptEvent,
     PromptRoute,
+    parse_codex_prompt_event,
     parse_prompt_event,
 )
 
@@ -102,9 +103,74 @@ def test_initialized_repository_routes_once_to_public_preflight(tmp_path: Path) 
     route = AdvisoryPromptRouter(runtime).route(event)
 
     assert route.action == "classify"
-    assert route.mcp_tool == "intent_preflight"
-    assert route.arguments == {"task": event.prompt}
+    assert route.mcp_tool == "intent_advisory_preflight"
+    assert route.arguments == {"conversation_ref": event.session_id}
     assert "token" not in json.dumps(route.model_dump(mode="json")).lower()
+
+
+def test_official_event_accepts_optional_host_identity_and_multiline_prompt_without_authority(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    payload = {
+        "session_id": "codex:thread-3",
+        "transcript_path": None,
+        "cwd": str(project),
+        "hook_event_name": "UserPromptSubmit",
+        "model": "gpt-5.6-sol",
+        "turn_id": "turn-7",
+        "permission_mode": "default",
+        "prompt": "First line\n\tsecond line",
+        "agent_id": "host-agent-7",
+        "agent_type": "reviewer",
+    }
+
+    event = parse_codex_prompt_event(payload)
+
+    assert event.prompt == "First line\n\tsecond line"
+    assert event.agent_id == "host-agent-7"
+    assert event.agent_type == "reviewer"
+
+
+@pytest.mark.parametrize("field", ["agent_id", "agent_type"])
+def test_optional_host_identity_rejects_null_subclasses_and_controls(
+    tmp_path: Path,
+    field: str,
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    base = {
+        "session_id": "codex:thread-3",
+        "transcript_path": None,
+        "cwd": str(project),
+        "hook_event_name": "UserPromptSubmit",
+        "model": "gpt-5.6-sol",
+        "turn_id": "turn-7",
+        "permission_mode": "default",
+        "prompt": "work",
+    }
+    for bad in (None, type("Text", (str,), {})("host-agent"), "bad\nidentity"):
+        with pytest.raises(ValueError, match="invalid Codex prompt event"):
+            parse_codex_prompt_event({**base, field: bad})
+
+
+@pytest.mark.parametrize("control", ["\x00", "\x07", "\x0b", "\x0c", "\x1f", "\x7f"])
+def test_official_prompt_rejects_disallowed_controls(tmp_path: Path, control: str) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    payload = {
+        "session_id": "codex:thread-3",
+        "transcript_path": None,
+        "cwd": str(project),
+        "hook_event_name": "UserPromptSubmit",
+        "model": "gpt-5.6-sol",
+        "turn_id": "turn-7",
+        "permission_mode": "default",
+        "prompt": f"before{control}after",
+    }
+    with pytest.raises(ValueError, match="invalid Codex prompt event"):
+        parse_codex_prompt_event(payload)
 
 
 def test_prompt_route_arguments_are_recursively_frozen_detached_and_token_safe(
@@ -198,8 +264,8 @@ def test_prompt_records_are_strict_frozen_detached_and_require_canonical_timesta
         PromptRoute(
             action="classify",
             message="Classify prompt through Intent Engineering.",
-            mcp_tool="intent_preflight",
-            arguments={"task": "work"},
+            mcp_tool="intent_advisory_preflight",
+            arguments={"conversation_ref": "codex:thread-3"},
             advisory=True,
             authorization_issued=True,
         )
@@ -317,7 +383,7 @@ def test_hidden_cli_reads_one_bounded_object_and_emits_fixed_secret_free_denial(
     runner = CliRunner()
     valid = runner.invoke(app, ["agent-prompt-hook"], input=_event(project).model_dump_json())
     assert valid.exit_code == 0
-    assert json.loads(valid.stdout)["mcp_tool"] == "intent_preflight"
+    assert json.loads(valid.stdout)["mcp_tool"] == "intent_advisory_preflight"
     assert valid.stderr == ""
 
     marker = "PRIVATE-HOOK-MALFORMED-8197"

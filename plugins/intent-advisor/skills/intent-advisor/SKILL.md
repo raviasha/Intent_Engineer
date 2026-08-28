@@ -12,15 +12,21 @@ request, display, persist, or infer a capability token. Do not weaken or work ar
 ## Follow the prompt route
 
 - For `action=offer_onboarding`, ask whether to start guided onboarding. Only after explicit human
-  confirmation, run `intent onboard --project .` and follow its proposal/confirmation flow. A
-  decline leaves the repository unchanged.
-- For `action=classify`, call the named public `intent_preflight` MCP tool once, using the current
-  human prompt as `task`. Ask every returned clarification question before implementation. Show the
-  exact graph proposal and obtain human confirmation before any graph change.
+  confirmation, ask the user for the PRD path. Confirm that exact path, then run
+  `intent onboard --project . --prd <confirmed path>` and follow its proposal/confirmation flow.
+  A decline leaves the repository unchanged.
+- For `action=classify`, first call public `intent_context` with the current human request for
+  bounded repository context. Form an agent classification draft containing classification, basis,
+  relevant node and evidence references, semantic effects, uncertainties, questions, conflicts,
+  and requested scope. Then call the named public `intent_advisory_preflight` MCP tool with the
+  route's `conversation_ref`, the current human request, and that draft. Never call the
+  authorization-producing preflight tool for this advisory flow. Ask every returned clarification
+  question before implementation. Use only the persisted clarification session returned by the
+  advisory result; show exact graph proposals and obtain human confirmation before any graph change.
 - For `action=answer_clarification`, call the named public `intent_clarification_answer` MCP tool
   with the supplied session metadata and the current human prompt as `answer`.
-  Do not classify the answer again. Continue only after the existing clarification flow returns a
-  resolved result.
+  Do not classify the answer again. Continue only with `intent_clarification_propose` and
+  `intent_clarification_confirm` when the returned session state permits those exact next steps.
 - For `action=continue`, follow the returned message without inventing authority or mutating intent
   state directly.
 
