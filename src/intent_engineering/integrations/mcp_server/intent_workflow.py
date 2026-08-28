@@ -12,7 +12,7 @@ from typing import Annotated, Never, Protocol, cast
 from mcp import MCPError
 from mcp.server.mcpserver import MCPServer
 from mcp.types import INVALID_PARAMS, ToolAnnotations
-from pydantic import BeforeValidator, ConfigDict, Field, field_validator
+from pydantic import BeforeValidator, ConfigDict, Field, ValidationInfo, field_validator
 
 from intent_engineering.cli.intent_workflow import (
     _bootstrap_service,
@@ -29,12 +29,26 @@ from intent_engineering.intent_workflow.authorization import (
     canonical_graph_digest,
 )
 from intent_engineering.intent_workflow.bootstrap import BootstrapSubmission
-from intent_engineering.intent_workflow.models import PreflightResult, TaskEnvelope
+from intent_engineering.intent_workflow.clarification import (
+    ClarificationCoordinator,
+    ProposalConfirmationResult,
+    ProposalConfirmationService,
+)
+from intent_engineering.intent_workflow.conversation import ConversationCapture
+from intent_engineering.intent_workflow.models import (
+    ClarificationIntentProposal,
+    ClarificationProposalSubmission,
+    ClarificationQuestionInput,
+    ClarificationSession,
+    PreflightResult,
+    TaskEnvelope,
+)
 from intent_engineering.intent_workflow.preflight import (
     AgentClassificationSubmission,
     AuthenticatedPreflightResult,
     PreflightService,
 )
+from intent_engineering.storage.executor import LocalChangeSetExecutor
 from intent_engineering.storage.yaml.graph_store import parse_graph
 
 _PROPOSE = ToolAnnotations(
@@ -67,6 +81,12 @@ _VERIFY = ToolAnnotations(
     idempotent_hint=True,
     open_world_hint=False,
 )
+_CLARIFY = ToolAnnotations(
+    read_only_hint=False,
+    destructive_hint=False,
+    idempotent_hint=False,
+    open_world_hint=False,
+)
 _MAX_REQUEST_BYTES = 1_048_576
 _MAX_CONFIRMED_NODES = 10_000
 _MAX_AUTHORIZATION_ITEMS = 256
@@ -77,6 +97,7 @@ _MAX_JSON_NODES = 65_536
 _PROPOSAL_ID = r"^proposal:sha256:[0-9a-f]{64}$"
 _DIGEST = r"^sha256:[0-9a-f]{64}$"
 _TASK_ID = r"^task:sha256:[0-9a-f]{64}$"
+_CLARIFICATION_ID = r"^clarification:sha256:[0-9a-f]{64}$"
 _CONTROL = re.compile(r"[\x00-\x1f\x7f]")
 _WINDOWS_DEVICE = re.compile(
     r"^(?:CON|PRN|AUX|NUL|CLOCK\$|COM[1-9]|LPT[1-9])$", re.IGNORECASE
@@ -153,6 +174,61 @@ type _AuthorizationTaskInput = Annotated[
 type _AuthorizationPathsInput = Annotated[
     list[Annotated[str, Field(min_length=1, max_length=_MAX_AUTHORIZATION_FIELD_BYTES)]],
     Field(max_length=_MAX_AUTHORIZATION_ITEMS),
+]
+
+
+def _question_input(value: object) -> ClarificationQuestionInput:
+    encoded: bytes | None = None
+    question: ClarificationQuestionInput | None = None
+    try:
+        if type(value) is ClarificationQuestionInput:
+            encoded = _canonical_json(value.model_dump(mode="json"))
+        elif type(value) is dict:
+            encoded = _canonical_json(value)
+        else:
+            raise ValueError("invalid workflow request")
+        question = ClarificationQuestionInput.model_validate_json(encoded)
+        return question
+    finally:
+        value = None
+        encoded = None
+        question = None
+
+
+def _clarification_submission_input(value: object) -> ClarificationProposalSubmission:
+    encoded: bytes | None = None
+    submission: ClarificationProposalSubmission | None = None
+    try:
+        if type(value) is ClarificationProposalSubmission:
+            encoded = _canonical_json(value.model_dump(mode="json"))
+        elif type(value) is dict:
+            encoded = _canonical_json(value)
+        else:
+            raise ValueError("invalid workflow request")
+        submission = ClarificationProposalSubmission.model_validate_json(encoded)
+        return submission
+    finally:
+        value = None
+        encoded = None
+        submission = None
+
+
+type _ClarificationQuestionInput = Annotated[
+    ClarificationQuestionInput,
+    BeforeValidator(_question_input),
+]
+type _ClarificationQuestionsInput = Annotated[
+    list[_ClarificationQuestionInput],
+    Field(min_length=1, max_length=16),
+]
+type _ClarificationSubmissionInput = Annotated[
+    ClarificationProposalSubmission,
+    BeforeValidator(_clarification_submission_input),
+]
+type _ClarificationIdInput = Annotated[str, Field(pattern=_CLARIFICATION_ID)]
+type _ClarificationNodeIdsInput = Annotated[
+    list[Annotated[str, Field(min_length=1, max_length=512)]],
+    Field(max_length=_MAX_CONFIRMED_NODES),
 ]
 
 
@@ -411,6 +487,140 @@ class AuthorizationVerifyRequest(_Request):
         return tuple(sorted(checked))
 
 
+def _workflow_timestamp(value: object, info: ValidationInfo) -> object:
+    if info.mode != "json":
+        return value
+    if type(value) is not str:
+        raise ValueError("invalid workflow request")
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        raise ValueError("invalid workflow request") from None
+    canonical = parsed.isoformat()
+    if canonical.endswith("+00:00"):
+        canonical = canonical[:-6] + "Z"
+    if value != canonical:
+        raise ValueError("invalid workflow request")
+    return parsed
+
+
+def _require_utc(value: datetime) -> datetime:
+    offset = value.utcoffset() if type(value) is datetime and value.tzinfo is not None else None
+    if offset is None or offset.total_seconds() != 0:
+        raise ValueError("invalid workflow request")
+    return value.astimezone(UTC)
+
+
+class ClarificationOpenRequest(_Request):
+    envelope: TaskEnvelope
+    classification_evidence_ref: Annotated[str, Field(min_length=1, max_length=256)]
+    questions: Annotated[
+        tuple[ClarificationQuestionInput, ...], Field(min_length=1, max_length=16)
+    ]
+    opened_by: Annotated[str, Field(min_length=1, max_length=256)]
+    opened_at: datetime
+
+    @field_validator("classification_evidence_ref", "opened_by")
+    @classmethod
+    def require_identity(cls, value: str) -> str:
+        return _bounded_identity(value)
+
+    @field_validator("questions")
+    @classmethod
+    def require_unique_questions(
+        cls, values: tuple[ClarificationQuestionInput, ...]
+    ) -> tuple[ClarificationQuestionInput, ...]:
+        if any(type(item) is not ClarificationQuestionInput for item in values) or len(
+            {item.id for item in values}
+        ) != len(values):
+            raise ValueError("invalid workflow request")
+        return values
+
+    @field_validator("opened_at", mode="before")
+    @classmethod
+    def parse_opened_at(cls, value: object, info: ValidationInfo) -> object:
+        return _workflow_timestamp(value, info)
+
+    @field_validator("opened_at")
+    @classmethod
+    def require_opened_at_utc(cls, value: datetime) -> datetime:
+        return _require_utc(value)
+
+
+class ClarificationAnswerRequest(_Request):
+    session_id: Annotated[str, Field(pattern=_CLARIFICATION_ID)]
+    question_id: Annotated[str, Field(min_length=1, max_length=256)]
+    answer: Annotated[str, Field(min_length=1)]
+    actor: Annotated[str, Field(min_length=1, max_length=256)]
+    answered_at: datetime
+
+    @field_validator("session_id", "question_id", "actor")
+    @classmethod
+    def require_identity(cls, value: str) -> str:
+        return _bounded_identity(value)
+
+    @field_validator("answer")
+    @classmethod
+    def require_bounded_answer(cls, value: str) -> str:
+        if type(value) is not str or len(value.encode("utf-8")) > 16 * 1024:
+            raise ValueError("invalid workflow request")
+        return value
+
+    @field_validator("answered_at", mode="before")
+    @classmethod
+    def parse_answered_at(cls, value: object, info: ValidationInfo) -> object:
+        return _workflow_timestamp(value, info)
+
+    @field_validator("answered_at")
+    @classmethod
+    def require_answered_at_utc(cls, value: datetime) -> datetime:
+        return _require_utc(value)
+
+
+class ClarificationProposeRequest(_Request):
+    submission: ClarificationProposalSubmission
+
+    @field_validator("submission")
+    @classmethod
+    def require_bounded_submission(
+        cls, value: ClarificationProposalSubmission
+    ) -> ClarificationProposalSubmission:
+        _canonical_json(value.model_dump(mode="json"))
+        return value
+
+
+class ClarificationConfirmRequest(_Request):
+    proposal_id: Annotated[str, Field(pattern=_PROPOSAL_ID)]
+    actor: Annotated[str, Field(min_length=1, max_length=256)]
+    at: datetime
+    selected_node_ids: Annotated[
+        tuple[Annotated[str, Field(min_length=1, max_length=512)], ...],
+        Field(max_length=_MAX_CONFIRMED_NODES),
+    ] = ()
+
+    @field_validator("actor")
+    @classmethod
+    def require_actor(cls, value: str) -> str:
+        return _bounded_identity(value)
+
+    @field_validator("selected_node_ids")
+    @classmethod
+    def require_sorted_unique_nodes(cls, values: tuple[str, ...]) -> tuple[str, ...]:
+        if tuple(sorted(set(values))) != values or any(_CONTROL.search(value) for value in values):
+            raise ValueError("invalid workflow request")
+        return values
+
+    @field_validator("at", mode="before")
+    @classmethod
+    def parse_at(cls, value: object, info: ValidationInfo) -> object:
+        return _workflow_timestamp(value, info)
+
+    @field_validator("at")
+    @classmethod
+    def require_at_utc(cls, value: datetime) -> datetime:
+        return _require_utc(value)
+
+
 class IntentWorkflowPort(Protocol):
     """Narrow workflow contract exposed to MCP registration."""
 
@@ -441,6 +651,37 @@ class IntentWorkflowPort(Protocol):
         task_id: str,
         graph_version: int,
         requested_paths: tuple[str, ...],
+    ) -> dict[str, object]: ...
+
+    async def clarification_open(
+        self,
+        envelope: TaskEnvelope,
+        classification_evidence_ref: str,
+        questions: tuple[ClarificationQuestionInput, ...],
+        opened_by: str,
+        opened_at: datetime,
+    ) -> dict[str, object]: ...
+
+    async def clarification_answer(
+        self,
+        session_id: str,
+        question_id: str,
+        answer: str,
+        actor: str,
+        answered_at: datetime,
+    ) -> dict[str, object]: ...
+
+    async def clarification_propose(
+        self,
+        submission: ClarificationProposalSubmission,
+    ) -> dict[str, object]: ...
+
+    async def clarification_confirm(
+        self,
+        proposal_id: str,
+        actor: str,
+        at: datetime,
+        selected_node_ids: tuple[str, ...],
     ) -> dict[str, object]: ...
 
 
@@ -502,6 +743,34 @@ def validate_intent_workflow_call(name: str, arguments: dict[str, object]) -> No
             AuthorizationVerifyRequest.model_validate(
                 {**arguments, "requested_paths": tuple(cast(list[object], paths))}
             )
+        elif name == "intent_clarification_open":
+            expected = {
+                "envelope",
+                "classification_evidence_ref",
+                "questions",
+                "opened_by",
+                "opened_at",
+            }
+            questions = dict.get(arguments, "questions")
+            if set(arguments) != expected or type(questions) is not list:
+                raise ValueError("invalid workflow request")
+            _task_envelope_input(dict.__getitem__(arguments, "envelope"))
+            ClarificationOpenRequest.model_validate_json(_canonical_json(arguments))
+        elif name == "intent_clarification_answer":
+            expected = {"session_id", "question_id", "answer", "actor", "answered_at"}
+            if set(arguments) != expected:
+                raise ValueError("invalid workflow request")
+            ClarificationAnswerRequest.model_validate_json(_canonical_json(arguments))
+        elif name == "intent_clarification_propose":
+            if set(arguments) != {"submission"}:
+                raise ValueError("invalid workflow request")
+            _clarification_submission_input(dict.__getitem__(arguments, "submission"))
+        elif name == "intent_clarification_confirm":
+            expected = {"proposal_id", "actor", "at", "selected_node_ids"}
+            selected_node_ids = dict.get(arguments, "selected_node_ids")
+            if set(arguments) != expected or type(selected_node_ids) is not list:
+                raise ValueError("invalid workflow request")
+            ClarificationConfirmRequest.model_validate_json(_canonical_json(arguments))
         elif name not in {
             "intent_bootstrap_propose",
             "intent_proposal_show",
@@ -515,6 +784,10 @@ def validate_intent_workflow_call(name: str, arguments: dict[str, object]) -> No
         arguments = {}
         paths = None
         confirmed_node_ids = None
+        if "questions" in locals():
+            questions = None
+        if "selected_node_ids" in locals():
+            selected_node_ids = None
 
 
 class McpIntentWorkflowServices:
@@ -536,6 +809,38 @@ class McpIntentWorkflowServices:
             )
         finally:
             config_file.close()
+        confirmation_config = runtime.workspace_directory.file("config.yaml")
+        confirmation_policy = runtime.workspace_directory.file("approvals/policy.yaml")
+        connector_directory = None
+        binding_files = {}
+        try:
+            connector_directory = runtime.workspace_directory.subdirectory("connectors")
+            for relative, _snapshot in connector_directory.walk_regular_files(
+                ".yaml", reject_symlinks=True
+            ):
+                binding_files[relative.as_posix()] = connector_directory.file(relative)
+            self._confirmation = ProposalConfirmationService(
+                graph_store=runtime.graph_store,
+                evidence_store=runtime.evidence_store,
+                case_store=runtime.case_store,
+                proposal_store=runtime.intent_proposals,
+                changeset_executor=LocalChangeSetExecutor(
+                    runtime.graph_store,
+                    runtime.case_store,
+                    runtime.transactions,
+                ),
+                transactions=runtime.transactions,
+                config_file=confirmation_config,
+                policy_file=confirmation_policy,
+                binding_files=binding_files,
+            )
+        finally:
+            confirmation_config.close()
+            confirmation_policy.close()
+            for file in binding_files.values():
+                file.close()
+            if connector_directory is not None:
+                connector_directory.close()
 
     @staticmethod
     def _rejected() -> dict[str, object]:
@@ -833,6 +1138,227 @@ class McpIntentWorkflowServices:
                 config = cast(ProjectConfig, None)
                 config_bytes = b""
 
+    def _clarification_authority(self) -> tuple[ProjectConfig, frozenset[str]]:
+        config, _config_bytes = _snapshot_config(self.runtime)
+        principals = frozenset({"agent:codex", *_principals(self.runtime, config)})
+        if config.local_actor not in principals:
+            raise ValueError("clarification authority unavailable")
+        return config, principals
+
+    def _clarification_coordinator(self, config: ProjectConfig) -> ClarificationCoordinator:
+        return ClarificationCoordinator(
+            graph_store=self.runtime.graph_store,
+            evidence_store=self.runtime.evidence_store,
+            proposal_store=self.runtime.intent_proposals,
+            transactions=self.runtime.transactions,
+            config=config,
+            capture=ConversationCapture(
+                self.runtime.evidence_store,
+                connector_id="conversation:codex",
+            ),
+        )
+
+    async def clarification_open(
+        self,
+        envelope: TaskEnvelope,
+        classification_evidence_ref: str,
+        questions: tuple[ClarificationQuestionInput, ...],
+        opened_by: str,
+        opened_at: datetime,
+    ) -> dict[str, object]:
+        detached_envelope: TaskEnvelope | None = None
+        detached_questions: tuple[ClarificationQuestionInput, ...] = ()
+        try:
+            request = ClarificationOpenRequest.model_validate(
+                {
+                    "envelope": envelope,
+                    "classification_evidence_ref": classification_evidence_ref,
+                    "questions": questions,
+                    "opened_by": opened_by,
+                    "opened_at": opened_at,
+                }
+            )
+            config, principals = self._clarification_authority()
+            if request.envelope.actor != config.local_actor or request.opened_by != "agent:codex":
+                return self._rejected()
+            detached_envelope = TaskEnvelope.model_validate_json(request.envelope.model_dump_json())
+            detached_questions = tuple(
+                ClarificationQuestionInput.model_validate_json(item.model_dump_json())
+                for item in request.questions
+            )
+            session = self._clarification_coordinator(config).open(
+                detached_envelope,
+                classification_evidence_ref=request.classification_evidence_ref,
+                questions=detached_questions,
+                opened_by=request.opened_by,
+                opened_at=request.opened_at,
+                principals=principals,
+            )
+            return {
+                "schema_version": 1,
+                "status": session.status,
+                "session": session.model_dump(mode="json"),
+            }
+        except Exception:  # noqa: BLE001 - fixed result contains no question body
+            return self._rejected()
+        except BaseException as error:
+            error.__traceback__ = None
+            error.__cause__ = None
+            error.__context__ = None
+            raise
+        finally:
+            envelope = cast(TaskEnvelope, None)
+            classification_evidence_ref = opened_by = ""
+            questions = ()
+            opened_at = cast(datetime, None)
+            detached_envelope = None
+            detached_questions = ()
+            if "request" in locals():
+                request = cast(ClarificationOpenRequest, None)
+            if "session" in locals():
+                session = cast(ClarificationSession, None)
+            if "principals" in locals():
+                principals = frozenset()
+
+    async def clarification_answer(
+        self,
+        session_id: str,
+        question_id: str,
+        answer: str,
+        actor: str,
+        answered_at: datetime,
+    ) -> dict[str, object]:
+        try:
+            request = ClarificationAnswerRequest.model_validate(
+                {
+                    "session_id": session_id,
+                    "question_id": question_id,
+                    "answer": answer,
+                    "actor": actor,
+                    "answered_at": answered_at,
+                }
+            )
+            config, principals = self._clarification_authority()
+            if request.actor != config.local_actor:
+                return self._rejected()
+            session = self._clarification_coordinator(config).answer(
+                request.session_id,
+                actor=request.actor,
+                question_id=request.question_id,
+                answer=request.answer,
+                answered_at=request.answered_at,
+                acl=tuple(sorted(principals)),
+                principals=principals,
+            )
+            return {
+                "schema_version": 1,
+                "status": session.status,
+                "session": session.model_dump(mode="json"),
+            }
+        except Exception:  # noqa: BLE001 - fixed result contains no answer body
+            return self._rejected()
+        except BaseException as error:
+            error.__traceback__ = None
+            error.__cause__ = None
+            error.__context__ = None
+            raise
+        finally:
+            session_id = question_id = answer = actor = ""
+            answered_at = cast(datetime, None)
+            if "request" in locals():
+                request = cast(ClarificationAnswerRequest, None)
+            if "session" in locals():
+                session = cast(ClarificationSession, None)
+            if "principals" in locals():
+                principals = frozenset()
+
+    async def clarification_propose(
+        self,
+        submission: ClarificationProposalSubmission,
+    ) -> dict[str, object]:
+        detached: ClarificationProposalSubmission | None = None
+        try:
+            request = ClarificationProposeRequest.model_validate({"submission": submission})
+            config, principals = self._clarification_authority()
+            if request.submission.actor != config.local_actor:
+                return self._rejected()
+            detached = ClarificationProposalSubmission.model_validate_json(
+                request.submission.model_dump_json()
+            )
+            proposal = self._clarification_coordinator(config).propose(
+                detached,
+                principals=principals,
+            )
+            return {
+                "schema_version": 1,
+                "status": "proposed",
+                "proposal_id": proposal.id,
+                "proposal_digest": proposal.digest,
+                "graph_version": proposal.baseline_graph_version,
+                "clarification_session_id": proposal.clarification_session_id,
+                "task_id": proposal.task_id,
+            }
+        except Exception:  # noqa: BLE001 - fixed result contains no candidate body
+            return self._rejected()
+        except BaseException as error:
+            error.__traceback__ = None
+            error.__cause__ = None
+            error.__context__ = None
+            raise
+        finally:
+            submission = cast(ClarificationProposalSubmission, None)
+            detached = None
+            if "request" in locals():
+                request = cast(ClarificationProposeRequest, None)
+            if "proposal" in locals():
+                proposal = cast(ClarificationIntentProposal, None)
+            if "principals" in locals():
+                principals = frozenset()
+
+    async def clarification_confirm(
+        self,
+        proposal_id: str,
+        actor: str,
+        at: datetime,
+        selected_node_ids: tuple[str, ...],
+    ) -> dict[str, object]:
+        try:
+            request = ClarificationConfirmRequest.model_validate(
+                {
+                    "proposal_id": proposal_id,
+                    "actor": actor,
+                    "at": at,
+                    "selected_node_ids": selected_node_ids,
+                }
+            )
+            config, _principals_live = self._clarification_authority()
+            if request.actor != config.local_actor:
+                return self._rejected()
+            result = self._confirmation.confirm(
+                request.proposal_id,
+                actor=request.actor,
+                at=request.at,
+                selected_node_ids=request.selected_node_ids,
+            )
+            return cast(dict[str, object], result.model_dump(mode="json"))
+        except Exception:  # noqa: BLE001 - fixed result contains no proposal detail
+            return self._rejected()
+        except BaseException as error:
+            error.__traceback__ = None
+            error.__cause__ = None
+            error.__context__ = None
+            raise
+        finally:
+            proposal_id = actor = ""
+            at = cast(datetime, None)
+            selected_node_ids = ()
+            if "request" in locals():
+                request = cast(ClarificationConfirmRequest, None)
+            if "result" in locals():
+                result = cast(ProposalConfirmationResult, None)
+            if "_principals_live" in locals():
+                _principals_live = frozenset()
+
 
 def load_intent_workflow_services(
     runtime: Runtime,
@@ -1011,8 +1537,154 @@ def register_intent_workflow_tools(
             requested_paths.clear()
             request = cast(AuthorizationVerifyRequest, None)
 
+    @server.tool(
+        name="intent_clarification_open",
+        annotations=_CLARIFY,
+        structured_output=True,
+    )
+    async def clarification_open(
+        envelope: _TaskEnvelopeInput,
+        classification_evidence_ref: _AuthorizationIdentityInput,
+        questions: _ClarificationQuestionsInput,
+        opened_by: _AuthorizationIdentityInput,
+        opened_at: datetime,
+    ) -> dict[str, object]:
+        detached_envelope: TaskEnvelope | None = None
+        detached_questions: tuple[ClarificationQuestionInput, ...] = ()
+        try:
+            request = ClarificationOpenRequest.model_validate(
+                {
+                    "envelope": envelope,
+                    "classification_evidence_ref": classification_evidence_ref,
+                    "questions": tuple(questions),
+                    "opened_by": opened_by,
+                    "opened_at": opened_at,
+                }
+            )
+            detached_envelope = TaskEnvelope.model_validate_json(
+                request.envelope.model_dump_json()
+            )
+            detached_questions = tuple(
+                ClarificationQuestionInput.model_validate_json(item.model_dump_json())
+                for item in request.questions
+            )
+            return await services.clarification_open(
+                detached_envelope,
+                request.classification_evidence_ref,
+                detached_questions,
+                request.opened_by,
+                request.opened_at,
+            )
+        except Exception:  # noqa: BLE001 - one fixed handler boundary
+            _fixed_arguments()
+        finally:
+            envelope = cast(TaskEnvelope, None)
+            classification_evidence_ref = opened_by = ""
+            questions.clear()
+            opened_at = cast(datetime, None)
+            detached_envelope = None
+            detached_questions = ()
+            request = cast(ClarificationOpenRequest, None)
+
+    @server.tool(
+        name="intent_clarification_answer",
+        annotations=_CLARIFY,
+        structured_output=True,
+    )
+    async def clarification_answer(
+        session_id: _ClarificationIdInput,
+        question_id: _AuthorizationIdentityInput,
+        answer: Annotated[str, Field(min_length=1)],
+        actor: _AuthorizationIdentityInput,
+        answered_at: datetime,
+    ) -> dict[str, object]:
+        try:
+            request = ClarificationAnswerRequest.model_validate(
+                {
+                    "session_id": session_id,
+                    "question_id": question_id,
+                    "answer": answer,
+                    "actor": actor,
+                    "answered_at": answered_at,
+                }
+            )
+            return await services.clarification_answer(
+                request.session_id,
+                request.question_id,
+                request.answer,
+                request.actor,
+                request.answered_at,
+            )
+        except Exception:  # noqa: BLE001 - one fixed handler boundary
+            _fixed_arguments()
+        finally:
+            session_id = question_id = answer = actor = ""
+            answered_at = cast(datetime, None)
+            request = cast(ClarificationAnswerRequest, None)
+
+    @server.tool(
+        name="intent_clarification_propose",
+        annotations=_CLARIFY,
+        structured_output=True,
+    )
+    async def clarification_propose(
+        submission: _ClarificationSubmissionInput,
+    ) -> dict[str, object]:
+        detached: ClarificationProposalSubmission | None = None
+        try:
+            request = ClarificationProposeRequest.model_validate({"submission": submission})
+            detached = ClarificationProposalSubmission.model_validate_json(
+                request.submission.model_dump_json()
+            )
+            return await services.clarification_propose(detached)
+        except Exception:  # noqa: BLE001 - one fixed handler boundary
+            _fixed_arguments()
+        finally:
+            submission = cast(ClarificationProposalSubmission, None)
+            detached = None
+            request = cast(ClarificationProposeRequest, None)
+
+    @server.tool(
+        name="intent_clarification_confirm",
+        annotations=_CLARIFY,
+        structured_output=True,
+    )
+    async def clarification_confirm(
+        proposal_id: _ProposalIdInput,
+        actor: _AuthorizationIdentityInput,
+        at: datetime,
+        selected_node_ids: _ClarificationNodeIdsInput,
+    ) -> dict[str, object]:
+        try:
+            request = ClarificationConfirmRequest.model_validate(
+                {
+                    "proposal_id": proposal_id,
+                    "actor": actor,
+                    "at": at,
+                    "selected_node_ids": tuple(selected_node_ids),
+                }
+            )
+            return await services.clarification_confirm(
+                request.proposal_id,
+                request.actor,
+                request.at,
+                request.selected_node_ids,
+            )
+        except Exception:  # noqa: BLE001 - one fixed handler boundary
+            _fixed_arguments()
+        finally:
+            proposal_id = actor = ""
+            at = cast(datetime, None)
+            selected_node_ids.clear()
+            request = cast(ClarificationConfirmRequest, None)
+
 
 __all__ = [
+    "AuthorizationVerifyRequest",
+    "ClarificationAnswerRequest",
+    "ClarificationConfirmRequest",
+    "ClarificationOpenRequest",
+    "ClarificationProposeRequest",
     "IntentWorkflowPort",
     "McpIntentWorkflowServices",
     "load_intent_workflow_services",

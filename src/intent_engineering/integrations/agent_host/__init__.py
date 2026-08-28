@@ -1,5 +1,11 @@
 """Host-neutral intent-aware agent lifecycle contracts."""
 
+from intent_engineering.integrations.agent_host.advisory import (
+    AdvisoryPromptError,
+    AdvisoryPromptRouter,
+    PromptEvent,
+    PromptRoute,
+)
 from intent_engineering.integrations.agent_host.base import (
     AgentHostAdapter,
     HostTask,
@@ -12,6 +18,8 @@ from intent_engineering.integrations.agent_host.base import (
 )
 
 __all__ = [
+    "AdvisoryPromptError",
+    "AdvisoryPromptRouter",
     "AgentHostAdapter",
     "HostTask",
     "HostTaskResult",
@@ -20,4 +28,6 @@ __all__ = [
     "MandatoryHookUnavailable",
     "MutationDecision",
     "MutationReason",
+    "PromptEvent",
+    "PromptRoute",
 ]

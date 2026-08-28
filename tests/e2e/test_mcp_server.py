@@ -116,6 +116,10 @@ async def test_intent_mcp_stdio_is_protocol_clean_and_read_only(tmp_path: Path) 
         "intent_proposal_confirm",
         "intent_preflight",
         "intent_authorization_verify",
+        "intent_clarification_open",
+        "intent_clarification_answer",
+        "intent_clarification_propose",
+        "intent_clarification_confirm",
     }
     assert status.structured_content["schema_version"] == "1"
     assert invalid.is_error is True

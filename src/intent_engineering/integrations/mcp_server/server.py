@@ -58,6 +58,10 @@ class _IntentMCPServer(MCPServer[Any]):
             "intent_proposal_confirm",
             "intent_preflight",
             "intent_authorization_verify",
+            "intent_clarification_open",
+            "intent_clarification_answer",
+            "intent_clarification_propose",
+            "intent_clarification_confirm",
         }
         failed = False
         response: CallToolResult | InputRequiredResult | None = None

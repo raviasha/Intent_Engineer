@@ -4,7 +4,9 @@
 
 from __future__ import annotations
 
+import json
 import os
+import sys
 from pathlib import Path
 from typing import cast
 
@@ -53,9 +55,18 @@ from intent_engineering.core.policy import (
     initialize_project,
     refs_allowed,
 )
+from intent_engineering.integrations.agent_host.advisory import (
+    AdvisoryPromptRouter,
+    PromptEvent,
+    PromptRoute,
+    parse_prompt_event,
+    repository_matches,
+    unavailable_prompt_route,
+)
 from intent_engineering.reconcile import ResolutionUnavailable
 from intent_engineering.render import GraphRenderer, render_drift_report
 from intent_engineering.storage.interfaces import GraphStore
+from intent_engineering.storage.secure import SecureDirectory
 from intent_engineering.sync.models import SyncRunResult, SyncRunStatus
 from intent_engineering.validation import validate_project
 
@@ -77,6 +88,8 @@ app.add_typer(proposals_app, name="proposals")
 app.command("bootstrap")(bootstrap_command)
 app.command("onboard")(onboard_command)
 
+_MAX_PROMPT_HOOK_BYTES = 64 * 1024
+
 
 def _configure_logging() -> None:
     """Keep library operational logs off the structured stdout protocol."""
@@ -84,6 +97,76 @@ def _configure_logging() -> None:
         processors=[structlog.processors.JSONRenderer()],
         logger_factory=structlog.WriteLoggerFactory(__import__("sys").stderr),
     )
+
+
+def _prompt_hook_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("invalid advisory prompt event")
+        result[key] = value
+    return result
+
+
+@app.command("agent-prompt-hook", hidden=True)
+def agent_prompt_hook_command() -> None:
+    """Route exactly one bounded advisory prompt event over stdin/stdout."""
+    raw: bytes | None = None
+    parsed: object = None
+    event: PromptEvent | None = None
+    runtime: Runtime | None = None
+    current: SecureDirectory | None = None
+    route: PromptRoute | None = None
+    signal: BaseException | None = None
+    ok = False
+    try:
+        raw = sys.stdin.buffer.read(_MAX_PROMPT_HOOK_BYTES + 1)
+        if not raw or len(raw) > _MAX_PROMPT_HOOK_BYTES:
+            raise ValueError("invalid advisory prompt event")
+        parsed = json.loads(raw, object_pairs_hook=_prompt_hook_object)
+        event = parse_prompt_event(parsed)
+        current = SecureDirectory.open(Path.cwd())
+        if not repository_matches(current, event.repository):
+            raise ValueError("advisory repository mismatch")
+        try:
+            runtime = load_runtime(Path.cwd())
+        except ProjectNotInitialized:
+            route = PromptRoute(
+                action="offer_onboarding",
+                message=(
+                    "This repository has not been onboarded into Intent Engineering. "
+                    "Start guided onboarding now?"
+                ),
+                mcp_tool=None,
+                arguments={},
+            )
+        else:
+            route = AdvisoryPromptRouter(runtime).route(event)
+        ok = True
+    except Exception:  # noqa: BLE001 - one fixed prompt-hook denial
+        route = unavailable_prompt_route()
+    except BaseException as caught:  # noqa: BLE001 - preserve cancellation identity
+        caught.__traceback__ = None
+        caught.__cause__ = None
+        caught.__context__ = None
+        signal = caught
+    finally:
+        if current is not None:
+            current.close()
+        raw = None
+        parsed = None
+        event = None
+        runtime = None
+        current = None
+    if signal is not None:
+        detached_signal = signal
+        signal = None
+        route = None
+        raise detached_signal.with_traceback(None)
+    typer.echo(cast(PromptRoute, route).model_dump_json())
+    route = None
+    if not ok:
+        raise typer.Exit(1)
 
 
 def _runtime(project: Path) -> Runtime:

@@ -18,6 +18,7 @@ import yaml  # type: ignore[import-untyped]
 from mcp.server.mcpserver.exceptions import ToolError
 
 from intent_engineering.cli.runtime import load_runtime
+from intent_engineering.core.models import ChangeSet, Node, NodeType, SourceMode
 from intent_engineering.core.policy.project import initialize_project
 from intent_engineering.integrations.mcp_server.intent_workflow import (
     AuthorizationVerifyRequest,
@@ -28,7 +29,12 @@ from intent_engineering.integrations.mcp_server.tools import McpReadServices
 from intent_engineering.intent_workflow.authorization import AuthorizationVerification
 from intent_engineering.intent_workflow.bootstrap import BootstrapSubmission
 from intent_engineering.intent_workflow.conversation import ConversationCapture
-from intent_engineering.intent_workflow.models import TaskClassification, TaskEnvelope
+from intent_engineering.intent_workflow.models import (
+    ClarificationProposalSubmission,
+    ClarificationQuestionInput,
+    TaskClassification,
+    TaskEnvelope,
+)
 from intent_engineering.intent_workflow.preflight import (
     AgentClassificationSubmission,
     classification_evidence_content,
@@ -53,6 +59,10 @@ _WORKFLOW_TOOLS = {
     "intent_proposal_confirm",
     "intent_preflight",
     "intent_authorization_verify",
+    "intent_clarification_open",
+    "intent_clarification_answer",
+    "intent_clarification_propose",
+    "intent_clarification_confirm",
 }
 
 
@@ -134,6 +144,72 @@ class _FakeWorkflow:
             "classification": "no_semantic_impact",
             "relevant_node_ids": [],
             "expires_at": "2026-08-26T12:05:00Z",
+        }
+
+    async def clarification_open(
+        self,
+        envelope: TaskEnvelope,
+        classification_evidence_ref: str,
+        questions: tuple[ClarificationQuestionInput, ...],
+        opened_by: str,
+        opened_at: datetime,
+    ) -> dict[str, object]:
+        self.calls.append(
+            (
+                "clarification_open",
+                (envelope, classification_evidence_ref, questions, opened_by, opened_at),
+            )
+        )
+        return {
+            "schema_version": 1,
+            "status": "open",
+            "session_id": "clarification:sha256:" + "1" * 64,
+        }
+
+    async def clarification_answer(
+        self,
+        session_id: str,
+        question_id: str,
+        answer: str,
+        actor: str,
+        answered_at: datetime,
+    ) -> dict[str, object]:
+        self.calls.append(
+            (
+                "clarification_answer",
+                (session_id, question_id, answer, actor, answered_at),
+            )
+        )
+        return {"schema_version": 1, "status": "open", "session_id": session_id}
+
+    async def clarification_propose(
+        self,
+        submission: ClarificationProposalSubmission,
+    ) -> dict[str, object]:
+        self.calls.append(("clarification_propose", submission))
+        return {
+            "schema_version": 1,
+            "status": "proposed",
+            "proposal_id": "proposal:sha256:" + "2" * 64,
+        }
+
+    async def clarification_confirm(
+        self,
+        proposal_id: str,
+        actor: str,
+        at: datetime,
+        selected_node_ids: tuple[str, ...],
+    ) -> dict[str, object]:
+        self.calls.append(
+            ("clarification_confirm", (proposal_id, actor, at, selected_node_ids))
+        )
+        return {
+            "schema_version": 1,
+            "status": "applied",
+            "proposal_id": proposal_id,
+            "graph_version": 1,
+            "decision_id": "proposal-decision:sha256:" + "3" * 64,
+            "case_id": None,
         }
 
 
@@ -229,6 +305,35 @@ def _valid_raw_workflow_arguments(tool_name: str) -> dict[str, object]:
         }
     if tool_name == "intent_preflight":
         return _raw_mechanical_preflight()
+    if tool_name == "intent_clarification_open":
+        return {
+            "envelope": _raw_mechanical_preflight()["envelope"],
+            "classification_evidence_ref": "evidence:conversation:" + "4" * 64,
+            "questions": [
+                {"id": "audience", "prompt": "Who may share reports?", "required": True}
+            ],
+            "opened_by": "agent:codex",
+            "opened_at": "2026-08-26T12:00:01Z",
+        }
+    if tool_name == "intent_clarification_answer":
+        return {
+            "session_id": "clarification:sha256:" + "1" * 64,
+            "question_id": "audience",
+            "answer": "Workspace administrators",
+            "actor": "local",
+            "answered_at": "2026-08-26T12:00:02Z",
+        }
+    if tool_name == "intent_clarification_propose":
+        return {
+            "submission": _clarification_submission().model_dump(mode="json")
+        }
+    if tool_name == "intent_clarification_confirm":
+        return {
+            "proposal_id": "proposal:sha256:" + "2" * 64,
+            "actor": "local",
+            "at": "2026-08-26T12:00:04Z",
+            "selected_node_ids": ["requirement:sharing"],
+        }
     return {
         "token": "bounded-token",
         "actor": "local",
@@ -237,6 +342,38 @@ def _valid_raw_workflow_arguments(tool_name: str) -> dict[str, object]:
         "graph_version": 0,
         "requested_paths": [],
     }
+
+
+def _clarification_submission() -> ClarificationProposalSubmission:
+    at = datetime(2026, 8, 26, 12, 0, 3, tzinfo=UTC)
+    evidence_refs = ("evidence:conversation:" + "5" * 64,)
+    changeset = ChangeSet(
+        id="changeset:clarification-test",
+        actor="local",
+        timestamp=at,
+        baseline_graph_version=0,
+        evidence_refs=evidence_refs,
+        nodes_added=(),
+        nodes_updated=(),
+        nodes_superseded=(),
+        edges_added=(),
+        edges_updated=(),
+        edges_superseded=(),
+        confidence_changes=(),
+        implementation_status_changes=(),
+        reconciliation_cases_created=(),
+        reconciliation_cases_resolved=(),
+        validation_status="validated",
+    )
+    return ClarificationProposalSubmission(
+        session_id="clarification:sha256:" + "1" * 64,
+        task_id="task:sha256:" + "2" * 64,
+        baseline_graph_version=0,
+        actor="local",
+        timestamp=at,
+        evidence_refs=evidence_refs,
+        changeset=changeset,
+    )
 
 
 async def test_workflow_registration_is_optional_additive_and_has_truthful_annotations(
@@ -255,11 +392,21 @@ async def test_workflow_registration_is_optional_additive_and_has_truthful_annot
     confirmed_annotations = by_name["intent_proposal_confirm"].annotations
     preflight_annotations = by_name["intent_preflight"].annotations
     verification_annotations = by_name["intent_authorization_verify"].annotations
+    clarification_annotations = tuple(
+        by_name[name].annotations
+        for name in (
+            "intent_clarification_open",
+            "intent_clarification_answer",
+            "intent_clarification_propose",
+            "intent_clarification_confirm",
+        )
+    )
     assert proposed_annotations is not None
     assert shown_annotations is not None
     assert confirmed_annotations is not None
     assert preflight_annotations is not None
     assert verification_annotations is not None
+    assert all(item is not None for item in clarification_annotations)
     assert (
         proposed_annotations.read_only_hint,
         proposed_annotations.destructive_hint,
@@ -290,6 +437,17 @@ async def test_workflow_registration_is_optional_additive_and_has_truthful_annot
         verification_annotations.idempotent_hint,
         verification_annotations.open_world_hint,
     ) == (True, False, True, False)
+    assert all(
+        (
+            item.read_only_hint,
+            item.destructive_hint,
+            item.idempotent_hint,
+            item.open_world_hint,
+        )
+        == (False, False, False, False)
+        for item in clarification_annotations
+        if item is not None
+    )
     all_public_names = {
         *by_name,
         *(prompt.name for prompt in await with_workflow.list_prompts()),
@@ -328,6 +486,130 @@ async def test_workflow_registration_is_optional_additive_and_has_truthful_annot
         preflight_schema["$defs"]["AgentClassificationSubmission"]["additionalProperties"]
         is False
     )
+    for name in (
+        "intent_clarification_open",
+        "intent_clarification_answer",
+        "intent_clarification_propose",
+        "intent_clarification_confirm",
+    ):
+        assert set(by_name[name].input_schema["properties"]) == {
+            "intent_clarification_open": {
+                "envelope",
+                "classification_evidence_ref",
+                "questions",
+                "opened_by",
+                "opened_at",
+            },
+            "intent_clarification_answer": {
+                "session_id",
+                "question_id",
+                "answer",
+                "actor",
+                "answered_at",
+            },
+            "intent_clarification_propose": {"submission"},
+            "intent_clarification_confirm": {
+                "proposal_id",
+                "actor",
+                "at",
+                "selected_node_ids",
+            },
+        }[name]
+
+
+async def test_clarification_tools_delegate_strict_detached_typed_payloads(
+    tmp_path: Path,
+) -> None:
+    workflow = _FakeWorkflow()
+    server = build_server(_services(tmp_path), intent_workflow_services=workflow)
+    raw = _raw_mechanical_preflight()
+    envelope = TaskEnvelope.model_validate_json(json.dumps(raw["envelope"]))
+    question = ClarificationQuestionInput(
+        id="audience", prompt="Who may share reports?", required=True
+    )
+    opened_at = datetime(2026, 8, 26, 12, 0, 1, tzinfo=UTC)
+    answered_at = datetime(2026, 8, 26, 12, 0, 2, tzinfo=UTC)
+    confirmed_at = datetime(2026, 8, 26, 12, 0, 4, tzinfo=UTC)
+
+    opened = await server.call_tool(
+        "intent_clarification_open",
+        {
+            "envelope": envelope.model_dump(mode="json"),
+            "classification_evidence_ref": "evidence:conversation:" + "4" * 64,
+            "questions": [question.model_dump(mode="json")],
+            "opened_by": "agent:codex",
+            "opened_at": "2026-08-26T12:00:01Z",
+        },
+    )
+    answered = await server.call_tool(
+        "intent_clarification_answer",
+        {
+            "session_id": "clarification:sha256:" + "1" * 64,
+            "question_id": "audience",
+            "answer": "Workspace administrators",
+            "actor": "local",
+            "answered_at": "2026-08-26T12:00:02Z",
+        },
+    )
+    submission = _clarification_submission()
+    proposed = await server.call_tool(
+        "intent_clarification_propose",
+        {"submission": submission.model_dump(mode="json")},
+    )
+    confirmed = await server.call_tool(
+        "intent_clarification_confirm",
+        {
+            "proposal_id": "proposal:sha256:" + "2" * 64,
+            "actor": "local",
+            "at": "2026-08-26T12:00:04Z",
+            "selected_node_ids": ["requirement:sharing"],
+        },
+    )
+
+    assert opened.structured_content["status"] == "open"
+    assert answered.structured_content["status"] == "open"
+    assert proposed.structured_content["status"] == "proposed"
+    assert confirmed.structured_content["status"] == "applied"
+    assert workflow.calls == [
+        (
+            "clarification_open",
+            (
+                envelope,
+                "evidence:conversation:" + "4" * 64,
+                (question,),
+                "agent:codex",
+                opened_at,
+            ),
+        ),
+        (
+            "clarification_answer",
+            (
+                "clarification:sha256:" + "1" * 64,
+                "audience",
+                "Workspace administrators",
+                "local",
+                answered_at,
+            ),
+        ),
+        ("clarification_propose", submission),
+        (
+            "clarification_confirm",
+            (
+                "proposal:sha256:" + "2" * 64,
+                "local",
+                confirmed_at,
+                ("requirement:sharing",),
+            ),
+        ),
+    ]
+    assert "authorization" not in json.dumps(
+        [
+            opened.structured_content,
+            answered.structured_content,
+            proposed.structured_content,
+            confirmed.structured_content,
+        ]
+    ).casefold()
 
 
 async def test_workflow_tools_delegate_detached_typed_payloads(tmp_path: Path) -> None:
@@ -679,6 +961,205 @@ async def test_production_preflight_issues_only_authorized_results_and_verifies_
         "expires_at",
     }
     assert "reason" not in denied_shape
+
+
+async def test_production_clarification_lifecycle_preserves_evidence_and_exact_confirmation(
+    tmp_path: Path,
+) -> None:
+    """The public ports reuse held production services without exposing conversation bodies."""
+    from intent_engineering.integrations.mcp_server.intent_workflow import (
+        load_intent_workflow_services,
+    )
+
+    project, bootstrap = await anyio.to_thread.run_sync(_configured_project, tmp_path)
+    policy = {
+        "schema_version": 1,
+        "contributors": ["local"],
+        "approvers": ["local"],
+        "executors": ["local"],
+        "identities": {"local": ["local", "local:authoritative-alias"]},
+    }
+    (project / ".intent/approvals/policy.yaml").write_text(
+        yaml.safe_dump(policy, sort_keys=True), encoding="utf-8"
+    )
+    runtime = load_runtime(project)
+    workflow = load_intent_workflow_services(runtime)
+    server = build_server(McpReadServices(runtime), intent_workflow_services=workflow)
+    proposed_baseline = await server.call_tool(
+        "intent_bootstrap_propose",
+        {"submission": bootstrap.model_dump(mode="json")},
+    )
+    await server.call_tool(
+        "intent_proposal_confirm",
+        {
+            "proposal_id": proposed_baseline.structured_content["proposal_id"],
+            "proposal_digest": proposed_baseline.structured_content["proposal_digest"],
+            "confirmed_node_ids": ["intent:local-export", "requirement:csv-export"],
+        },
+    )
+    envelope, classification = _preflight_inputs(
+        runtime,
+        classification=TaskClassification.NEW_OR_AMBIGUOUS,
+        conversation_ref="codex:clarification-lifecycle",
+        request="Add report sharing",
+        questions=("Who may share reports?",),
+    )
+    preflight = await server.call_tool(
+        "intent_preflight",
+        {
+            "envelope": envelope.model_dump(mode="json"),
+            "submission": classification.model_dump(mode="json"),
+        },
+    )
+    assert "authorization_token" not in preflight.structured_content
+
+    base = envelope.created_at
+    question_text = "Who may share reports? [question-only marker]"
+    answer_text = "Workspace administrators [answer-only marker]"
+    opened = await server.call_tool(
+        "intent_clarification_open",
+        {
+            "envelope": envelope.model_dump(mode="json"),
+            "classification_evidence_ref": classification.agent_evidence_ref,
+            "questions": [{"id": "audience", "prompt": question_text, "required": True}],
+            "opened_by": "agent:codex",
+            "opened_at": (base + timedelta(microseconds=2)).isoformat().replace("+00:00", "Z"),
+        },
+    )
+    session_id = opened.structured_content["session"]["id"]
+    answered = await server.call_tool(
+        "intent_clarification_answer",
+        {
+            "session_id": session_id,
+            "question_id": "audience",
+            "answer": answer_text,
+            "actor": "local",
+            "answered_at": (base + timedelta(microseconds=5)).isoformat().replace(
+                "+00:00", "Z"
+            ),
+        },
+    )
+    session = runtime.intent_proposals.session(session_id)
+    assert tuple(item.author for item in session.questions) == ("agent:codex",)
+    assert tuple(item.actor for item in session.answers) == ("local",)
+    assert "local:authoritative-alias" in runtime.evidence_store.get(
+        session.answers[0].evidence_ref
+    ).acl
+    evidence_refs = (
+        session.request_evidence_ref,
+        session.classification_evidence_ref,
+        *(item.evidence_ref for item in session.questions),
+        *(item.evidence_ref for item in session.answers),
+    )
+    proposal_at = base + timedelta(microseconds=6)
+    node = Node(
+        id="requirement:report-sharing",
+        type=NodeType.REQUIREMENT,
+        label="Workspace administrators may share reports",
+        status="proposed",
+        created_by="local",
+        created_at=proposal_at,
+        last_modified_by="local",
+        last_modified_at=proposal_at,
+        source_mode=SourceMode.INFERRED,
+        intent_fidelity_confidence=0.8,
+        confidence_basis="Clarified conversation",
+        last_reassessed_at=proposal_at,
+        evidence_refs=evidence_refs,
+    )
+    changeset = ChangeSet(
+        id="",
+        actor="local",
+        timestamp=proposal_at,
+        baseline_graph_version=session.baseline_graph_version,
+        evidence_refs=evidence_refs,
+        nodes_added=(node,),
+        nodes_updated=(),
+        nodes_superseded=(),
+        edges_added=(),
+        edges_updated=(),
+        edges_superseded=(),
+        confidence_changes=(),
+        implementation_status_changes=(),
+        reconciliation_cases_created=(),
+        reconciliation_cases_resolved=(),
+        validation_status="validated",
+    )
+    submission = ClarificationProposalSubmission(
+        session_id=session.id,
+        task_id=session.task_id,
+        baseline_graph_version=session.baseline_graph_version,
+        actor="local",
+        timestamp=proposal_at,
+        evidence_refs=evidence_refs,
+        changeset=changeset,
+        core_node_ids=(node.id,),
+    )
+    proposed = await server.call_tool(
+        "intent_clarification_propose",
+        {"submission": submission.model_dump(mode="json")},
+    )
+    proposal_id = proposed.structured_content["proposal_id"]
+    graph_before = runtime.graph_store.load()
+    incorrect = await server.call_tool(
+        "intent_clarification_confirm",
+        {
+            "proposal_id": proposal_id,
+            "actor": "local",
+            "at": (base + timedelta(microseconds=7)).isoformat().replace("+00:00", "Z"),
+            "selected_node_ids": ["requirement:not-in-proposal"],
+        },
+    )
+    assert incorrect.structured_content["status"] == "rejected"
+    assert runtime.graph_store.load() == graph_before
+    confirmed = await server.call_tool(
+        "intent_clarification_confirm",
+        {
+            "proposal_id": proposal_id,
+            "actor": "local",
+            "at": (base + timedelta(microseconds=8)).isoformat().replace("+00:00", "Z"),
+            "selected_node_ids": [node.id],
+        },
+    )
+
+    events = runtime.intent_proposals.clarification_events(session_id)
+    assert tuple(item.event_type for item in events) == (
+        "opened",
+        "answered",
+        "proposed",
+        "closed",
+    )
+    assert tuple(item.predecessor_event_id for item in events) == (
+        None,
+        events[0].id,
+        events[1].id,
+        events[2].id,
+    )
+    assert runtime.intent_proposals.get(proposal_id).proposed_by == "local"
+    assert confirmed.structured_content["status"] == "applied"
+    assert runtime.graph_store.load().nodes[-1].id == node.id
+    public = json.dumps(
+        [
+            opened.structured_content,
+            answered.structured_content,
+            proposed.structured_content,
+            incorrect.structured_content,
+            confirmed.structured_content,
+        ]
+    )
+    assert question_text not in public
+    assert answer_text not in public
+    assert "authorization" not in public.casefold()
+    durable_proposals = (project / ".intent/history/intent-proposals.jsonl").read_text(
+        encoding="utf-8"
+    )
+    durable_evidence = (project / ".intent/evidence/evidence.jsonl").read_text(
+        encoding="utf-8"
+    )
+    assert question_text not in durable_proposals
+    assert answer_text not in durable_proposals
+    assert question_text in durable_evidence
+    assert answer_text in durable_evidence
 
 
 async def test_production_verification_reauthenticates_live_graph_and_config(
@@ -1159,6 +1640,16 @@ async def test_production_port_proposes_shows_and_activates_without_propose_time
                 "graph_version": 0,
                 "requested_paths": [],
             },
+        ),
+        *(
+            (
+                "intent_clarification_open",
+                {
+                    **_valid_raw_workflow_arguments("intent_clarification_open"),
+                    field_name: ["PRIVATE-CALLER-SUPERSET"],
+                },
+            )
+            for field_name in ("principals", "actor_aliases", "acl")
         ),
         *(
             (
