@@ -10,6 +10,7 @@ import pytest
 from pydantic import ValidationError
 from typer.testing import CliRunner
 
+import intent_engineering.integrations.agent_host.advisory as advisory_module
 from intent_engineering.cli.app import app
 from intent_engineering.cli.runtime import load_runtime
 from intent_engineering.core.models import Graph, Node, NodeType
@@ -135,6 +136,11 @@ def test_same_host_turn_reuses_ref_while_distinct_turns_do_not(tmp_path: Path) -
         first.arguments["conversation_ref"],
         identical_next_turn.arguments["conversation_ref"],
     }
+    assert getattr(advisory_module, "CODEX_CONVERSATION_REF_BYTES", None) == 145
+    assert tuple(
+        len(route.arguments["conversation_ref"].encode("utf-8"))
+        for route in (first, retry, identical_next_turn, changed_next_turn)
+    ) == (145, 145, 145, 145)
 
 
 def test_turn_ref_is_bounded_and_delimiter_safe_without_raw_host_identity(

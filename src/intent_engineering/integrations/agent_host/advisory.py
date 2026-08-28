@@ -42,6 +42,7 @@ _MAX_REPOSITORY_BYTES = 4 * 1024
 _MAX_EVENT_BYTES = 64 * 1024
 _MAX_JSON_DEPTH = 128
 _MAX_JSON_NODES = 65_536
+CODEX_CONVERSATION_REF_BYTES = 145
 _OFFER = (
     "This repository has not been onboarded into Intent Engineering. Start guided onboarding now?"
 )
@@ -90,12 +91,15 @@ def _codex_identity_digest(label: str, *values: str) -> str:
 
 
 def codex_conversation_ref(session_id: str, turn_id: str) -> str:
-    """Return one bounded retry identity with a separately matchable session lineage."""
+    """Return the exact 145-byte retry identity with a matchable session lineage."""
     checked_session = _identity(session_id)
     checked_turn = _identity(turn_id)
     session_digest = _codex_identity_digest("codex-session-v1", checked_session)
     turn_digest = _codex_identity_digest("codex-turn-v1", checked_session, checked_turn)
-    return f"codex-prompt:v1:{session_digest}:{turn_digest}"
+    reference = f"codex-prompt:v1:{session_digest}:{turn_digest}"
+    if len(reference.encode("utf-8")) != CODEX_CONVERSATION_REF_BYTES:
+        raise ValueError("invalid advisory conversation reference")
+    return reference
 
 
 def _codex_session_lineage(conversation_ref: object) -> str | None:
@@ -599,6 +603,7 @@ class AdvisoryPromptRouter:
 
 __all__ = [
     "CODEX_ADVISORY_FALLBACK",
+    "CODEX_CONVERSATION_REF_BYTES",
     "AdvisoryPromptError",
     "AdvisoryPromptRouter",
     "CodexUserPromptSubmitEvent",
