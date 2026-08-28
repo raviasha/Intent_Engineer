@@ -36,6 +36,7 @@ from intent_engineering.core.models import (
     SourceRoleAssignment,
 )
 from intent_engineering.core.models._base import StrictModel
+from intent_engineering.core.policy import ProjectNotInitialized, initialize_project
 from intent_engineering.intent_workflow.bootstrap import BootstrapService
 from intent_engineering.intent_workflow.onboarding import (
     OnboardingRuntime,
@@ -495,13 +496,39 @@ def _existing_onboarding_result(
         status,
         state=OnboardState.REVIEW_REQUIRED,
         proposal=cast(dict[str, JsonValue], preview),
-        next_action="intent_proposals_confirm",
+        next_action="intent_proposal_confirm",
     )
 
 
 def _inspect_onboarding(runtime: Runtime) -> OnboardingStatus:
     """Adapt the CLI's immutable runtime to the read-only onboarding protocol."""
     return inspect_onboarding(cast(OnboardingRuntime, runtime))
+
+
+def _uninitialized_onboarding_status() -> OnboardingStatus:
+    """Represent a missing workspace as a consent-gated, pre-baseline repository."""
+    return OnboardingStatus(
+        state=OnboardingState.REQUIRED,
+        graph_version=0,
+        active_node_count=0,
+        pending_proposal_ids=(),
+    )
+
+
+def _post_capture_onboarding_result(
+    runtime: Runtime,
+    status: OnboardingStatus,
+    source_role: SourceRoleAssignment,
+) -> OnboardingCommandResult:
+    """Project the exact state observed after capture/configuration without overwriting it."""
+    if status.state is not OnboardingState.REQUIRED:
+        return _existing_onboarding_result(runtime, status)
+    return _onboarding_result(
+        status,
+        state=OnboardState.PROPOSAL_REQUIRED,
+        source_role=source_role,
+        next_action="intent_bootstrap_propose",
+    )
 
 
 def _onboard_result(
@@ -513,7 +540,23 @@ def _onboard_result(
     runtime: Runtime | None = None
     payload: OnboardingCommandResult | None = None
     try:
-        runtime = load_runtime(project)
+        try:
+            runtime = load_runtime(project)
+        except ProjectNotInitialized:
+            status = _uninitialized_onboarding_status()
+            if not yes:
+                return (
+                    True,
+                    _onboarding_result(
+                        status,
+                        state=OnboardState.CONFIRMATION_REQUIRED,
+                        next_action="intent_onboard_confirm",
+                        message="Start guided onboarding now?",
+                    ),
+                    None,
+                )
+            initialize_project(project)
+            runtime = load_runtime(project)
         status = _inspect_onboarding(runtime)
         if status.state is not OnboardingState.REQUIRED:
             return True, _existing_onboarding_result(runtime, status), None
@@ -562,11 +605,10 @@ def _onboard_result(
         evidence_refs = bootstrap_payload.get("evidence_refs")
         if type(evidence_refs) is not list or not all(type(item) is str for item in evidence_refs):
             return False, None, None
-        payload = _onboarding_result(
+        payload = _post_capture_onboarding_result(
+            runtime,
             _inspect_onboarding(runtime),
-            state=OnboardState.PROPOSAL_REQUIRED,
-            source_role=source_role,
-            next_action="intent_bootstrap_propose",
+            source_role,
         )
         return True, payload, None
     except Exception:  # noqa: BLE001 - public CLI receives one fixed failure
@@ -592,7 +634,10 @@ def onboard_command(
     ok, payload, abort = _onboard_result(project, prd, yes)
     del project, prd, yes
     if abort is not None:
-        raise abort
+        try:
+            raise abort
+        finally:
+            abort = None
     if not ok or payload is None:
         _fixed_error()
     assert payload is not None

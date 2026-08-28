@@ -22,6 +22,59 @@ def _durable_bytes(project: Path) -> dict[str, bytes]:
     return _state(project)
 
 
+def _uninitialized_project(tmp_path: Path) -> Path:
+    """Create a PRD project with no durable Intent Engineering workspace."""
+    project = tmp_path / "uninitialized"
+    (project / "docs").mkdir(parents=True)
+    (project / "docs" / "prd.md").write_text("# Product\n\nExport local CSV.\n", encoding="utf-8")
+    return project
+
+
+def _repository_traceback_locals(error: BaseException) -> str:
+    """Collect only Intent Engineering traceback locals for secret-boundary assertions."""
+    values: list[str] = []
+    traceback = error.__traceback__
+    while traceback is not None:
+        if "/src/intent_engineering/" in traceback.tb_frame.f_code.co_filename:
+            values.append(repr(traceback.tb_frame.f_locals))
+        traceback = traceback.tb_next
+    return "\n".join(values)
+
+
+def test_onboard_uninitialized_decline_is_a_byte_noop(tmp_path: Path) -> None:
+    """Catches a first-use decline that creates a workspace before consent."""
+    project = _uninitialized_project(tmp_path)
+    prd = project / "docs" / "prd.md"
+    before = prd.read_bytes()
+
+    result = CliRunner().invoke(
+        app,
+        ["onboard", "--project", str(project), "--prd", "docs/prd.md", "--format", "json"],
+    )
+
+    assert result.exit_code == 1
+    assert json.loads(result.stdout)["state"] == "confirmation_required"
+    assert prd.read_bytes() == before
+    assert not (project / ".intent").exists()
+
+
+def test_onboard_uninitialized_acceptance_initializes_then_captures(tmp_path: Path) -> None:
+    """Catches accepted first-use onboarding that does not initialize its workspace."""
+    project = _uninitialized_project(tmp_path)
+
+    result = CliRunner().invoke(
+        app,
+        ["onboard", "--project", str(project), "--prd", "docs/prd.md", "--yes", "--format", "json"],
+    )
+
+    assert result.exit_code == 0, repr(result.exception)
+    payload = json.loads(result.stdout)
+    assert payload["state"] == "proposal_required"
+    assert payload["source_role"]["role"] == "declared_intent"
+    assert (project / ".intent").is_dir()
+    assert len(load_runtime(project).evidence()) == 1
+
+
 def test_onboard_requires_confirmation_before_capture(tmp_path: Path) -> None:
     """Catches a command that captures a PRD before explicit source consent."""
     project = _project(tmp_path)
@@ -87,7 +140,7 @@ def test_onboard_existing_proposal_displays_review_without_recapture(
     payload = json.loads(result.stdout)
     assert payload["state"] == "review_required"
     assert payload["proposal"]["proposal_id"] == review.proposal_id
-    assert payload["next_action"] == "intent_proposals_confirm"
+    assert payload["next_action"] == "intent_proposal_confirm"
     assert payload["authorization_issued"] is False
     assert _durable_bytes(project) == before
 
@@ -178,21 +231,96 @@ def test_onboard_replaces_a_prior_role_for_the_prd(tmp_path: Path) -> None:
     assert updated.source_roles[0].role is SourceRole.DECLARED_INTENT
 
 
-def test_onboard_preserves_cancellation_identity_and_scrubs_its_traceback(
+def test_onboard_projects_a_concurrent_proposal_from_fresh_state(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Catches conversion of cancellation into a public fixed failure."""
-    project = _project(tmp_path)
-    cancellation = asyncio.CancelledError("private-onboard-cancellation")
+    """Catches a post-config proposal race reported as stale proposal-required state."""
+    project, submission = _configured_project(tmp_path)
 
     import intent_engineering.cli.intent_workflow as workflow_cli
 
+    original = workflow_cli._source_role_result
+
+    def configure_then_propose(*args):
+        result = original(*args)
+        _propose(project, submission)
+        return result
+
+    monkeypatch.setattr(workflow_cli, "_source_role_result", configure_then_propose)
+    result = CliRunner().invoke(
+        app,
+        ["onboard", "--project", str(project), "--prd", "docs/prd.md", "--yes", "--format", "json"],
+    )
+
+    assert result.exit_code == 0, repr(result.exception)
+    payload = json.loads(result.stdout)
+    assert payload["state"] == "review_required"
+    assert payload["proposal"]["proposal_id"] == load_runtime(project).intent_proposals.list()[0].id
+    assert payload["next_action"] == "intent_proposal_confirm"
+
+
+def test_onboard_projects_a_concurrent_activation_from_fresh_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Catches a post-config activation race reported as stale proposal-required state."""
+    project, submission = _configured_project(tmp_path)
+
+    import intent_engineering.cli.intent_workflow as workflow_cli
+    from tests.e2e.test_cli_intent_bootstrap import _Terminal
+
+    original = workflow_cli._source_role_result
+
+    def configure_then_activate(*args):
+        result = original(*args)
+        review = _propose(project, submission)
+        confirmed, _payload, abort = workflow_cli._confirmation_result(
+            project,
+            review.proposal_id,
+            _Terminal(True, f"confirm {review.proposal_digest}"),
+        )
+        assert confirmed is True
+        assert abort is None
+        return result
+
+    monkeypatch.setattr(workflow_cli, "_source_role_result", configure_then_activate)
+    result = CliRunner().invoke(
+        app,
+        ["onboard", "--project", str(project), "--prd", "docs/prd.md", "--yes", "--format", "json"],
+    )
+
+    assert result.exit_code == 0, repr(result.exception)
+    payload = json.loads(result.stdout)
+    assert payload["state"] == "ready"
+    assert payload["next_action"] is None
+    assert load_runtime(project).graph_store.load().version == 1
+
+
+def test_onboard_preserves_real_cancellation_identity_and_scrubs_traceback_locals(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Catches cancellation conversion or source bytes retained in production traceback frames."""
+    project = _project(tmp_path)
+    before = _durable_bytes(project)
+    secret = "private-onboard-cancellation-source"
+    cancellation = asyncio.CancelledError(secret)
+
+    import intent_engineering.cli.intent_workflow as workflow_cli
+
+    def cancel_capture(*_args):
+        raise cancellation
+
     monkeypatch.setattr(
         workflow_cli,
-        "_bootstrap_result",
-        lambda *_args: (False, None, cancellation),
+        "_capture_prd",
+        cancel_capture,
     )
-    ok, payload, abort = workflow_cli._onboard_result(project, "docs/prd.md", True)
 
-    assert (ok, payload, abort) == (False, None, cancellation)
-    assert cancellation.__traceback__ is None
+    with pytest.raises(asyncio.CancelledError) as caught:
+        workflow_cli.onboard_command("docs/prd.md", project, output_format="json", yes=True)
+
+    assert caught.value is cancellation
+    assert cancellation.__traceback__ is not None
+    assert cancellation.__cause__ is None
+    assert cancellation.__context__ is None
+    assert secret not in _repository_traceback_locals(cancellation)
+    assert _durable_bytes(project) == before
