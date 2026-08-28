@@ -43,6 +43,17 @@ class _ProposalStore:
 
 
 @dataclass
+class _BoundedProposalStore(_ProposalStore):
+    decision_lookups: int = 0
+
+    def decision_for(self, proposal_id: str) -> object | None:
+        if self.decision_lookups >= 256:
+            raise AssertionError("decision lookup exceeded the proposal-list limit")
+        self.decision_lookups += 1
+        return super().decision_for(proposal_id)
+
+
+@dataclass
 class _Runtime:
     graph_store: _GraphStore
     intent_proposals: _ProposalStore
@@ -167,13 +178,15 @@ def test_pending_proposal_is_reported_without_becoming_a_baseline(
 
 
 def test_pending_proposals_are_bounded_to_the_public_proposal_list_limit() -> None:
-    """Catches an unbounded status response for an oversized proposal ledger."""
+    """Catches decision lookups continuing past the bounded proposal summary."""
     proposals = tuple(_proposal(index) for index in range(257))
-    runtime = _Runtime(_GraphStore(_graph()), _ProposalStore(proposals))
+    proposal_store = _BoundedProposalStore(proposals)
+    runtime = _Runtime(_GraphStore(_graph()), proposal_store)
 
     status = inspect_onboarding(runtime)
 
     assert status.pending_proposal_ids == tuple(proposal.id for proposal in proposals[:256])
+    assert proposal_store.decision_lookups == 256
 
 
 def test_status_rejects_unbounded_pending_proposal_ids() -> None:

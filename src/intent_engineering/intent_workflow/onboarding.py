@@ -68,7 +68,7 @@ def inspect_onboarding(runtime: OnboardingRuntime) -> OnboardingStatus:
         proposals = runtime.intent_proposals.list()
         if type(proposals) is not tuple:
             raise ValueError("invalid proposal ledger")
-        for proposal in proposals:
+        for proposal in proposals[:_MAX_PENDING_PROPOSALS]:
             proposal_id = proposal.id
             if type(proposal_id) is not str or proposal_id in pending_seen:
                 raise ValueError("invalid proposal ledger")
