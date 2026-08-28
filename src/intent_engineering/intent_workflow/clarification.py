@@ -956,6 +956,7 @@ class ProposalConfirmationService:
         config_file: SecureFile,
         policy_file: SecureFile,
         binding_files: Mapping[str, SecureFile] | None = None,
+        authority_read_policies: Mapping[str, LocalTransactionExtraReadPolicy] | None = None,
     ) -> None:
         self._graph_store = graph_store
         self._evidence_store = evidence_store
@@ -969,6 +970,20 @@ class ProposalConfirmationService:
         }
         for index, (_name, file) in enumerate(sorted((binding_files or {}).items())):
             self._extras[f"authority_binding_{index}"] = file.duplicate()
+        if authority_read_policies is not None and (
+            set(authority_read_policies) != set(self._extras)
+            or any(
+                type(policy) is not LocalTransactionExtraReadPolicy
+                for policy in authority_read_policies.values()
+            )
+        ):
+            for file in self._extras.values():
+                file.close()
+            self._extras.clear()
+            raise ValueError("invalid confirmation authority read policies")
+        self._authority_read_policies = (
+            None if authority_read_policies is None else dict(authority_read_policies)
+        )
 
     @staticmethod
     def _authority(
@@ -1223,6 +1238,7 @@ class ProposalConfirmationService:
         with self._transactions.transaction(
             rollback_base_exceptions=True,
             extras=self._extras,
+            extra_read_policies=self._authority_read_policies,
         ) as transaction:
             if any(
                 transaction.read_optional(name) != content
@@ -1499,7 +1515,10 @@ class ProposalConfirmationService:
         at: datetime,
         selected: tuple[str, ...],
     ) -> ProposalConfirmationResult:
-        snapshot = self._transactions.snapshot(self._extras)
+        snapshot = self._transactions.snapshot(
+            self._extras,
+            extra_read_policies=self._authority_read_policies,
+        )
         config, policy, provider_principals = self._authority(snapshot)
         graph, evidence, _ = _records(snapshot)
         ledger = snapshot.content.get("intent_proposals")
@@ -1632,7 +1651,10 @@ class ProposalConfirmationService:
         selected_node_ids: tuple[str, ...],
     ) -> ProposalConfirmationResult:
         at = _utc(at)
-        snapshot = self._transactions.snapshot(self._extras)
+        snapshot = self._transactions.snapshot(
+            self._extras,
+            extra_read_policies=self._authority_read_policies,
+        )
         config, policy, provider_principals = self._authority(snapshot)
         graph, evidence, _ = _records(snapshot)
         ledger = snapshot.content.get("intent_proposals")
@@ -1688,7 +1710,10 @@ class ProposalConfirmationService:
                 )
             if not set(actor_aliases).isdisjoint(set(proposer_aliases) | set(conflict_aliases)):
                 raise ValueError("reviewer is not independent")
-            snapshot = self._transactions.snapshot(self._extras)
+            snapshot = self._transactions.snapshot(
+                self._extras,
+                extra_read_policies=self._authority_read_policies,
+            )
         authenticated = self._authenticate_confirmation_snapshot(
             snapshot,
             proposal=proposal,
@@ -1792,6 +1817,7 @@ class ProposalConfirmationService:
                 rollback_base_exceptions=True,
                 read_only_extras=self._extras,
                 extra_preimages=extras_preimages,
+                extra_read_policies=self._authority_read_policies,
             )
         except Exception:
             durable = self._store.decision_for(proposal.id)
@@ -1847,6 +1873,8 @@ class ProposalConfirmationService:
         for file in self._extras.values():
             file.close()
         self._extras.clear()
+        if self._authority_read_policies is not None:
+            self._authority_read_policies.clear()
 
 
 __all__ = [

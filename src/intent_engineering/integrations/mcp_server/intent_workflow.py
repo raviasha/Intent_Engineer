@@ -926,6 +926,12 @@ class McpIntentWorkflowServices:
             )
             for relative, _snapshot in connector_bindings:
                 binding_files[relative.as_posix()] = connector_directory.file(relative)
+            confirmation_authority_files = {
+                "authority_config": confirmation_config,
+                "authority_policy": confirmation_policy,
+            }
+            for index, (_name, file) in enumerate(sorted(binding_files.items())):
+                confirmation_authority_files[f"authority_binding_{index}"] = file
             self._confirmation = ProposalConfirmationService(
                 graph_store=runtime.graph_store,
                 evidence_store=runtime.evidence_store,
@@ -940,6 +946,9 @@ class McpIntentWorkflowServices:
                 config_file=confirmation_config,
                 policy_file=confirmation_policy,
                 binding_files=binding_files,
+                authority_read_policies=_clarification_authority_read_policies(
+                    confirmation_authority_files
+                ),
             )
             self._clarification_authority_base_files = {
                 "authority_config": confirmation_config.duplicate(),

@@ -18,7 +18,11 @@ from intent_engineering.storage.jsonl.case_store import (
 )
 from intent_engineering.storage.jsonl.history_store import serialize_changeset
 from intent_engineering.storage.secure import SecureFile
-from intent_engineering.storage.transaction import LocalTransaction, LocalTransactionCoordinator
+from intent_engineering.storage.transaction import (
+    LocalTransaction,
+    LocalTransactionCoordinator,
+    LocalTransactionExtraReadPolicy,
+)
 from intent_engineering.storage.yaml.graph_store import (
     YamlGraphStore,
     parse_graph,
@@ -88,6 +92,7 @@ class LocalChangeSetExecutor:
         rollback_base_exceptions: bool = False,
         read_only_extras: Mapping[str, SecureFile] | None = None,
         extra_preimages: Mapping[str, bytes | None] | None = None,
+        extra_read_policies: Mapping[str, LocalTransactionExtraReadPolicy] | None = None,
     ) -> Graph:
         """Prevalidate all groups, then durably commit every declared local effect."""
         if (intent_proposal_preimage is None) != (intent_proposal_append is None) or (
@@ -95,14 +100,24 @@ class LocalChangeSetExecutor:
             and (type(intent_proposal_append) is not bytes or not intent_proposal_append)
         ):
             raise ValueError("invalid intent proposal transaction effect")
-        if intent_proposal_append is not None and "intent_proposals" not in self._transactions.target_names:
+        if (
+            intent_proposal_append is not None
+            and "intent_proposals" not in self._transactions.target_names
+        ):
             raise ValueError("intent proposal transaction target is unavailable")
         if evidence_preimage is not None and "evidence" not in self._transactions.target_names:
             raise ValueError("evidence transaction target is unavailable")
         if case_preimage is not None and not bind_case_preimage:
             raise ValueError("case preimage requires an explicit binding")
-        if (read_only_extras is None) != (extra_preimages is None) or (
-            read_only_extras is not None and set(read_only_extras) != set(extra_preimages or {})
+        if (
+            (read_only_extras is None) != (extra_preimages is None)
+            or (
+                read_only_extras is not None and set(read_only_extras) != set(extra_preimages or {})
+            )
+            or (
+                extra_read_policies is not None
+                and set(extra_read_policies) != set(read_only_extras or {})
+            )
         ):
             raise ValueError("invalid read-only transaction binding")
         validated: ChangeSet | None = None
@@ -119,6 +134,7 @@ class LocalChangeSetExecutor:
             with self._transactions.transaction(
                 rollback_base_exceptions=rollback_base_exceptions,
                 extras=read_only_extras,
+                extra_read_policies=extra_read_policies,
             ) as transaction:
                 if extra_preimages is not None and any(
                     transaction.read_optional(name) != content
@@ -174,6 +190,7 @@ class LocalChangeSetExecutor:
             rollback_base_exceptions = False
             read_only_extras = None
             extra_preimages = None
+            extra_read_policies = None
             validated = None
             effects = ()
             graph = None

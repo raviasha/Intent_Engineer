@@ -918,10 +918,56 @@ def _clarification_fifo_snapshot_child(
         sending.close()
 
 
+def _clarification_confirm_fifo_child(
+    workflow: object,
+    server: object,
+    binding_path: str,
+    arguments: dict[str, object],
+    stage: str,
+    sending: Connection,
+) -> None:
+    """Swap one binding after adapter authentication and report bounded confirmation."""
+    target = Path(binding_path)
+
+    def swap_to_fifo() -> None:
+        target.unlink()
+        os.mkfifo(target)
+
+    if stage == "service_authentication":
+        original_authority = workflow._clarification_authority  # type: ignore[attr-defined]
+
+        def authority_then_swap():
+            authority = original_authority()
+            swap_to_fifo()
+            return authority
+
+        workflow._clarification_authority = authority_then_swap  # type: ignore[attr-defined]
+    else:
+        original_apply = workflow._confirmation._executor.apply  # type: ignore[attr-defined]
+
+        def apply_after_swap(*args: object, **kwargs: object):
+            swap_to_fifo()
+            return original_apply(*args, **kwargs)  # type: ignore[arg-type]
+
+        workflow._confirmation._executor.apply = apply_after_swap  # type: ignore[attr-defined]
+    try:
+        response = anyio.run(  # type: ignore[arg-type]
+            server.call_tool,  # type: ignore[attr-defined]
+            "intent_clarification_confirm",
+            arguments,
+        )
+        sending.send(response.structured_content)
+    except BaseException:  # noqa: BLE001 - the child reports only completion class
+        sending.send("raised")
+    finally:
+        sending.close()
+
+
 async def _production_clarification_server(
     tmp_path: Path,
     *,
     initial_binding: bool = False,
+    initial_binding_names: tuple[str, ...] = (),
 ):
     from intent_engineering.integrations.mcp_server.intent_workflow import (
         load_intent_workflow_services,
@@ -944,10 +990,13 @@ async def _production_clarification_server(
     (project / ".intent/approvals/policy.yaml").write_text(
         yaml.safe_dump(policy, sort_keys=True), encoding="utf-8"
     )
-    if initial_binding:
+    if initial_binding and initial_binding_names:
+        raise ValueError("choose one initial binding fixture")
+    binding_names = ("authority.yaml",) if initial_binding else initial_binding_names
+    for binding_name in binding_names:
         _write_test_connector_binding(
             project,
-            "authority.yaml",
+            binding_name,
             principal="local:connector-authority",
         )
     runtime = load_runtime(project)
@@ -1037,6 +1086,31 @@ async def _clarification_operation_arguments(
     return {"submission": _proposal_submission_for_session(session).model_dump(mode="json")}
 
 
+async def _clarification_confirmation_arguments(
+    runtime,
+    server,
+    envelope: TaskEnvelope,
+    classification: AgentClassificationSubmission,
+) -> dict[str, object]:
+    proposed = await server.call_tool(
+        "intent_clarification_propose",
+        await _clarification_operation_arguments(
+            runtime,
+            server,
+            envelope,
+            classification,
+            "propose",
+        ),
+    )
+    assert proposed.structured_content["status"] == "proposed"
+    return {
+        "proposal_id": proposed.structured_content["proposal_id"],
+        "actor": "local",
+        "at": (envelope.created_at + timedelta(microseconds=7)).isoformat().replace("+00:00", "Z"),
+        "selected_node_ids": ["requirement:authority-race"],
+    }
+
+
 @pytest.mark.parametrize("operation", ["open", "answer", "propose"])
 async def test_clarification_authority_change_before_each_write_is_an_exact_noop(
     tmp_path: Path,
@@ -1098,6 +1172,194 @@ async def test_clarification_authority_change_before_each_write_is_an_exact_noop
     response = await server.call_tool(tool_name, arguments)
 
     assert raced is True
+    assert response.structured_content == {
+        "schema_version": "1",
+        "status": "rejected",
+        "reason": "intent_workflow_unavailable",
+    }
+    assert _transaction_bytes(runtime) == before
+
+
+@pytest.mark.parametrize("stage", ["service_authentication", "executor_commit"])
+async def test_clarification_confirm_rejects_fifo_after_adapter_check_without_blocking(
+    tmp_path: Path,
+    stage: str,
+) -> None:
+    (
+        project,
+        runtime,
+        workflow,
+        server,
+        envelope,
+        classification,
+    ) = await _production_clarification_server(tmp_path, initial_binding=True)
+    arguments = await _clarification_confirmation_arguments(
+        runtime,
+        server,
+        envelope,
+        classification,
+    )
+    before = _transaction_bytes(runtime)
+    binding = project / ".intent/connectors/authority.yaml"
+    context = multiprocessing.get_context("fork")
+    receiving, sending = context.Pipe(duplex=False)
+    process = context.Process(
+        target=_clarification_confirm_fifo_child,
+        args=(workflow, server, str(binding), arguments, stage, sending),
+    )
+    process.start()
+    sending.close()
+    process.join(timeout=2.0)
+    timed_out = process.is_alive()
+    if timed_out:
+        process.terminate()
+        process.join(timeout=1.0)
+    try:
+        assert timed_out is False
+        assert process.exitcode == 0
+        assert receiving.poll(timeout=0.1)
+        assert receiving.recv() == {
+            "schema_version": "1",
+            "status": "rejected",
+            "reason": "intent_workflow_unavailable",
+        }
+    finally:
+        receiving.close()
+        binding.unlink(missing_ok=True)
+
+    assert _transaction_bytes(runtime) == before
+
+
+@pytest.mark.parametrize("stage", ["service_authentication", "executor_commit"])
+async def test_clarification_confirm_per_file_limit_reaches_every_authority_comparison(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    stage: str,
+) -> None:
+    (
+        project,
+        runtime,
+        workflow,
+        server,
+        envelope,
+        classification,
+    ) = await _production_clarification_server(tmp_path, initial_binding=True)
+    arguments = await _clarification_confirmation_arguments(
+        runtime,
+        server,
+        envelope,
+        classification,
+    )
+    binding = project / ".intent/connectors/authority.yaml"
+    before = _transaction_bytes(runtime)
+    raced = False
+    binding_read_limits: list[int | None] = []
+    original_read_optional_nonblocking = secure.SecureFile.read_optional_nonblocking
+
+    def grow_binding() -> None:
+        nonlocal raced
+        if raced:
+            return
+        raced = True
+        _pad_test_connector_binding(binding, 1_048_577)
+
+    if stage == "service_authentication":
+        original_authority = workflow._clarification_authority
+
+        def authority_then_grow():
+            authority = original_authority()
+            grow_binding()
+            return authority
+
+        monkeypatch.setattr(workflow, "_clarification_authority", authority_then_grow)
+    else:
+        original_apply = workflow._confirmation._executor.apply
+
+        def apply_after_growth(*args: object, **kwargs: object):
+            grow_binding()
+            return original_apply(*args, **kwargs)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(workflow._confirmation._executor, "apply", apply_after_growth)
+
+    def observe_read_limit(
+        self: secure.SecureFile,
+        *,
+        max_bytes: int | None = None,
+    ) -> bytes | None:
+        if raced and self.name == binding.name:
+            binding_read_limits.append(max_bytes)
+        return original_read_optional_nonblocking(self, max_bytes=max_bytes)
+
+    monkeypatch.setattr(secure.SecureFile, "read_optional_nonblocking", observe_read_limit)
+    response = await server.call_tool("intent_clarification_confirm", arguments)
+
+    assert raced is True
+    assert binding_read_limits
+    assert None not in binding_read_limits
+    assert all(limit is not None and limit <= 1_048_576 for limit in binding_read_limits)
+    assert response.structured_content == {
+        "schema_version": "1",
+        "status": "rejected",
+        "reason": "intent_workflow_unavailable",
+    }
+    assert _transaction_bytes(runtime) == before
+
+
+@pytest.mark.parametrize("stage", ["service_authentication", "executor_commit"])
+async def test_clarification_confirm_rejects_aggregate_authority_over_exact_limit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    stage: str,
+) -> None:
+    binding_names = tuple(f"authority-{index:02d}.yaml" for index in range(9))
+    (
+        project,
+        runtime,
+        workflow,
+        server,
+        envelope,
+        classification,
+    ) = await _production_clarification_server(
+        tmp_path,
+        initial_binding_names=binding_names,
+    )
+    arguments = await _clarification_confirmation_arguments(
+        runtime,
+        server,
+        envelope,
+        classification,
+    )
+    bindings = tuple(project / ".intent/connectors" / name for name in binding_names)
+    before = _transaction_bytes(runtime)
+    raced = False
+
+    def grow_bindings() -> None:
+        nonlocal raced
+        for binding in bindings:
+            _pad_test_connector_binding(binding, 1_000_000)
+        raced = True
+
+    if stage == "service_authentication":
+        original_authority = workflow._clarification_authority
+
+        def authority_then_grow():
+            authority = original_authority()
+            grow_bindings()
+            return authority
+
+        monkeypatch.setattr(workflow, "_clarification_authority", authority_then_grow)
+    else:
+        original_apply = workflow._confirmation._executor.apply
+
+        def apply_after_growth(*args: object, **kwargs: object):
+            grow_bindings()
+            return original_apply(*args, **kwargs)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(workflow._confirmation._executor, "apply", apply_after_growth)
+    response = await server.call_tool("intent_clarification_confirm", arguments)
+
+    assert raced is True
+    assert sum(binding.stat().st_size for binding in bindings) == 9_000_000
     assert response.structured_content == {
         "schema_version": "1",
         "status": "rejected",
