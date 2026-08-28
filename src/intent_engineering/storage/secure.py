@@ -136,6 +136,8 @@ def _read_named_nonblocking(
     try:
         metadata = os.fstat(descriptor)
         _require_regular(metadata)
+        if max_bytes is not None and metadata.st_size > max_bytes:
+            raise UnsafePathError()
         return _read_descriptor(descriptor, max_bytes=max_bytes), metadata
     finally:
         os.close(descriptor)
@@ -661,13 +663,26 @@ class SecureFile:
     def read_bytes(self) -> bytes:
         return _read_named(self.parent_fd, self.name)[0]
 
-    def read_bytes_nonblocking(self) -> bytes:
+    def read_bytes_nonblocking(self, *, max_bytes: int | None = None) -> bytes:
         """Read one regular file after a nonblocking descriptor-kind authentication."""
-        return _read_named_nonblocking(self.parent_fd, self.name)[0]
+        if max_bytes is not None and (type(max_bytes) is not int or max_bytes < 0):
+            raise UnsafePathError()
+        return _read_named_nonblocking(self.parent_fd, self.name, max_bytes=max_bytes)[0]
 
     def read_optional(self) -> bytes | None:
         try:
             return self.read_bytes()
+        except UnsafePathError:
+            try:
+                os.stat(self.name, dir_fd=self.parent_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                return None
+            raise
+
+    def read_optional_nonblocking(self, *, max_bytes: int | None = None) -> bytes | None:
+        """Read one optional regular file without blocking and with an optional byte cap."""
+        try:
+            return self.read_bytes_nonblocking(max_bytes=max_bytes)
         except UnsafePathError:
             try:
                 os.stat(self.name, dir_fd=self.parent_fd, follow_symlinks=False)

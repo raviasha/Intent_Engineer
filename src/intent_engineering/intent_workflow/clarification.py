@@ -79,6 +79,7 @@ from intent_engineering.storage.jsonl.history_store import serialize_changeset
 from intent_engineering.storage.secure import SecureFile
 from intent_engineering.storage.transaction import (
     LocalTransactionCoordinator,
+    LocalTransactionExtraReadPolicy,
     LocalTransactionSnapshot,
 )
 from intent_engineering.storage.yaml.graph_store import YamlGraphStore, parse_graph
@@ -315,6 +316,7 @@ class ClarificationCoordinator:
         capture: ConversationCapture | None = None,
         authority_files: Mapping[str, SecureFile] | None = None,
         authority_preimages: Mapping[str, bytes | None] | None = None,
+        authority_read_policies: Mapping[str, LocalTransactionExtraReadPolicy] | None = None,
         authority_membership_digest: str | None = None,
         authority_membership_resolver: Callable[[], str] | None = None,
     ) -> None:
@@ -333,11 +335,16 @@ class ClarificationCoordinator:
                 authority_files is not None
                 and set(authority_files) != set(authority_preimages or {})
             )
+            or (
+                authority_read_policies is not None
+                and set(authority_read_policies) != set(authority_files or {})
+            )
             or (authority_membership_digest is None) != (authority_membership_resolver is None)
         ):
             raise ValueError("invalid clarification authority binding")
         self._authority_files = dict(authority_files or {})
         self._authority_preimages = dict(authority_preimages or {})
+        self._authority_read_policies = dict(authority_read_policies or {})
         self._authority_membership_digest = authority_membership_digest
         self._authority_membership_resolver = authority_membership_resolver
 
@@ -354,6 +361,7 @@ class ClarificationCoordinator:
         with self._transactions.transaction(
             rollback_base_exceptions=True,
             extras=self._authority_files,
+            extra_read_policies=self._authority_read_policies,
         ) as transaction:
             if not self._authority_membership_matches() or any(
                 transaction.read_optional(name) != content

@@ -9,9 +9,10 @@ from pathlib import Path
 
 import pytest
 
-from intent_engineering.storage.secure import SecureDirectory
+from intent_engineering.storage.secure import SecureDirectory, SecureFile, UnsafePathError
 from intent_engineering.storage.transaction import (
     LocalTransactionCoordinator,
+    LocalTransactionExtraReadPolicy,
     TransactionRecoveryError,
 )
 
@@ -213,6 +214,253 @@ def test_snapshot_recovers_before_returning_one_locked_cross_store_view(tmp_path
     assert snapshot.recovered is True
     assert dict(snapshot.content) == {**before, "evidence": b"evidence-before\n"}
     assert not journal.exists()
+
+
+def _bounded_authority_policy(
+    *,
+    max_bytes: int = 4,
+    max_aggregate_bytes: int = 8,
+) -> LocalTransactionExtraReadPolicy:
+    return LocalTransactionExtraReadPolicy(
+        max_bytes=max_bytes,
+        nonblocking_regular=True,
+        aggregate_group="authority",
+        max_aggregate_bytes=max_aggregate_bytes,
+    )
+
+
+@pytest.mark.parametrize("stage", ["snapshot", "pre", "post"])
+def test_bounded_nonblocking_extra_policy_applies_to_every_authority_read_stage(
+    tmp_path: Path,
+    stage: str,
+) -> None:
+    coordinator, paths, journal = _coordinator(tmp_path)
+    before = _seed(paths)
+    authority_path = tmp_path / "authority.yaml"
+    authority_path.write_bytes(b"safe")
+    root = SecureDirectory.open(tmp_path)
+    authority = root.file(authority_path.name)
+    extras = {"authority": authority}
+    policies = {"authority": _bounded_authority_policy()}
+
+    if stage == "snapshot":
+        authority_path.write_bytes(b"large")
+        with pytest.raises(UnsafePathError):
+            coordinator.snapshot(extras, extra_read_policies=policies)
+    else:
+        snapshot = coordinator.snapshot(extras, extra_read_policies=policies)
+        assert snapshot.content["authority"] == b"safe"
+        if stage == "pre":
+            authority_path.write_bytes(b"large")
+        with (
+            pytest.raises(UnsafePathError),
+            coordinator.transaction(
+                rollback_base_exceptions=True,
+                extras=extras,
+                extra_read_policies=policies,
+            ) as transaction,
+        ):
+            if stage == "post":
+                assert transaction.read_optional("authority") == b"safe"
+            transaction.write("graph", b"changed\n")
+            if stage == "post":
+                authority_path.write_bytes(b"large")
+            transaction.read_optional("authority")
+
+    assert {
+        name: path.read_bytes() if path.exists() else None for name, path in paths.items()
+    } == before
+    assert not journal.exists()
+
+
+def test_bounded_extra_policy_enforces_one_aggregate_before_returning_snapshot(
+    tmp_path: Path,
+) -> None:
+    coordinator, _paths, _journal = _coordinator(tmp_path)
+    root = SecureDirectory.open(tmp_path)
+    extras = {}
+    policies = {}
+    for name, content in (("authority_a", b"aaaa"), ("authority_b", b"bbbb")):
+        (tmp_path / f"{name}.yaml").write_bytes(content)
+        extras[name] = root.file(f"{name}.yaml")
+        policies[name] = _bounded_authority_policy()
+
+    exact = coordinator.snapshot(extras, extra_read_policies=policies)
+    assert exact.content["authority_a"] == b"aaaa"
+    assert exact.content["authority_b"] == b"bbbb"
+    (tmp_path / "authority_c.yaml").write_bytes(b"c")
+    extras["authority_c"] = root.file("authority_c.yaml")
+    policies["authority_c"] = _bounded_authority_policy()
+
+    with pytest.raises(UnsafePathError):
+        coordinator.snapshot(extras, extra_read_policies=policies)
+
+
+def test_bounded_extra_policy_enforces_aggregate_again_during_transaction(
+    tmp_path: Path,
+) -> None:
+    coordinator, paths, journal = _coordinator(tmp_path)
+    before = _seed(paths)
+    root = SecureDirectory.open(tmp_path)
+    extras = {}
+    policies = {}
+    for name in ("authority_a", "authority_b"):
+        (tmp_path / f"{name}.yaml").write_bytes(b"safe")
+        extras[name] = root.file(f"{name}.yaml")
+        policies[name] = _bounded_authority_policy()
+    extras["authority_c"] = root.file("authority_c.yaml")
+    policies["authority_c"] = _bounded_authority_policy()
+    snapshot = coordinator.snapshot(extras, extra_read_policies=policies)
+    assert snapshot.content["authority_c"] is None
+
+    with (
+        pytest.raises(UnsafePathError),
+        coordinator.transaction(
+            rollback_base_exceptions=True,
+            extras=extras,
+            extra_read_policies=policies,
+        ) as transaction,
+    ):
+        assert transaction.read_optional("authority_a") == b"safe"
+        assert transaction.read_optional("authority_b") == b"safe"
+        assert transaction.read_optional("authority_c") is None
+        transaction.write("graph", b"changed\n")
+        (tmp_path / "authority_c.yaml").write_bytes(b"x")
+        transaction.read_optional("authority_c")
+
+    assert {
+        name: path.read_bytes() if path.exists() else None for name, path in paths.items()
+    } == before
+    assert not journal.exists()
+
+
+def test_nested_extra_read_inherits_outer_bounded_policy(tmp_path: Path) -> None:
+    coordinator, paths, journal = _coordinator(tmp_path)
+    before = _seed(paths)
+    authority_path = tmp_path / "authority.yaml"
+    authority_path.write_bytes(b"safe")
+    root = SecureDirectory.open(tmp_path)
+    authority = root.file(authority_path.name)
+    extras = {"authority": authority}
+
+    with (
+        pytest.raises(UnsafePathError),
+        coordinator.transaction(
+            rollback_base_exceptions=True,
+            extras=extras,
+            extra_read_policies={"authority": _bounded_authority_policy()},
+        ) as transaction,
+    ):
+        transaction.write("graph", b"changed\n")
+        authority_path.write_bytes(b"large")
+        with coordinator.read_transaction(extras) as nested:
+            nested.read_optional("authority")
+
+    assert {
+        name: path.read_bytes() if path.exists() else None for name, path in paths.items()
+    } == before
+    assert not journal.exists()
+
+
+@pytest.mark.parametrize("race", ["create", "delete"])
+def test_bounded_extra_policy_observes_missing_create_and_delete_races(
+    tmp_path: Path,
+    race: str,
+) -> None:
+    coordinator, paths, journal = _coordinator(tmp_path)
+    before = _seed(paths)
+    authority_path = tmp_path / "authority.yaml"
+    if race == "delete":
+        authority_path.write_bytes(b"safe")
+    root = SecureDirectory.open(tmp_path)
+    authority = root.file(authority_path.name)
+    extras = {"authority": authority}
+    policies = {"authority": _bounded_authority_policy()}
+    expected = None if race == "create" else b"safe"
+    snapshot = coordinator.snapshot(extras, extra_read_policies=policies)
+    assert snapshot.content["authority"] == expected
+
+    with (
+        pytest.raises(ValueError, match="authority changed"),
+        coordinator.transaction(
+            rollback_base_exceptions=True,
+            extras=extras,
+            extra_read_policies=policies,
+        ) as transaction,
+    ):
+        assert transaction.read_optional("authority") == expected
+        transaction.write("graph", b"changed\n")
+        if race == "create":
+            authority_path.write_bytes(b"safe")
+        else:
+            authority_path.unlink()
+        if transaction.read_optional("authority") != expected:
+            raise ValueError("authority changed")
+
+    assert {
+        name: path.read_bytes() if path.exists() else None for name, path in paths.items()
+    } == before
+    assert authority_path.exists() is (race == "create")
+    assert not journal.exists()
+
+
+def test_bounded_extra_policy_preserves_cancellation_identity_and_rolls_back(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Cancellation(BaseException):
+        pass
+
+    coordinator, paths, journal = _coordinator(tmp_path)
+    before = _seed(paths)
+    authority_path = tmp_path / "authority.yaml"
+    authority_path.write_bytes(b"safe")
+    root = SecureDirectory.open(tmp_path)
+    authority = root.file(authority_path.name)
+    signal = Cancellation()
+    original_read = SecureFile.read_optional_nonblocking
+
+    def cancel_authority(
+        self: SecureFile,
+        *,
+        max_bytes: int | None = None,
+    ) -> bytes | None:
+        if self.name == authority_path.name:
+            raise signal
+        return original_read(self, max_bytes=max_bytes)
+
+    monkeypatch.setattr(SecureFile, "read_optional_nonblocking", cancel_authority)
+
+    with (
+        pytest.raises(Cancellation) as caught,
+        coordinator.transaction(
+            rollback_base_exceptions=True,
+            extras={"authority": authority},
+            extra_read_policies={"authority": _bounded_authority_policy()},
+        ) as transaction,
+    ):
+        transaction.write("graph", b"changed\n")
+        transaction.read_optional("authority")
+
+    assert caught.value is signal
+    assert {
+        name: path.read_bytes() if path.exists() else None for name, path in paths.items()
+    } == before
+    assert not journal.exists()
+
+
+def test_legacy_extra_reads_remain_blocking_and_unbounded_by_default(tmp_path: Path) -> None:
+    coordinator, _paths, _journal = _coordinator(tmp_path)
+    content = b"x" * 2_097_152
+    extra_path = tmp_path / "legacy-extra.bin"
+    extra_path.write_bytes(content)
+    root = SecureDirectory.open(tmp_path)
+    extra = root.file(extra_path.name)
+
+    snapshot = coordinator.snapshot({"legacy_extra": extra})
+    assert snapshot.content["legacy_extra"] == content
+    with coordinator.read_transaction({"legacy_extra": extra}) as transaction:
+        assert transaction.read_optional("legacy_extra") == content
 
 
 def _preimage(target: str, content: bytes | None) -> dict[str, object]:

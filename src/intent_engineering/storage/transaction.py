@@ -19,7 +19,7 @@ from pydantic import ConfigDict, Field, ValidationError, model_validator
 
 from intent_engineering.core.models._base import StrictModel
 from intent_engineering.storage._atomic import same_path_lock
-from intent_engineering.storage.secure import SecureFile
+from intent_engineering.storage.secure import SecureFile, UnsafePathError
 
 _TARGET_PATTERN = re.compile(r"^[a-z][a-z0-9_]*$")
 
@@ -37,6 +37,71 @@ class LocalTransactionSnapshot:
 
     content: Mapping[str, bytes | None]
     recovered: bool
+
+
+@dataclass(frozen=True)
+class LocalTransactionExtraReadPolicy:
+    """Opt-in limits for one descriptor-held read-only transaction extra."""
+
+    max_bytes: int
+    nonblocking_regular: bool
+    aggregate_group: str | None = None
+    max_aggregate_bytes: int | None = None
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.max_bytes) is not int
+            or self.max_bytes < 0
+            or self.nonblocking_regular is not True
+            or (self.aggregate_group is None) != (self.max_aggregate_bytes is None)
+            or (
+                self.aggregate_group is not None
+                and not _TARGET_PATTERN.fullmatch(self.aggregate_group)
+            )
+            or (
+                self.max_aggregate_bytes is not None
+                and (type(self.max_aggregate_bytes) is not int or self.max_aggregate_bytes < 0)
+            )
+        ):
+            raise ValueError("invalid local transaction extra read policy")
+
+
+class _ExtraReadBudget:
+    """Track the latest retained size for each bounded extra within one lock scope."""
+
+    def __init__(self, policies: Mapping[str, LocalTransactionExtraReadPolicy]) -> None:
+        self._policies = dict(policies)
+        self._sizes: dict[str, int] = {}
+        self._totals: dict[str, int] = {}
+
+    def read_optional(self, name: str, target: SecureFile) -> bytes | None:
+        policy = self._policies.get(name)
+        if policy is None:
+            return target.read_optional()
+        max_bytes = policy.max_bytes
+        previous = self._sizes.get(name, 0)
+        group = policy.aggregate_group
+        if group is not None:
+            aggregate_limit = policy.max_aggregate_bytes
+            if aggregate_limit is None:  # pragma: no cover - constructor invariant
+                raise ValueError("invalid local transaction extra read policy")
+            retained_without_current = self._totals.get(group, 0) - previous
+            max_bytes = min(max_bytes, aggregate_limit - retained_without_current)
+            if max_bytes < 0:
+                raise UnsafePathError()
+        content = target.read_optional_nonblocking(max_bytes=max_bytes)
+        current = 0 if content is None else len(content)
+        if group is not None:
+            aggregate_limit = policy.max_aggregate_bytes
+            if aggregate_limit is None:  # pragma: no cover - constructor invariant
+                raise ValueError("invalid local transaction extra read policy")
+            next_total = self._totals.get(group, 0) - previous + current
+            if next_total > aggregate_limit:
+                content = None
+                raise UnsafePathError()
+            self._totals[group] = next_total
+        self._sizes[name] = current
+        return content
 
 
 class _Preimage(StrictModel):
@@ -88,10 +153,14 @@ class LocalTransaction:
         extras: Mapping[str, SecureFile] | None = None,
         *,
         read_only: bool = False,
+        extra_read_policies: Mapping[str, LocalTransactionExtraReadPolicy] | None = None,
+        extra_read_budget: _ExtraReadBudget | None = None,
     ) -> None:
         self._owner = owner
         self._extras = dict(extras or {})
         self._read_only = read_only
+        self._extra_read_policies = dict(extra_read_policies or {})
+        self._extra_read_budget = extra_read_budget or _ExtraReadBudget(self._extra_read_policies)
         self._active = True
 
     def _target(self, name: str) -> SecureFile:
@@ -117,10 +186,18 @@ class LocalTransaction:
 
     def read_optional(self, name: str) -> bytes | None:
         """Read one target while the transaction's complete lock set is held."""
-        return self._read_target(name).read_optional()
+        target = self._read_target(name)
+        if name in self._extras:
+            return self._extra_read_budget.read_optional(name, target)
+        return target.read_optional()
 
     def read(self, name: str) -> bytes:
         """Read one existing target while the transaction is active."""
+        if name in self._extras:
+            content = self.read_optional(name)
+            if content is None:
+                raise UnsafePathError()
+            return content
         return self._read_target(name).read_bytes()
 
     def write(self, name: str, content: bytes) -> None:
@@ -139,6 +216,7 @@ class LocalTransaction:
         self._active = False
         self._read_only = True
         self._extras.clear()
+        self._extra_read_policies.clear()
 
 
 class _TransactionThreadState(local):
@@ -147,6 +225,8 @@ class _TransactionThreadState(local):
     def __init__(self) -> None:
         self.active = False
         self.extras: dict[str, SecureFile] = {}
+        self.extra_read_policies: dict[str, LocalTransactionExtraReadPolicy] = {}
+        self.extra_read_budget: _ExtraReadBudget | None = None
         self.poisoned = False
 
 
@@ -191,6 +271,65 @@ class LocalTransactionCoordinator:
             for name, file in extras.items()
         ):
             raise ValueError("nested local transaction cannot expand targets")
+
+    @staticmethod
+    def _extra_read_policies(
+        extras: Mapping[str, SecureFile],
+        policies: Mapping[str, LocalTransactionExtraReadPolicy] | None,
+    ) -> dict[str, LocalTransactionExtraReadPolicy]:
+        result = dict(policies or {})
+        if set(result) - set(extras) or any(
+            type(policy) is not LocalTransactionExtraReadPolicy for policy in result.values()
+        ):
+            raise ValueError("invalid local transaction extra read policies")
+        aggregate_limits: dict[str, int] = {}
+        for policy in result.values():
+            group = policy.aggregate_group
+            limit = policy.max_aggregate_bytes
+            if group is None or limit is None:
+                continue
+            existing = aggregate_limits.setdefault(group, limit)
+            if existing != limit:
+                raise ValueError("inconsistent local transaction aggregate read policy")
+        return result
+
+    def _nested_extra_read_state(
+        self,
+        extras: Mapping[str, SecureFile],
+        requested: Mapping[str, LocalTransactionExtraReadPolicy],
+    ) -> tuple[dict[str, LocalTransactionExtraReadPolicy], _ExtraReadBudget]:
+        held = self._thread_state.extra_read_policies
+        if any(name not in held or held[name] != policy for name, policy in requested.items()):
+            raise ValueError("nested local transaction cannot change extra read policies")
+        policies = {name: held[name] for name in extras if name in held}
+        budget = self._thread_state.extra_read_budget
+        if budget is None:  # pragma: no cover - active-state invariant
+            raise ValueError("invalid nested local transaction read state")
+        return policies, budget
+
+    @staticmethod
+    def _read_files(
+        files: Mapping[str, SecureFile],
+        policies: Mapping[str, LocalTransactionExtraReadPolicy],
+        *,
+        budget: _ExtraReadBudget | None = None,
+    ) -> dict[str, bytes | None]:
+        reads = budget or _ExtraReadBudget(policies)
+        content: dict[str, bytes | None] = {}
+        succeeded = False
+        try:
+            for name in sorted(files):
+                if name in policies:
+                    value = reads.read_optional(name, files[name])
+                else:
+                    value = files[name].read_optional()
+                content[name] = value
+                value = None
+            succeeded = True
+            return content
+        finally:
+            if not succeeded:
+                content.clear()
 
     @property
     def target_names(self) -> frozenset[str]:
@@ -343,9 +482,12 @@ class LocalTransactionCoordinator:
     def snapshot(
         self,
         extras: Mapping[str, SecureFile] | None = None,
+        *,
+        extra_read_policies: Mapping[str, LocalTransactionExtraReadPolicy] | None = None,
     ) -> LocalTransactionSnapshot:
         """Recover, then read every canonical target under one deterministic lock set."""
         extra_files = dict(extras or {})
+        policies = self._extra_read_policies(extra_files, extra_read_policies)
         if any(not _TARGET_PATTERN.fullmatch(name) for name in extra_files):
             raise ValueError("invalid local snapshot targets")
         if set(extra_files) & set(self._targets):
@@ -356,20 +498,24 @@ class LocalTransactionCoordinator:
             raise ValueError("duplicate local snapshot target")
         if self._thread_state.active:
             self._require_nested_extras(extra_files)
-            content = {name: all_files[name].read_optional() for name in sorted(all_files)}
+            policies, budget = self._nested_extra_read_state(extra_files, policies)
+            content = self._read_files(all_files, policies, budget=budget)
             return LocalTransactionSnapshot(MappingProxyType(content), False)
         with self._locks(extra_files):
             recovered = self._recover_unlocked()
-            content = {name: all_files[name].read_optional() for name in sorted(all_files)}
+            content = self._read_files(all_files, policies)
         return LocalTransactionSnapshot(MappingProxyType(content), recovered)
 
     @contextmanager
     def read_transaction(
         self,
         extras: Mapping[str, SecureFile] | None = None,
+        *,
+        extra_read_policies: Mapping[str, LocalTransactionExtraReadPolicy] | None = None,
     ) -> Iterator[LocalTransaction]:
         """Yield a read-only view while the complete canonical lock set remains held."""
         extra_files = dict(extras or {})
+        policies = self._extra_read_policies(extra_files, extra_read_policies)
         if any(not _TARGET_PATTERN.fullmatch(name) for name in extra_files):
             raise ValueError("invalid local transaction extras")
         if set(extra_files) & set(self._targets):
@@ -380,7 +526,14 @@ class LocalTransactionCoordinator:
             raise ValueError("duplicate local transaction target")
         if self._thread_state.active:
             self._require_nested_extras(extra_files)
-            transaction = LocalTransaction(self, extra_files, read_only=True)
+            policies, budget = self._nested_extra_read_state(extra_files, policies)
+            transaction = LocalTransaction(
+                self,
+                extra_files,
+                read_only=True,
+                extra_read_policies=policies,
+                extra_read_budget=budget,
+            )
             try:
                 yield transaction
             finally:
@@ -388,7 +541,12 @@ class LocalTransactionCoordinator:
             return
         with self._locks(extra_files):
             self._recover_unlocked()
-            transaction = LocalTransaction(self, extra_files, read_only=True)
+            transaction = LocalTransaction(
+                self,
+                extra_files,
+                read_only=True,
+                extra_read_policies=policies,
+            )
             try:
                 yield transaction
             finally:
@@ -400,9 +558,11 @@ class LocalTransactionCoordinator:
         *,
         rollback_base_exceptions: bool = False,
         extras: Mapping[str, SecureFile] | None = None,
+        extra_read_policies: Mapping[str, LocalTransactionExtraReadPolicy] | None = None,
     ) -> Iterator[LocalTransaction]:
         """Yield a mutation scope with durable targets and locked read-only extras."""
         extra_files = dict(extras or {})
+        policies = self._extra_read_policies(extra_files, extra_read_policies)
         if any(not _TARGET_PATTERN.fullmatch(name) for name in extra_files):
             raise ValueError("invalid local transaction extras")
         if set(extra_files) & set(self._targets):
@@ -413,7 +573,13 @@ class LocalTransactionCoordinator:
             raise ValueError("duplicate local transaction target")
         if self._thread_state.active:
             self._require_nested_extras(extra_files)
-            transaction = LocalTransaction(self, extra_files)
+            policies, budget = self._nested_extra_read_state(extra_files, policies)
+            transaction = LocalTransaction(
+                self,
+                extra_files,
+                extra_read_policies=policies,
+                extra_read_budget=budget,
+            )
             try:
                 yield transaction
             except BaseException:
@@ -428,9 +594,17 @@ class LocalTransactionCoordinator:
             transaction_id = secrets.token_hex(32)
             prepared = self._journal_for(preimages, "prepared", transaction_id)
             self._write_journal(prepared)
-            transaction = LocalTransaction(self, extra_files)
+            budget = _ExtraReadBudget(policies)
+            transaction = LocalTransaction(
+                self,
+                extra_files,
+                extra_read_policies=policies,
+                extra_read_budget=budget,
+            )
             self._thread_state.active = True
             self._thread_state.extras = extra_files
+            self._thread_state.extra_read_policies = policies
+            self._thread_state.extra_read_budget = budget
             self._thread_state.poisoned = False
             try:
                 self._fault("journal_prepared")
@@ -460,4 +634,6 @@ class LocalTransactionCoordinator:
                 transaction._finish()
                 self._thread_state.active = False
                 self._thread_state.extras = {}
+                self._thread_state.extra_read_policies = {}
+                self._thread_state.extra_read_budget = None
                 self._thread_state.poisoned = False

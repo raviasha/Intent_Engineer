@@ -51,6 +51,7 @@ from intent_engineering.intent_workflow.preflight import (
 )
 from intent_engineering.storage.executor import LocalChangeSetExecutor
 from intent_engineering.storage.secure import SecureDirectory, SecureFile, SecureRead
+from intent_engineering.storage.transaction import LocalTransactionExtraReadPolicy
 from intent_engineering.storage.yaml.graph_store import parse_graph
 
 _PROPOSE = ToolAnnotations(
@@ -344,6 +345,26 @@ def _connector_membership_records(
         reject_symlinks=True,
         read_content=read_content,
     )
+
+
+def _clarification_authority_read_policies(
+    authority_files: Mapping[str, SecureFile],
+) -> dict[str, LocalTransactionExtraReadPolicy]:
+    policies: dict[str, LocalTransactionExtraReadPolicy] = {}
+    for name in authority_files:
+        if name.startswith("authority_binding_"):
+            policies[name] = LocalTransactionExtraReadPolicy(
+                max_bytes=_MAX_CONNECTOR_BINDING_FILE_BYTES,
+                nonblocking_regular=True,
+                aggregate_group="connector_bindings",
+                max_aggregate_bytes=_MAX_CONNECTOR_BINDING_TOTAL_BYTES,
+            )
+        else:
+            policies[name] = LocalTransactionExtraReadPolicy(
+                max_bytes=_MAX_CONNECTOR_BINDING_FILE_BYTES,
+                nonblocking_regular=True,
+            )
+    return policies
 
 
 def _connector_records_digest(
@@ -1247,7 +1268,10 @@ class McpIntentWorkflowServices:
                 authority_files[f"authority_binding_{index}"] = (
                     self._clarification_connector_directory.file(relative)
                 )
-            snapshot = self.runtime.transactions.snapshot(authority_files)
+            snapshot = self.runtime.transactions.snapshot(
+                authority_files,
+                extra_read_policies=_clarification_authority_read_policies(authority_files),
+            )
             if _connector_membership_digest(
                 self._clarification_connector_directory
             ) != membership_digest or any(
@@ -1299,6 +1323,7 @@ class McpIntentWorkflowServices:
             ),
             authority_files=authority_files,
             authority_preimages=authority_preimages,
+            authority_read_policies=_clarification_authority_read_policies(authority_files),
             authority_membership_digest=authority_membership_digest,
             authority_membership_resolver=lambda: _connector_membership_digest(
                 self._clarification_connector_directory

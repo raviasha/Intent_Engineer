@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import multiprocessing
+import os
 from collections.abc import ItemsView, Iterator
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -40,6 +41,7 @@ from intent_engineering.intent_workflow.preflight import (
     AgentClassificationSubmission,
     classification_evidence_content,
 )
+from intent_engineering.storage import secure
 from tests.e2e.test_cli_intent_bootstrap import _configured_project
 
 pytestmark = pytest.mark.anyio
@@ -886,6 +888,36 @@ def _pad_test_connector_binding(path: Path, size: int) -> None:
     assert path.stat().st_size == size
 
 
+def _clarification_fifo_snapshot_child(
+    workflow: object,
+    binding_path: str,
+    sending: Connection,
+) -> None:
+    """Swap one scanned binding before its locked snapshot and report bounded completion."""
+    target = Path(binding_path)
+    transactions = workflow.runtime.transactions  # type: ignore[attr-defined]
+    original_snapshot = transactions.snapshot
+    authority_files: dict[str, object] = {}
+
+    def snapshot_after_swap(extras: object = None, **kwargs: object):
+        target.unlink()
+        os.mkfifo(target)
+        return original_snapshot(extras, **kwargs)
+
+    transactions.snapshot = snapshot_after_swap  # type: ignore[method-assign]
+    try:
+        result = workflow._clarification_authority()  # type: ignore[attr-defined]
+        authority_files = result[2]
+    except Exception:  # noqa: BLE001 - the child reports only the fixed outcome class
+        sending.send("rejected")
+    else:
+        sending.send("accepted")
+    finally:
+        for file in authority_files.values():
+            file.close()  # type: ignore[attr-defined]
+        sending.close()
+
+
 async def _production_clarification_server(
     tmp_path: Path,
     *,
@@ -1066,6 +1098,106 @@ async def test_clarification_authority_change_before_each_write_is_an_exact_noop
     response = await server.call_tool(tool_name, arguments)
 
     assert raced is True
+    assert response.structured_content == {
+        "schema_version": "1",
+        "status": "rejected",
+        "reason": "intent_workflow_unavailable",
+    }
+    assert _transaction_bytes(runtime) == before
+
+
+async def test_clarification_scan_to_snapshot_fifo_swap_fails_without_blocking(
+    tmp_path: Path,
+) -> None:
+    (
+        project,
+        runtime,
+        workflow,
+        _server,
+        _envelope,
+        _classification,
+    ) = await _production_clarification_server(tmp_path, initial_binding=True)
+    before = _transaction_bytes(runtime)
+    binding = project / ".intent/connectors/authority.yaml"
+    context = multiprocessing.get_context("fork")
+    receiving, sending = context.Pipe(duplex=False)
+    process = context.Process(
+        target=_clarification_fifo_snapshot_child,
+        args=(workflow, str(binding), sending),
+    )
+    process.start()
+    sending.close()
+    process.join(timeout=2.0)
+    timed_out = process.is_alive()
+    if timed_out:
+        process.terminate()
+        process.join(timeout=1.0)
+    try:
+        assert timed_out is False
+        assert process.exitcode == 0
+        assert receiving.poll(timeout=0.1)
+        assert receiving.recv() == "rejected"
+    finally:
+        receiving.close()
+        binding.unlink(missing_ok=True)
+
+    assert _transaction_bytes(runtime) == before
+
+
+@pytest.mark.parametrize("operation", ["open", "answer", "propose"])
+async def test_clarification_scan_to_snapshot_growth_never_uses_an_unbounded_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+) -> None:
+    (
+        project,
+        runtime,
+        _workflow,
+        server,
+        envelope,
+        classification,
+    ) = await _production_clarification_server(tmp_path, initial_binding=True)
+    arguments = await _clarification_operation_arguments(
+        runtime,
+        server,
+        envelope,
+        classification,
+        operation,
+    )
+    binding = project / ".intent/connectors/authority.yaml"
+    before = _transaction_bytes(runtime)
+    original_snapshot = runtime.transactions.snapshot
+    original_read_descriptor = secure._read_descriptor
+    raced = False
+    binding_read_limits: list[int | None] = []
+
+    def grow_after_scan(extras: object = None, **kwargs: object):
+        nonlocal raced
+        if extras is not None and not raced:
+            raced = True
+            _pad_test_connector_binding(binding, 2_097_152)
+        return original_snapshot(extras, **kwargs)
+
+    def observe_read_limit(
+        descriptor: int,
+        *,
+        max_bytes: int | None = None,
+    ) -> bytes:
+        opened = os.fstat(descriptor)
+        current = os.stat(binding, follow_symlinks=False)
+        if (opened.st_dev, opened.st_ino) == (current.st_dev, current.st_ino):
+            binding_read_limits.append(max_bytes)
+        return original_read_descriptor(descriptor, max_bytes=max_bytes)
+
+    monkeypatch.setattr(runtime.transactions, "snapshot", grow_after_scan)
+    monkeypatch.setattr(secure, "_read_descriptor", observe_read_limit)
+
+    response = await server.call_tool(f"intent_clarification_{operation}", arguments)
+
+    assert raced is True
+    assert None not in binding_read_limits
+    assert all(limit is not None and limit <= 1_048_576 for limit in binding_read_limits)
     assert response.structured_content == {
         "schema_version": "1",
         "status": "rejected",
