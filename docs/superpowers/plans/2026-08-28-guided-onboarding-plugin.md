@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Add a guided `intent onboard` journey and an advisory Codex plugin that checks repository readiness after each human prompt, routes initialized repositories through existing intent preflight tools, and leaves scheduled assurance CLI-driven.
+**Goal:** Add a guided `intent onboard` journey and an advisory Codex plugin that checks repository readiness after each host-submitted prompt, routes initialized repositories through existing intent preflight tools, and leaves scheduled assurance CLI-driven.
 
 **Architecture:** A new read-only onboarding-state service reports whether an approved baseline exists. The CLI composes initialization, PRD capture, source-role assignment, proposal review, and confirmation without duplicating bootstrap logic. A small stdin/stdout hook adapter emits advisory prompt instructions only; the plugin delegates all semantic work to existing MCP tools, while canonical state remains owned by current deterministic services.
 
@@ -274,16 +274,19 @@ def test_uninitialized_repository_returns_onboarding_offer_without_writes(router
 def test_initialized_repository_routes_once_to_public_preflight(router_with_baseline, prompt_event) -> None:
     route = router_with_baseline.route(prompt_event)
     assert route.action == "classify"
-    assert route.mcp_tool == "intent_preflight"
-    assert route.arguments == {"task": prompt_event.prompt}
+    assert route.mcp_tool == "intent_advisory_preflight"
+    assert route.arguments == {
+        "conversation_ref": router_with_baseline.conversation_ref,
+        "request_evidence_ref": router_with_baseline.request_evidence_ref,
+    }
     assert "token" not in json.dumps(route.model_dump(mode="json")).lower()
 
 
-def test_active_clarification_answer_routes_to_session_without_reclassification(router_with_session, answer_event) -> None:
+def test_active_clarification_hook_input_requires_independent_human_authority(router_with_session, answer_event) -> None:
     route = router_with_session.route(answer_event)
-    assert route.action == "answer_clarification"
-    assert route.mcp_tool == "intent_clarification_answer"
-    assert route.arguments["session_id"] == router_with_session.session_id
+    assert route.action == "human_confirmation_required"
+    assert route.mcp_tool is None
+    assert route.arguments == {}
 ```
 
 Add exact-container/subclass, cyclic JSON, depth/node/UTF-8 bounds, canonical timestamp, cross-repository, symlink, cancellation, fixed-error, and traceback-secrecy tests modeled on `tests/contract/agent_host/test_host_contract.py`.
@@ -373,7 +376,7 @@ git commit -m "feat: route prompts through advisory intent checks"
 
 **Interfaces:**
 - Consumes: `intent agent-prompt-hook` stdin/stdout contract and existing `intent mcp --project .` server.
-- Produces: a discoverable `intent-advisor` plugin that invokes the prompt router after human prompts and teaches the agent to call only public MCP workflow tools.
+- Produces: a discoverable `intent-advisor` plugin that invokes the prompt router after host-submitted prompts, treats the hook as untrusted agent context, and leaves human-required answers and approval to an independently authenticated non-MCP local integration.
 
 - [ ] **Step 1: Load the required plugin-authoring skill and scaffold the bundle**
 

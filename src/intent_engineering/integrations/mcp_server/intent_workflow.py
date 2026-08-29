@@ -22,7 +22,7 @@ from intent_engineering.cli.intent_workflow import (
     proposal_payload,
 )
 from intent_engineering.cli.runtime import Runtime
-from intent_engineering.core.models import JsonValue, ProjectConfig
+from intent_engineering.core.models import EvidenceRecord, JsonValue, ProjectConfig, SourceMode
 from intent_engineering.core.models._base import StrictModel
 from intent_engineering.core.policy.access import refs_allowed
 from intent_engineering.intent_workflow.authorization import (
@@ -33,7 +33,6 @@ from intent_engineering.intent_workflow.authorization import (
 from intent_engineering.intent_workflow.bootstrap import BootstrapSubmission
 from intent_engineering.intent_workflow.clarification import (
     ClarificationCoordinator,
-    ProposalConfirmationResult,
     ProposalConfirmationService,
 )
 from intent_engineering.intent_workflow.conversation import (
@@ -108,9 +107,9 @@ _CLARIFY = ToolAnnotations(
     open_world_hint=False,
 )
 _CLARIFY_CONFIRM = ToolAnnotations(
-    read_only_hint=False,
-    destructive_hint=True,
-    idempotent_hint=False,
+    read_only_hint=True,
+    destructive_hint=False,
+    idempotent_hint=True,
     open_world_hint=False,
 )
 _MAX_REQUEST_BYTES = 1_048_576
@@ -1045,6 +1044,16 @@ class McpIntentWorkflowServices:
                 conversation_connector_id="conversation:codex",
                 principal_resolver=lambda config, _snapshot: _principals(runtime, config),
             )
+            self._advisory_preflight = PreflightService(
+                transactions=runtime.transactions,
+                config_file=config_file,
+                agent_principal="agent:codex",
+                conversation_connector_id="conversation:codex",
+                principal_resolver=lambda config, _snapshot: _principals(runtime, config),
+                request_actor="agent:codex",
+                request_role="agent",
+                request_source_mode=SourceMode.INFERRED,
+            )
         finally:
             config_file.close()
         confirmation_config = runtime.workspace_directory.file("config.yaml")
@@ -1069,6 +1078,14 @@ class McpIntentWorkflowServices:
             "schema_version": "1",
             "status": "rejected",
             "reason": "intent_workflow_unavailable",
+        }
+
+    @staticmethod
+    def _human_confirmation_required() -> dict[str, object]:
+        return {
+            "schema_version": "1",
+            "status": "human_confirmation_required",
+            "reason": "authenticated_local_human_evidence_required",
         }
 
     async def bootstrap_propose(self, submission: BootstrapSubmission) -> dict[str, object]:
@@ -1401,21 +1418,32 @@ class McpIntentWorkflowServices:
                 )
                 if validated.request_evidence_ref in legacy_ids:
                     raise ValueError("advisory request evidence unavailable")
-                human, human_request = validate_conversation_ingestion(
+                allowed_question_refs = tuple(
+                    question.evidence_ref
+                    for event in self.runtime.intent_proposals.clarification_events()
+                    if event.session.conversation_ref == validated.conversation_ref
+                    for question in event.session.questions
+                )
+                request_evidence, request_text = validate_conversation_ingestion(
                     evidence,
                     ingestions,
                     evidence_ref=validated.request_evidence_ref,
                     conversation_ref=validated.conversation_ref,
-                    author=config.local_actor,
+                    role="agent",
+                    author="agent:codex",
                     acl=tuple(sorted(policy_principals)),
                     connector_id="conversation:codex",
+                    allowed_later_text_refs=tuple(sorted(set(allowed_question_refs))),
                 )
-                verify_codex_conversation_ref(validated.conversation_ref, human_request)
+                verify_codex_conversation_ref(validated.conversation_ref, request_text)
                 ledger = tuple(
                     item for item in ingestions if item.connector_id == "conversation:codex"
                 )
                 for item in ledger:
-                    if item.evidence.payload.get("role") != "human":
+                    if (
+                        item.evidence.payload.get("role") != "agent"
+                        or type(item.evidence.payload.get("content")) is not str
+                    ):
                         continue
                     try:
                         existing_binding = codex_conversation_binding(
@@ -1430,19 +1458,19 @@ class McpIntentWorkflowServices:
                         raise ValueError("advisory host turn changed")
                 envelope = TaskEnvelope(
                     repository_id=config.project_id,
-                    actor=config.local_actor,
+                    actor="agent:codex",
                     conversation_ref=validated.conversation_ref,
-                    request=human_request,
-                    request_evidence_ref=human.id,
+                    request=request_text,
+                    request_evidence_ref=request_evidence.id,
                     graph_version=graph.version,
-                    created_at=human.observed_at,
+                    created_at=request_evidence.observed_at,
                     requested_scope=detached_draft.requested_scope,
                 )
                 expected_content = self._advisory_content(envelope, detached_draft)
                 agent_candidates = tuple(
                     item
                     for item in ledger
-                    if item.predecessor_id == human.id
+                    if item.predecessor_id == request_evidence.id
                     and item.evidence.external_object_id == validated.conversation_ref
                     and item.evidence.payload.get("role") == "agent"
                 )
@@ -1455,12 +1483,16 @@ class McpIntentWorkflowServices:
                         conversation_ref=validated.conversation_ref,
                         role="agent",
                         author="agent:codex",
-                        acl=human.acl,
+                        acl=request_evidence.acl,
                     )
                     if (
                         agent_content != expected_content
                         or agent_entry.sequence
-                        != next(item.sequence for item in ledger if item.evidence.id == human.id)
+                        != next(
+                            item.sequence
+                            for item in ledger
+                            if item.evidence.id == request_evidence.id
+                        )
                         + 1
                     ):
                         raise ValueError("divergent advisory replay")
@@ -1475,7 +1507,7 @@ class McpIntentWorkflowServices:
                         raise ValueError("invalid advisory clock")
                     captured_at = max(
                         captured_at.astimezone(UTC),
-                        human.observed_at + timedelta(microseconds=1),
+                        request_evidence.observed_at + timedelta(microseconds=1),
                     )
                     agent = capture.record_turn(
                         conversation_ref=validated.conversation_ref,
@@ -1483,11 +1515,11 @@ class McpIntentWorkflowServices:
                         author="agent:codex",
                         content=expected_content,
                         captured_at=captured_at,
-                        acl=human.acl,
+                        acl=request_evidence.acl,
                     )
                     agent_ref = agent.id
                 submission = self._advisory_submission(envelope, detached_draft, agent_ref)
-                result = self._preflight.evaluate(
+                result = self._advisory_preflight.evaluate(
                     envelope,
                     submission,
                     principals=policy_principals,
@@ -1548,8 +1580,8 @@ class McpIntentWorkflowServices:
                 existing_binding = ("", "", "")
             if "payload" in locals():
                 payload = {}
-            if "human_request" in locals():
-                human_request = ""
+            if "request_text" in locals():
+                request_text = ""
 
     async def authorization_verify(
         self,
@@ -1822,7 +1854,9 @@ class McpIntentWorkflowServices:
         question_id: str,
         answer_evidence_ref: str,
     ) -> dict[str, object]:
+        """Accept only independently persisted human evidence, never hook attribution."""
         authority_files: dict[str, SecureFile] = {}
+        submitted: EvidenceRecord | None = None
         try:
             request = ClarificationAnswerRequest.model_validate(
                 {
@@ -1831,6 +1865,9 @@ class McpIntentWorkflowServices:
                     "answer_evidence_ref": answer_evidence_ref,
                 }
             )
+            submitted = self.runtime.evidence_store.get(request.answer_evidence_ref)
+            if submitted.payload.get("role") == "agent" or submitted.author == "agent:codex":
+                return self._human_confirmation_required()
             (
                 config,
                 principals,
@@ -1871,6 +1908,7 @@ class McpIntentWorkflowServices:
                 session = cast(ClarificationSession, None)
             if "principals" in locals():
                 principals = frozenset()
+            submitted = None
 
     async def clarification_propose(
         self,
@@ -2042,9 +2080,9 @@ class McpIntentWorkflowServices:
         at: datetime,
         selected_node_ids: tuple[str, ...],
     ) -> dict[str, object]:
-        authority_files: dict[str, SecureFile] = {}
+        """Keep confirmation pending because public MCP cannot authenticate a human."""
         try:
-            request = ClarificationConfirmRequest.model_validate(
+            ClarificationConfirmRequest.model_validate(
                 {
                     "proposal_id": proposal_id,
                     "proposal_digest": proposal_digest,
@@ -2053,31 +2091,7 @@ class McpIntentWorkflowServices:
                     "selected_node_ids": selected_node_ids,
                 }
             )
-            (
-                config,
-                _principals_live,
-                authority_files,
-                authority_preimages,
-                authority_membership_digest,
-            ) = self._clarification_authority()
-            if request.actor != config.local_actor:
-                return self._rejected()
-            confirmation = self._clarification_confirmation_service(
-                authority_files,
-                authority_preimages,
-                authority_membership_digest,
-            )
-            try:
-                result = confirmation.confirm(
-                    request.proposal_id,
-                    proposal_digest=request.proposal_digest,
-                    actor=request.actor,
-                    at=request.at,
-                    selected_node_ids=request.selected_node_ids,
-                )
-            finally:
-                confirmation.close()
-            return cast(dict[str, object], result.model_dump(mode="json"))
+            return self._human_confirmation_required()
         except Exception:  # noqa: BLE001 - fixed result contains no proposal detail
             return self._rejected()
         except BaseException as error:
@@ -2089,15 +2103,6 @@ class McpIntentWorkflowServices:
             proposal_id = proposal_digest = actor = ""
             at = cast(datetime, None)
             selected_node_ids = ()
-            self._close_clarification_authority(authority_files)
-            if "request" in locals():
-                request = cast(ClarificationConfirmRequest, None)
-            if "result" in locals():
-                result = cast(ProposalConfirmationResult, None)
-            if "_principals_live" in locals():
-                _principals_live = frozenset()
-            if "confirmation" in locals():
-                confirmation = cast(ProposalConfirmationService, None)
 
 
 def load_intent_workflow_services(
@@ -2372,6 +2377,7 @@ def register_intent_workflow_tools(
         question_id: _AuthorizationIdentityInput,
         answer_evidence_ref: Annotated[str, Field(pattern=_CONVERSATION_EVIDENCE_ID)],
     ) -> dict[str, object]:
+        """Use an independently authenticated human evidence record or remain pending."""
         try:
             request = ClarificationAnswerRequest.model_validate(
                 {
@@ -2440,6 +2446,7 @@ def register_intent_workflow_tools(
         at: datetime,
         selected_node_ids: _ClarificationNodeIdsInput,
     ) -> dict[str, object]:
+        """Return human_confirmation_required without applying the proposal."""
         try:
             request = ClarificationConfirmRequest.model_validate(
                 {

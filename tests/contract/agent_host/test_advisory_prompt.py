@@ -128,8 +128,8 @@ def test_initialized_repository_routes_once_to_public_preflight(tmp_path: Path) 
     assert captured[0].predecessor_id is None
     assert captured[0].evidence.external_object_id == TURN_7_CONVERSATION_REF
     assert captured[0].evidence.source_locator == TURN_7_CONVERSATION_REF
-    assert captured[0].evidence.author == "local"
-    assert captured[0].evidence.payload == {"role": "human", "content": event.prompt}
+    assert captured[0].evidence.author == "agent:codex"
+    assert captured[0].evidence.payload == {"role": "agent", "content": event.prompt}
     assert "token" not in json.dumps(route.model_dump(mode="json")).lower()
 
 
@@ -289,7 +289,7 @@ def test_prompt_route_arguments_are_recursively_frozen_detached_and_token_safe(
     assert "token" not in json.dumps(route.model_dump(mode="json")).casefold()
 
 
-def test_active_clarification_answer_routes_without_reclassification(
+def test_active_clarification_hook_answer_requires_independent_human_authority(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -316,18 +316,19 @@ def test_active_clarification_answer_routes_without_reclassification(
 
     route = AdvisoryPromptRouter(runtime).route(answer)
 
-    assert route.action == "answer_clarification"
-    assert route.mcp_tool == "intent_clarification_answer"
+    assert route.action == "human_confirmation_required"
+    assert route.mcp_tool is None
+    assert route.arguments == {}
     evidence = runtime.evidence_store.ledger("conversation:codex")
     assert len(evidence) == 1
-    answer_ref = evidence[0].evidence.id
     assert evidence[0].evidence.external_object_id != Session.conversation_ref
-    assert evidence[0].evidence.payload == {"role": "human", "content": answer.prompt}
-    assert route.arguments == {
-        "session_id": Session.id,
-        "question_id": "audience",
-        "answer_evidence_ref": answer_ref,
-    }
+    assert evidence[0].evidence.author == "agent:codex"
+    assert evidence[0].evidence.payload == {"role": "agent", "content": answer.prompt}
+    assert advisory_module.codex_prompt_context(route) == (
+        "action=human_confirmation_required. This advisory hook cannot authenticate a local "
+        "human answer or approval. Keep the clarification pending until an independently "
+        "authenticated non-MCP local human workflow records it."
+    )
 
 
 @pytest.mark.parametrize(
@@ -369,7 +370,8 @@ def test_proposed_clarification_routes_to_exact_public_preview_after_restart(
     assert "intent_clarification_show" in context
     assert "exact proposal_digest" in context
     assert "decline" in context.casefold()
-    assert "intent_clarification_confirm" in context
+    assert "intent_clarification_confirm" not in context
+    assert "independently authenticated non-MCP local human workflow" in context
 
 
 @pytest.mark.parametrize("status", ["open", "proposed"])

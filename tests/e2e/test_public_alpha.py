@@ -144,6 +144,12 @@ def test_public_alpha_docs_and_bindings_match_the_shipped_operating_model(
         assert "codex plugin marketplace add ." not in text
         assert "separate terminal" not in text.casefold()
         assert "launches the plugin-owned MCP server" in text
+        assert "agent:codex" in text
+        assert "human_confirmation_required" in text
+        assert "non-MCP local human" in text
+        assert "no CLI command" in text or "no shipped CLI command" in text
+        assert "exact human prompt as attributed" not in text
+        assert "human-authored evidence" not in text
     assert "clients that launch and connect stdio themselves" in guide
     assert "intent validate --project ." in github
     assert "intent sync --project . --sources markdown,git,github" in github
@@ -153,6 +159,8 @@ def test_public_alpha_docs_and_bindings_match_the_shipped_operating_model(
     assert "no_semantic_impact" in guided_spec
     assert "non_requirement" not in guided_spec
     assert "| `mechanical` |" not in guided_spec
+    assert "untrusted `agent:codex` evidence" in guided_spec
+    assert "independently authenticated non-MCP local human" in guided_spec
     assert "intent sources add markdown" in adoption
     assert "intent sources add '<source-role-connector-id>'" in adoption
     assert "polling" in guide

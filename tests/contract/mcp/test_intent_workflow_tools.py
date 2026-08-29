@@ -18,6 +18,7 @@ import pytest
 import yaml  # type: ignore[import-untyped]
 from mcp.server.mcpserver.exceptions import ToolError
 
+from intent_engineering.cli.intent_workflow import _principals
 from intent_engineering.cli.runtime import load_runtime
 from intent_engineering.core.models import ChangeSet, Graph, Node, NodeType, SourceMode
 from intent_engineering.core.policy.project import initialize_project
@@ -29,6 +30,7 @@ from intent_engineering.integrations.agent_host.advisory import (
 )
 from intent_engineering.integrations.mcp_server.intent_workflow import (
     AuthorizationVerifyRequest,
+    ClarificationConfirmRequest,
     validate_intent_workflow_call,
 )
 from intent_engineering.integrations.mcp_server.server import build_server
@@ -534,7 +536,7 @@ async def test_workflow_registration_is_optional_additive_and_has_truthful_annot
         clarification_confirm_annotations.destructive_hint,
         clarification_confirm_annotations.idempotent_hint,
         clarification_confirm_annotations.open_world_hint,
-    ) == (False, True, False, False)
+    ) == (True, False, True, False)
     all_public_names = {
         *by_name,
         *(prompt.name for prompt in await with_workflow.list_prompts()),
@@ -957,8 +959,8 @@ async def test_production_advisory_preflight_is_durable_idempotent_and_token_fre
     chain = runtime.evidence_store.chain(
         "conversation:codex", "conversation", arguments["conversation_ref"]
     )
-    assert tuple(item.evidence.payload["role"] for item in chain) == ("human", "agent")
-    assert chain[0].evidence.author == "local"
+    assert tuple(item.evidence.payload["role"] for item in chain) == ("agent", "agent")
+    assert chain[0].evidence.author == "agent:codex"
     assert chain[1].evidence.author == "agent:codex"
     assert chain[1].predecessor_id == chain[0].evidence.id
     assert "authorization_token" not in caplog.text
@@ -977,7 +979,6 @@ async def test_production_advisory_preflight_is_durable_idempotent_and_token_fre
         for path in sorted((project / ".intent").rglob("*"))
         if path.is_file() and not path.is_symlink()
     } == replayed
-
     altered_same_turn = json.loads(json.dumps(arguments))
     altered_same_turn["conversation_ref"] = codex_conversation_ref(
         "codex:thread-3",
@@ -1014,6 +1015,72 @@ async def test_production_advisory_preflight_is_durable_idempotent_and_token_fre
     revoked = await server.call_tool("intent_advisory_preflight", arguments)
     assert revoked.structured_content == rejected.structured_content
     assert tuple(runtime.evidence_store.ledger("conversation:codex")) == before_revocation
+
+
+async def test_advisory_conflict_attributes_request_side_as_agent_inference(
+    tmp_path: Path,
+) -> None:
+    from intent_engineering.integrations.mcp_server.intent_workflow import (
+        load_intent_workflow_services,
+    )
+
+    project, bootstrap = await anyio.to_thread.run_sync(_configured_project, tmp_path)
+    runtime = load_runtime(project)
+    server = build_server(
+        McpReadServices(runtime),
+        intent_workflow_services=load_intent_workflow_services(runtime),
+    )
+    proposed = await server.call_tool(
+        "intent_bootstrap_propose", {"submission": bootstrap.model_dump(mode="json")}
+    )
+    await server.call_tool(
+        "intent_proposal_confirm",
+        {
+            "proposal_id": proposed.structured_content["proposal_id"],
+            "proposal_digest": proposed.structured_content["proposal_digest"],
+            "confirmed_node_ids": ["intent:local-export", "requirement:csv-export"],
+        },
+    )
+    graph = runtime.graph_store.load()
+    node = next(item for item in graph.nodes if item.id == "requirement:csv-export")
+    request = "Remove CSV export"
+    route = AdvisoryPromptRouter(runtime).route(
+        PromptEvent(
+            session_id="codex:advisory-conflict",
+            turn_id="turn-1",
+            repository=str(project),
+            actor="local",
+            prompt=request,
+            created_at=datetime(2026, 8, 28, 12, 2, tzinfo=UTC),
+        )
+    )
+
+    response = await server.call_tool(
+        "intent_advisory_preflight",
+        {
+            **dict(route.arguments),
+            "draft": {
+                "classification": "conflicting",
+                "basis": "The request removes an active requirement",
+                "relevant_node_ids": [node.id],
+                "evidence_refs": list(node.evidence_refs),
+                "semantic_effects": ["Removes CSV export"],
+                "uncertainties": [],
+                "questions": [],
+                "conflict_claims": ["The active baseline requires CSV export"],
+                "requested_scope": ["src/export.py"],
+            },
+        },
+    )
+
+    assert response.structured_content["classification"] == "conflicting"
+    case = runtime.case_store.get(response.structured_content["review_case_id"])
+    request_side = next(item for item in case.evidence_sides if item.label == "task_request")
+    assert request_side.authors == ("agent:codex",)
+    assert request_side.source_mode is SourceMode.INFERRED
+    assert runtime.evidence_store.get(route.arguments["request_evidence_ref"]).author == (
+        "agent:codex"
+    )
 
 
 async def test_advisory_preflight_rejects_direct_forged_and_spliced_human_evidence(
@@ -1079,7 +1146,7 @@ async def test_advisory_preflight_rejects_direct_forged_and_spliced_human_eviden
             turn_id="turn-2",
             repository=str(project),
             actor="local",
-            prompt="Second exact human request",
+            prompt="Second exact hook request",
             created_at=datetime(2026, 8, 28, 12, 3, tzinfo=UTC),
         )
     )
@@ -1140,7 +1207,7 @@ async def test_advisory_preflight_authenticates_exact_current_hook_ingestion(
             edges=(),
         )
     )
-    request = "PRIVATE-HUMAN-REQUEST-MUST-NOT-CROSS-MCP"
+    request = "PRIVATE-HOOK-REQUEST-MUST-NOT-CROSS-MCP"
     route = AdvisoryPromptRouter(runtime).route(
         PromptEvent(
             session_id="codex:advisory-ingestion",
@@ -1157,8 +1224,8 @@ async def test_advisory_preflight_authenticates_exact_current_hook_ingestion(
             connector_id="conversation:codex",
         ).record_turn(
             conversation_ref=str(route.arguments["conversation_ref"]),
-            role="human",
-            author="local",
+            role="agent",
+            author="agent:codex",
             content=request,
             captured_at=observed_at + timedelta(microseconds=1),
             acl=("local",),
@@ -1169,7 +1236,7 @@ async def test_advisory_preflight_authenticates_exact_current_hook_ingestion(
         row = json.loads(lines[-1])
         record = row["evidence"]
         if tamper == "content":
-            record["payload"]["content"] = "PRIVATE-ALTERED-HUMAN-TEXT"
+            record["payload"]["content"] = "PRIVATE-ALTERED-HOOK-TEXT"
         elif tamper == "connector_id":
             row["connector_id"] = "conversation:other"
         elif tamper == "connector_type":
@@ -1181,7 +1248,7 @@ async def test_advisory_preflight_authenticates_exact_current_hook_ingestion(
                 "codex:other-session", "turn-1", request
             )
         elif tamper == "author":
-            record["author"] = "local:other"
+            record["author"] = "agent:other"
         elif tamper == "acl":
             record["acl"] = ["local:other"]
         else:
@@ -1409,6 +1476,13 @@ async def test_production_advisory_ambiguity_opens_exact_persisted_session(
         for path in sorted((project / ".intent").rglob("*"))
         if path.is_file() and not path.is_symlink()
     } == durable
+    hook_retry = AdvisoryPromptRouter(runtime).route(first_event)
+    assert hook_retry == first_route
+    assert {
+        path.relative_to(project).as_posix(): path.read_bytes()
+        for path in sorted((project / ".intent").rglob("*"))
+        if path.is_file() and not path.is_symlink()
+    } == durable
     restarted = load_runtime(project)
     answer = AdvisoryPromptRouter(restarted).route(
         PromptEvent(
@@ -1420,29 +1494,39 @@ async def test_production_advisory_ambiguity_opens_exact_persisted_session(
             created_at=datetime(2026, 8, 28, 13, 1, tzinfo=UTC),
         )
     )
-    assert answer.action == "answer_clarification"
-    assert answer.arguments["session_id"] == session.id
+    assert answer.action == "human_confirmation_required"
+    assert answer.mcp_tool is None
+    assert answer.arguments == {}
+    answer_ingestion = restarted.evidence_store.ledger("conversation:codex")[-1]
+    assert answer_ingestion.evidence.author == "agent:codex"
+    assert answer_ingestion.evidence.payload == {
+        "role": "agent",
+        "content": "Workspace administrators only",
+    }
     restarted_server = build_server(
         McpReadServices(restarted),
         intent_workflow_services=load_intent_workflow_services(restarted),
     )
+    answer_arguments = {
+        "session_id": session.id,
+        "question_id": session.questions[0].id,
+        "answer_evidence_ref": answer_ingestion.evidence.id,
+    }
+    before_answer = _transaction_bytes(restarted)
     first_answered = await restarted_server.call_tool(
-        "intent_clarification_answer", dict(answer.arguments)
+        "intent_clarification_answer", answer_arguments
     )
-    after_first_answer = {
-        path.relative_to(project).as_posix(): path.read_bytes()
-        for path in sorted((project / ".intent").rglob("*"))
-        if path.is_file() and not path.is_symlink()
+    assert first_answered.structured_content == {
+        "schema_version": "1",
+        "status": "human_confirmation_required",
+        "reason": "authenticated_local_human_evidence_required",
     }
     retried_answer = await restarted_server.call_tool(
-        "intent_clarification_answer", dict(answer.arguments)
+        "intent_clarification_answer", answer_arguments
     )
     assert retried_answer.structured_content == first_answered.structured_content
-    assert {
-        path.relative_to(project).as_posix(): path.read_bytes()
-        for path in sorted((project / ".intent").rglob("*"))
-        if path.is_file() and not path.is_symlink()
-    } == after_first_answer
+    assert _transaction_bytes(restarted) == before_answer
+    assert restarted.intent_proposals.session(session.id).answers == ()
 
     conflicting_route = AdvisoryPromptRouter(restarted).route(
         PromptEvent(
@@ -1454,19 +1538,11 @@ async def test_production_advisory_ambiguity_opens_exact_persisted_session(
             created_at=datetime(2026, 8, 28, 13, 2, tzinfo=UTC),
         )
     )
-    assert conflicting_route.action == "answer_clarification"
-    conflicting_arguments = dict(conflicting_route.arguments)
-    conflicting_arguments["question_id"] = answer.arguments["question_id"]
-    conflicted = await restarted_server.call_tool(
-        "intent_clarification_answer", conflicting_arguments
-    )
-    conflicted_session = conflicted.structured_content["session"]
-    assert len(conflicted_session["answers"]) == 1
-    assert len(conflicted_session["conflicts"]) == 1
-    assert (
-        conflicted_session["conflicts"][0]["conflicting_evidence_ref"]
-        == (conflicting_route.arguments["answer_evidence_ref"])
-    )
+    assert conflicting_route.action == "human_confirmation_required"
+    assert conflicting_route.arguments == {}
+    pending = restarted.intent_proposals.session(session.id)
+    assert pending.answers == ()
+    assert pending.conflicts == ()
 
 
 async def test_advisory_replay_fixed_fails_after_graph_change_without_new_evidence(
@@ -1577,7 +1653,7 @@ async def test_advisory_authority_race_rolls_back_conversation_pair(
     def race(self: ConversationCapture, **kwargs: object):
         nonlocal raced
         result = original(self, **kwargs)
-        if kwargs.get("role") == "human" and not raced:
+        if kwargs.get("role") == "agent" and not raced:
             raced = True
             changed = {**policy, "identities": {"local": ["local", "local:changed"]}}
             policy_path.write_text(yaml.safe_dump(changed, sort_keys=True), encoding="utf-8")
@@ -1786,7 +1862,6 @@ def _clarification_fifo_snapshot_child(
 
 def _clarification_confirm_fifo_child(
     workflow: object,
-    server: object,
     binding_path: str,
     arguments: dict[str, object],
     stage: str,
@@ -1817,12 +1892,7 @@ def _clarification_confirm_fifo_child(
 
         ProposalConfirmationService._confirm = confirm_after_swap  # type: ignore[method-assign]
     try:
-        response = anyio.run(  # type: ignore[arg-type]
-            server.call_tool,  # type: ignore[attr-defined]
-            "intent_clarification_confirm",
-            arguments,
-        )
-        sending.send(response.structured_content)
+        sending.send(_authenticated_local_confirmation(workflow, arguments))
     except BaseException:  # noqa: BLE001 - the child reports only completion class
         sending.send("raised")
     finally:
@@ -1905,6 +1975,76 @@ def _open_arguments(
     }
 
 
+def _authenticated_answer_arguments(
+    runtime,
+    session: ClarificationSession,
+    *,
+    host_session_id: str,
+    turn_id: str,
+    answer: str,
+    captured_at: datetime,
+) -> dict[str, object]:
+    conversation_ref = codex_conversation_ref(host_session_id, turn_id, answer)
+    record = ConversationCapture(
+        runtime.evidence_store,
+        connector_id="conversation:codex",
+    ).record_turn(
+        conversation_ref=conversation_ref,
+        role="human",
+        author=runtime.config.local_actor,
+        content=answer,
+        captured_at=captured_at,
+        acl=tuple(sorted(_principals(runtime, runtime.config))),
+    )
+    return {
+        "session_id": session.id,
+        "question_id": session.questions[0].id,
+        "answer_evidence_ref": record.id,
+    }
+
+
+def _authenticated_local_confirmation(
+    workflow,
+    arguments: dict[str, object],
+) -> dict[str, object]:
+    authority_files: dict[str, object] = {}
+    confirmation = None
+    try:
+        request = ClarificationConfirmRequest.model_validate_json(
+            json.dumps(arguments, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+        )
+        (
+            _config,
+            _principals_live,
+            authority_files,
+            authority_preimages,
+            authority_membership_digest,
+        ) = workflow._clarification_authority()
+        confirmation = workflow._clarification_confirmation_service(
+            authority_files,
+            authority_preimages,
+            authority_membership_digest,
+        )
+        result = confirmation.confirm(
+            request.proposal_id,
+            proposal_digest=request.proposal_digest,
+            actor=request.actor,
+            at=request.at,
+            selected_node_ids=request.selected_node_ids,
+        )
+        return result.model_dump(mode="json")
+    except Exception:  # noqa: BLE001 - test adapter mirrors the fixed local boundary
+        return {
+            "schema_version": "1",
+            "status": "rejected",
+            "reason": "intent_workflow_unavailable",
+        }
+    finally:
+        if confirmation is not None:
+            confirmation.close()
+        workflow._close_clarification_authority(authority_files)
+
+
 async def _clarification_operation_arguments(
     runtime,
     server,
@@ -1919,20 +2059,18 @@ async def _clarification_operation_arguments(
         )
     if operation == "propose":
         assert opened is not None
-        answer_route = AdvisoryPromptRouter(runtime).route(
-            PromptEvent(
-                session_id="codex:authority-race",
-                turn_id="turn-2",
-                repository=str(runtime.root),
-                actor=runtime.config.local_actor,
-                prompt="Workspace administrators",
-                created_at=envelope.created_at + timedelta(microseconds=5),
-            )
+        session = runtime.intent_proposals.session(opened.structured_content["session"]["id"])
+        answer_arguments = _authenticated_answer_arguments(
+            runtime,
+            session,
+            host_session_id="codex:authority-race",
+            turn_id="turn-2",
+            answer="Workspace administrators",
+            captured_at=envelope.created_at + timedelta(microseconds=5),
         )
-        assert answer_route.action == "answer_clarification"
         await server.call_tool(
             "intent_clarification_answer",
-            dict(answer_route.arguments),
+            answer_arguments,
         )
     session = (
         None
@@ -1943,18 +2081,14 @@ async def _clarification_operation_arguments(
         return _open_arguments(envelope, classification)
     if operation == "answer":
         assert session is not None
-        answer_route = AdvisoryPromptRouter(runtime).route(
-            PromptEvent(
-                session_id="codex:authority-race",
-                turn_id="turn-2",
-                repository=str(runtime.root),
-                actor=runtime.config.local_actor,
-                prompt="Workspace administrators",
-                created_at=envelope.created_at + timedelta(microseconds=5),
-            )
+        return _authenticated_answer_arguments(
+            runtime,
+            session,
+            host_session_id="codex:authority-race",
+            turn_id="turn-2",
+            answer="Workspace administrators",
+            captured_at=envelope.created_at + timedelta(microseconds=5),
         )
-        assert answer_route.action == "answer_clarification"
-        return dict(answer_route.arguments)
     assert session is not None
     return {"submission": _proposal_submission_for_session(session).model_dump(mode="json")}
 
@@ -1973,7 +2107,7 @@ async def _clarification_operation_arguments(
         "current_version",
     ],
 )
-async def test_clarification_answer_authenticates_exact_later_hook_ingestion(
+async def test_clarification_answer_authenticates_exact_independent_human_ingestion(
     tmp_path: Path,
     tamper: str,
 ) -> None:
@@ -1990,17 +2124,14 @@ async def test_clarification_answer_authenticates_exact_later_hook_ingestion(
     )
     session = runtime.intent_proposals.session(opened.structured_content["session"]["id"])
     answer_text = "PRIVATE-EXACT-CLARIFICATION-ANSWER"
-    answer_route = AdvisoryPromptRouter(runtime).route(
-        PromptEvent(
-            session_id="codex:authority-race",
-            turn_id="turn-2",
-            repository=str(project),
-            actor="local",
-            prompt=answer_text,
-            created_at=envelope.created_at + timedelta(microseconds=5),
-        )
+    arguments = _authenticated_answer_arguments(
+        runtime,
+        session,
+        host_session_id="codex:authority-race",
+        turn_id="turn-2",
+        answer=answer_text,
+        captured_at=envelope.created_at + timedelta(microseconds=5),
     )
-    arguments = dict(answer_route.arguments)
     answer_ref = str(arguments["answer_evidence_ref"])
     if tamper == "swapped_ref":
         arguments["answer_evidence_ref"] = session.request_evidence_ref
@@ -2283,7 +2414,7 @@ async def test_clarification_confirm_rejects_fifo_after_adapter_check_without_bl
     receiving, sending = context.Pipe(duplex=False)
     process = context.Process(
         target=_clarification_confirm_fifo_child,
-        args=(workflow, server, str(binding), arguments, stage, sending),
+        args=(workflow, str(binding), arguments, stage, sending),
     )
     process.start()
     sending.close()
@@ -2369,13 +2500,13 @@ async def test_clarification_confirm_per_file_limit_reaches_every_authority_comp
         return original_read_optional_nonblocking(self, max_bytes=max_bytes)
 
     monkeypatch.setattr(secure.SecureFile, "read_optional_nonblocking", observe_read_limit)
-    response = await server.call_tool("intent_clarification_confirm", arguments)
+    response = _authenticated_local_confirmation(workflow, arguments)
 
     assert raced is True
     assert binding_read_limits
     assert None not in binding_read_limits
     assert all(limit is not None and limit <= 1_048_576 for limit in binding_read_limits)
-    assert response.structured_content == {
+    assert response == {
         "schema_version": "1",
         "status": "rejected",
         "reason": "intent_workflow_unavailable",
@@ -2434,11 +2565,11 @@ async def test_clarification_confirm_rejects_aggregate_authority_over_exact_limi
             return original_confirm(self, *args, **kwargs)  # type: ignore[arg-type]
 
         monkeypatch.setattr(ProposalConfirmationService, "_confirm", confirm_after_growth)
-    response = await server.call_tool("intent_clarification_confirm", arguments)
+    response = _authenticated_local_confirmation(workflow, arguments)
 
     assert raced is True
     assert sum(binding.stat().st_size for binding in bindings) == 9_000_000
-    assert response.structured_content == {
+    assert response == {
         "schema_version": "1",
         "status": "rejected",
         "reason": "intent_workflow_unavailable",
@@ -2459,7 +2590,7 @@ async def test_clarification_confirm_binds_current_membership_through_commit(
     (
         project,
         runtime,
-        _workflow,
+        workflow,
         server,
         envelope,
         classification,
@@ -2508,10 +2639,10 @@ async def test_clarification_confirm_binds_current_membership_through_commit(
         return original_confirm(self, *args, **kwargs)  # type: ignore[arg-type]
 
     monkeypatch.setattr(ProposalConfirmationService, "_confirm", confirm_after_change)
-    response = await server.call_tool("intent_clarification_confirm", arguments)
+    response = _authenticated_local_confirmation(workflow, arguments)
 
     assert raced is True
-    assert response.structured_content == {
+    assert response == {
         "schema_version": "1",
         "status": "rejected",
         "reason": "intent_workflow_unavailable",
@@ -3125,21 +3256,18 @@ async def test_production_clarification_lifecycle_preserves_evidence_and_exact_c
         },
     )
     session_id = opened.structured_content["session"]["id"]
-    answer_route = AdvisoryPromptRouter(runtime).route(
-        PromptEvent(
-            session_id="codex:clarification-lifecycle",
-            turn_id="turn-2",
-            repository=str(project),
-            actor="local",
-            prompt=answer_text,
-            created_at=base + timedelta(microseconds=5),
-        )
+    session = runtime.intent_proposals.session(session_id)
+    answer_arguments = _authenticated_answer_arguments(
+        runtime,
+        session,
+        host_session_id="codex:clarification-lifecycle",
+        turn_id="turn-2",
+        answer=answer_text,
+        captured_at=base + timedelta(microseconds=5),
     )
-    assert answer_route.action == "answer_clarification"
-    assert answer_route.arguments["session_id"] == session_id
     answered = await server.call_tool(
         "intent_clarification_answer",
-        dict(answer_route.arguments),
+        answer_arguments,
     )
     session = runtime.intent_proposals.session(session_id)
     assert tuple(item.author for item in session.questions) == ("agent:codex",)
@@ -3227,7 +3355,12 @@ async def test_production_clarification_lifecycle_preserves_evidence_and_exact_c
             "selected_node_ids": [node.id],
         },
     )
-    assert mismatched_digest.structured_content["status"] == "rejected"
+    human_required = {
+        "schema_version": "1",
+        "status": "human_confirmation_required",
+        "reason": "authenticated_local_human_evidence_required",
+    }
+    assert mismatched_digest.structured_content == human_required
     assert runtime.graph_store.load() == graph_before
     incorrect = await server.call_tool(
         "intent_clarification_confirm",
@@ -3239,7 +3372,7 @@ async def test_production_clarification_lifecycle_preserves_evidence_and_exact_c
             "selected_node_ids": ["requirement:not-in-proposal"],
         },
     )
-    assert incorrect.structured_content["status"] == "rejected"
+    assert incorrect.structured_content == human_required
     assert runtime.graph_store.load() == graph_before
     confirmed = await server.call_tool(
         "intent_clarification_confirm",
@@ -3252,6 +3385,22 @@ async def test_production_clarification_lifecycle_preserves_evidence_and_exact_c
         },
     )
 
+    assert confirmed.structured_content == human_required
+    assert runtime.graph_store.load() == graph_before
+    assert tuple(
+        item.event_type for item in runtime.intent_proposals.clarification_events(session_id)
+    ) == ("opened", "answered", "proposed")
+
+    locally_confirmed = _authenticated_local_confirmation(
+        workflow,
+        {
+            "proposal_id": proposal_id,
+            "proposal_digest": stored.digest,
+            "actor": "local",
+            "at": (base + timedelta(microseconds=8)).isoformat().replace("+00:00", "Z"),
+            "selected_node_ids": [node.id],
+        },
+    )
     events = runtime.intent_proposals.clarification_events(session_id)
     assert tuple(item.event_type for item in events) == (
         "opened",
@@ -3266,7 +3415,7 @@ async def test_production_clarification_lifecycle_preserves_evidence_and_exact_c
         events[2].id,
     )
     assert runtime.intent_proposals.get(proposal_id).proposed_by == "local"
-    assert confirmed.structured_content["status"] == "applied"
+    assert locally_confirmed["status"] == "applied"
     assert runtime.graph_store.load().nodes[-1].id == node.id
     hidden_after_decision = await server.call_tool(
         "intent_clarification_show", {"proposal_id": proposal_id}

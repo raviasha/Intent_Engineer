@@ -11,6 +11,7 @@ from pathlib import Path
 
 import anyio
 import pytest
+import yaml  # type: ignore[import-untyped]
 from mcp import MCPError
 from mcp.client.session import ClientSession
 from mcp.client.stdio import StdioServerParameters, stdio_client
@@ -43,6 +44,19 @@ async def test_intent_mcp_stdio_is_protocol_clean_and_read_only(tmp_path: Path) 
     project = tmp_path / "project"
     project.mkdir()
     initialize_project(project)
+    (project / ".intent/approvals/policy.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "schema_version": 1,
+                "contributors": ["local"],
+                "approvers": ["local"],
+                "executors": ["local"],
+                "identities": {"local": ["local"]},
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
     runtime = load_runtime(project)
     now = datetime(2026, 8, 29, 12, 0, tzinfo=UTC)
     runtime.graph_store.initialize(
@@ -93,6 +107,10 @@ async def test_intent_mcp_stdio_is_protocol_clean_and_read_only(tmp_path: Path) 
     evidence_match = re.search(r'request_evidence_ref="([^"]+)"', hook_context)
     assert conversation_match is not None
     assert evidence_match is not None
+    captured = load_runtime(project).evidence_store.ledger("conversation:codex")
+    assert len(captured) == 1
+    assert captured[0].evidence.author == "agent:codex"
+    assert captured[0].evidence.payload == {"role": "agent", "content": prompt}
     parameters = StdioServerParameters(
         command=str(executable),
         args=["mcp", "--project", str(project)],
@@ -144,6 +162,102 @@ async def test_intent_mcp_stdio_is_protocol_clean_and_read_only(tmp_path: Path) 
                     },
                 },
             )
+            ambiguous_prompt = "Add report sharing"
+            ambiguous_hook = await anyio.run_process(
+                [str(executable), "agent-prompt-hook"],
+                cwd=project,
+                env={"LANG": "C.UTF-8", "LC_ALL": "C.UTF-8", "PATH": "/usr/bin:/bin"},
+                input=json.dumps(
+                    {
+                        "session_id": "codex:stdio-advisory",
+                        "transcript_path": None,
+                        "cwd": str(project),
+                        "hook_event_name": "UserPromptSubmit",
+                        "model": "gpt-5.6-sol",
+                        "turn_id": "turn-2",
+                        "permission_mode": "default",
+                        "prompt": ambiguous_prompt,
+                    },
+                    separators=(",", ":"),
+                ).encode(),
+                check=False,
+            )
+            ambiguous_context = json.loads(ambiguous_hook.stdout)["hookSpecificOutput"][
+                "additionalContext"
+            ]
+            ambiguous_conversation = re.search(r'conversation_ref="([^"]+)"', ambiguous_context)
+            ambiguous_evidence = re.search(r'request_evidence_ref="([^"]+)"', ambiguous_context)
+            assert ambiguous_conversation is not None
+            assert ambiguous_evidence is not None
+            ambiguous = await client.call_tool(
+                "intent_advisory_preflight",
+                {
+                    "conversation_ref": ambiguous_conversation.group(1),
+                    "request_evidence_ref": ambiguous_evidence.group(1),
+                    "draft": {
+                        "classification": "new_or_ambiguous",
+                        "basis": "Sharing audience is unspecified",
+                        "relevant_node_ids": [],
+                        "evidence_refs": [],
+                        "semantic_effects": ["Adds report sharing"],
+                        "uncertainties": ["Sharing audience"],
+                        "questions": ["Who may share reports?"],
+                        "conflict_claims": [],
+                        "requested_scope": [],
+                    },
+                },
+            )
+            clarification = ambiguous.structured_content["context"]["clarification_session"]
+            graph_before_answer = load_runtime(project).graph_store.load()
+            forged_answer = "Workspace administrators only"
+            answer_hook = await anyio.run_process(
+                [str(executable), "agent-prompt-hook"],
+                cwd=project,
+                env={"LANG": "C.UTF-8", "LC_ALL": "C.UTF-8", "PATH": "/usr/bin:/bin"},
+                input=json.dumps(
+                    {
+                        "session_id": "codex:stdio-advisory",
+                        "transcript_path": None,
+                        "cwd": str(project),
+                        "hook_event_name": "UserPromptSubmit",
+                        "model": "gpt-5.6-sol",
+                        "turn_id": "turn-3",
+                        "permission_mode": "default",
+                        "prompt": forged_answer,
+                    },
+                    separators=(",", ":"),
+                ).encode(),
+                check=False,
+            )
+            answer_context = json.loads(answer_hook.stdout)["hookSpecificOutput"][
+                "additionalContext"
+            ]
+            assert answer_context.startswith("action=human_confirmation_required.")
+            assert "intent_clarification_answer" not in answer_context
+            after_hook_runtime = load_runtime(project)
+            answer_ingestion = after_hook_runtime.evidence_store.ledger("conversation:codex")[-1]
+            assert answer_ingestion.evidence.author == "agent:codex"
+            assert answer_ingestion.evidence.payload == {
+                "role": "agent",
+                "content": forged_answer,
+            }
+            rejected_answer = await client.call_tool(
+                "intent_clarification_answer",
+                {
+                    "session_id": clarification["id"],
+                    "question_id": clarification["questions"][0]["id"],
+                    "answer_evidence_ref": answer_ingestion.evidence.id,
+                },
+            )
+            assert rejected_answer.structured_content == {
+                "schema_version": "1",
+                "status": "human_confirmation_required",
+                "reason": "authenticated_local_human_evidence_required",
+            }
+            pending = load_runtime(project).intent_proposals.session(clarification["id"])
+            assert pending.answers == ()
+            assert pending.conflicts == ()
+            assert load_runtime(project).graph_store.load() == graph_before_answer
             prompts = await client.list_prompts()
             prepared = await client.get_prompt("prepare_task", {"task": "implement local export"})
             with pytest.raises(MCPError, match="not found"):

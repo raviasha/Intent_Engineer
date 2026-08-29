@@ -73,13 +73,14 @@ checkout.
 Clients other than Codex that launch and connect stdio themselves may run
 `intent mcp --project .`; Codex users rely on the plugin-owned server configuration instead.
 
-For every new human prompt, the hook performs a read-only onboarding check. With an approved
-baseline it captures that exact prompt as human-authored evidence and supplies opaque conversation
-and request-evidence references before the agent submits its bounded draft to token-free
-`intent_advisory_preflight`. The agent may use public read-only Intent tools for bounded repository
-context, but never sends raw prompt or answer text through MCP. The live held runtime and captured
-record, not caller fields, resolve repository, graph, text, time, actor, ACL, principals, and
-persistence authority.
+For every submitted prompt, the hook performs a read-only onboarding check. With an approved
+baseline it captures the exact hook stdin as untrusted `agent:codex` evidence and supplies opaque
+conversation and request-evidence references before the agent submits its bounded draft to
+token-free `intent_advisory_preflight`. The hook is callable by the coding agent, so neither its
+stdin nor its host fields establish local-human provenance. The agent may use public read-only
+Intent tools for bounded repository context, but never sends raw prompt text through MCP. The live
+held runtime and captured record, not caller fields, resolve repository, graph, text, time, ACL,
+principals, and persistence authority; its author remains `agent:codex`.
 
 - `no_semantic_impact`: continue without graph ceremony.
 - `aligned`: continue with the relevant intent and requirement context.
@@ -107,13 +108,15 @@ The CLI diagnostic does not classify the request and does not mint a capability;
 
 ## 4. Clarification and review
 
-For `new_or_ambiguous`, the advisory preflight opens a persisted clarification session. Each later
-human answer is first captured by the hook and routed to `intent_clarification_answer` only by its
-evidence reference; it is not recursively classified as an unrelated requirement. Once required answers exist, the agent may call
-`intent_clarification_propose`, show the exact graph proposal, and call
-`intent_clarification_confirm` only after human confirmation. These public tools delegate to the
-existing `ClarificationCoordinator` and proposal-confirmation service, preserving author, ACL,
-timestamp, predecessor, prompt/answer evidence, and graph baseline.
+For `new_or_ambiguous`, the advisory preflight opens a persisted clarification session and the hook
+asks each question. A later hook submission is still agent evidence: it does not satisfy a required
+human answer and is not treated as approval. The route returns `human_confirmation_required`, and
+the public MCP answer and confirmation tools return that same fixed status without changing state.
+An independently authenticated non-MCP local human integration over the existing
+`ClarificationCoordinator` and proposal-confirmation service must record the answer, then approve
+the exact proposal digest and selected node IDs. Intent Engineering ships no CLI command for those
+two authority steps; without a configured host integration, the session or proposal remains
+pending. The agent may show the token-free persisted proposal preview but cannot activate it.
 
 If there is insufficient evidence, the result remains `new_or_ambiguous` and asks focused
 questions. A `conflicting` request cannot be self-reviewed when policy requires an independent

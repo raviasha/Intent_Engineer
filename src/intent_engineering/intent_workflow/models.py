@@ -212,9 +212,7 @@ class ProposalDecisionV3(ProposalDecision):
 
     schema_version: Literal[3] = 3  # type: ignore[assignment]
     action: Literal["confirm"] = "confirm"
-    selected_node_ids: Annotated[
-        tuple[str, ...], Field(max_length=_MAX_DECISION_NODE_IDS)
-    ] = ()
+    selected_node_ids: Annotated[tuple[str, ...], Field(max_length=_MAX_DECISION_NODE_IDS)] = ()
     activation_changeset_id: Annotated[str, Field(min_length=1)]
     activation_graph_effect_digest: Annotated[str, Field(pattern=_HASH_PATTERN)]
     review_case_id: str | None = None
@@ -336,7 +334,9 @@ class ClarificationSession(_WorkflowModel):
         tuple[ClarificationQuestion, ...],
         Field(min_length=1, max_length=_MAX_CLARIFICATION_ITEMS),
     ]
-    answers: Annotated[tuple[ClarificationAnswer, ...], Field(max_length=_MAX_CLARIFICATION_ITEMS)] = ()
+    answers: Annotated[
+        tuple[ClarificationAnswer, ...], Field(max_length=_MAX_CLARIFICATION_ITEMS)
+    ] = ()
     conflicts: Annotated[
         tuple[ClarificationConflict, ...], Field(max_length=_MAX_CLARIFICATION_ITEMS)
     ] = ()
@@ -356,11 +356,9 @@ class ClarificationSession(_WorkflowModel):
             raise ValueError("duplicate clarification question")
         if len(answer_ids) != len(set(answer_ids)) or not set(answer_ids).issubset(question_ids):
             raise ValueError("invalid clarification answers")
-        if (
-            any(item.question_id not in answer_ids for item in self.conflicts)
-            or len({item.conflicting_evidence_ref for item in self.conflicts})
-            != len(self.conflicts)
-        ):
+        if any(item.question_id not in answer_ids for item in self.conflicts) or len(
+            {item.conflicting_evidence_ref for item in self.conflicts}
+        ) != len(self.conflicts):
             raise ValueError("invalid clarification conflicts")
         immutable = {
             "schema_version": self.schema_version,
@@ -418,8 +416,10 @@ class ClarificationEvent(_WorkflowModel):
             raise ValueError("clarification event identifier does not match canonical hash")
         if self.session.latest_event_id != self.id:
             raise ValueError("clarification event/session binding mismatch")
-        expected_status = "proposed" if self.event_type == "proposed" else (
-            "closed" if self.event_type == "closed" else "open"
+        expected_status = (
+            "proposed"
+            if self.event_type == "proposed"
+            else ("closed" if self.event_type == "closed" else "open")
         )
         if self.session.status != expected_status:
             raise ValueError("clarification event status mismatch")
@@ -481,7 +481,7 @@ class ClarificationProposalSubmission(_WorkflowModel):
 
 
 class TaskEnvelope(_WorkflowModel):
-    """Bounded, canonical preflight input built from a single human message."""
+    """Bounded, canonical preflight input built from one attributed request record."""
 
     schema_version: Literal[1] = 1
     id: str = ""

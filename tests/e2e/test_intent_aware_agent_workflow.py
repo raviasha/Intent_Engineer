@@ -9,7 +9,7 @@ import os
 import re
 import stat
 import subprocess
-from datetime import datetime, timedelta
+from datetime import timedelta
 from pathlib import Path
 from typing import cast
 
@@ -19,6 +19,7 @@ import yaml  # type: ignore[import-untyped]
 from structlog.testing import capture_logs
 
 from intent_engineering.capture.git.connector import GitConnector
+from intent_engineering.cli.intent_workflow import _principals
 from intent_engineering.cli.writes import MutationPolicy
 from intent_engineering.core.models import ChangeSet, Node, NodeType, SourceMode
 from intent_engineering.integrations.mcp_server.intent_workflow import (
@@ -27,13 +28,21 @@ from intent_engineering.integrations.mcp_server.intent_workflow import (
 from intent_engineering.integrations.mcp_server.server import build_server
 from intent_engineering.integrations.mcp_server.tools import McpReadServices
 from intent_engineering.intent_workflow.authorization import AuthorizationIssuer
+from intent_engineering.intent_workflow.conversation import (
+    ConversationCapture,
+    codex_conversation_ref,
+)
 from intent_engineering.intent_workflow.models import (
     ClarificationProposalSubmission,
-    PreflightResult,
     ProposalDecisionV2,
+    TaskClassification,
     TaskEnvelope,
 )
 from intent_engineering.intent_workflow.post_task import PostTaskSubmission
+from intent_engineering.intent_workflow.preflight import (
+    AgentClassificationSubmission,
+    classification_evidence_content,
+)
 from tests.e2e.intent_aware_agent_harness import (
     GuidedOnboardingHarness,
     IntentAwareAgentHarness,
@@ -116,11 +125,6 @@ def _request_evidence_ref(context: str) -> str:
     return matched.group(1)
 
 
-def _clarification_answer_arguments(context: str) -> dict[str, object]:
-    encoded = context.partition("with ")[2].partition(". The hook")[0]
-    return cast(dict[str, object], json.loads(encoded))
-
-
 def test_guided_onboarding_plugin_and_assurance_share_one_project(
     guided_onboarding_harness: GuidedOnboardingHarness,
     monkeypatch: pytest.MonkeyPatch,
@@ -142,7 +146,7 @@ def test_guided_onboarding_plugin_and_assurance_share_one_project(
         "Implement CSV export",
         turn_id="turn-1",
     )
-    transcript.extend(("human: Implement CSV export", offer_stdout, offer_stderr))
+    transcript.extend(("hook-submitted: Implement CSV export", offer_stdout, offer_stderr))
     assert offer == (
         "This repository has not been onboarded into Intent Engineering. "
         "Start guided onboarding now?"
@@ -267,7 +271,7 @@ def test_guided_onboarding_plugin_and_assurance_share_one_project(
     )
     transcript.extend(
         (
-            "human: Implement CSV export",
+            "hook-submitted: Implement CSV export",
             aligned_hook_stdout,
             aligned_hook_stderr,
         )
@@ -297,25 +301,77 @@ def test_guided_onboarding_plugin_and_assurance_share_one_project(
     assert aligned["authorized"] is True
     assert advisory_issuer.issue_calls == advisory_issuer.revoke_calls == 0
 
-    human_request = next(
+    agent_request = next(
         record
         for record in runtime.evidence()
         if record.connector_type == "conversation"
         and record.external_object_id == _conversation_ref(aligned_route)
-        and record.payload.get("role") == "human"
+        and record.payload.get("role") == "agent"
         and record.payload.get("content") == "Implement CSV export"
+    )
+    assert agent_request.author == "agent:codex"
+    principals = _principals(runtime, runtime.config)
+    local_conversation_ref = codex_conversation_ref(
+        "local:guided-release-proof",
+        "authorized-turn-2",
+        "Implement CSV export",
+    )
+    capture = ConversationCapture(runtime.evidence_store, connector_id="conversation:codex")
+    human_request = capture.record_turn(
+        conversation_ref=local_conversation_ref,
+        role="human",
+        author=actor,
+        content="Implement CSV export",
+        captured_at=harness.tick(),
+        acl=tuple(sorted(principals)),
     )
     envelope = TaskEnvelope(
         repository_id=runtime.config.project_id,
         actor=actor,
-        conversation_ref=_conversation_ref(aligned_route),
+        conversation_ref=local_conversation_ref,
         request="Implement CSV export",
         request_evidence_ref=human_request.id,
         graph_version=1,
         created_at=human_request.observed_at,
         requested_scope=("src/export.py", "tests/test_export.py"),
     )
-    preflight = PreflightResult.model_validate_json(json.dumps(aligned))
+    classification_content = classification_evidence_content(
+        task_id=envelope.id,
+        task_digest=envelope.digest,
+        graph_version=envelope.graph_version,
+        classification=TaskClassification.ALIGNED,
+        basis="Matches the confirmed CSV export requirement",
+        relevant_node_ids=("requirement:csv-export",),
+        evidence_refs=(evidence[0].id,),
+        semantic_effects=("Implement the confirmed CSV export requirement",),
+        requested_scope=envelope.requested_scope,
+    )
+    classification_record = capture.record_turn(
+        conversation_ref=local_conversation_ref,
+        role="agent",
+        author="agent:codex",
+        content=classification_content,
+        captured_at=harness.tick(),
+        acl=tuple(sorted(principals)),
+    )
+    local_submission = AgentClassificationSubmission(
+        task_id=envelope.id,
+        task_digest=envelope.digest,
+        graph_version=envelope.graph_version,
+        classification=TaskClassification.ALIGNED,
+        basis="Matches the confirmed CSV export requirement",
+        relevant_node_ids=("requirement:csv-export",),
+        evidence_refs=(evidence[0].id,),
+        agent_evidence_ref=classification_record.id,
+        semantic_effects=("Implement the confirmed CSV export requirement",),
+        requested_scope=envelope.requested_scope,
+    )
+    preflight = workflow._preflight.evaluate(
+        envelope,
+        local_submission,
+        principals=principals,
+    )
+    assert preflight.authorized
     assert envelope.id == preflight.task_id
     post_issuer = AuthorizationIssuer()
     post_issued_at = max(harness.tick(), human_request.observed_at)
@@ -450,7 +506,9 @@ def test_guided_onboarding_plugin_and_assurance_share_one_project(
         "Add team sharing",
         turn_id="turn-3",
     )
-    transcript.extend(("human: Add team sharing", ambiguous_hook_stdout, ambiguous_hook_stderr))
+    transcript.extend(
+        ("hook-submitted: Add team sharing", ambiguous_hook_stdout, ambiguous_hook_stderr)
+    )
     ambiguous = call_tool(
         "intent_advisory_preflight",
         {
@@ -476,36 +534,100 @@ def test_guided_onboarding_plugin_and_assurance_share_one_project(
     assert ambiguous["questions"]
     session_payload = cast(dict[str, object], ambiguous["context"])["clarification_session"]
 
+    session_id = cast(str, cast(dict[str, object], session_payload)["id"])
     for turn_id, answer in (
         ("turn-4", "Workspace admins may share read-only reports."),
         ("turn-5", "Sharing grants expire after seven days."),
     ):
+        pending = runtime.intent_proposals.session(session_id)
+        question = next(
+            item
+            for item in pending.questions
+            if item.id not in {record.question_id for record in pending.answers}
+        )
         answer_route, answer_hook_stdout, answer_hook_stderr = _plugin_prompt(
             project,
             answer,
             turn_id=turn_id,
         )
-        transcript.extend((f"human: {answer}", answer_hook_stdout, answer_hook_stderr))
-        assert "action=answer_clarification" in answer_route
-        answered = call_tool(
-            "intent_clarification_answer",
-            _clarification_answer_arguments(answer_route),
+        transcript.extend((f"hook-submitted: {answer}", answer_hook_stdout, answer_hook_stderr))
+        assert "action=human_confirmation_required" in answer_route
+        assert "intent_clarification_answer" not in answer_route
+        answer_conversation_ref = codex_conversation_ref(
+            "codex:guided-release-proof",
+            turn_id,
+            answer,
         )
-        assert answered["status"] == "open"
+        hook_answer = next(
+            record
+            for record in runtime.evidence()
+            if record.external_object_id == answer_conversation_ref
+            and record.payload.get("content") == answer
+        )
+        assert hook_answer.payload.get("role") == "agent"
+        assert hook_answer.author == "agent:codex"
+        answer_evidence_ref = hook_answer.id
+        graph_before_answer = (project / ".intent/graph.yaml").read_bytes()
+        session_before_answer = (project / ".intent/history/intent-proposals.jsonl").read_bytes()
+        rejected_answer = call_tool(
+            "intent_clarification_answer",
+            {
+                "session_id": session_id,
+                "question_id": question.id,
+                "answer_evidence_ref": answer_evidence_ref,
+            },
+        )
+        assert rejected_answer == {
+            "schema_version": "1",
+            "status": "human_confirmation_required",
+            "reason": "authenticated_local_human_evidence_required",
+        }
+        assert (project / ".intent/graph.yaml").read_bytes() == graph_before_answer
+        assert (
+            project / ".intent/history/intent-proposals.jsonl"
+        ).read_bytes() == session_before_answer
+        (
+            authority_config,
+            authority_principals,
+            authority_files,
+            authority_preimages,
+            authority_membership_digest,
+        ) = workflow._clarification_authority()
+        try:
+            answered_session = workflow._clarification_coordinator(
+                authority_config,
+                authority_files,
+                authority_preimages,
+                authority_membership_digest,
+            ).answer(
+                session_id,
+                actor=actor,
+                question_id=question.id,
+                answer=answer,
+                answered_at=max(
+                    harness.tick(),
+                    pending.questions[-1].asked_at + timedelta(microseconds=1),
+                    *(
+                        (pending.answers[-1].answered_at + timedelta(microseconds=1),)
+                        if pending.answers
+                        else ()
+                    ),
+                ),
+                acl=tuple(sorted(authority_principals)),
+                principals=authority_principals,
+            )
+        finally:
+            workflow._close_clarification_authority(authority_files)
+        assert answered_session.answers[-1].question_id == question.id
 
-    session = runtime.intent_proposals.session(cast(dict[str, object], session_payload)["id"])
+    session = runtime.intent_proposals.session(session_id)
     evidence_refs = (
         session.request_evidence_ref,
         session.classification_evidence_ref,
         *(item.evidence_ref for item in session.questions),
         *(item.evidence_ref for item in session.answers),
     )
-    last_answered_at = datetime.fromisoformat(
-        cast(
-            str,
-            cast(dict[str, object], answered["session"])["answers"][-1]["answered_at"],  # type: ignore[index]
-        )
-    )
+    last_answered_at = session.answers[-1].answered_at
     proposal_at = last_answered_at + timedelta(microseconds=1)
     node = Node(
         id="requirement:team-sharing",
@@ -563,7 +685,7 @@ def test_guided_onboarding_plugin_and_assurance_share_one_project(
     )
     transcript.extend(
         (
-            f"human: confirm {clarification_proposed['proposal_digest']}",
+            f"hook-submitted: confirm {clarification_proposed['proposal_digest']}",
             review_hook_stdout,
             review_hook_stderr,
         )
@@ -578,7 +700,11 @@ def test_guided_onboarding_plugin_and_assurance_share_one_project(
     assert clarification_preview["proposal_digest"] == clarification_proposed["proposal_digest"]
     assert clarification_preview["core_node_ids"] == [node.id]
     assert clarification_preview["evidence_refs"] == list(evidence_refs)
-    clarification_confirmed = call_tool(
+    graph_before_confirmation = (project / ".intent/graph.yaml").read_bytes()
+    clarification_ledger_before_confirmation = (
+        project / ".intent/history/intent-proposals.jsonl"
+    ).read_bytes()
+    rejected_confirmation = call_tool(
         "intent_clarification_confirm",
         {
             "proposal_id": clarification_proposed["proposal_id"],
@@ -588,7 +714,39 @@ def test_guided_onboarding_plugin_and_assurance_share_one_project(
             "selected_node_ids": [node.id],
         },
     )
-    assert clarification_confirmed["status"] == "applied"
+    assert rejected_confirmation == {
+        "schema_version": "1",
+        "status": "human_confirmation_required",
+        "reason": "authenticated_local_human_evidence_required",
+    }
+    assert (project / ".intent/graph.yaml").read_bytes() == graph_before_confirmation
+    assert (
+        project / ".intent/history/intent-proposals.jsonl"
+    ).read_bytes() == clarification_ledger_before_confirmation
+    (
+        _authority_config,
+        _authority_principals,
+        authority_files,
+        authority_preimages,
+        authority_membership_digest,
+    ) = workflow._clarification_authority()
+    confirmation_service = workflow._clarification_confirmation_service(
+        authority_files,
+        authority_preimages,
+        authority_membership_digest,
+    )
+    try:
+        clarification_confirmed = confirmation_service.confirm(
+            cast(str, clarification_proposed["proposal_id"]),
+            proposal_digest=cast(str, clarification_preview["proposal_digest"]),
+            actor=actor,
+            at=proposal_at + timedelta(microseconds=1),
+            selected_node_ids=(node.id,),
+        )
+    finally:
+        confirmation_service.close()
+        workflow._close_clarification_authority(authority_files)
+    assert clarification_confirmed.status == "applied"
     assert node.id in {item.id for item in runtime.graph_store.load().nodes}
 
     assert not (project / "plugins/intent-advisor").exists()

@@ -83,7 +83,7 @@ def _codex_digest(label: str, *values: str) -> str:
 
 
 def codex_conversation_ref(session_id: str, turn_id: str, request: str) -> str:
-    """Bind one host session, turn, and exact human request to a retry-stable locator."""
+    """Bind one host session, turn, and exact submitted request to a stable locator."""
     checked_session = _identity(session_id)
     checked_turn = _identity(turn_id)
     checked_request = _prompt(request)
@@ -110,7 +110,7 @@ def verify_codex_conversation_ref(
     conversation_ref: str,
     request: str,
 ) -> tuple[str, str, str]:
-    """Authenticate the caller request against its exact Codex locator digest."""
+    """Verify submitted request bytes against their exact Codex locator digest."""
     binding = codex_conversation_binding(conversation_ref)
     if binding[2] != _codex_digest("codex-request-v1", _prompt(request)):
         raise ValueError("invalid Codex conversation reference")
@@ -220,11 +220,22 @@ def validate_conversation_ingestion(
     *,
     evidence_ref: str,
     conversation_ref: str | None,
+    role: Literal["human", "agent"] = "human",
     author: str,
     acl: tuple[str, ...],
     connector_id: str,
+    allowed_later_text_refs: tuple[str, ...] = (),
 ) -> tuple[EvidenceRecord, str]:
-    """Resolve one exact current human turn from its authenticated connector ingestion."""
+    """Resolve one exact current text turn from its authenticated connector ingestion."""
+    if (
+        type(role) is not str
+        or role not in {"human", "agent"}
+        or type(allowed_later_text_refs) is not tuple
+        or any(type(item) is not str for item in allowed_later_text_refs)
+        or len(allowed_later_text_refs) != len(set(allowed_later_text_refs))
+        or evidence_ref in allowed_later_text_refs
+    ):
+        raise ValueError("invalid conversation evidence")
     selected = tuple(
         item
         for item in ingestions
@@ -240,7 +251,7 @@ def validate_conversation_ingestion(
     content = validate_conversation_record(
         record,
         conversation_ref=locator,
-        role="human",
+        role=role,
         author=author,
         acl=acl,
     )
@@ -251,13 +262,19 @@ def validate_conversation_ingestion(
         and item.evidence.connector_type == "conversation"
         and item.evidence.external_object_id == locator
     )
-    human_versions = tuple(item for item in chain if item.evidence.payload.get("role") == "human")
+    text_versions = tuple(
+        item
+        for item in chain
+        if item.evidence.payload.get("role") == role
+        and type(item.evidence.payload.get("content")) is str
+    )
+    allowed_text_ids = {evidence_ref, *allowed_later_text_refs}
     if (
         len(indexed) != 1
         or indexed[0] != record
         or type(content) is not str
         or ingestion.predecessor_id is not None
-        or human_versions != selected
+        or {item.evidence.id for item in text_versions} != allowed_text_ids
     ):
         raise ValueError("invalid conversation evidence")
     return record, content

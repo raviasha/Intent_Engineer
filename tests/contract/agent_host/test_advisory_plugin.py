@@ -273,7 +273,8 @@ def test_real_hook_routes_ready_prompt_to_preflight_without_secret_or_echo(
     captured = load_runtime(project).evidence_store.ledger("conversation:codex")
     assert len(captured) == 1
     assert captured[0].evidence.external_object_id == expected_ref
-    assert captured[0].evidence.payload == {"role": "human", "content": marker}
+    assert captured[0].evidence.author == "agent:codex"
+    assert captured[0].evidence.payload == {"role": "agent", "content": marker}
 
 
 def test_real_hook_uses_retry_stable_turn_specific_ref_without_host_id_leakage(
@@ -585,11 +586,11 @@ def test_plugin_configured_mcp_missing_project_is_protocol_clean(tmp_path: Path)
 def test_skill_routes_clarifications_and_states_advisory_mcp_failure_boundary() -> None:
     skill = (PLUGIN_ROOT / "skills" / "intent-advisor" / "SKILL.md").read_text(encoding="utf-8")
 
-    assert "action=answer_clarification" in skill
-    assert "intent_clarification_answer" in skill
-    assert "Do not classify the answer again" in skill
+    assert "action=human_confirmation_required" in skill
+    assert "intent_clarification_answer" not in skill
     assert "action=review_clarification_proposal" in skill
     assert "intent_clarification_show" in skill
+    assert "intent_clarification_confirm" not in skill
     assert "proposal_digest" in skill
     assert "decline" in skill.casefold()
     assert "no_semantic_impact" in skill
@@ -600,7 +601,7 @@ def test_skill_routes_clarifications_and_states_advisory_mcp_failure_boundary() 
     assert "ask the user for the PRD path" in skill
     assert "intent onboard --project . --prd <confirmed path> --yes" in skill
     assert "request_evidence_ref" in skill
-    assert "answer_evidence_ref" in skill
+    assert "answer_evidence_ref" not in skill
     assert "current human request" not in skill
     assert "current human prompt as `answer`" not in skill
     assert "intent_advisory_preflight" in skill
@@ -609,3 +610,4 @@ def test_skill_routes_clarifications_and_states_advisory_mcp_failure_boundary() 
     assert "MandatoryHookUnavailable" in skill
     assert "capability token" in skill
     assert "advisory" in skill.casefold()
+    assert "independently authenticated non-MCP local human" in skill

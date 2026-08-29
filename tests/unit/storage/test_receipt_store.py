@@ -168,7 +168,9 @@ def test_two_processes_can_create_only_one_durable_claim(tmp_path: Path) -> None
     plan = base_plan()
     approval = _approve(plan)
     path = tmp_path / "receipts.jsonl"
-    context = multiprocessing.get_context("fork")
+    assert JsonlReceiptStore(path).list() == ()
+    context = multiprocessing.get_context("spawn")
+    assert context.get_start_method() == "spawn"
     barrier = context.Barrier(2)
     results = context.Queue()
     processes = tuple(
@@ -182,10 +184,15 @@ def test_two_processes_can_create_only_one_durable_claim(tmp_path: Path) -> None
     for process in processes:
         process.start()
     for process in processes:
-        process.join()
+        process.join(timeout=10)
+        if process.is_alive():
+            process.terminate()
+            process.join(timeout=5)
+        assert not process.is_alive()
         assert process.exitcode == 0
     output = sorted(results.get() for _ in processes)
     results.close()
+    results.join_thread()
 
     assert output == [False, True]
     assert JsonlReceiptStore(path).is_claimed(plan.id, approval.id)

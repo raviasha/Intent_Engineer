@@ -22,8 +22,9 @@ The user experience has three phases:
 
 1. **Onboarding:** the CLI creates and human-confirms the first intent baseline from a PRD and
    optional supporting sources.
-2. **Interactive development:** a thin plugin classifies each new human prompt and directs the
-   existing MCP workflows for aligned, new, ambiguous, or conflicting work.
+2. **Interactive development:** a thin plugin classifies each host-submitted prompt as untrusted
+   agent context and directs the existing MCP workflows for aligned, new, ambiguous, or
+   conflicting work.
 3. **Independent assurance:** CLI commands invoked locally or by CI periodically compare captured
    code and test evidence with the approved intent graph.
 
@@ -68,8 +69,9 @@ manufacture human confirmation.
 
 ### 3.3 Initialized repository
 
-Once a valid baseline exists, the plugin classifies each new human prompt using the current graph
-snapshot and the existing preflight service:
+Once a valid baseline exists, the plugin classifies each host-submitted prompt using the current
+graph snapshot and the existing preflight service. Because the coding agent can invoke the hook,
+that prompt is attributed to `agent:codex`, not a local human:
 
 | Classification | Interaction |
 | --- | --- |
@@ -78,8 +80,9 @@ snapshot and the existing preflight service:
 | `new_or_ambiguous` | Pause implementation, ask focused questions, and propose an attributed graph update. |
 | `conflicting` | Block implementation and create a human-review case. |
 
-Answers to an active clarification session are routed to that session and are not recursively
-classified as unrelated new requirements.
+Hook-submitted answers do not satisfy an active clarification question. Required answers and exact
+proposal approval remain pending until an independently authenticated non-MCP local human
+integration records them through the existing coordinator and confirmation services.
 
 ## 4. Plugin boundary
 
@@ -107,15 +110,16 @@ synchronous mutation coverage against the provider-neutral host contract.
 
 ## 5. Prompt-time flow
 
-For each new human prompt:
+For each new host-submitted prompt:
 
 1. identify the repository and actor without mutating state;
 2. check for a valid approved baseline;
 3. if absent, offer onboarding and stop semantic mutation;
-4. if present, capture the human prompt as attributed evidence;
+4. if present, capture the hook prompt as untrusted `agent:codex` evidence;
 5. request a typed classification from the agent;
 6. validate that classification against the current graph and authorized evidence;
-7. route the validated result according to the classification table;
+7. route the validated result according to the classification table, while keeping clarification
+   answers and graph approval pending for independently authenticated local-human evidence;
 8. invalidate and repeat preflight when the prompt, graph, actor, or requested scope materially
    changes; and
 9. after completed work, capture implementation and test evidence and run post-task reconciliation.

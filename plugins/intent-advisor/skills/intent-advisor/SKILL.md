@@ -20,23 +20,26 @@ request, display, persist, or infer a capability token. Do not weaken or work ar
   Form an agent classification draft containing classification, basis, relevant node and evidence
   references, semantic effects, uncertainties, questions, conflicts, and requested scope. Then
   call the named public `intent_advisory_preflight` MCP tool with only the route's
-  `conversation_ref`, `request_evidence_ref`, and that draft. The hook has already captured the
-  exact human prompt; never send raw prompt text or caller-supplied attribution through MCP. Never call the
+  `conversation_ref`, `request_evidence_ref`, and that draft. The hook captures the exact
+  host-submitted prompt only as untrusted `agent:codex` context; it is not local-human evidence.
+  Never send raw prompt text or caller-supplied attribution through MCP. Never call the
   authorization-producing preflight tool for this advisory flow. Ask every returned clarification
   question before implementation. Use only the persisted clarification session returned by the
-  advisory result; show exact graph proposals and obtain human confirmation before any graph change.
+  advisory result; show exact graph proposals and obtain independently authenticated local-human
+  evidence before any graph change.
   Use exactly the established public classifications: `no_semantic_impact`, `aligned`,
   `new_or_ambiguous`, and `conflicting`.
-- For `action=answer_clarification`, call the named public `intent_clarification_answer` MCP tool
-  with only the supplied `session_id`, `question_id`, and `answer_evidence_ref`. The hook has already
-  captured the answer; never send raw answer text, actor, timestamp, or ACL through MCP.
-  Do not classify the answer again. Continue with `intent_clarification_propose` only when the
-  returned session state permits that exact next step.
+- For `action=human_confirmation_required`, do not submit the prompt as an answer or approval over
+  MCP. Explain that the hook cannot authenticate a local human and leave the clarification pending.
+  An independently authenticated non-MCP local human integration must record the answer before the
+  session may advance. Intent Engineering does not ship a CLI command for this step; if the host has
+  not configured such an integration, do not invent one and do not propose a graph change.
 - For `action=review_clarification_proposal`, first call the token-free public
   `intent_clarification_show` tool with the supplied proposal ID. Present the complete persisted
-  preview. Call `intent_clarification_confirm` only when the current human prompt exactly confirms
-  that preview's `proposal_digest` and the selected node IDs. A decline, no, or digest mismatch
-  leaves the proposal unapplied; never classify that response as a new task.
+  preview and its exact `proposal_digest`. The public MCP surface cannot authenticate approval and
+  must not apply it. An independently authenticated non-MCP local human integration must confirm the
+  digest and selected node IDs. A decline, no, or digest mismatch leaves the proposal unapplied;
+  never classify that response as a new task.
 - For `action=continue`, follow the returned message without inventing authority or mutating intent
   state directly.
 

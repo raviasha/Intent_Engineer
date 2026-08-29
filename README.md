@@ -74,10 +74,11 @@ working directory. A remote executor must explicitly reproduce or configure that
 working directory; it must not assume `.` refers to the user's checkout.
 
 The bundle automatically offers onboarding when no approved baseline exists. After approval the
-hook persists the exact human prompt as attributed local evidence, supplies only its opaque
+hook persists its exact stdin prompt as untrusted `agent:codex` context, supplies only opaque
 conversation and evidence references, and routes the agent's bounded classification draft through
-token-free `intent_advisory_preflight`. Raw human prompt and answer text never crosses that MCP
-wire boundary.
+token-free `intent_advisory_preflight`. The hook boundary is callable by the coding agent, so it
+never claims local-human attribution or approval. Raw prompt text never crosses that MCP wire
+boundary.
 
 The advisory classifications are `no_semantic_impact`, `aligned`, `new_or_ambiguous`, and
 `conflicting`. Continue normal work for the first two. The plugin never receives a mutation
@@ -94,11 +95,14 @@ Clients other than Codex that launch and connect stdio themselves may run
 
 ### Clarification and review
 
-For `new_or_ambiguous`, answer every persisted question before the agent calls
-`intent_clarification_answer`, `intent_clarification_propose`, and
-`intent_clarification_confirm`. Answers stay attached to their active session and are not
-recursively classified as new requirements. For `conflicting`, stop implementation and require the
-configured independent human review before any graph change.
+For `new_or_ambiguous`, the hook asks every persisted question but cannot authenticate the reply.
+Its prompt route leaves the session pending, and the public MCP answer and confirmation tools
+return `human_confirmation_required` without changing state. An independently authenticated
+non-MCP local human integration over the existing clarification coordinator and proposal
+confirmation service must record the answer and approve the exact digest and selected node IDs.
+Intent Engineering ships no CLI command for those two clarification authority steps; when no host
+integration is configured, the proposal remains pending. For `conflicting`, stop implementation
+and require the configured independent human review before any graph change.
 
 ### Scheduled CLI assurance
 

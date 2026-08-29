@@ -374,6 +374,9 @@ class PreflightService:
         agent_principal: str,
         conversation_connector_id: str = "conversation:codex",
         principal_resolver: PrincipalResolver | None = None,
+        request_actor: str | None = None,
+        request_role: Literal["human", "agent"] = "human",
+        request_source_mode: SourceMode = SourceMode.EXPLICIT,
     ) -> None:
         required = {"graph", "evidence", "cases", "intent_proposals"}
         if not required.issubset(transactions.target_names):
@@ -383,6 +386,15 @@ class PreflightService:
         self._agent_principal = _bounded_text(agent_principal)
         self._conversation_connector_id = _bounded_text(conversation_connector_id)
         self._principal_resolver = principal_resolver or _project_principals
+        if request_actor is not None:
+            request_actor = _bounded_text(request_actor)
+        if type(request_role) is not str or request_role not in {"human", "agent"}:
+            raise ValueError("invalid preflight request provenance")
+        if type(request_source_mode) is not SourceMode:
+            raise ValueError("invalid preflight request provenance")
+        self._request_actor: str | None = request_actor
+        self._request_role: Literal["human", "agent"] = request_role
+        self._request_source_mode: SourceMode = request_source_mode
 
     def _validate_turns(
         self,
@@ -392,7 +404,7 @@ class PreflightService:
         ingestions: tuple[EvidenceIngestion, ...],
         principals: frozenset[str],
     ) -> tuple[EvidenceRecord, EvidenceRecord]:
-        human_entry = _turn_ingestion(
+        request_entry = _turn_ingestion(
             envelope.request_evidence_ref,
             ingestions,
             self._conversation_connector_id,
@@ -402,7 +414,7 @@ class PreflightService:
             ingestions,
             self._conversation_connector_id,
         )
-        human = human_entry.evidence
+        request = request_entry.evidence
         agent = agent_entry.evidence
         agent_payload = cast(dict[str, JsonValue], agent.model_dump(mode="json")["payload"])
         expected_agent_content = classification_evidence_content(
@@ -420,32 +432,32 @@ class PreflightService:
             requested_scope=submission.requested_scope,
         )
         if (
-            human.connector_type != "conversation"
+            request.connector_type != "conversation"
             or agent.connector_type != "conversation"
-            or human.external_object_id != envelope.conversation_ref
+            or request.external_object_id != envelope.conversation_ref
             or agent.external_object_id != envelope.conversation_ref
-            or human.source_locator != envelope.conversation_ref
+            or request.source_locator != envelope.conversation_ref
             or agent.source_locator != envelope.conversation_ref
-            or human.author != envelope.actor
+            or request.author != envelope.actor
             or agent.author != self._agent_principal
-            or human.observed_at != envelope.created_at
-            or agent.observed_at < human.observed_at
-            or human.payload.get("role") != "human"
-            or human.payload.get("content") != envelope.request
+            or request.observed_at != envelope.created_at
+            or agent.observed_at < request.observed_at
+            or request.payload.get("role") != self._request_role
+            or request.payload.get("content") != envelope.request
             or agent_payload.get("role") != "agent"
             or agent_payload.get("content") != expected_agent_content
-            or human.acl != agent.acl
-            or agent_entry.predecessor_id != human.id
-            or agent_entry.sequence != human_entry.sequence + 1
-            or not evidence_allowed(human, principals)
+            or request.acl != agent.acl
+            or agent_entry.predecessor_id != request.id
+            or agent_entry.sequence != request_entry.sequence + 1
+            or not evidence_allowed(request, principals)
             or not evidence_allowed(agent, principals)
-            or human.id == agent.id
+            or request.id == agent.id
         ):
             raise ValueError("invalid conversation evidence")
         evidence_index = {record.id: record for record in evidence}
-        if evidence_index.get(human.id) != human or evidence_index.get(agent.id) != agent:
+        if evidence_index.get(request.id) != request or evidence_index.get(agent.id) != agent:
             raise ValueError("invalid conversation evidence")
-        return human, agent
+        return request, agent
 
     def _proposal_index(
         self,
@@ -666,11 +678,14 @@ class PreflightService:
         )
         if not active_refs or not active_authors:
             raise ValueError("ungrounded conflict")
+        request_material_key = (
+            "human_evidence" if self._request_role == "human" else "request_evidence"
+        )
         material = {
             "active_evidence": list(active_refs),
             "claims": list(submission.conflict_claims),
             "graph_id": graph.id,
-            "human_evidence": envelope.request_evidence_ref,
+            request_material_key: envelope.request_evidence_ref,
             "agent_evidence": submission.agent_evidence_ref,
             "relevant_node_ids": list(submission.relevant_node_ids),
         }
@@ -706,9 +721,9 @@ class PreflightService:
                         envelope.created_at,
                         evidence_index[submission.agent_evidence_ref].observed_at,
                     ),
-                    authors=tuple(sorted((envelope.actor, self._agent_principal))),
+                    authors=tuple(sorted({envelope.actor, self._agent_principal})),
                     confidence=1.0,
-                    source_mode=SourceMode.EXPLICIT,
+                    source_mode=self._request_source_mode,
                 ),
             ),
             detector_id="intent_workflow.preflight.v1",
@@ -815,10 +830,11 @@ class PreflightService:
             raise ValueError("missing preflight graph snapshot")
         graph_digest = canonical_graph_digest(graph_content)
         authenticated_principals = _principals(self._principal_resolver(config, snapshot))
+        expected_actor = self._request_actor or config.local_actor
         if (
             config.project_id != envelope.repository_id
-            or envelope.actor != config.local_actor
-            or envelope.actor not in principals
+            or envelope.actor != expected_actor
+            or (self._request_actor is None and envelope.actor not in principals)
             or config.local_actor not in principals
             or principals != authenticated_principals
             or graph.version != envelope.graph_version
@@ -828,7 +844,9 @@ class PreflightService:
             or submission.requested_scope != tuple(sorted(envelope.requested_scope))
         ):
             raise ValueError("stale preflight binding")
-        human, agent = self._validate_turns(envelope, submission, evidence, ingestions, principals)
+        request, agent = self._validate_turns(
+            envelope, submission, evidence, ingestions, principals
+        )
         selected, relevant_evidence = self._validate_references(
             submission,
             graph,
@@ -898,7 +916,7 @@ class PreflightService:
             case _:
                 raise ValueError("invalid classification")
 
-        result_evidence = tuple(dict.fromkeys((human.id, agent.id, *submission.evidence_refs)))
+        result_evidence = tuple(dict.fromkeys((request.id, agent.id, *submission.evidence_refs)))
         result = PreflightResult(
             task_id=envelope.id,
             graph_version=graph.version,

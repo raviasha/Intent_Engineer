@@ -549,7 +549,8 @@ class ClarificationCoordinator:
             or request is None
             or classification is None
             or request.author != task.actor
-            or request.payload.get("role") != "human"
+            or request.payload.get("role")
+            != ("agent" if task.actor == opened_by == "agent:codex" else "human")
             or classification.payload.get("role") != "agent"
             or not refs_allowed(
                 (task.request_evidence_ref, classification_evidence_ref), evidence, principals
@@ -902,7 +903,7 @@ class ClarificationCoordinator:
         return self._store.session(session_id)
 
     def answer_evidence(self, session_id: str, **kwargs: object) -> ClarificationSession:
-        """Append one hook-authenticated human answer without re-capturing raw text."""
+        """Append independently authenticated human evidence without re-capturing text."""
         result: ClarificationSession | None = None
         signal: BaseException | None = None
         failed = False

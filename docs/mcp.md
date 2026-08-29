@@ -50,17 +50,17 @@ Codex host binds the plugin-owned MCP process to the active repository working d
 executor must explicitly reproduce or configure that working directory and must not assume `.` is
 the user's checkout.
 
-The hook automatically offers onboarding when the baseline is absent. Otherwise it persists the
-exact human prompt as attributed evidence, allows the agent to use public read-only Intent tools
-for repository context, and routes a bounded draft through token-free
-`intent_advisory_preflight`.
+The hook automatically offers onboarding when the baseline is absent. Otherwise it persists its
+exact stdin prompt as untrusted `agent:codex` evidence, allows the agent to use public read-only
+Intent tools for repository context, and routes a bounded draft through token-free
+`intent_advisory_preflight`. Because the coding agent can invoke the hook, neither the prompt nor
+the submitted host fields establish local-human provenance.
 
 The possible classifications are `no_semantic_impact`, `aligned`, `new_or_ambiguous`, and
 `conflicting`. The advisory tool request contains only the opaque conversation reference, the
 authenticated request-evidence reference, and a bounded classification draft. Repository, graph,
-human text, time, actor, ACL, principals, and persistence authority come from held local state.
-Clarification answers likewise cross MCP only as captured evidence references. Neither request nor
-response contains a mutation capability.
+prompt text, time, ACL, principals, and persistence authority come from held local state; the
+request author remains `agent:codex`. Neither request nor response contains a mutation capability.
 
 The plugin is not mandatory enforcement. The audited Codex host still returns
 `MandatoryHookUnavailable` with `Codex mandatory mutation hook is unavailable`. To opt out, decline
@@ -69,11 +69,15 @@ surfaces continue unchanged.
 
 ## Clarification and review
 
-For `new_or_ambiguous`, the persisted session is continued with
-`intent_clarification_answer`, `intent_clarification_propose`, and
-`intent_clarification_confirm`. A clarification answer is routed directly to the active session and
-is not classified again. The agent shows the exact proposal for human confirmation. A `conflicting`
-request pauses implementation and follows configured independent review policy.
+For `new_or_ambiguous`, the hook asks the persisted questions but cannot authenticate answers or
+approval. Public MCP answer and confirmation calls return the fixed
+`human_confirmation_required` result and do not change state. An independently authenticated
+non-MCP local human integration over the existing clarification coordinator and confirmation
+service must record the answer and confirm the exact proposal digest and selected node IDs. There
+is no shipped CLI command for these clarification authority steps; without a configured host
+integration, the session or proposal remains pending. The public preview remains available to show
+the exact persisted proposal. A `conflicting` request pauses implementation and follows configured
+independent review policy.
 
 ## Scheduled CLI assurance
 
