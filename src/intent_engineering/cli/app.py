@@ -69,6 +69,11 @@ from intent_engineering.integrations.agent_host.advisory import (
     repository_matches,
     unavailable_prompt_route,
 )
+from intent_engineering.intent_workflow.onboarding import (
+    OnboardingRuntime,
+    OnboardingState,
+    inspect_onboarding,
+)
 from intent_engineering.reconcile import ResolutionUnavailable
 from intent_engineering.render import GraphRenderer, render_drift_report
 from intent_engineering.storage.interfaces import GraphStore
@@ -522,14 +527,44 @@ def drift_command(
 def status_command(
     project: Path = typer.Option(Path("."), "--project"),
     output_format: OutputFormat = typer.Option(OutputFormat.TEXT, "--format"),
+    require_baseline: bool = typer.Option(False, "--require-baseline"),
 ) -> None:
     """Summarize durable graph, evidence, and reconciliation state."""
-    runtime = _runtime(project)
+    if require_baseline:
+        try:
+            runtime = load_runtime(project)
+        except ProjectNotInitialized:
+            emit(
+                {
+                    "status": "onboarding_required",
+                    "reason": "approved_intent_baseline_required",
+                },
+                output_format,
+            )
+            raise typer.Exit(4) from None
+        except Exception as error:
+            raise typer.Exit(code=_runtime_error(error)) from error
+        try:
+            onboarding = inspect_onboarding(cast(OnboardingRuntime, runtime))
+        except Exception as error:
+            raise typer.Exit(code=_runtime_error(error)) from error
+        if onboarding.state is not OnboardingState.READY:
+            emit(
+                {
+                    "status": "onboarding_required",
+                    "reason": "approved_intent_baseline_required",
+                },
+                output_format,
+            )
+            raise typer.Exit(4)
+    else:
+        runtime = _runtime(project)
     principals = _authorized_principals(runtime)
     graph = _authorized_graph(runtime, principals)
     cases = _authorized_cases(runtime, principals)
     emit(
         {
+            **({"status": "ready"} if require_baseline else {}),
             "project_id": runtime.config.project_id,
             "graph_version": graph.version,
             "node_count": len(graph.nodes),

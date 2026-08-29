@@ -20,6 +20,7 @@ from jsonschema import Draft7Validator
 from intent_engineering.cli.runtime import load_runtime
 from intent_engineering.core.models import Graph, Node, NodeType
 from intent_engineering.core.policy.project import initialize_project
+from intent_engineering.integrations.agent_host.advisory import codex_conversation_ref
 
 REPO_ROOT = Path(__file__).parents[3]
 PLUGIN_ROOT = REPO_ROOT / "plugins" / "intent-advisor"
@@ -28,11 +29,6 @@ NOW = datetime(2026, 8, 28, 12, 0, tzinfo=UTC)
 FALLBACK = (
     "Intent advisory prompt routing is unavailable. Do not mutate the intent graph, "
     "infer authorization, or treat this advisory as enforcement."
-)
-TURN_7_CONVERSATION_REF = (
-    "codex-prompt:v1:"
-    "ee992e532c89c226e193af5b2cfe3c40dbd3596b37804968fa1548be18a0437d:"
-    "75bb37228f98a1e72918a0dcc06aadebf6e602b29ef2447e366303dba85beea1"
 )
 
 
@@ -260,7 +256,8 @@ def test_real_hook_routes_ready_prompt_to_preflight_without_secret_or_echo(
     context = _additional_context(completed)
     assert "intent_advisory_preflight" in context
     assert "intent_context" in context
-    assert f'conversation_ref="{TURN_7_CONVERSATION_REF}"' in context
+    expected_ref = codex_conversation_ref("codex:thread-3", "turn-7", marker)
+    assert f'conversation_ref="{expected_ref}"' in context
     lowered = completed.stdout.decode().casefold()
     assert marker.casefold() not in lowered
     assert "authorization" not in lowered
@@ -287,6 +284,12 @@ def test_real_hook_uses_retry_stable_turn_specific_ref_without_host_id_leakage(
         session_id=session_marker,
         turn_id="PRIVATE:TURN:8198",
     )
+    altered_same_turn = _official_event(
+        project,
+        prompt="Add team export",
+        session_id=session_marker,
+        turn_id=turn_marker,
+    )
 
     first_context = _additional_context(
         _run_hook(project, json.dumps(first, separators=(",", ":")).encode())
@@ -297,10 +300,14 @@ def test_real_hook_uses_retry_stable_turn_specific_ref_without_host_id_leakage(
     next_context = _additional_context(
         _run_hook(project, json.dumps(next_turn, separators=(",", ":")).encode())
     )
+    altered_context = _additional_context(
+        _run_hook(project, json.dumps(altered_same_turn, separators=(",", ":")).encode())
+    )
 
     assert first_context == retry_context
     assert first_context != next_context
-    combined = first_context + retry_context + next_context
+    assert first_context != altered_context
+    combined = first_context + retry_context + next_context + altered_context
     assert session_marker not in combined
     assert turn_marker not in combined
     assert "PRIVATE:TURN:8198" not in combined
@@ -567,6 +574,15 @@ def test_skill_routes_clarifications_and_states_advisory_mcp_failure_boundary() 
     assert "action=answer_clarification" in skill
     assert "intent_clarification_answer" in skill
     assert "Do not classify the answer again" in skill
+    assert "action=review_clarification_proposal" in skill
+    assert "intent_clarification_show" in skill
+    assert "proposal_digest" in skill
+    assert "decline" in skill.casefold()
+    assert "no_semantic_impact" in skill
+    assert "new_or_ambiguous" in skill
+    assert "conflicting" in skill
+    assert "mechanical" not in skill.casefold()
+    assert "non_requirement" not in skill.casefold()
     assert "ask the user for the PRD path" in skill
     assert "intent onboard --project . --prd <confirmed path> --yes" in skill
     assert "intent_context" in skill

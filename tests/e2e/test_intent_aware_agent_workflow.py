@@ -19,6 +19,7 @@ import yaml  # type: ignore[import-untyped]
 from structlog.testing import capture_logs
 
 from intent_engineering.capture.git.connector import GitConnector
+from intent_engineering.cli.writes import MutationPolicy
 from intent_engineering.core.models import ChangeSet, Node, NodeType, SourceMode
 from intent_engineering.integrations.mcp_server.intent_workflow import (
     load_intent_workflow_services,
@@ -165,18 +166,15 @@ def test_guided_onboarding_plugin_and_assurance_share_one_project(
     runtime = harness.bind_runtime()
     assert harness.runtime_loads == 1
     actor = runtime.config.local_actor
-    (project / ".intent/approvals/policy.yaml").write_text(
-        yaml.safe_dump(
-            {
-                "schema_version": 1,
-                "contributors": [actor],
-                "approvers": [actor],
-                "executors": [actor],
-                "identities": {actor: [actor]},
-            },
-            sort_keys=True,
-        ),
-        encoding="utf-8",
+    assert MutationPolicy.model_validate(
+        yaml.safe_load((project / ".intent/approvals/policy.yaml").read_bytes())
+    ) == MutationPolicy.model_validate(
+        {
+            "contributors": [actor],
+            "approvers": [actor],
+            "executors": [actor],
+            "identities": {actor: [actor]},
+        }
     )
     (project / ".intent/repository.id").write_text(
         f"{runtime.config.project_id}\n",
@@ -189,6 +187,13 @@ def test_guided_onboarding_plugin_and_assurance_share_one_project(
     assert evidence[0].source_locator == "docs/prd.md"
 
     workflow = load_intent_workflow_services(runtime, clock=lambda: harness.tick())
+    assert workflow.runtime is runtime
+    assert workflow.runtime.transactions is runtime.transactions
+    plugin_mcp = json.loads((ROOT / "plugins/intent-advisor/.mcp.json").read_bytes())
+    assert plugin_mcp["mcpServers"]["intent_advisor"] == {
+        "command": "intent",
+        "args": ["mcp", "--project", "."],
+    }
 
     class AdvisoryIssuerSpy:
         def __init__(self) -> None:
@@ -546,10 +551,33 @@ def test_guided_onboarding_plugin_and_assurance_share_one_project(
         },
     )
     assert clarification_proposed["status"] == "proposed"
+    review_route, review_hook_stdout, review_hook_stderr = _plugin_prompt(
+        project,
+        f"confirm {clarification_proposed['proposal_digest']}",
+        turn_id="turn-6",
+    )
+    transcript.extend(
+        (
+            f"human: confirm {clarification_proposed['proposal_digest']}",
+            review_hook_stdout,
+            review_hook_stderr,
+        )
+    )
+    assert "action=review_clarification_proposal" in review_route
+    assert "intent_clarification_show" in review_route
+    clarification_shown = call_tool(
+        "intent_clarification_show",
+        {"proposal_id": clarification_proposed["proposal_id"]},
+    )
+    clarification_preview = cast(dict[str, object], clarification_shown["proposal"])
+    assert clarification_preview["proposal_digest"] == clarification_proposed["proposal_digest"]
+    assert clarification_preview["core_node_ids"] == [node.id]
+    assert clarification_preview["evidence_refs"] == list(evidence_refs)
     clarification_confirmed = call_tool(
         "intent_clarification_confirm",
         {
             "proposal_id": clarification_proposed["proposal_id"],
+            "proposal_digest": clarification_preview["proposal_digest"],
             "actor": actor,
             "at": (proposal_at + timedelta(microseconds=1)).isoformat().replace("+00:00", "Z"),
             "selected_node_ids": [node.id],
@@ -559,6 +587,15 @@ def test_guided_onboarding_plugin_and_assurance_share_one_project(
     assert node.id in {item.id for item in runtime.graph_store.load().nodes}
 
     assert not (project / "plugins/intent-advisor").exists()
+    baseline_status = run_intent(
+        project,
+        "status",
+        "--project",
+        ".",
+        "--format",
+        "json",
+        "--require-baseline",
+    )
     validated = run_intent(project, "validate", "--project", ".", "--format", "json")
     first_sync = run_intent(
         project,
@@ -590,8 +627,10 @@ def test_guided_onboarding_plugin_and_assurance_share_one_project(
         "--output",
         "intent-drift.md",
     )
-    for result in (validated, first_sync, second_sync, drift):
+    for result in (baseline_status, validated, first_sync, second_sync, drift):
         captured_outputs.extend((result.stdout, result.stderr))
+    assert baseline_status.returncode == 0, baseline_status.stderr
+    assert baseline_status.json()["status"] == "ready"
     assert validated.returncode == 0, validated.stderr
     assert first_sync.returncode == 0, first_sync.stderr
     assert second_sync.returncode == 0, second_sync.stderr
@@ -608,7 +647,7 @@ def test_guided_onboarding_plugin_and_assurance_share_one_project(
         "tests/test_export.py",
     }
     assurance_wire = "\n".join(
-        result.stdout for result in (validated, first_sync, second_sync, drift)
+        result.stdout for result in (baseline_status, validated, first_sync, second_sync, drift)
     ).casefold()
     assert "intent-advisor" not in assurance_wire
     assert "authorization_token" not in assurance_wire

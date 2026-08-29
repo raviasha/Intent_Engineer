@@ -73,8 +73,7 @@ snapshot and the existing preflight service:
 
 | Classification | Interaction |
 | --- | --- |
-| `non_requirement` | Continue without graph ceremony. |
-| `mechanical` | Continue with bounded scope. |
+| `no_semantic_impact` | Continue without graph ceremony for non-requirement or formatting-only work. |
 | `aligned` | Provide relevant intent context and continue. |
 | `new_or_ambiguous` | Pause implementation, ask focused questions, and propose an attributed graph update. |
 | `conflicting` | Block implementation and create a human-review case. |

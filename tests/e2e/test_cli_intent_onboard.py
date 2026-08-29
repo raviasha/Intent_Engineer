@@ -13,6 +13,7 @@ from typer.testing import CliRunner
 
 from intent_engineering.cli.app import app
 from intent_engineering.cli.runtime import load_runtime
+from intent_engineering.cli.writes import MutationPolicy
 from intent_engineering.core.models import ProjectConfig, SourceRole, SourceRoleAssignment
 from tests.e2e.test_cli_intent_bootstrap import _configured_project, _project, _propose, _state
 
@@ -72,7 +73,48 @@ def test_onboard_uninitialized_acceptance_initializes_then_captures(tmp_path: Pa
     assert payload["state"] == "proposal_required"
     assert payload["source_role"]["role"] == "declared_intent"
     assert (project / ".intent").is_dir()
-    assert len(load_runtime(project).evidence()) == 1
+    runtime = load_runtime(project)
+    assert len(runtime.evidence()) == 1
+    assert runtime.graph_store.load().version == 0
+    assert runtime.intent_proposals.list() == ()
+    assert MutationPolicy.model_validate(
+        yaml.safe_load((project / ".intent/approvals/policy.yaml").read_bytes())
+    ) == MutationPolicy.model_validate(
+        {
+            "contributors": [runtime.config.local_actor],
+            "approvers": [runtime.config.local_actor],
+            "executors": [runtime.config.local_actor],
+            "identities": {runtime.config.local_actor: [runtime.config.local_actor]},
+        }
+    )
+
+
+def test_onboard_never_overwrites_existing_custom_approval_policy(tmp_path: Path) -> None:
+    project = _project(tmp_path)
+    policy_path = project / ".intent/approvals/policy.yaml"
+    custom = yaml.safe_dump(
+        {
+            "schema_version": 1,
+            "contributors": ["local", "agent:codex"],
+            "approvers": ["reviewer"],
+            "executors": ["local"],
+            "identities": {
+                "agent:codex": ["agent:codex"],
+                "local": ["local"],
+                "reviewer": ["reviewer"],
+            },
+        },
+        sort_keys=True,
+    ).encode()
+    policy_path.write_bytes(custom)
+
+    result = CliRunner().invoke(
+        app,
+        ["onboard", "--project", str(project), "--prd", "docs/prd.md", "--yes", "--format", "json"],
+    )
+
+    assert result.exit_code == 0, repr(result.exception)
+    assert policy_path.read_bytes() == custom
 
 
 def test_onboard_requires_confirmation_before_capture(tmp_path: Path) -> None:

@@ -62,6 +62,7 @@ class _IntentMCPServer(MCPServer[Any]):
             "intent_clarification_open",
             "intent_clarification_answer",
             "intent_clarification_propose",
+            "intent_clarification_show",
             "intent_clarification_confirm",
         }
         failed = False

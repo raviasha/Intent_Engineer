@@ -13,6 +13,7 @@ from mcp.client.session import ClientSession
 from mcp.client.stdio import StdioServerParameters, stdio_client
 
 from intent_engineering.core.policy.project import initialize_project
+from intent_engineering.integrations.agent_host.advisory import codex_conversation_ref
 
 pytestmark = pytest.mark.anyio
 
@@ -75,7 +76,11 @@ async def test_intent_mcp_stdio_is_protocol_clean_and_read_only(tmp_path: Path) 
             advisory = await client.call_tool(
                 "intent_advisory_preflight",
                 {
-                    "conversation_ref": "codex:stdio-advisory",
+                    "conversation_ref": codex_conversation_ref(
+                        "codex:stdio-advisory",
+                        "turn-1",
+                        "Format README\nwithout changing semantics",
+                    ),
                     "request": "Format README\nwithout changing semantics",
                     "draft": {
                         "classification": "no_semantic_impact",
@@ -138,6 +143,7 @@ async def test_intent_mcp_stdio_is_protocol_clean_and_read_only(tmp_path: Path) 
         "intent_clarification_open",
         "intent_clarification_answer",
         "intent_clarification_propose",
+        "intent_clarification_show",
         "intent_clarification_confirm",
     }
     assert status.structured_content["schema_version"] == "1"

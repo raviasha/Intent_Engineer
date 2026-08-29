@@ -25,16 +25,22 @@ Requires Python 3.12 or newer.
 
 ```bash
 python -m pip install intent-engineering
-intent onboard --project . --prd docs/PRD.md --yes
-intent mcp --project .
+codex plugin marketplace add .
+codex plugin add intent-advisor@intent-engineering-local
 ```
 
-First obtain explicit human consent and confirm the exact PRD path; only then run the advancing
-`intent onboard ... --yes` command above. It captures that PRD as immutable declared-intent evidence
-and returns the public `intent_bootstrap_propose` next action. Running the same command without
+Restart the ChatGPT desktop app and start a new task rooted in the target repository. Codex
+launches the plugin-owned MCP server from `plugins/intent-advisor/.mcp.json`; do not start an
+additional server process for the plugin. First obtain explicit human consent and confirm the
+exact PRD path; only then run the advancing
+`intent onboard ... --yes` command below. It captures that PRD as immutable declared-intent evidence
+and returns the public bootstrap-proposal next action. Running the same command without
 `--yes` is only an offer/no-op diagnostic and does not advance onboarding. Onboarding never invents
-or activates canonical intent by itself. Start `intent mcp` in a separate terminal so an active
-agent can submit the typed proposal through the held project runtime.
+or activates canonical intent by itself:
+
+```bash
+intent onboard --project . --prd docs/PRD.md --yes
+```
 
 ### Approve the baseline
 
@@ -53,15 +59,8 @@ manufacture it. Existing automation may still use `intent init --project .`,
 
 ### Use ordinary prompts
 
-The validated advisory bundle is `plugins/intent-advisor`. From this source checkout, install its
-repository marketplace entry with the supported Codex CLI:
-
-```bash
-codex plugin marketplace add .
-codex plugin add intent-advisor@intent-engineering-local
-```
-
-Restart the ChatGPT desktop app, open **Plugins Directory**, select **Intent Engineering Local**,
+The validated advisory bundle installed above is `plugins/intent-advisor`. Open **Plugins
+Directory**, select **Intent Engineering Local**,
 enable `intent-advisor`, and review/trust its `UserPromptSubmit` hook. The marketplace keeps the
 bundle path explicit as `source.path: "./plugins/intent-advisor"`. The plugin MCP configuration
 intentionally omits `cwd`: on a local Codex host, `--project .` binds to the active repository's
@@ -82,6 +81,9 @@ To opt out, decline the onboarding offer or disable/uninstall `intent-advisor`. 
 the repository unchanged for that task; disabling the plugin leaves ordinary coding behavior
 unchanged. The CLI and MCP services remain usable independently.
 
+Clients other than Codex that launch and connect stdio themselves may run
+`intent mcp --project .`; that is a client-managed process, not an extra Codex setup step.
+
 ### Clarification and review
 
 For `new_or_ambiguous`, answer every persisted question before the agent calls
@@ -96,6 +98,7 @@ The plugin is not needed for assurance. Run the deterministic CLI sequence local
 through `.github/workflows/intent-sync.yml`:
 
 ```bash
+intent status --project . --format json --require-baseline
 intent validate --project .
 intent sync --project . --sources markdown,git,github
 intent drift --project . --format markdown --output intent-drift.md
@@ -106,6 +109,10 @@ issue authorization or silently rewrite the approved graph. See the executable
 [intent-aware agent adoption guide](docs/intent-aware-agent.md) for source roles, compatible
 Slack/Jira/Confluence/Notion setup, clarification, independent review, post-task evidence, and
 scheduling.
+
+The workflow deliberately fails with `onboarding_required` on a clean checkout unless an approved
+`.intent` baseline is restored first or the job runs in a persistent/self-hosted workspace. It
+never initializes and reports a clean graph version 0.
 
 For team conversations and external requirements, configure GitHub and/or a compatible MCP source,
 then schedule capture independently from reconciliation:

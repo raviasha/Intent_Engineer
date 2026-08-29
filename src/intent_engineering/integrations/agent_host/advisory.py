@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import re
@@ -23,7 +22,12 @@ from pydantic import (
 
 from intent_engineering.cli.intent_workflow import _snapshot_config
 from intent_engineering.cli.runtime import Runtime
-from intent_engineering.intent_workflow.models import ClarificationSession
+from intent_engineering.intent_workflow.conversation import (
+    CODEX_CONVERSATION_REF_BYTES,
+    codex_conversation_binding,
+    codex_conversation_ref,
+)
+from intent_engineering.intent_workflow.models import ClarificationEvent
 from intent_engineering.intent_workflow.onboarding import (
     OnboardingRuntime,
     OnboardingState,
@@ -35,14 +39,12 @@ from .base import _HostModel
 
 _CONTROL = re.compile(r"[\x00-\x1f\x7f]")
 _PROMPT_CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
-_CODEX_CONVERSATION_REF = re.compile(r"\Acodex-prompt:v1:([0-9a-f]{64}):([0-9a-f]{64})\Z")
 _MAX_ID_BYTES = 2 * 1024
 _MAX_PROMPT_BYTES = 16 * 1024
 _MAX_REPOSITORY_BYTES = 4 * 1024
 _MAX_EVENT_BYTES = 64 * 1024
 _MAX_JSON_DEPTH = 128
 _MAX_JSON_NODES = 65_536
-CODEX_CONVERSATION_REF_BYTES = 145
 _OFFER = (
     "This repository has not been onboarded into Intent Engineering. Start guided onboarding now?"
 )
@@ -81,36 +83,15 @@ def _prompt(value: str) -> str:
     return value
 
 
-def _codex_identity_digest(label: str, *values: str) -> str:
-    material = json.dumps(
-        [label, *values],
-        ensure_ascii=False,
-        separators=(",", ":"),
-    ).encode("utf-8")
-    return hashlib.sha256(material).hexdigest()
-
-
-def codex_conversation_ref(session_id: str, turn_id: str) -> str:
-    """Return the exact 145-byte retry identity with a matchable session lineage."""
-    checked_session = _identity(session_id)
-    checked_turn = _identity(turn_id)
-    session_digest = _codex_identity_digest("codex-session-v1", checked_session)
-    turn_digest = _codex_identity_digest("codex-turn-v1", checked_session, checked_turn)
-    reference = f"codex-prompt:v1:{session_digest}:{turn_digest}"
-    if len(reference.encode("utf-8")) != CODEX_CONVERSATION_REF_BYTES:
-        raise ValueError("invalid advisory conversation reference")
-    return reference
-
-
 def _codex_session_lineage(conversation_ref: object) -> str | None:
     if type(conversation_ref) is not str:
         raise ValueError("invalid advisory clarification reference")
-    matched = _CODEX_CONVERSATION_REF.fullmatch(conversation_ref)
-    if matched is None:
-        if conversation_ref.startswith("codex-prompt:"):
-            raise ValueError("invalid advisory clarification reference")
+    if not conversation_ref.startswith("codex-prompt:"):
         return None
-    return matched.group(1)
+    try:
+        return codex_conversation_binding(conversation_ref)[0]
+    except ValueError:
+        raise ValueError("invalid advisory clarification reference") from None
 
 
 def _repository(value: str) -> str:
@@ -322,7 +303,13 @@ class PromptRoute(_HostModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True, validate_default=True)
 
     schema_version: Literal[1] = 1
-    action: Literal["offer_onboarding", "classify", "answer_clarification", "continue"]
+    action: Literal[
+        "offer_onboarding",
+        "classify",
+        "answer_clarification",
+        "review_clarification_proposal",
+        "continue",
+    ]
     message: Annotated[str, Field(min_length=1, max_length=2048)]
     mcp_tool: str | None
     arguments: Mapping[str, object]
@@ -359,6 +346,7 @@ class PromptRoute(_HostModel):
             "offer_onboarding": None,
             "classify": "intent_advisory_preflight",
             "answer_clarification": "intent_clarification_answer",
+            "review_clarification_proposal": "intent_clarification_show",
             "continue": None,
         }[self.action]
         if self.mcp_tool != expected_tool:
@@ -460,6 +448,18 @@ def codex_prompt_context(route: PromptRoute) -> str:
         if len(context) > 2048:
             raise ValueError("invalid advisory prompt route")
         return context
+    if route.action == "review_clarification_proposal":
+        proposal_id = route.arguments.get("proposal_id")
+        if type(proposal_id) is not str:
+            raise ValueError("invalid advisory prompt route")
+        encoded_id = json.dumps(proposal_id, ensure_ascii=False, separators=(",", ":"))
+        return (
+            "action=review_clarification_proposal. First call public MCP tool "
+            f"intent_clarification_show with proposal_id={encoded_id}. Present that persisted "
+            "preview without inventing fields. Call intent_clarification_confirm only when the "
+            "current human prompt exactly confirms the preview's exact proposal_digest and "
+            "selected node IDs. A decline, no, or digest mismatch must leave it unapplied."
+        )
     return route.message
 
 
@@ -523,28 +523,42 @@ class AdvisoryPromptRouter:
                 arguments={},
             )
         events = self._runtime.intent_proposals.clarification_events()
-        latest: dict[str, ClarificationSession] = {}
+        latest: dict[str, ClarificationEvent] = {}
         for item in events:
-            session = item.session
-            latest[session.id] = session
-        conversation_ref = codex_conversation_ref(checked.session_id, checked.turn_id)
+            latest[item.session.id] = item
+        conversation_ref = codex_conversation_ref(
+            checked.session_id,
+            checked.turn_id,
+            checked.prompt,
+        )
         lineage = _codex_session_lineage(conversation_ref)
-        open_codex: list[tuple[ClarificationSession, str]] = []
-        for session in latest.values():
-            if session.status != "open":
+        active_codex: list[tuple[ClarificationEvent, str]] = []
+        for item in latest.values():
+            session = item.session
+            if session.status not in {"open", "proposed"}:
                 continue
             session_lineage = _codex_session_lineage(session.conversation_ref)
             if session_lineage is not None:
-                open_codex.append((session, session_lineage))
-        active = tuple(session for session, item in open_codex if item == lineage)
+                active_codex.append((item, session_lineage))
+        active = tuple(item for item, item_lineage in active_codex if item_lineage == lineage)
         if len(active) > 1:
             raise ValueError("ambiguous advisory clarification")
-        if not active and open_codex:
+        if not active and active_codex:
             raise ValueError("cross-session advisory clarification")
         if active:
-            session = active[0]
+            current = active[0]
+            session = current.session
             if session.opened_by != "agent:codex":
                 raise ValueError("advisory clarification actor mismatch")
+            if session.status == "proposed":
+                if current.event_type != "proposed" or current.proposal_id is None:
+                    raise ValueError("advisory clarification proposal unavailable")
+                return PromptRoute(
+                    action="review_clarification_proposal",
+                    message="Review the exact persisted clarification proposal.",
+                    mcp_tool="intent_clarification_show",
+                    arguments={"proposal_id": current.proposal_id},
+                )
             answered = {item.question_id for item in session.answers}
             question = next(
                 (item for item in session.questions if item.id not in answered),

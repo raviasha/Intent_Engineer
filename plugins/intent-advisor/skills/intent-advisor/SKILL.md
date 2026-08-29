@@ -24,10 +24,17 @@ request, display, persist, or infer a capability token. Do not weaken or work ar
   authorization-producing preflight tool for this advisory flow. Ask every returned clarification
   question before implementation. Use only the persisted clarification session returned by the
   advisory result; show exact graph proposals and obtain human confirmation before any graph change.
+  Use exactly the established public classifications: `no_semantic_impact`, `aligned`,
+  `new_or_ambiguous`, and `conflicting`.
 - For `action=answer_clarification`, call the named public `intent_clarification_answer` MCP tool
   with the supplied session metadata and the current human prompt as `answer`.
-  Do not classify the answer again. Continue only with `intent_clarification_propose` and
-  `intent_clarification_confirm` when the returned session state permits those exact next steps.
+  Do not classify the answer again. Continue with `intent_clarification_propose` only when the
+  returned session state permits that exact next step.
+- For `action=review_clarification_proposal`, first call the token-free public
+  `intent_clarification_show` tool with the supplied proposal ID. Present the complete persisted
+  preview. Call `intent_clarification_confirm` only when the current human prompt exactly confirms
+  that preview's `proposal_digest` and the selected node IDs. A decline, no, or digest mismatch
+  leaves the proposal unapplied; never classify that response as a new task.
 - For `action=continue`, follow the returned message without inventing authority or mutating intent
   state directly.
 

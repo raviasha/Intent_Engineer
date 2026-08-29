@@ -24,6 +24,7 @@ from intent_engineering.cli.intent_workflow import (
 from intent_engineering.cli.runtime import Runtime
 from intent_engineering.core.models import JsonValue, ProjectConfig
 from intent_engineering.core.models._base import StrictModel
+from intent_engineering.core.policy.access import refs_allowed
 from intent_engineering.intent_workflow.authorization import (
     AuthorizationIssuer,
     AuthorizationVerification,
@@ -35,7 +36,12 @@ from intent_engineering.intent_workflow.clarification import (
     ProposalConfirmationResult,
     ProposalConfirmationService,
 )
-from intent_engineering.intent_workflow.conversation import ConversationCapture
+from intent_engineering.intent_workflow.conversation import (
+    CODEX_CONVERSATION_REF_BYTES,
+    ConversationCapture,
+    codex_conversation_binding,
+    verify_codex_conversation_ref,
+)
 from intent_engineering.intent_workflow.models import (
     ClarificationIntentProposal,
     ClarificationProposalSubmission,
@@ -52,6 +58,7 @@ from intent_engineering.intent_workflow.preflight import (
     classification_evidence_content,
 )
 from intent_engineering.storage.executor import LocalChangeSetExecutor
+from intent_engineering.storage.jsonl.evidence_store import parse_evidence_lines
 from intent_engineering.storage.secure import SecureDirectory, SecureFile, SecureRead
 from intent_engineering.storage.transaction import LocalTransactionExtraReadPolicy
 from intent_engineering.storage.yaml.graph_store import parse_graph
@@ -119,6 +126,7 @@ _PROPOSAL_ID = r"^proposal:sha256:[0-9a-f]{64}$"
 _DIGEST = r"^sha256:[0-9a-f]{64}$"
 _TASK_ID = r"^task:sha256:[0-9a-f]{64}$"
 _CLARIFICATION_ID = r"^clarification:sha256:[0-9a-f]{64}$"
+_CODEX_CONVERSATION_REF = r"^codex-prompt:v1:[0-9a-f]{64}:[0-9a-f]{64}:[0-9a-f]{64}$"
 _CONTROL = re.compile(r"[\x00-\x1f\x7f]")
 _PROMPT_CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 _WINDOWS_DEVICE = re.compile(r"^(?:CON|PRN|AUX|NUL|CLOCK\$|COM[1-9]|LPT[1-9])$", re.IGNORECASE)
@@ -630,14 +638,25 @@ class AdvisoryClassificationDraft(_Request):
 
 
 class IntentAdvisoryPreflightRequest(_Request):
-    conversation_ref: Annotated[str, Field(min_length=1, max_length=512)]
+    conversation_ref: Annotated[
+        str,
+        Field(
+            min_length=CODEX_CONVERSATION_REF_BYTES,
+            max_length=CODEX_CONVERSATION_REF_BYTES,
+            pattern=_CODEX_CONVERSATION_REF,
+        ),
+    ]
     request: Annotated[str, Field(min_length=1, max_length=16 * 1024)]
     draft: AdvisoryClassificationDraft
 
     @field_validator("conversation_ref")
     @classmethod
     def require_conversation_ref(cls, value: str) -> str:
-        if type(value) is not str or _CONTROL.search(value) or len(value.encode("utf-8")) > 512:
+        if (
+            type(value) is not str
+            or _CONTROL.search(value)
+            or len(value.encode("utf-8")) != CODEX_CONVERSATION_REF_BYTES
+        ):
             raise ValueError("invalid workflow request")
         return value
 
@@ -813,6 +832,7 @@ class ClarificationProposeRequest(_Request):
 
 class ClarificationConfirmRequest(_Request):
     proposal_id: Annotated[str, Field(pattern=_PROPOSAL_ID)]
+    proposal_digest: Annotated[str, Field(pattern=_DIGEST)]
     actor: Annotated[str, Field(min_length=1, max_length=256)]
     at: datetime
     selected_node_ids: Annotated[
@@ -903,9 +923,12 @@ class IntentWorkflowPort(Protocol):
         submission: ClarificationProposalSubmission,
     ) -> dict[str, object]: ...
 
+    async def clarification_show(self, proposal_id: str) -> dict[str, object]: ...
+
     async def clarification_confirm(
         self,
         proposal_id: str,
+        proposal_digest: str,
         actor: str,
         at: datetime,
         selected_node_ids: tuple[str, ...],
@@ -994,8 +1017,18 @@ def validate_intent_workflow_call(name: str, arguments: dict[str, object]) -> No
             if set(arguments) != {"submission"}:
                 raise ValueError("invalid workflow request")
             _clarification_submission_input(dict.__getitem__(arguments, "submission"))
+        elif name == "intent_clarification_show":
+            if set(arguments) != {"proposal_id"}:
+                raise ValueError("invalid workflow request")
+            ProposalShowRequest.model_validate(arguments)
         elif name == "intent_clarification_confirm":
-            expected = {"proposal_id", "actor", "at", "selected_node_ids"}
+            expected = {
+                "proposal_id",
+                "proposal_digest",
+                "actor",
+                "at",
+                "selected_node_ids",
+            }
             selected_node_ids = dict.get(arguments, "selected_node_ids")
             if set(arguments) != expected or type(selected_node_ids) is not list:
                 raise ValueError("invalid workflow request")
@@ -1005,6 +1038,7 @@ def validate_intent_workflow_call(name: str, arguments: dict[str, object]) -> No
             "intent_proposal_show",
             "intent_proposal_confirm",
             "intent_advisory_preflight",
+            "intent_clarification_show",
         }:
             raise ValueError("invalid workflow request")
     except Exception:  # noqa: BLE001 - one fixed raw-request validation boundary
@@ -1042,39 +1076,8 @@ class McpIntentWorkflowServices:
         confirmation_config = runtime.workspace_directory.file("config.yaml")
         confirmation_policy = runtime.workspace_directory.file("approvals/policy.yaml")
         connector_directory = None
-        binding_files = {}
-        connector_bindings: tuple[tuple[PurePosixPath, SecureRead], ...] = ()
         try:
             connector_directory = runtime.workspace_directory.subdirectory("connectors")
-            _membership_digest, connector_bindings = _connector_membership_snapshot(
-                connector_directory
-            )
-            for relative, _snapshot in connector_bindings:
-                binding_files[relative.as_posix()] = connector_directory.file(relative)
-            confirmation_authority_files = {
-                "authority_config": confirmation_config,
-                "authority_policy": confirmation_policy,
-            }
-            for index, (_name, file) in enumerate(sorted(binding_files.items())):
-                confirmation_authority_files[f"authority_binding_{index}"] = file
-            self._confirmation = ProposalConfirmationService(
-                graph_store=runtime.graph_store,
-                evidence_store=runtime.evidence_store,
-                case_store=runtime.case_store,
-                proposal_store=runtime.intent_proposals,
-                changeset_executor=LocalChangeSetExecutor(
-                    runtime.graph_store,
-                    runtime.case_store,
-                    runtime.transactions,
-                ),
-                transactions=runtime.transactions,
-                config_file=confirmation_config,
-                policy_file=confirmation_policy,
-                binding_files=binding_files,
-                authority_read_policies=_clarification_authority_read_policies(
-                    confirmation_authority_files
-                ),
-            )
             self._clarification_authority_base_files = {
                 "authority_config": confirmation_config.duplicate(),
                 "authority_policy": confirmation_policy.duplicate(),
@@ -1083,11 +1086,6 @@ class McpIntentWorkflowServices:
         finally:
             confirmation_config.close()
             confirmation_policy.close()
-            for file in binding_files.values():
-                file.close()
-            connector_bindings = ()
-            if "_snapshot" in locals():
-                del _snapshot
             if connector_directory is not None:
                 connector_directory.close()
 
@@ -1361,6 +1359,10 @@ class McpIntentWorkflowServices:
             validated = IntentAdvisoryPreflightRequest.model_validate(
                 {"conversation_ref": conversation_ref, "request": request, "draft": draft}
             )
+            conversation_binding = verify_codex_conversation_ref(
+                validated.conversation_ref,
+                validated.request,
+            )
             detached_draft = AdvisoryClassificationDraft.model_validate_json(
                 validated.draft.model_dump_json()
             )
@@ -1417,6 +1419,20 @@ class McpIntentWorkflowServices:
                     raise ValueError("advisory authority changed")
                 graph = self.runtime.graph_store.load()
                 ledger = tuple(self.runtime.evidence_store.ledger("conversation:codex"))
+                for item in ledger:
+                    if item.evidence.payload.get("role") != "human":
+                        continue
+                    try:
+                        existing_binding = codex_conversation_binding(
+                            item.evidence.external_object_id
+                        )
+                    except ValueError:
+                        continue
+                    if (
+                        existing_binding[:2] == conversation_binding[:2]
+                        and item.evidence.external_object_id != validated.conversation_ref
+                    ):
+                        raise ValueError("advisory host turn changed")
                 human_candidates = tuple(
                     item
                     for item in ledger
@@ -1554,6 +1570,10 @@ class McpIntentWorkflowServices:
             self._close_clarification_authority(authority_files)
             if "validated" in locals():
                 validated = cast(IntentAdvisoryPreflightRequest, None)
+            if "conversation_binding" in locals():
+                conversation_binding = ("", "", "")
+            if "existing_binding" in locals():
+                existing_binding = ("", "", "")
             if "payload" in locals():
                 payload = {}
 
@@ -1708,6 +1728,39 @@ class McpIntentWorkflowServices:
             authority_files=authority_files,
             authority_preimages=authority_preimages,
             authority_read_policies=_clarification_authority_read_policies(authority_files),
+            authority_membership_digest=authority_membership_digest,
+            authority_membership_resolver=lambda: _connector_membership_digest(
+                self._clarification_connector_directory
+            ),
+        )
+
+    def _clarification_confirmation_service(
+        self,
+        authority_files: Mapping[str, SecureFile],
+        authority_preimages: Mapping[str, bytes | None],
+        authority_membership_digest: str,
+    ) -> ProposalConfirmationService:
+        binding_files = {
+            name: file
+            for name, file in authority_files.items()
+            if name.startswith("authority_binding_")
+        }
+        return ProposalConfirmationService(
+            graph_store=self.runtime.graph_store,
+            evidence_store=self.runtime.evidence_store,
+            case_store=self.runtime.case_store,
+            proposal_store=self.runtime.intent_proposals,
+            changeset_executor=LocalChangeSetExecutor(
+                self.runtime.graph_store,
+                self.runtime.case_store,
+                self.runtime.transactions,
+            ),
+            transactions=self.runtime.transactions,
+            config_file=authority_files["authority_config"],
+            policy_file=authority_files["authority_policy"],
+            binding_files=binding_files,
+            authority_read_policies=_clarification_authority_read_policies(authority_files),
+            authority_preimages=authority_preimages,
             authority_membership_digest=authority_membership_digest,
             authority_membership_resolver=lambda: _connector_membership_digest(
                 self._clarification_connector_directory
@@ -1910,9 +1963,116 @@ class McpIntentWorkflowServices:
             if "principals" in locals():
                 principals = frozenset()
 
+    async def clarification_show(self, proposal_id: str) -> dict[str, object]:
+        authority_files: dict[str, SecureFile] = {}
+        try:
+            request = ProposalShowRequest.model_validate({"proposal_id": proposal_id})
+            (
+                config,
+                _principals_live,
+                authority_files,
+                authority_preimages,
+                authority_membership_digest,
+            ) = self._clarification_authority()
+            authority_policies = _clarification_authority_read_policies(authority_files)
+            with self.runtime.transactions.read_transaction(
+                authority_files,
+                extra_read_policies=authority_policies,
+            ) as transaction:
+
+                def authority_matches() -> bool:
+                    return _connector_membership_digest(
+                        self._clarification_connector_directory
+                    ) == authority_membership_digest and all(
+                        transaction.read_optional(name) == content
+                        for name, content in authority_preimages.items()
+                    )
+
+                if not authority_matches():
+                    raise ValueError("clarification authority changed")
+                snapshot = self.runtime.transactions.snapshot(
+                    authority_files,
+                    extra_read_policies=authority_policies,
+                )
+                graph_content = snapshot.content.get("graph")
+                if graph_content is None:
+                    raise ValueError("clarification graph unavailable")
+                graph = parse_graph(graph_content)
+                evidence, _ingestions, _legacy = parse_evidence_lines(
+                    snapshot.content.get("evidence")
+                )
+                if self.runtime.intent_proposals.bytes() != snapshot.content.get(
+                    "intent_proposals"
+                ):
+                    raise ValueError("clarification proposal ledger changed")
+                proposal = self.runtime.intent_proposals.get(request.proposal_id)
+                if not isinstance(proposal, ClarificationIntentProposal):
+                    raise TypeError("clarification proposal unavailable")
+                decision = self.runtime.intent_proposals.decision_for(proposal.id)
+                session = self.runtime.intent_proposals.session(proposal.clarification_session_id)
+                events = self.runtime.intent_proposals.clarification_events(session.id)
+                _policy_config, policy, provider_principals = (
+                    ProposalConfirmationService._authority(snapshot)
+                )
+                actor_aliases = frozenset(
+                    ProposalConfirmationService._aliases(
+                        config.local_actor,
+                        policy,
+                        provider_principals,
+                    )
+                )
+                if (
+                    _policy_config != config
+                    or decision is not None
+                    or session.status != "proposed"
+                    or proposal.proposed_by != config.local_actor
+                    or proposal.baseline_graph_version != graph.version
+                    or not events
+                    or events[-1].event_type != "proposed"
+                    or events[-1].proposal_id != proposal.id
+                    or events[-1].session != session
+                    or not refs_allowed(proposal.evidence_refs, evidence, actor_aliases)
+                ):
+                    raise ValueError("clarification proposal unavailable")
+                ProposalConfirmationService._validate_source_roles(
+                    proposal,
+                    config,
+                    evidence,
+                    snapshot,
+                )
+                preview = proposal.model_dump(mode="json")
+                preview["proposal_id"] = preview.pop("id")
+                preview["proposal_digest"] = proposal.digest
+                if not authority_matches():
+                    raise ValueError("clarification authority changed")
+            return {
+                "schema_version": 1,
+                "status": "proposed",
+                "proposal": preview,
+            }
+        except Exception:  # noqa: BLE001 - hidden, missing, and unavailable are identical
+            return self._rejected()
+        except BaseException as error:
+            error.__traceback__ = None
+            error.__cause__ = None
+            error.__context__ = None
+            raise
+        finally:
+            proposal_id = ""
+            self._close_clarification_authority(authority_files)
+            if "request" in locals():
+                request = cast(ProposalShowRequest, None)
+            if "preview" in locals():
+                preview = {}
+            if "proposal" in locals():
+                proposal = cast(ClarificationIntentProposal, None)
+            if "actor_aliases" in locals():
+                actor_aliases = frozenset()
+
     async def clarification_confirm(
         self,
         proposal_id: str,
+        proposal_digest: str,
         actor: str,
         at: datetime,
         selected_node_ids: tuple[str, ...],
@@ -1922,6 +2082,7 @@ class McpIntentWorkflowServices:
             request = ClarificationConfirmRequest.model_validate(
                 {
                     "proposal_id": proposal_id,
+                    "proposal_digest": proposal_digest,
                     "actor": actor,
                     "at": at,
                     "selected_node_ids": selected_node_ids,
@@ -1931,17 +2092,26 @@ class McpIntentWorkflowServices:
                 config,
                 _principals_live,
                 authority_files,
-                _authority_preimages,
-                _authority_membership_digest,
+                authority_preimages,
+                authority_membership_digest,
             ) = self._clarification_authority()
             if request.actor != config.local_actor:
                 return self._rejected()
-            result = self._confirmation.confirm(
-                request.proposal_id,
-                actor=request.actor,
-                at=request.at,
-                selected_node_ids=request.selected_node_ids,
+            confirmation = self._clarification_confirmation_service(
+                authority_files,
+                authority_preimages,
+                authority_membership_digest,
             )
+            try:
+                result = confirmation.confirm(
+                    request.proposal_id,
+                    proposal_digest=request.proposal_digest,
+                    actor=request.actor,
+                    at=request.at,
+                    selected_node_ids=request.selected_node_ids,
+                )
+            finally:
+                confirmation.close()
             return cast(dict[str, object], result.model_dump(mode="json"))
         except Exception:  # noqa: BLE001 - fixed result contains no proposal detail
             return self._rejected()
@@ -1951,7 +2121,7 @@ class McpIntentWorkflowServices:
             error.__context__ = None
             raise
         finally:
-            proposal_id = actor = ""
+            proposal_id = proposal_digest = actor = ""
             at = cast(datetime, None)
             selected_node_ids = ()
             self._close_clarification_authority(authority_files)
@@ -1961,6 +2131,8 @@ class McpIntentWorkflowServices:
                 result = cast(ProposalConfirmationResult, None)
             if "_principals_live" in locals():
                 _principals_live = frozenset()
+            if "confirmation" in locals():
+                confirmation = cast(ProposalConfirmationService, None)
 
 
 def load_intent_workflow_services(
@@ -2096,7 +2268,14 @@ def register_intent_workflow_tools(
         structured_output=True,
     )
     async def intent_advisory_preflight(
-        conversation_ref: Annotated[str, Field(min_length=1, max_length=512)],
+        conversation_ref: Annotated[
+            str,
+            Field(
+                min_length=CODEX_CONVERSATION_REF_BYTES,
+                max_length=CODEX_CONVERSATION_REF_BYTES,
+                pattern=_CODEX_CONVERSATION_REF,
+            ),
+        ],
         request: Annotated[str, Field(min_length=1, max_length=16 * 1024)],
         draft: _AdvisoryDraftInput,
     ) -> dict[str, object]:
@@ -2273,12 +2452,28 @@ def register_intent_workflow_tools(
             request = cast(ClarificationProposeRequest, None)
 
     @server.tool(
+        name="intent_clarification_show",
+        annotations=_SHOW,
+        structured_output=True,
+    )
+    async def clarification_show(proposal_id: _ProposalIdInput) -> dict[str, object]:
+        try:
+            request = ProposalShowRequest.model_validate({"proposal_id": proposal_id})
+            return await services.clarification_show(request.proposal_id)
+        except Exception:  # noqa: BLE001 - one fixed handler boundary
+            _fixed_arguments()
+        finally:
+            proposal_id = ""
+            request = cast(ProposalShowRequest, None)
+
+    @server.tool(
         name="intent_clarification_confirm",
         annotations=_CLARIFY_CONFIRM,
         structured_output=True,
     )
     async def clarification_confirm(
         proposal_id: _ProposalIdInput,
+        proposal_digest: _DigestInput,
         actor: _AuthorizationIdentityInput,
         at: datetime,
         selected_node_ids: _ClarificationNodeIdsInput,
@@ -2287,6 +2482,7 @@ def register_intent_workflow_tools(
             request = ClarificationConfirmRequest.model_validate(
                 {
                     "proposal_id": proposal_id,
+                    "proposal_digest": proposal_digest,
                     "actor": actor,
                     "at": at,
                     "selected_node_ids": tuple(selected_node_ids),
@@ -2294,6 +2490,7 @@ def register_intent_workflow_tools(
             )
             return await services.clarification_confirm(
                 request.proposal_id,
+                request.proposal_digest,
                 request.actor,
                 request.at,
                 request.selected_node_ids,
@@ -2301,7 +2498,7 @@ def register_intent_workflow_tools(
         except Exception:  # noqa: BLE001 - one fixed handler boundary
             _fixed_arguments()
         finally:
-            proposal_id = actor = ""
+            proposal_id = proposal_digest = actor = ""
             at = cast(datetime, None)
             selected_node_ids.clear()
             request = cast(ClarificationConfirmRequest, None)

@@ -21,7 +21,11 @@ from mcp.server.mcpserver.exceptions import ToolError
 from intent_engineering.cli.runtime import load_runtime
 from intent_engineering.core.models import ChangeSet, Graph, Node, NodeType, SourceMode
 from intent_engineering.core.policy.project import initialize_project
-from intent_engineering.integrations.agent_host.advisory import AdvisoryPromptRouter, PromptEvent
+from intent_engineering.integrations.agent_host.advisory import (
+    AdvisoryPromptRouter,
+    PromptEvent,
+    codex_conversation_ref,
+)
 from intent_engineering.integrations.mcp_server.intent_workflow import (
     AuthorizationVerifyRequest,
     validate_intent_workflow_call,
@@ -30,6 +34,7 @@ from intent_engineering.integrations.mcp_server.server import build_server
 from intent_engineering.integrations.mcp_server.tools import McpReadServices
 from intent_engineering.intent_workflow.authorization import AuthorizationVerification
 from intent_engineering.intent_workflow.bootstrap import BootstrapSubmission
+from intent_engineering.intent_workflow.clarification import ProposalConfirmationService
 from intent_engineering.intent_workflow.conversation import ConversationCapture
 from intent_engineering.intent_workflow.models import (
     ClarificationProposalSubmission,
@@ -67,6 +72,7 @@ _WORKFLOW_TOOLS = {
     "intent_clarification_open",
     "intent_clarification_answer",
     "intent_clarification_propose",
+    "intent_clarification_show",
     "intent_clarification_confirm",
 }
 
@@ -218,14 +224,31 @@ class _FakeWorkflow:
             "proposal_id": "proposal:sha256:" + "2" * 64,
         }
 
+    async def clarification_show(self, proposal_id: str) -> dict[str, object]:
+        self.calls.append(("clarification_show", proposal_id))
+        return {
+            "schema_version": 1,
+            "status": "proposed",
+            "proposal": {
+                "proposal_id": proposal_id,
+                "proposal_digest": "sha256:" + "4" * 64,
+            },
+        }
+
     async def clarification_confirm(
         self,
         proposal_id: str,
+        proposal_digest: str,
         actor: str,
         at: datetime,
         selected_node_ids: tuple[str, ...],
     ) -> dict[str, object]:
-        self.calls.append(("clarification_confirm", (proposal_id, actor, at, selected_node_ids)))
+        self.calls.append(
+            (
+                "clarification_confirm",
+                (proposal_id, proposal_digest, actor, at, selected_node_ids),
+            )
+        )
         return {
             "schema_version": 1,
             "status": "applied",
@@ -329,9 +352,10 @@ def _valid_raw_workflow_arguments(tool_name: str) -> dict[str, object]:
     if tool_name == "intent_preflight":
         return _raw_mechanical_preflight()
     if tool_name == "intent_advisory_preflight":
+        request = "Format README\nwithout changing semantics"
         return {
-            "conversation_ref": "codex:thread-3",
-            "request": "Format README\nwithout changing semantics",
+            "conversation_ref": codex_conversation_ref("codex:thread-3", "turn-7", request),
+            "request": request,
             "draft": {
                 "classification": "no_semantic_impact",
                 "basis": "Formatting only",
@@ -362,9 +386,12 @@ def _valid_raw_workflow_arguments(tool_name: str) -> dict[str, object]:
         }
     if tool_name == "intent_clarification_propose":
         return {"submission": _clarification_submission().model_dump(mode="json")}
+    if tool_name == "intent_clarification_show":
+        return {"proposal_id": "proposal:sha256:" + "2" * 64}
     if tool_name == "intent_clarification_confirm":
         return {
             "proposal_id": "proposal:sha256:" + "2" * 64,
+            "proposal_digest": "sha256:" + "4" * 64,
             "actor": "local",
             "at": "2026-08-26T12:00:04Z",
             "selected_node_ids": ["requirement:sharing"],
@@ -434,6 +461,7 @@ async def test_workflow_registration_is_optional_additive_and_has_truthful_annot
             "intent_clarification_open",
             "intent_clarification_answer",
             "intent_clarification_propose",
+            "intent_clarification_show",
             "intent_clarification_confirm",
         )
     )
@@ -491,7 +519,15 @@ async def test_workflow_registration_is_optional_additive_and_has_truthful_annot
         for item in clarification_annotations[:3]
         if item is not None
     )
-    clarification_confirm_annotations = clarification_annotations[3]
+    clarification_show_annotations = clarification_annotations[3]
+    assert clarification_show_annotations is not None
+    assert (
+        clarification_show_annotations.read_only_hint,
+        clarification_show_annotations.destructive_hint,
+        clarification_show_annotations.idempotent_hint,
+        clarification_show_annotations.open_world_hint,
+    ) == (True, False, True, False)
+    clarification_confirm_annotations = clarification_annotations[4]
     assert clarification_confirm_annotations is not None
     assert (
         clarification_confirm_annotations.read_only_hint,
@@ -537,6 +573,13 @@ async def test_workflow_registration_is_optional_additive_and_has_truthful_annot
     advisory_schema = by_name["intent_advisory_preflight"].input_schema
     assert set(advisory_schema["properties"]) == {"conversation_ref", "request", "draft"}
     assert set(advisory_schema["required"]) == {"conversation_ref", "request", "draft"}
+    assert advisory_schema["properties"]["conversation_ref"] == {
+        "maxLength": 210,
+        "minLength": 210,
+        "pattern": r"^codex-prompt:v1:[0-9a-f]{64}:[0-9a-f]{64}:[0-9a-f]{64}$",
+        "title": "Conversation Ref",
+        "type": "string",
+    }
     assert "actor" not in advisory_schema["properties"]
     assert "authorization_token" not in json.dumps(advisory_schema)
     assert advisory_schema["$defs"]["AdvisoryClassificationDraft"]["additionalProperties"] is False
@@ -545,6 +588,7 @@ async def test_workflow_registration_is_optional_additive_and_has_truthful_annot
         "intent_clarification_open",
         "intent_clarification_answer",
         "intent_clarification_propose",
+        "intent_clarification_show",
         "intent_clarification_confirm",
     ):
         assert (
@@ -565,8 +609,10 @@ async def test_workflow_registration_is_optional_additive_and_has_truthful_annot
                     "answered_at",
                 },
                 "intent_clarification_propose": {"submission"},
+                "intent_clarification_show": {"proposal_id"},
                 "intent_clarification_confirm": {
                     "proposal_id",
+                    "proposal_digest",
                     "actor",
                     "at",
                     "selected_node_ids",
@@ -614,10 +660,15 @@ async def test_clarification_tools_delegate_strict_detached_typed_payloads(
         "intent_clarification_propose",
         {"submission": submission.model_dump(mode="json")},
     )
+    shown = await server.call_tool(
+        "intent_clarification_show",
+        {"proposal_id": "proposal:sha256:" + "2" * 64},
+    )
     confirmed = await server.call_tool(
         "intent_clarification_confirm",
         {
             "proposal_id": "proposal:sha256:" + "2" * 64,
+            "proposal_digest": "sha256:" + "4" * 64,
             "actor": "local",
             "at": "2026-08-26T12:00:04Z",
             "selected_node_ids": ["requirement:sharing"],
@@ -627,6 +678,7 @@ async def test_clarification_tools_delegate_strict_detached_typed_payloads(
     assert opened.structured_content["status"] == "open"
     assert answered.structured_content["status"] == "open"
     assert proposed.structured_content["status"] == "proposed"
+    assert shown.structured_content["status"] == "proposed"
     assert confirmed.structured_content["status"] == "applied"
     assert workflow.calls == [
         (
@@ -650,10 +702,12 @@ async def test_clarification_tools_delegate_strict_detached_typed_payloads(
             ),
         ),
         ("clarification_propose", submission),
+        ("clarification_show", "proposal:sha256:" + "2" * 64),
         (
             "clarification_confirm",
             (
                 "proposal:sha256:" + "2" * 64,
+                "sha256:" + "4" * 64,
                 "local",
                 confirmed_at,
                 ("requirement:sharing",),
@@ -667,6 +721,7 @@ async def test_clarification_tools_delegate_strict_detached_typed_payloads(
                 opened.structured_content,
                 answered.structured_content,
                 proposed.structured_content,
+                shown.structured_content,
                 confirmed.structured_content,
             ]
         ).casefold()
@@ -807,7 +862,9 @@ async def test_advisory_preflight_delegates_exact_detached_draft(tmp_path: Path)
     call = workflow.calls[-1]
     assert call[0] == "advisory_preflight"
     conversation_ref, request, draft = call[1]
-    assert conversation_ref == "codex:thread-3"
+    assert conversation_ref == codex_conversation_ref(
+        "codex:thread-3", "turn-7", "Format README\nwithout changing semantics"
+    )
     assert request == "Format README\nwithout changing semantics"
     assert type(draft) is AdvisoryClassificationDraft
     assert draft.requested_scope == ("README.md",)
@@ -864,7 +921,9 @@ async def test_production_advisory_preflight_is_durable_idempotent_and_token_fre
     wire_and_durable = json.dumps(first.structured_content).encode() + b"".join(durable.values())
     assert b"authorization_token" not in wire_and_durable
     assert b"capability" not in wire_and_durable.lower()
-    chain = runtime.evidence_store.chain("conversation:codex", "conversation", "codex:thread-3")
+    chain = runtime.evidence_store.chain(
+        "conversation:codex", "conversation", arguments["conversation_ref"]
+    )
     assert tuple(item.evidence.payload["role"] for item in chain) == ("human", "agent")
     assert chain[0].evidence.author == "local"
     assert chain[1].evidence.author == "agent:codex"
@@ -885,6 +944,26 @@ async def test_production_advisory_preflight_is_durable_idempotent_and_token_fre
         for path in sorted((project / ".intent").rglob("*"))
         if path.is_file() and not path.is_symlink()
     } == replayed
+
+    altered_same_turn = json.loads(json.dumps(arguments))
+    altered_same_turn["request"] = "Format CONTRIBUTING without changing semantics"
+    altered_same_turn["conversation_ref"] = codex_conversation_ref(
+        "codex:thread-3",
+        "turn-7",
+        altered_same_turn["request"],
+    )
+    forged_ref = json.loads(json.dumps(arguments))
+    forged_ref["conversation_ref"] = arguments["conversation_ref"][:-1] + (
+        "0" if arguments["conversation_ref"][-1] != "0" else "1"
+    )
+    for rejected_arguments in (altered_same_turn, forged_ref):
+        rejected_turn = await server.call_tool("intent_advisory_preflight", rejected_arguments)
+        assert rejected_turn.structured_content == rejected.structured_content
+        assert {
+            path.relative_to(project).as_posix(): path.read_bytes()
+            for path in sorted((project / ".intent").rglob("*"))
+            if path.is_file() and not path.is_symlink()
+        } == replayed
     policy_path = project / ".intent/approvals/policy.yaml"
     policy_path.write_text(
         yaml.safe_dump(
@@ -1405,13 +1484,13 @@ def _clarification_confirm_fifo_child(
 
         workflow._clarification_authority = authority_then_swap  # type: ignore[attr-defined]
     else:
-        original_apply = workflow._confirmation._executor.apply  # type: ignore[attr-defined]
+        original_confirm = ProposalConfirmationService._confirm
 
-        def apply_after_swap(*args: object, **kwargs: object):
+        def confirm_after_swap(self, *args: object, **kwargs: object):
             swap_to_fifo()
-            return original_apply(*args, **kwargs)  # type: ignore[arg-type]
+            return original_confirm(self, *args, **kwargs)  # type: ignore[arg-type]
 
-        workflow._confirmation._executor.apply = apply_after_swap  # type: ignore[attr-defined]
+        ProposalConfirmationService._confirm = confirm_after_swap  # type: ignore[method-assign]
     try:
         response = anyio.run(  # type: ignore[arg-type]
             server.call_tool,  # type: ignore[attr-defined]
@@ -1567,10 +1646,102 @@ async def _clarification_confirmation_arguments(
     assert proposed.structured_content["status"] == "proposed"
     return {
         "proposal_id": proposed.structured_content["proposal_id"],
+        "proposal_digest": proposed.structured_content["proposal_digest"],
         "actor": "local",
         "at": (envelope.created_at + timedelta(microseconds=7)).isoformat().replace("+00:00", "Z"),
         "selected_node_ids": ["requirement:authority-race"],
     }
+
+
+async def test_clarification_show_checks_live_authority_and_races_without_writes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (
+        project,
+        runtime,
+        _workflow,
+        server,
+        envelope,
+        classification,
+    ) = await _production_clarification_server(tmp_path, initial_binding=True)
+    arguments = await _clarification_confirmation_arguments(
+        runtime, server, envelope, classification
+    )
+    proposal_id = arguments["proposal_id"]
+    before = _transaction_bytes(runtime)
+    original_get = runtime.intent_proposals.get
+    raced = False
+
+    def get_then_change_authority(selected_id: str):
+        nonlocal raced
+        proposal = original_get(selected_id)
+        if not raced:
+            raced = True
+            (project / ".intent/approvals/policy.yaml").write_text(
+                yaml.safe_dump(
+                    {
+                        "schema_version": 1,
+                        "contributors": ["local"],
+                        "approvers": ["local"],
+                        "executors": ["local"],
+                        "identities": {"local": ["local", "local:authority-after"]},
+                    },
+                    sort_keys=True,
+                ),
+                encoding="utf-8",
+            )
+        return proposal
+
+    monkeypatch.setattr(runtime.intent_proposals, "get", get_then_change_authority)
+    response = await server.call_tool("intent_clarification_show", {"proposal_id": proposal_id})
+
+    assert raced is True
+    assert response.structured_content == {
+        "schema_version": "1",
+        "status": "rejected",
+        "reason": "intent_workflow_unavailable",
+    }
+    assert _transaction_bytes(runtime) == before
+
+
+async def test_clarification_show_tamper_is_hidden_and_cancellation_identity_survives(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (
+        project,
+        runtime,
+        _workflow,
+        server,
+        envelope,
+        classification,
+    ) = await _production_clarification_server(tmp_path)
+    arguments = await _clarification_confirmation_arguments(
+        runtime, server, envelope, classification
+    )
+    proposal_id = arguments["proposal_id"]
+    ledger = project / ".intent/history/intent-proposals.jsonl"
+    original_ledger = ledger.read_bytes()
+    ledger.write_bytes(original_ledger.replace(b'"status":"proposed"', b'"status":"open"'))
+
+    tampered = await server.call_tool("intent_clarification_show", {"proposal_id": proposal_id})
+    assert tampered.structured_content == {
+        "schema_version": "1",
+        "status": "rejected",
+        "reason": "intent_workflow_unavailable",
+    }
+    ledger.write_bytes(original_ledger)
+
+    signal = _CancellationSignal()
+    monkeypatch.setattr(
+        runtime.intent_proposals,
+        "get",
+        lambda _proposal_id: (_ for _ in ()).throw(signal),
+    )
+    with pytest.raises(_CancellationSignal) as caught:
+        await server.call_tool("intent_clarification_show", {"proposal_id": proposal_id})
+    assert caught.value is signal
 
 
 @pytest.mark.parametrize("operation", ["open", "answer", "propose"])
@@ -1735,13 +1906,13 @@ async def test_clarification_confirm_per_file_limit_reaches_every_authority_comp
 
         monkeypatch.setattr(workflow, "_clarification_authority", authority_then_grow)
     else:
-        original_apply = workflow._confirmation._executor.apply
+        original_confirm = ProposalConfirmationService._confirm
 
-        def apply_after_growth(*args: object, **kwargs: object):
+        def confirm_after_growth(self, *args: object, **kwargs: object):
             grow_binding()
-            return original_apply(*args, **kwargs)  # type: ignore[arg-type]
+            return original_confirm(self, *args, **kwargs)  # type: ignore[arg-type]
 
-        monkeypatch.setattr(workflow._confirmation._executor, "apply", apply_after_growth)
+        monkeypatch.setattr(ProposalConfirmationService, "_confirm", confirm_after_growth)
 
     def observe_read_limit(
         self: secure.SecureFile,
@@ -1811,17 +1982,90 @@ async def test_clarification_confirm_rejects_aggregate_authority_over_exact_limi
 
         monkeypatch.setattr(workflow, "_clarification_authority", authority_then_grow)
     else:
-        original_apply = workflow._confirmation._executor.apply
+        original_confirm = ProposalConfirmationService._confirm
 
-        def apply_after_growth(*args: object, **kwargs: object):
+        def confirm_after_growth(self, *args: object, **kwargs: object):
             grow_bindings()
-            return original_apply(*args, **kwargs)  # type: ignore[arg-type]
+            return original_confirm(self, *args, **kwargs)  # type: ignore[arg-type]
 
-        monkeypatch.setattr(workflow._confirmation._executor, "apply", apply_after_growth)
+        monkeypatch.setattr(ProposalConfirmationService, "_confirm", confirm_after_growth)
     response = await server.call_tool("intent_clarification_confirm", arguments)
 
     assert raced is True
     assert sum(binding.stat().st_size for binding in bindings) == 9_000_000
+    assert response.structured_content == {
+        "schema_version": "1",
+        "status": "rejected",
+        "reason": "intent_workflow_unavailable",
+    }
+    assert _transaction_bytes(runtime) == before
+
+
+@pytest.mark.parametrize(
+    "membership_change",
+    ["create", "delete", "rename", "content", "fifo", "oversize"],
+)
+async def test_clarification_confirm_binds_current_membership_through_commit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    membership_change: str,
+) -> None:
+    initial_binding = membership_change != "create"
+    (
+        project,
+        runtime,
+        _workflow,
+        server,
+        envelope,
+        classification,
+    ) = await _production_clarification_server(
+        tmp_path,
+        initial_binding=initial_binding,
+    )
+    arguments = await _clarification_confirmation_arguments(
+        runtime, server, envelope, classification
+    )
+    before = _transaction_bytes(runtime)
+    connector_directory = project / ".intent/connectors"
+    binding = connector_directory / "authority.yaml"
+    original_confirm = ProposalConfirmationService._confirm
+    raced = False
+
+    def change_membership() -> None:
+        nonlocal raced
+        if raced:
+            return
+        raced = True
+        if membership_change == "create":
+            _write_test_connector_binding(
+                project,
+                "authority-added.yaml",
+                principal="local:connector-authority",
+            )
+        elif membership_change == "delete":
+            binding.unlink()
+        elif membership_change == "rename":
+            binding.rename(connector_directory / "authority-renamed.yaml")
+        elif membership_change == "content":
+            _write_test_connector_binding(
+                project,
+                "authority.yaml",
+                principal="local:authority-before",
+            )
+        elif membership_change == "fifo":
+            binding.unlink()
+            os.mkfifo(binding)
+        else:
+            _pad_test_connector_binding(binding, 1_048_577)
+
+    def confirm_after_change(self, *args: object, **kwargs: object):
+        change_membership()
+        return original_confirm(self, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(ProposalConfirmationService, "_confirm", confirm_after_change)
+    response = await server.call_tool("intent_clarification_confirm", arguments)
+
+    assert raced is True
     assert response.structured_content == {
         "schema_version": "1",
         "status": "rejected",
@@ -2499,11 +2743,37 @@ async def test_production_clarification_lifecycle_preserves_evidence_and_exact_c
         {"submission": submission.model_dump(mode="json")},
     )
     proposal_id = proposed.structured_content["proposal_id"]
+    shown = await server.call_tool(
+        "intent_clarification_show",
+        {"proposal_id": proposal_id},
+    )
+    stored = runtime.intent_proposals.get(proposal_id)
+    expected_preview = stored.model_dump(mode="json")
+    expected_preview["proposal_id"] = expected_preview.pop("id")
+    expected_preview["proposal_digest"] = stored.digest
+    assert shown.structured_content == {
+        "schema_version": 1,
+        "status": "proposed",
+        "proposal": expected_preview,
+    }
     graph_before = runtime.graph_store.load()
+    mismatched_digest = await server.call_tool(
+        "intent_clarification_confirm",
+        {
+            "proposal_id": proposal_id,
+            "proposal_digest": "sha256:" + "0" * 64,
+            "actor": "local",
+            "at": (base + timedelta(microseconds=7)).isoformat().replace("+00:00", "Z"),
+            "selected_node_ids": [node.id],
+        },
+    )
+    assert mismatched_digest.structured_content["status"] == "rejected"
+    assert runtime.graph_store.load() == graph_before
     incorrect = await server.call_tool(
         "intent_clarification_confirm",
         {
             "proposal_id": proposal_id,
+            "proposal_digest": stored.digest,
             "actor": "local",
             "at": (base + timedelta(microseconds=7)).isoformat().replace("+00:00", "Z"),
             "selected_node_ids": ["requirement:not-in-proposal"],
@@ -2515,6 +2785,7 @@ async def test_production_clarification_lifecycle_preserves_evidence_and_exact_c
         "intent_clarification_confirm",
         {
             "proposal_id": proposal_id,
+            "proposal_digest": stored.digest,
             "actor": "local",
             "at": (base + timedelta(microseconds=8)).isoformat().replace("+00:00", "Z"),
             "selected_node_ids": [node.id],
@@ -2537,11 +2808,28 @@ async def test_production_clarification_lifecycle_preserves_evidence_and_exact_c
     assert runtime.intent_proposals.get(proposal_id).proposed_by == "local"
     assert confirmed.structured_content["status"] == "applied"
     assert runtime.graph_store.load().nodes[-1].id == node.id
+    hidden_after_decision = await server.call_tool(
+        "intent_clarification_show", {"proposal_id": proposal_id}
+    )
+    missing = await server.call_tool(
+        "intent_clarification_show", {"proposal_id": "proposal:sha256:" + "f" * 64}
+    )
+    assert (
+        hidden_after_decision.structured_content
+        == missing.structured_content
+        == {
+            "schema_version": "1",
+            "status": "rejected",
+            "reason": "intent_workflow_unavailable",
+        }
+    )
     public = json.dumps(
         [
             opened.structured_content,
             answered.structured_content,
             proposed.structured_content,
+            shown.structured_content,
+            mismatched_digest.structured_content,
             incorrect.structured_content,
             confirmed.structured_content,
         ]

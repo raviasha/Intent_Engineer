@@ -12,9 +12,15 @@ from intent_engineering.core.models import EvidenceRecord, JsonValue
 from intent_engineering.storage.jsonl.evidence_store import JsonlEvidenceStore
 
 _CONTROL = re.compile(r"[\x00-\x1f\x7f]")
+_PROMPT_CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+_CODEX_CONVERSATION_REF = re.compile(
+    r"\Acodex-prompt:v1:([0-9a-f]{64}):([0-9a-f]{64}):([0-9a-f]{64})\Z"
+)
 _MAX_IDENTITY_BYTES = 2 * 1024
+_MAX_PROMPT_BYTES = 16 * 1024
 _MAX_CONTENT_BYTES = 4 * 1024 * 1024
 _MAX_ACL_ENTRIES = 256
+CODEX_CONVERSATION_REF_BYTES = 210
 
 
 class ConversationCaptureError(ValueError):
@@ -51,9 +57,64 @@ def _normalize_json(value: object) -> JsonValue:
 
 
 def _identity(value: str) -> str:
-    if not value or _CONTROL.search(value) or len(value.encode("utf-8")) > _MAX_IDENTITY_BYTES:
+    if (
+        type(value) is not str
+        or not value
+        or _CONTROL.search(value)
+        or len(value.encode("utf-8")) > _MAX_IDENTITY_BYTES
+    ):
         raise ValueError("invalid conversation identity")
     return value
+
+
+def _prompt(value: str) -> str:
+    if (
+        type(value) is not str
+        or not value
+        or _PROMPT_CONTROL.search(value)
+        or len(value.encode("utf-8")) > _MAX_PROMPT_BYTES
+    ):
+        raise ValueError("invalid conversation request")
+    return value
+
+
+def _codex_digest(label: str, *values: str) -> str:
+    return hashlib.sha256(_canonical_json([label, *values])).hexdigest()
+
+
+def codex_conversation_ref(session_id: str, turn_id: str, request: str) -> str:
+    """Bind one host session, turn, and exact human request to a retry-stable locator."""
+    checked_session = _identity(session_id)
+    checked_turn = _identity(turn_id)
+    checked_request = _prompt(request)
+    session_digest = _codex_digest("codex-session-v1", checked_session)
+    turn_digest = _codex_digest("codex-turn-v1", checked_session, checked_turn)
+    request_digest = _codex_digest("codex-request-v1", checked_request)
+    reference = f"codex-prompt:v1:{session_digest}:{turn_digest}:{request_digest}"
+    if len(reference.encode("utf-8")) != CODEX_CONVERSATION_REF_BYTES:
+        raise ValueError("invalid Codex conversation reference")
+    return reference
+
+
+def codex_conversation_binding(conversation_ref: str) -> tuple[str, str, str]:
+    """Parse the three opaque digests from one exact public Codex locator."""
+    if type(conversation_ref) is not str:
+        raise ValueError("invalid Codex conversation reference")
+    matched = _CODEX_CONVERSATION_REF.fullmatch(conversation_ref)
+    if matched is None:
+        raise ValueError("invalid Codex conversation reference")
+    return matched.group(1), matched.group(2), matched.group(3)
+
+
+def verify_codex_conversation_ref(
+    conversation_ref: str,
+    request: str,
+) -> tuple[str, str, str]:
+    """Authenticate the caller request against its exact Codex locator digest."""
+    binding = codex_conversation_binding(conversation_ref)
+    if binding[2] != _codex_digest("codex-request-v1", _prompt(request)):
+        raise ValueError("invalid Codex conversation reference")
+    return binding
 
 
 def _utc(value: datetime) -> datetime:
@@ -182,4 +243,11 @@ class ConversationCapture:
         return result
 
 
-__all__ = ["ConversationCapture", "ConversationCaptureError"]
+__all__ = [
+    "CODEX_CONVERSATION_REF_BYTES",
+    "ConversationCapture",
+    "ConversationCaptureError",
+    "codex_conversation_binding",
+    "codex_conversation_ref",
+    "verify_codex_conversation_ref",
+]

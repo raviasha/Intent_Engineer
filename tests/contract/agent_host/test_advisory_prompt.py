@@ -32,7 +32,8 @@ OFFER = (
 TURN_7_CONVERSATION_REF = (
     "codex-prompt:v1:"
     "ee992e532c89c226e193af5b2cfe3c40dbd3596b37804968fa1548be18a0437d:"
-    "75bb37228f98a1e72918a0dcc06aadebf6e602b29ef2447e366303dba85beea1"
+    "75bb37228f98a1e72918a0dcc06aadebf6e602b29ef2447e366303dba85beea1:"
+    "42696c6976e08e7338133134cbd82654ea97d770557563d3e81754f8a1a511de"
 )
 
 
@@ -128,20 +129,22 @@ def test_same_host_turn_reuses_ref_while_distinct_turns_do_not(tmp_path: Path) -
 
     first = router.route(_event(project))
     retry = router.route(_event(project))
+    altered_same_turn = router.route(_event(project, prompt="Add team export"))
     identical_next_turn = router.route(_event(project, turn_id="turn-8"))
     changed_next_turn = router.route(_event(project, prompt="Add team export", turn_id="turn-9"))
 
     assert first.arguments["conversation_ref"] == retry.arguments["conversation_ref"]
+    assert altered_same_turn.arguments["conversation_ref"] != first.arguments["conversation_ref"]
     assert identical_next_turn.arguments["conversation_ref"] != first.arguments["conversation_ref"]
     assert changed_next_turn.arguments["conversation_ref"] not in {
         first.arguments["conversation_ref"],
         identical_next_turn.arguments["conversation_ref"],
     }
-    assert getattr(advisory_module, "CODEX_CONVERSATION_REF_BYTES", None) == 145
+    assert getattr(advisory_module, "CODEX_CONVERSATION_REF_BYTES", None) == 210
     assert tuple(
         len(route.arguments["conversation_ref"].encode("utf-8"))
-        for route in (first, retry, identical_next_turn, changed_next_turn)
-    ) == (145, 145, 145, 145)
+        for route in (first, retry, altered_same_turn, identical_next_turn, changed_next_turn)
+    ) == (210, 210, 210, 210, 210)
 
 
 def test_turn_ref_is_bounded_and_delimiter_safe_without_raw_host_identity(
@@ -301,9 +304,53 @@ def test_active_clarification_answer_routes_without_reclassification(
     }
 
 
-def test_two_open_clarifications_in_same_host_lineage_fail_closed(
+@pytest.mark.parametrize(
+    "prompt",
+    ["confirm sha256:" + "3" * 64, "no", "decline", "confirm sha256:" + "9" * 64],
+)
+def test_proposed_clarification_routes_to_exact_public_preview_after_restart(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    prompt: str,
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    runtime = _ready_runtime(project)
+    proposal_id = "proposal:sha256:" + "2" * 64
+
+    class Session:
+        id = "clarification:sha256:" + "1" * 64
+        conversation_ref = TURN_7_CONVERSATION_REF
+        opened_by = "agent:codex"
+        status = "proposed"
+        questions: tuple[object, ...] = ()
+        answers: tuple[object, ...] = ()
+
+    event = type(
+        "Event",
+        (),
+        {"session": Session(), "event_type": "proposed", "proposal_id": proposal_id},
+    )()
+
+    monkeypatch.setattr(runtime.intent_proposals, "clarification_events", lambda: (event,))
+
+    route = AdvisoryPromptRouter(runtime).route(_event(project, prompt=prompt, turn_id="turn-8"))
+
+    assert route.action == "review_clarification_proposal"
+    assert route.mcp_tool == "intent_clarification_show"
+    assert route.arguments == {"proposal_id": proposal_id}
+    context = advisory_module.codex_prompt_context(route)
+    assert "intent_clarification_show" in context
+    assert "exact proposal_digest" in context
+    assert "decline" in context.casefold()
+    assert "intent_clarification_confirm" in context
+
+
+@pytest.mark.parametrize("status", ["open", "proposed"])
+def test_two_active_clarifications_in_same_host_lineage_fail_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    status: str,
 ) -> None:
     project = tmp_path / "project"
     project.mkdir()
@@ -315,7 +362,7 @@ def test_two_open_clarifications_in_same_host_lineage_fail_closed(
     class Question:
         id = "audience"
 
-    def event(session_id: str, conversation_ref: object):
+    def event(session_id: str, conversation_ref: object, proposal_id: str):
         session = type(
             "Session",
             (),
@@ -323,19 +370,27 @@ def test_two_open_clarifications_in_same_host_lineage_fail_closed(
                 "id": session_id,
                 "conversation_ref": conversation_ref,
                 "opened_by": "agent:codex",
-                "status": "open",
+                "status": status,
                 "questions": (Question(),),
                 "answers": (),
             },
         )()
-        return type("Event", (), {"session": session})()
+        return type("Event", (), {"session": session, "proposal_id": proposal_id})()
 
     monkeypatch.setattr(
         runtime.intent_proposals,
         "clarification_events",
         lambda: (
-            event("clarification:sha256:" + "1" * 64, first_ref),
-            event("clarification:sha256:" + "2" * 64, second_ref),
+            event(
+                "clarification:sha256:" + "1" * 64,
+                first_ref,
+                "proposal:sha256:" + "3" * 64,
+            ),
+            event(
+                "clarification:sha256:" + "2" * 64,
+                second_ref,
+                "proposal:sha256:" + "4" * 64,
+            ),
         ),
     )
 
@@ -343,34 +398,45 @@ def test_two_open_clarifications_in_same_host_lineage_fail_closed(
         router.route(_event(project, prompt="Workspace admins", turn_id="turn-9"))
 
 
+@pytest.mark.parametrize("status", ["open", "proposed"])
 def test_clarification_lineage_rejects_actor_drift(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    status: str,
 ) -> None:
     project = tmp_path / "project"
     project.mkdir()
     runtime = _ready_runtime(project)
 
-    class Session:
-        id = "clarification:sha256:" + "1" * 64
-        conversation_ref = TURN_7_CONVERSATION_REF
-        opened_by = "other"
-        status = "open"
-        questions: tuple[object, ...] = ()
-        answers: tuple[object, ...] = ()
+    session = type(
+        "Session",
+        (),
+        {
+            "id": "clarification:sha256:" + "1" * 64,
+            "conversation_ref": TURN_7_CONVERSATION_REF,
+            "opened_by": "other",
+            "status": status,
+            "questions": (),
+            "answers": (),
+        },
+    )()
+    event = type(
+        "Event",
+        (),
+        {"session": session, "proposal_id": "proposal:sha256:" + "2" * 64},
+    )()
 
-    class Event:
-        session = Session()
-
-    monkeypatch.setattr(runtime.intent_proposals, "clarification_events", lambda: (Event(),))
+    monkeypatch.setattr(runtime.intent_proposals, "clarification_events", lambda: (event,))
 
     with pytest.raises(AdvisoryPromptError):
         AdvisoryPromptRouter(runtime).route(_event(project, turn_id="turn-8"))
 
 
-def test_open_clarification_from_another_host_session_is_not_reused(
+@pytest.mark.parametrize("status", ["open", "proposed"])
+def test_active_clarification_from_another_host_session_is_not_reused(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    status: str,
 ) -> None:
     project = tmp_path / "project"
     project.mkdir()
@@ -380,18 +446,25 @@ def test_open_clarification_from_another_host_session_is_not_reused(
         _event(project, session_id="codex:other-thread", turn_id="turn-1")
     ).arguments["conversation_ref"]
 
-    class Session:
-        id = "clarification:sha256:" + "1" * 64
-        conversation_ref = other_ref
-        opened_by = "agent:codex"
-        status = "open"
-        questions: tuple[object, ...] = ()
-        answers: tuple[object, ...] = ()
+    session = type(
+        "Session",
+        (),
+        {
+            "id": "clarification:sha256:" + "1" * 64,
+            "conversation_ref": other_ref,
+            "opened_by": "agent:codex",
+            "status": status,
+            "questions": (),
+            "answers": (),
+        },
+    )()
+    event = type(
+        "Event",
+        (),
+        {"session": session, "proposal_id": "proposal:sha256:" + "2" * 64},
+    )()
 
-    class Event:
-        session = Session()
-
-    monkeypatch.setattr(runtime.intent_proposals, "clarification_events", lambda: (Event(),))
+    monkeypatch.setattr(runtime.intent_proposals, "clarification_events", lambda: (event,))
 
     with pytest.raises(AdvisoryPromptError):
         router.route(_event(project, turn_id="turn-8"))

@@ -80,6 +80,10 @@ def test_public_alpha_docs_and_bindings_match_the_shipped_operating_model(
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     guide = (ROOT / "docs/mcp.md").read_text(encoding="utf-8")
     adoption = (ROOT / "docs/intent-aware-agent.md").read_text(encoding="utf-8")
+    github = (ROOT / "docs/github.md").read_text(encoding="utf-8")
+    guided_spec = (
+        ROOT / "docs/superpowers/specs/2026-08-28-guided-onboarding-plugin-design.md"
+    ).read_text(encoding="utf-8")
     profiles = (ROOT / "docs/provider-profiles.md").read_text(encoding="utf-8")
     examples = (ROOT / "examples/mcp-bindings/README.md").read_text(encoding="utf-8")
 
@@ -124,6 +128,21 @@ def test_public_alpha_docs_and_bindings_match_the_shipped_operating_model(
     assert adoption.index("intent onboard --project . --prd docs/PRD.md") < adoption.index(
         "intent_bootstrap_propose"
     )
+    for text in (readme, guide, adoption):
+        assert "codex plugin marketplace add ." in text
+        assert "codex plugin add intent-advisor@intent-engineering-local" in text
+        assert "new task" in text.casefold() or "restart" in text.casefold()
+        assert "separate terminal" not in text.casefold()
+        assert "launches the plugin-owned MCP server" in text
+    assert "clients that launch and connect stdio themselves" in guide
+    assert "intent validate --project ." in github
+    assert "intent sync --project . --sources markdown,git,github" in github
+    assert "intent drift --project . --format markdown --output intent-drift.md" in github
+    assert "approved baseline" in github.casefold()
+    assert "clean checkout" in github.casefold()
+    assert "no_semantic_impact" in guided_spec
+    assert "non_requirement" not in guided_spec
+    assert "| `mechanical` |" not in guided_spec
     assert "intent sources add markdown" in adoption
     assert "intent sources add '<source-role-connector-id>'" in adoption
     assert "polling" in guide
@@ -305,7 +324,7 @@ def test_scheduled_workflow_is_read_only_and_orders_capture_before_assurance() -
     }
     assert [step["name"] for step in steps[2:7]] == [
         "Install Intent Engineering",
-        "Initialize or load local intent state",
+        "Require restored approved intent baseline",
         "Validate local intent state",
         "Capture configured source versions",
         "Render drift and assurance report",
@@ -316,8 +335,7 @@ def test_scheduled_workflow_is_read_only_and_orders_capture_before_assurance() -
     }
     commands = [step.get("run", "") for step in steps]
     assert commands[2] == "python -m pip install ."
-    assert commands[3] == "intent init --project ."
-    assert "--force" not in commands[3]
+    assert commands[3] == "intent status --project . --format json --require-baseline"
     assert commands[4] == "intent validate --project ."
     assert commands[5] == "intent sync --project . --sources markdown,git,github"
     assert commands[6] == ("intent drift --project . --format markdown --output intent-drift.md")
@@ -331,6 +349,7 @@ def test_scheduled_workflow_is_read_only_and_orders_capture_before_assurance() -
         "write preview",
         "write approve",
         "write execute",
+        "intent init",
         "contents: write",
         "echo $",
     )
@@ -381,7 +400,7 @@ def test_guided_adoption_docs_and_plugin_independent_assurance_are_ordered() -> 
     }
     assert [step.get("run") for step in steps[2:7]] == [
         "python -m pip install .",
-        "intent init --project .",
+        "intent status --project . --format json --require-baseline",
         "intent validate --project .",
         "intent sync --project . --sources markdown,git,github",
         "intent drift --project . --format markdown --output intent-drift.md",

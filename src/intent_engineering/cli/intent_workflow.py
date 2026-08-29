@@ -28,7 +28,7 @@ from intent_engineering.capture.mcp.profile_loader import load_strict_yaml_mappi
 from intent_engineering.cli.connectors import configured_actor_principals, connector_catalog
 from intent_engineering.cli.output import OutputFormat, emit
 from intent_engineering.cli.runtime import Runtime, github_repository_scope, load_runtime
-from intent_engineering.cli.writes import policy_actor_aliases
+from intent_engineering.cli.writes import MutationPolicy, policy_actor_aliases
 from intent_engineering.core.models import (
     JsonValue,
     ProjectConfig,
@@ -531,6 +531,33 @@ def _post_capture_onboarding_result(
     )
 
 
+def _provision_local_clarification_policy(runtime: Runtime, config: ProjectConfig) -> None:
+    """Create only the empty-workspace local policy needed for low-risk clarification."""
+    policy_file = runtime.workspace_directory.file("approvals/policy.yaml")
+    try:
+        with same_path_lock(policy_file):
+            preimage = policy_file.read_optional_nonblocking(max_bytes=_MAX_PRD_BYTES)
+            if preimage:
+                return
+            policy = MutationPolicy.model_validate(
+                {
+                    "schema_version": 1,
+                    "contributors": [config.local_actor],
+                    "approvers": [config.local_actor],
+                    "executors": [config.local_actor],
+                    "identities": {config.local_actor: [config.local_actor]},
+                }
+            )
+            encoded = yaml.safe_dump(
+                policy.model_dump(mode="json"),
+                allow_unicode=True,
+                sort_keys=True,
+            ).encode("utf-8")
+            policy_file.atomic_write(encoded, reject_target_races=True)
+    finally:
+        policy_file.close()
+
+
 def _onboard_result(
     project: Path,
     prd: str,
@@ -605,6 +632,12 @@ def _onboard_result(
         evidence_refs = bootstrap_payload.get("evidence_refs")
         if type(evidence_refs) is not list or not all(type(item) is str for item in evidence_refs):
             return False, None, None
+        runtime = load_runtime(project)
+        refreshed = _inspect_onboarding(runtime)
+        if refreshed.state is not OnboardingState.REQUIRED:
+            return True, _existing_onboarding_result(runtime, refreshed), None
+        config, _config_bytes = _snapshot_config(runtime)
+        _provision_local_clarification_policy(runtime, config)
         payload = _post_capture_onboarding_result(
             runtime,
             _inspect_onboarding(runtime),

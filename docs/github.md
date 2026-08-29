@@ -87,11 +87,16 @@ cron `17 2 * * *`. Its exact read-only permissions are `contents: read`,
 
 ```bash
 python -m pip install .
-intent init
-intent validate
-intent sync --sources markdown,git,github
-intent drift --format markdown --output intent-drift.md
+intent status --project . --format json --require-baseline
+intent validate --project .
+intent sync --project . --sources markdown,git,github
+intent drift --project . --format markdown --output intent-drift.md
 ```
+
+Because `.intent` is ignored and this template has no restore source, a clean checkout deliberately
+fails the first command with `onboarding_required`. Restore an approved baseline artifact before
+the guard, or run the job in a persistent/self-hosted workspace. The workflow never runs
+`intent init` and can never report an empty graph version 0 as clean.
 
 The sync step supplies `GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}` and
 `GITHUB_REPOSITORY: ${{ github.repository }}`. The workflow uploads the exact

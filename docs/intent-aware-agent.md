@@ -11,18 +11,23 @@ Python 3.12 or newer is required. From the repository root:
 
 ```bash
 python -m pip install intent-engineering
-intent onboard --project . --prd docs/PRD.md --yes
-intent mcp --project .
+codex plugin marketplace add .
+codex plugin add intent-advisor@intent-engineering-local
 ```
 
-For a source checkout, use `python -m pip install -e .` instead. First obtain explicit human consent
+For a source checkout, use `python -m pip install -e .` instead. Restart the ChatGPT desktop app and
+start a new task rooted in the target repository. Codex launches the plugin-owned MCP server from
+the bundle configuration; do not start an additional process for it. First obtain explicit human consent
 and confirm the exact PRD path; only then run the advancing `intent onboard ... --yes` command
-above. A decline leaves the repository byte-unchanged and disables intent-aware classification only
+below. A decline leaves the repository byte-unchanged and disables intent-aware classification only
 for that task. Running onboarding without `--yes` is only an offer/no-op diagnostic: it does not
 initialize `.intent/`, read the PRD, capture evidence, or assign `declared_intent`. The consented
-first run returns `proposal_required` and names `intent_bootstrap_propose`; it does not manufacture
-an agent proposal or human approval. Run `intent mcp` in a separate terminal for the agent-facing
-public tools.
+first run returns `proposal_required` and names the bootstrap-proposal action; it does not manufacture
+an agent proposal or human approval.
+
+```bash
+intent onboard --project . --prd docs/PRD.md --yes
+```
 
 ## 2. Approve the baseline
 
@@ -50,23 +55,19 @@ intent sources add markdown docs/prd.md --role declared_intent --project .
 
 ## 3. Install the advisor and use ordinary prompts
 
-The validated plugin bundle is `plugins/intent-advisor`. From this source checkout, register the
-shipped repository marketplace and install the bundle with the supported Codex CLI:
-
-```bash
-codex plugin marketplace add .
-codex plugin add intent-advisor@intent-engineering-local
-```
-
-Restart the ChatGPT desktop app, open **Plugins Directory**, select **Intent Engineering Local**,
+The validated plugin bundle installed above is `plugins/intent-advisor`. Open **Plugins Directory**,
+select **Intent Engineering Local**,
 enable `intent-advisor`, and review/trust the bundled `UserPromptSubmit` hook. The shipped entry's
 `source.path` is exactly `"./plugins/intent-advisor"`.
 
-The bundle intentionally omits an MCP `cwd`. On a local Codex host, its
-`intent mcp --project .` process inherits the active repository working directory, binding the held
+The bundle intentionally omits an MCP `cwd`. On a local Codex host, its plugin-owned server process
+inherits the active repository working directory, binding the held
 runtime to that checkout. This is a local-host-only ruling: a remote executor must explicitly
 reproduce or configure the repository working directory and must not assume `.` is the user's
 checkout.
+
+Clients other than Codex that launch and connect stdio themselves may run
+`intent mcp --project .`; Codex users rely on the plugin-owned server configuration instead.
 
 For every new human prompt, the hook performs a read-only onboarding check. With an approved
 baseline it supplies an opaque conversation reference and instructs the agent to call
@@ -125,6 +126,7 @@ Prompt-time advice and assurance have separate lifecycles. Capture at the source
 validation/drift at the review cadence, whether or not the plugin is installed or enabled:
 
 ```bash
+intent status --project . --format json --require-baseline
 intent validate --project .
 intent sync --project . --sources markdown,git,github,mcp
 intent drift --project . --format markdown --output intent-drift.md --require-review
@@ -132,8 +134,10 @@ intent drift --project . --format markdown --output intent-drift.md --require-re
 
 The default CLI uses deterministic checks and optional configured connectors; it issues no
 authorization. Repeating the same capture is a semantic no-op. The repository's
-`.github/workflows/intent-sync.yml` preserves the same clean-checkout sequence without
-installing or invoking `intent-advisor`.
+`.github/workflows/intent-sync.yml` uses the same guard without installing or invoking
+`intent-advisor`. Because `.intent` is ignored, a clean checkout deliberately fails with
+`onboarding_required` unless an approved baseline is restored first or a persistent/self-hosted
+workspace supplies it. The workflow never initializes and reports a clean graph version 0.
 
 Scheduled semantic inference is optional and may only propose grounded review cases. Confidence is
 not a claim of truth and never approves a proposal, resolves a conflict, or authorizes a canonical

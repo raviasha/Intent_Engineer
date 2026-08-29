@@ -92,7 +92,7 @@ def test_github_guide_keeps_release_boundaries_and_action_contract_visible() -> 
     steps = job["steps"]
     assert [step["run"] for step in steps if "run" in step] == [
         "python -m pip install .",
-        "intent init --project .",
+        "intent status --project . --format json --require-baseline",
         "intent validate --project .",
         "intent sync --project . --sources markdown,git,github",
         "intent drift --project . --format markdown --output intent-drift.md",

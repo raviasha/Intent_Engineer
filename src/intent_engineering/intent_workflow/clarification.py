@@ -957,6 +957,9 @@ class ProposalConfirmationService:
         policy_file: SecureFile,
         binding_files: Mapping[str, SecureFile] | None = None,
         authority_read_policies: Mapping[str, LocalTransactionExtraReadPolicy] | None = None,
+        authority_preimages: Mapping[str, bytes | None] | None = None,
+        authority_membership_digest: str | None = None,
+        authority_membership_resolver: Callable[[], str] | None = None,
     ) -> None:
         self._graph_store = graph_store
         self._evidence_store = evidence_store
@@ -970,12 +973,19 @@ class ProposalConfirmationService:
         }
         for index, (_name, file) in enumerate(sorted((binding_files or {}).items())):
             self._extras[f"authority_binding_{index}"] = file.duplicate()
-        if authority_read_policies is not None and (
-            set(authority_read_policies) != set(self._extras)
-            or any(
-                type(policy) is not LocalTransactionExtraReadPolicy
-                for policy in authority_read_policies.values()
+        if (
+            (
+                authority_read_policies is not None
+                and (
+                    set(authority_read_policies) != set(self._extras)
+                    or any(
+                        type(policy) is not LocalTransactionExtraReadPolicy
+                        for policy in authority_read_policies.values()
+                    )
+                )
             )
+            or (authority_preimages is not None and set(authority_preimages) != set(self._extras))
+            or (authority_membership_digest is None) != (authority_membership_resolver is None)
         ):
             for file in self._extras.values():
                 file.close()
@@ -984,6 +994,42 @@ class ProposalConfirmationService:
         self._authority_read_policies = (
             None if authority_read_policies is None else dict(authority_read_policies)
         )
+        self._authority_preimages = (
+            None if authority_preimages is None else dict(authority_preimages)
+        )
+        self._authority_membership_digest = authority_membership_digest
+        self._authority_membership_resolver = authority_membership_resolver
+
+    def _authority_membership_matches(self) -> bool:
+        if self._authority_membership_resolver is None:
+            return True
+        return self._authority_membership_resolver() == self._authority_membership_digest
+
+    @contextmanager
+    def _authority_transaction(self) -> Iterator[None]:
+        if self._authority_preimages is None:
+            yield
+            return
+        with self._transactions.transaction(
+            rollback_base_exceptions=True,
+            extras=self._extras,
+            extra_read_policies=self._authority_read_policies,
+        ) as transaction:
+            preimages_match = all(
+                transaction.read_optional(name) == content
+                for name, content in self._authority_preimages.items()
+            )
+            membership_matches = self._authority_membership_matches()
+            if not membership_matches or not preimages_match:
+                raise ValueError("confirmation authority changed")
+            yield
+            preimages_match = all(
+                transaction.read_optional(name) == content
+                for name, content in self._authority_preimages.items()
+            )
+            membership_matches = self._authority_membership_matches()
+            if not membership_matches or not preimages_match:
+                raise ValueError("confirmation authority changed")
 
     @staticmethod
     def _authority(
@@ -1646,6 +1692,7 @@ class ProposalConfirmationService:
         self,
         proposal_id: str,
         *,
+        proposal_digest: str | None = None,
         actor: str,
         at: datetime,
         selected_node_ids: tuple[str, ...],
@@ -1663,6 +1710,8 @@ class ProposalConfirmationService:
         proposal = self._store.get(proposal_id)
         if not isinstance(proposal, ClarificationIntentProposal):
             raise TypeError("proposal is not clarification-bound")
+        if proposal_digest is not None and proposal.digest != proposal_digest:
+            raise ValueError("proposal digest changed")
         actor_aliases = self._aliases(actor, policy, provider_principals)
         proposer_aliases = self._aliases(proposal.proposed_by, policy, provider_principals)
         conflict_aliases = tuple(
@@ -1842,18 +1891,21 @@ class ProposalConfirmationService:
         self,
         proposal_id: str,
         *,
+        proposal_digest: str | None = None,
         actor: str,
         at: datetime,
         selected_node_ids: tuple[str, ...] = (),
     ) -> ProposalConfirmationResult:
         signal: BaseException | None = None
         try:
-            return self._confirm(
-                proposal_id,
-                actor=actor,
-                at=at,
-                selected_node_ids=selected_node_ids,
-            )
+            with self._authority_transaction():
+                return self._confirm(
+                    proposal_id,
+                    proposal_digest=proposal_digest,
+                    actor=actor,
+                    at=at,
+                    selected_node_ids=selected_node_ids,
+                )
         except Exception:  # noqa: BLE001, S110 - fixed opaque boundary; no logging
             pass
         except BaseException as caught:  # noqa: BLE001 - preserve exact cancellation identity
@@ -1861,6 +1913,7 @@ class ProposalConfirmationService:
             signal = caught
         finally:
             proposal_id = ""
+            proposal_digest = None
             actor = ""
             at = cast(datetime, None)
             selected_node_ids = ()
@@ -1875,6 +1928,10 @@ class ProposalConfirmationService:
         self._extras.clear()
         if self._authority_read_policies is not None:
             self._authority_read_policies.clear()
+        if self._authority_preimages is not None:
+            self._authority_preimages.clear()
+        self._authority_membership_digest = None
+        self._authority_membership_resolver = None
 
 
 __all__ = [
