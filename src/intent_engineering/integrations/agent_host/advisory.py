@@ -20,12 +20,16 @@ from pydantic import (
     model_validator,
 )
 
-from intent_engineering.cli.intent_workflow import _snapshot_config
+from intent_engineering.cli.intent_workflow import _principals, _snapshot_config
 from intent_engineering.cli.runtime import Runtime
+from intent_engineering.core.models import ProjectConfig
 from intent_engineering.intent_workflow.conversation import (
     CODEX_CONVERSATION_REF_BYTES,
+    ConversationCapture,
     codex_conversation_binding,
     codex_conversation_ref,
+    validate_conversation_record,
+    verify_codex_conversation_ref,
 )
 from intent_engineering.intent_workflow.models import ClarificationEvent
 from intent_engineering.intent_workflow.onboarding import (
@@ -418,20 +422,27 @@ def codex_prompt_context(route: PromptRoute) -> str:
         return _OFFER
     if route.action == "classify":
         conversation_ref = route.arguments.get("conversation_ref")
-        if type(conversation_ref) is not str:
+        request_evidence_ref = route.arguments.get("request_evidence_ref")
+        if type(conversation_ref) is not str or type(request_evidence_ref) is not str:
             raise ValueError("invalid advisory prompt route")
         encoded_ref = json.dumps(conversation_ref, ensure_ascii=False, separators=(",", ":"))
+        encoded_evidence = json.dumps(
+            request_evidence_ref,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
         return (
-            "action=classify. First call public MCP tool intent_context with the current human "
-            "request for bounded repository context. Form a classification draft, then call "
-            f"public MCP tool intent_advisory_preflight with conversation_ref={encoded_ref}, the "
-            "current human request, and that draft. Ask returned questions and follow only the "
-            "persisted clarification workflow before implementation."
+            "action=classify. Use public read-only Intent tools as needed for bounded repository "
+            "context and form a classification draft from the current prompt locally. Then call "
+            f"public MCP tool intent_advisory_preflight with conversation_ref={encoded_ref}, "
+            f"request_evidence_ref={encoded_evidence}, and that draft. Never send the raw human "
+            "prompt through MCP. Ask returned questions and follow only the persisted "
+            "clarification workflow before implementation."
         )
     if route.action == "answer_clarification":
         safe_arguments = {
             key: route.arguments[key]
-            for key in ("session_id", "question_id", "actor", "answered_at")
+            for key in ("session_id", "question_id", "answer_evidence_ref")
         }
         encoded = json.dumps(
             safe_arguments,
@@ -442,8 +453,9 @@ def codex_prompt_context(route: PromptRoute) -> str:
         )
         context = (
             "action=answer_clarification. Call public MCP tool "
-            f"intent_clarification_answer with {encoded} and the current human prompt as answer. "
-            "Do not classify the answer again."
+            f"intent_clarification_answer with {encoded}. The hook already captured the exact "
+            "human answer; do not send raw answer text or caller-supplied attribution through "
+            "MCP. Do not classify the answer again."
         )
         if len(context) > 2048:
             raise ValueError("invalid advisory prompt route")
@@ -505,32 +517,72 @@ class AdvisoryPromptRouter:
     def __init__(self, runtime: Runtime) -> None:
         self._runtime = runtime
 
-    def _route(self, event: PromptEvent) -> PromptRoute:
-        if type(event) is not PromptEvent:
-            raise ValueError("invalid advisory prompt event")
-        checked = PromptEvent.model_validate_json(event.model_dump_json())
-        if not repository_matches(self._runtime.project_directory, checked.repository):
-            raise ValueError("advisory repository mismatch")
-        config, _config_bytes = _snapshot_config(self._runtime)
-        if checked.actor != config.local_actor:
-            raise ValueError("advisory actor mismatch")
-        onboarding = inspect_onboarding(cast(OnboardingRuntime, self._runtime))
-        if onboarding.state is not OnboardingState.READY:
-            return PromptRoute(
-                action="offer_onboarding",
-                message=_OFFER,
-                mcp_tool=None,
-                arguments={},
+    def _capture_prompt(
+        self,
+        event: PromptEvent,
+        conversation_ref: str,
+        config: ProjectConfig,
+        principals: frozenset[str],
+    ) -> str:
+        binding = codex_conversation_binding(conversation_ref)
+        ledger = tuple(self._runtime.evidence_store.ledger("conversation:codex"))
+        exact = []
+        for item in ledger:
+            if item.evidence.payload.get("role") != "human":
+                continue
+            try:
+                existing = codex_conversation_binding(item.evidence.external_object_id)
+            except ValueError:
+                continue
+            if existing[:2] == binding[:2] and item.evidence.external_object_id != conversation_ref:
+                raise ValueError("advisory host turn changed")
+            if item.evidence.external_object_id == conversation_ref:
+                exact.append(item)
+        if len(exact) > 1:
+            raise ValueError("ambiguous advisory host turn")
+        acl = tuple(sorted(principals))
+        if exact:
+            ingestion = exact[0]
+            content = validate_conversation_record(
+                ingestion.evidence,
+                conversation_ref=conversation_ref,
+                role="human",
+                author=config.local_actor,
+                acl=acl,
             )
+            if (
+                type(content) is not str
+                or content != event.prompt
+                or ingestion.predecessor_id is not None
+            ):
+                raise ValueError("advisory host turn changed")
+            verify_codex_conversation_ref(conversation_ref, content)
+            return ingestion.evidence.id
+        captured = ConversationCapture(
+            self._runtime.evidence_store,
+            connector_id="conversation:codex",
+        ).record_turn(
+            conversation_ref=conversation_ref,
+            role="human",
+            author=config.local_actor,
+            content=event.prompt,
+            captured_at=event.created_at,
+            acl=acl,
+        )
+        verify_codex_conversation_ref(conversation_ref, event.prompt)
+        return captured.id
+
+    def _ready_route(
+        self,
+        checked: PromptEvent,
+        conversation_ref: str,
+        prompt_evidence_ref: str,
+    ) -> PromptRoute:
+
         events = self._runtime.intent_proposals.clarification_events()
         latest: dict[str, ClarificationEvent] = {}
         for item in events:
             latest[item.session.id] = item
-        conversation_ref = codex_conversation_ref(
-            checked.session_id,
-            checked.turn_id,
-            checked.prompt,
-        )
         lineage = _codex_session_lineage(conversation_ref)
         active_codex: list[tuple[ClarificationEvent, str]] = []
         for item in latest.values():
@@ -578,17 +630,70 @@ class AdvisoryPromptRouter:
                 arguments={
                     "session_id": session.id,
                     "question_id": question.id,
-                    "answer": checked.prompt,
-                    "actor": checked.actor,
-                    "answered_at": checked.created_at.isoformat().replace("+00:00", "Z"),
+                    "answer_evidence_ref": prompt_evidence_ref,
                 },
             )
         return PromptRoute(
             action="classify",
             message="Classify this prompt through Intent Engineering before implementation.",
             mcp_tool="intent_advisory_preflight",
-            arguments={"conversation_ref": conversation_ref},
+            arguments={
+                "conversation_ref": conversation_ref,
+                "request_evidence_ref": prompt_evidence_ref,
+            },
         )
+
+    def _route(self, event: PromptEvent) -> PromptRoute:
+        if type(event) is not PromptEvent:
+            raise ValueError("invalid advisory prompt event")
+        checked = PromptEvent.model_validate_json(event.model_dump_json())
+        if not repository_matches(self._runtime.project_directory, checked.repository):
+            raise ValueError("advisory repository mismatch")
+        config, config_bytes = _snapshot_config(self._runtime)
+        if checked.actor != config.local_actor:
+            raise ValueError("advisory actor mismatch")
+        onboarding = inspect_onboarding(cast(OnboardingRuntime, self._runtime))
+        if onboarding.state is not OnboardingState.READY:
+            return PromptRoute(
+                action="offer_onboarding",
+                message=_OFFER,
+                mcp_tool=None,
+                arguments={},
+            )
+        conversation_ref = codex_conversation_ref(
+            checked.session_id,
+            checked.turn_id,
+            checked.prompt,
+        )
+        principals = _principals(self._runtime, config)
+        config_file = self._runtime.workspace_directory.file("config.yaml")
+        try:
+            with self._runtime.transactions.transaction(
+                rollback_base_exceptions=True,
+                extras={"advisory_config": config_file},
+            ) as transaction:
+                if (
+                    transaction.read("advisory_config") != config_bytes
+                    or _principals(self._runtime, config) != principals
+                    or inspect_onboarding(cast(OnboardingRuntime, self._runtime)).state
+                    is not OnboardingState.READY
+                ):
+                    raise ValueError("advisory prompt authority changed")
+                prompt_evidence_ref = self._capture_prompt(
+                    checked,
+                    conversation_ref,
+                    config,
+                    principals,
+                )
+                route = self._ready_route(checked, conversation_ref, prompt_evidence_ref)
+                if (
+                    transaction.read("advisory_config") != config_bytes
+                    or _principals(self._runtime, config) != principals
+                ):
+                    raise ValueError("advisory prompt authority changed")
+                return route
+        finally:
+            config_file.close()
 
     def route(self, event: PromptEvent) -> PromptRoute:
         result: PromptRoute | None = None

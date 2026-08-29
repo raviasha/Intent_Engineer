@@ -22,6 +22,7 @@ from intent_engineering.cli.runtime import load_runtime
 from intent_engineering.core.models import ChangeSet, Graph, Node, NodeType, SourceMode
 from intent_engineering.core.policy.project import initialize_project
 from intent_engineering.integrations.agent_host.advisory import (
+    AdvisoryPromptError,
     AdvisoryPromptRouter,
     PromptEvent,
     codex_conversation_ref,
@@ -34,7 +35,10 @@ from intent_engineering.integrations.mcp_server.server import build_server
 from intent_engineering.integrations.mcp_server.tools import McpReadServices
 from intent_engineering.intent_workflow.authorization import AuthorizationVerification
 from intent_engineering.intent_workflow.bootstrap import BootstrapSubmission
-from intent_engineering.intent_workflow.clarification import ProposalConfirmationService
+from intent_engineering.intent_workflow.clarification import (
+    ClarificationCoordinator,
+    ProposalConfirmationService,
+)
 from intent_engineering.intent_workflow.conversation import ConversationCapture
 from intent_engineering.intent_workflow.models import (
     ClarificationProposalSubmission,
@@ -135,10 +139,10 @@ class _FakeWorkflow:
     async def advisory_preflight(
         self,
         conversation_ref: str,
-        request: str,
+        request_evidence_ref: str,
         draft: object,
     ) -> dict[str, object]:
-        self.calls.append(("advisory_preflight", (conversation_ref, request, draft)))
+        self.calls.append(("advisory_preflight", (conversation_ref, request_evidence_ref, draft)))
         return {
             "schema_version": 1,
             "task_id": "task:sha256:" + "9" * 64,
@@ -201,14 +205,12 @@ class _FakeWorkflow:
         self,
         session_id: str,
         question_id: str,
-        answer: str,
-        actor: str,
-        answered_at: datetime,
+        answer_evidence_ref: str,
     ) -> dict[str, object]:
         self.calls.append(
             (
                 "clarification_answer",
-                (session_id, question_id, answer, actor, answered_at),
+                (session_id, question_id, answer_evidence_ref),
             )
         )
         return {"schema_version": 1, "status": "open", "session_id": session_id}
@@ -355,7 +357,7 @@ def _valid_raw_workflow_arguments(tool_name: str) -> dict[str, object]:
         request = "Format README\nwithout changing semantics"
         return {
             "conversation_ref": codex_conversation_ref("codex:thread-3", "turn-7", request),
-            "request": request,
+            "request_evidence_ref": "evidence:conversation:" + "7" * 64,
             "draft": {
                 "classification": "no_semantic_impact",
                 "basis": "Formatting only",
@@ -380,9 +382,7 @@ def _valid_raw_workflow_arguments(tool_name: str) -> dict[str, object]:
         return {
             "session_id": "clarification:sha256:" + "1" * 64,
             "question_id": "audience",
-            "answer": "Workspace administrators",
-            "actor": "local",
-            "answered_at": "2026-08-26T12:00:02Z",
+            "answer_evidence_ref": "evidence:conversation:" + "8" * 64,
         }
     if tool_name == "intent_clarification_propose":
         return {"submission": _clarification_submission().model_dump(mode="json")}
@@ -571,8 +571,16 @@ async def test_workflow_registration_is_optional_additive_and_has_truthful_annot
         preflight_schema["$defs"]["AgentClassificationSubmission"]["additionalProperties"] is False
     )
     advisory_schema = by_name["intent_advisory_preflight"].input_schema
-    assert set(advisory_schema["properties"]) == {"conversation_ref", "request", "draft"}
-    assert set(advisory_schema["required"]) == {"conversation_ref", "request", "draft"}
+    assert set(advisory_schema["properties"]) == {
+        "conversation_ref",
+        "request_evidence_ref",
+        "draft",
+    }
+    assert set(advisory_schema["required"]) == {
+        "conversation_ref",
+        "request_evidence_ref",
+        "draft",
+    }
     assert advisory_schema["properties"]["conversation_ref"] == {
         "maxLength": 210,
         "minLength": 210,
@@ -604,9 +612,7 @@ async def test_workflow_registration_is_optional_additive_and_has_truthful_annot
                 "intent_clarification_answer": {
                     "session_id",
                     "question_id",
-                    "answer",
-                    "actor",
-                    "answered_at",
+                    "answer_evidence_ref",
                 },
                 "intent_clarification_propose": {"submission"},
                 "intent_clarification_show": {"proposal_id"},
@@ -632,7 +638,6 @@ async def test_clarification_tools_delegate_strict_detached_typed_payloads(
         id="audience", prompt="Who may share reports?", required=True
     )
     opened_at = datetime(2026, 8, 26, 12, 0, 1, tzinfo=UTC)
-    answered_at = datetime(2026, 8, 26, 12, 0, 2, tzinfo=UTC)
     confirmed_at = datetime(2026, 8, 26, 12, 0, 4, tzinfo=UTC)
 
     opened = await server.call_tool(
@@ -650,9 +655,7 @@ async def test_clarification_tools_delegate_strict_detached_typed_payloads(
         {
             "session_id": "clarification:sha256:" + "1" * 64,
             "question_id": "audience",
-            "answer": "Workspace administrators",
-            "actor": "local",
-            "answered_at": "2026-08-26T12:00:02Z",
+            "answer_evidence_ref": "evidence:conversation:" + "8" * 64,
         },
     )
     submission = _clarification_submission()
@@ -696,9 +699,7 @@ async def test_clarification_tools_delegate_strict_detached_typed_payloads(
             (
                 "clarification:sha256:" + "1" * 64,
                 "audience",
-                "Workspace administrators",
-                "local",
-                answered_at,
+                "evidence:conversation:" + "8" * 64,
             ),
         ),
         ("clarification_propose", submission),
@@ -861,11 +862,11 @@ async def test_advisory_preflight_delegates_exact_detached_draft(tmp_path: Path)
     assert "authorization_token" not in response.structured_content
     call = workflow.calls[-1]
     assert call[0] == "advisory_preflight"
-    conversation_ref, request, draft = call[1]
+    conversation_ref, request_evidence_ref, draft = call[1]
     assert conversation_ref == codex_conversation_ref(
         "codex:thread-3", "turn-7", "Format README\nwithout changing semantics"
     )
-    assert request == "Format README\nwithout changing semantics"
+    assert request_evidence_ref == "evidence:conversation:" + "7" * 64
     assert type(draft) is AdvisoryClassificationDraft
     assert draft.requested_scope == ("README.md",)
 
@@ -895,11 +896,43 @@ async def test_production_advisory_preflight_is_durable_idempotent_and_token_fre
         encoding="utf-8",
     )
     runtime = load_runtime(project)
+    runtime.graph_store.initialize(
+        Graph(
+            id="graph:advisory-evidence",
+            version=1,
+            name="Advisory evidence",
+            nodes=(
+                Node(
+                    id="intent:advisory-evidence",
+                    type=NodeType.PRODUCT_INTENT,
+                    label="Preserve attributed advisory evidence",
+                    status="active",
+                    created_by="local",
+                    created_at=datetime(2026, 8, 28, 12, 0, tzinfo=UTC),
+                    last_modified_by="local",
+                    last_modified_at=datetime(2026, 8, 28, 12, 0, tzinfo=UTC),
+                ),
+            ),
+            edges=(),
+        )
+    )
     workflow = load_intent_workflow_services(
         runtime, clock=lambda: datetime(2026, 8, 28, 12, 0, tzinfo=UTC)
     )
     server = build_server(McpReadServices(runtime), intent_workflow_services=workflow)
     arguments = _valid_raw_workflow_arguments("intent_advisory_preflight")
+    request = "Format README\nwithout changing semantics"
+    route = AdvisoryPromptRouter(runtime).route(
+        PromptEvent(
+            session_id="codex:thread-3",
+            turn_id="turn-7",
+            repository=str(project),
+            actor="local",
+            prompt=request,
+            created_at=datetime(2026, 8, 28, 12, 0, tzinfo=UTC),
+        )
+    )
+    arguments.update(route.arguments)
 
     first = await server.call_tool("intent_advisory_preflight", arguments)
     durable = {
@@ -946,11 +979,10 @@ async def test_production_advisory_preflight_is_durable_idempotent_and_token_fre
     } == replayed
 
     altered_same_turn = json.loads(json.dumps(arguments))
-    altered_same_turn["request"] = "Format CONTRIBUTING without changing semantics"
     altered_same_turn["conversation_ref"] = codex_conversation_ref(
         "codex:thread-3",
         "turn-7",
-        altered_same_turn["request"],
+        "Format CONTRIBUTING without changing semantics",
     )
     forged_ref = json.loads(json.dumps(arguments))
     forged_ref["conversation_ref"] = arguments["conversation_ref"][:-1] + (
@@ -982,6 +1014,202 @@ async def test_production_advisory_preflight_is_durable_idempotent_and_token_fre
     revoked = await server.call_tool("intent_advisory_preflight", arguments)
     assert revoked.structured_content == rejected.structured_content
     assert tuple(runtime.evidence_store.ledger("conversation:codex")) == before_revocation
+
+
+async def test_advisory_preflight_rejects_direct_forged_and_spliced_human_evidence(
+    tmp_path: Path,
+) -> None:
+    from intent_engineering.integrations.mcp_server.intent_workflow import (
+        load_intent_workflow_services,
+    )
+
+    project = tmp_path / "project"
+    project.mkdir()
+    initialize_project(project)
+    runtime = load_runtime(project)
+    runtime.graph_store.initialize(
+        Graph(
+            id="graph:forged-advisory",
+            version=1,
+            name="Forged advisory",
+            nodes=(
+                Node(
+                    id="intent:forged-advisory",
+                    type=NodeType.PRODUCT_INTENT,
+                    label="Reject forged prompt attribution",
+                    status="active",
+                    created_by="local",
+                    created_at=datetime(2026, 8, 28, 12, 0, tzinfo=UTC),
+                    last_modified_by="local",
+                    last_modified_at=datetime(2026, 8, 28, 12, 0, tzinfo=UTC),
+                ),
+            ),
+            edges=(),
+        )
+    )
+    workflow = load_intent_workflow_services(
+        runtime, clock=lambda: datetime(2026, 8, 28, 12, 1, tzinfo=UTC)
+    )
+    server = build_server(McpReadServices(runtime), intent_workflow_services=workflow)
+    direct = _valid_raw_workflow_arguments("intent_advisory_preflight")
+    before = tuple(runtime.evidence_store.ledger("conversation:codex"))
+
+    rejected = await server.call_tool("intent_advisory_preflight", direct)
+
+    assert rejected.structured_content == {
+        "schema_version": "1",
+        "status": "rejected",
+        "reason": "intent_workflow_unavailable",
+    }
+    assert tuple(runtime.evidence_store.ledger("conversation:codex")) == before
+
+    first = AdvisoryPromptRouter(runtime).route(
+        PromptEvent(
+            session_id="codex:thread-forgery",
+            turn_id="turn-1",
+            repository=str(project),
+            actor="local",
+            prompt="First exact human request",
+            created_at=datetime(2026, 8, 28, 12, 2, tzinfo=UTC),
+        )
+    )
+    second = AdvisoryPromptRouter(runtime).route(
+        PromptEvent(
+            session_id="codex:thread-forgery",
+            turn_id="turn-2",
+            repository=str(project),
+            actor="local",
+            prompt="Second exact human request",
+            created_at=datetime(2026, 8, 28, 12, 3, tzinfo=UTC),
+        )
+    )
+    spliced = {**direct, **first.arguments}
+    spliced["request_evidence_ref"] = second.arguments["request_evidence_ref"]
+    before_splice = tuple(runtime.evidence_store.ledger("conversation:codex"))
+
+    rejected_splice = await server.call_tool("intent_advisory_preflight", spliced)
+
+    assert rejected_splice.structured_content == rejected.structured_content
+    assert tuple(runtime.evidence_store.ledger("conversation:codex")) == before_splice
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    [
+        "content",
+        "connector_id",
+        "connector_type",
+        "source_locator",
+        "external_object_id",
+        "author",
+        "acl",
+        "external_version",
+        "current_version",
+    ],
+)
+async def test_advisory_preflight_authenticates_exact_current_hook_ingestion(
+    tmp_path: Path,
+    tamper: str,
+) -> None:
+    from intent_engineering.integrations.mcp_server.intent_workflow import (
+        load_intent_workflow_services,
+    )
+
+    project = tmp_path / "project"
+    project.mkdir()
+    initialize_project(project)
+    runtime = load_runtime(project)
+    observed_at = datetime(2026, 8, 28, 12, 0, tzinfo=UTC)
+    runtime.graph_store.initialize(
+        Graph(
+            id="graph:advisory-ingestion",
+            version=1,
+            name="Advisory ingestion",
+            nodes=(
+                Node(
+                    id="intent:advisory-ingestion",
+                    type=NodeType.PRODUCT_INTENT,
+                    label="Authenticate exact hook evidence",
+                    status="active",
+                    created_by="local",
+                    created_at=observed_at,
+                    last_modified_by="local",
+                    last_modified_at=observed_at,
+                ),
+            ),
+            edges=(),
+        )
+    )
+    request = "PRIVATE-HUMAN-REQUEST-MUST-NOT-CROSS-MCP"
+    route = AdvisoryPromptRouter(runtime).route(
+        PromptEvent(
+            session_id="codex:advisory-ingestion",
+            turn_id="turn-1",
+            repository=str(project),
+            actor="local",
+            prompt=request,
+            created_at=observed_at,
+        )
+    )
+    if tamper == "current_version":
+        ConversationCapture(
+            runtime.evidence_store,
+            connector_id="conversation:codex",
+        ).record_turn(
+            conversation_ref=str(route.arguments["conversation_ref"]),
+            role="human",
+            author="local",
+            content=request,
+            captured_at=observed_at + timedelta(microseconds=1),
+            acl=("local",),
+        )
+    else:
+        evidence_path = project / ".intent/evidence/evidence.jsonl"
+        lines = evidence_path.read_bytes().splitlines()
+        row = json.loads(lines[-1])
+        record = row["evidence"]
+        if tamper == "content":
+            record["payload"]["content"] = "PRIVATE-ALTERED-HUMAN-TEXT"
+        elif tamper == "connector_id":
+            row["connector_id"] = "conversation:other"
+        elif tamper == "connector_type":
+            record["connector_type"] = "conversation-other"
+        elif tamper == "source_locator":
+            record["source_locator"] += ":altered"
+        elif tamper == "external_object_id":
+            record["external_object_id"] = codex_conversation_ref(
+                "codex:other-session", "turn-1", request
+            )
+        elif tamper == "author":
+            record["author"] = "local:other"
+        elif tamper == "acl":
+            record["acl"] = ["local:other"]
+        else:
+            record["external_version"] = "sha256:" + "f" * 64
+        lines[-1] = json.dumps(
+            row,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode()
+        evidence_path.write_bytes(b"\n".join(lines) + b"\n")
+
+    before = (project / ".intent/evidence/evidence.jsonl").read_bytes()
+    arguments = _valid_raw_workflow_arguments("intent_advisory_preflight")
+    arguments.update(route.arguments)
+    server = build_server(
+        McpReadServices(runtime),
+        intent_workflow_services=load_intent_workflow_services(runtime),
+    )
+    rejected = await server.call_tool("intent_advisory_preflight", arguments)
+
+    assert rejected.structured_content == {
+        "schema_version": "1",
+        "status": "rejected",
+        "reason": "intent_workflow_unavailable",
+    }
+    assert (project / ".intent/evidence/evidence.jsonl").read_bytes() == before
+    assert request not in json.dumps(rejected.model_dump(mode="json"))
 
 
 async def test_official_turn_refs_drive_retry_and_distinct_evidence_pairs(
@@ -1017,7 +1245,7 @@ async def test_official_turn_refs_drive_retry_and_distinct_evidence_pairs(
     )
     router = AdvisoryPromptRouter(runtime)
 
-    def route_ref(turn_id: str, request: str) -> str:
+    def route_arguments(turn_id: str, request: str) -> dict[str, object]:
         route = router.route(
             PromptEvent(
                 session_id="codex:thread-3",
@@ -1030,34 +1258,36 @@ async def test_official_turn_refs_drive_retry_and_distinct_evidence_pairs(
         )
         conversation_ref = route.arguments["conversation_ref"]
         assert type(conversation_ref) is str
-        return conversation_ref
+        return dict(route.arguments)
 
     first_request = "Format README\nwithout changing semantics"
-    first_ref = route_ref("turn-7", first_request)
-    identical_next_ref = route_ref("turn-8", first_request)
-    changed_request = "Format CONTRIBUTING without changing semantics"
-    changed_next_ref = route_ref("turn-9", changed_request)
-    server = build_server(
-        McpReadServices(runtime),
-        intent_workflow_services=load_intent_workflow_services(
-            runtime, clock=lambda: datetime(2026, 8, 28, 12, 1, tzinfo=UTC)
-        ),
+    first_arguments = route_arguments("turn-7", first_request)
+    first_ref = str(first_arguments["conversation_ref"])
+    workflow = load_intent_workflow_services(
+        runtime, clock=lambda: datetime(2026, 8, 28, 12, 1, tzinfo=UTC)
     )
+    server = build_server(McpReadServices(runtime), intent_workflow_services=workflow)
     base = _valid_raw_workflow_arguments("intent_advisory_preflight")
-    base["conversation_ref"] = first_ref
-    base["request"] = first_request
+    base.update(first_arguments)
 
     first = await server.call_tool("intent_advisory_preflight", base)
     retry = await server.call_tool("intent_advisory_preflight", base)
+    identical_next_arguments = route_arguments("turn-8", first_request)
+    identical_next_ref = str(identical_next_arguments["conversation_ref"])
     identical_next = json.loads(json.dumps(base))
-    identical_next["conversation_ref"] = identical_next_ref
+    identical_next.update(identical_next_arguments)
     second = await server.call_tool("intent_advisory_preflight", identical_next)
+    changed_request = "Format CONTRIBUTING without changing semantics"
+    changed_next_arguments = route_arguments("turn-9", changed_request)
+    changed_next_ref = str(changed_next_arguments["conversation_ref"])
     changed_next = json.loads(json.dumps(base))
-    changed_next["conversation_ref"] = changed_next_ref
-    changed_next["request"] = changed_request
+    changed_next.update(changed_next_arguments)
     third = await server.call_tool("intent_advisory_preflight", changed_next)
 
     assert first.structured_content == retry.structured_content
+    assert [
+        result.structured_content.get("authorized") for result in (first, retry, second, third)
+    ] == [True, True, True, True]
     assert first_ref != identical_next_ref != changed_next_ref
     assert tuple(
         len(runtime.evidence_store.chain("conversation:codex", "conversation", ref))
@@ -1128,16 +1358,17 @@ async def test_production_advisory_ambiguity_opens_exact_persisted_session(
     )
     server = build_server(McpReadServices(runtime), intent_workflow_services=workflow)
     arguments = _valid_raw_workflow_arguments("intent_advisory_preflight")
+    request = "Format README\nwithout changing semantics"
     first_event = PromptEvent(
         session_id="codex:thread-3",
         turn_id="turn-7",
         repository=str(project),
         actor="local",
-        prompt=str(arguments["request"]),
+        prompt=request,
         created_at=datetime(2026, 8, 28, 13, 0, tzinfo=UTC),
     )
     first_route = AdvisoryPromptRouter(runtime).route(first_event)
-    arguments["conversation_ref"] = first_route.arguments["conversation_ref"]
+    arguments.update(first_route.arguments)
     draft = arguments["draft"]
     assert type(draft) is dict
     draft.update(
@@ -1145,7 +1376,7 @@ async def test_production_advisory_ambiguity_opens_exact_persisted_session(
             "classification": "new_or_ambiguous",
             "basis": "Audience is missing",
             "uncertainties": ["Sharing audience"],
-            "questions": ["Who may share reports?"],
+            "questions": ["Who may share reports?", "When should sharing expire?"],
             "requested_scope": [],
         }
     )
@@ -1155,7 +1386,10 @@ async def test_production_advisory_ambiguity_opens_exact_persisted_session(
     payload = response.structured_content
     assert payload["authorized"] is False
     assert payload["classification"] == "new_or_ambiguous"
-    assert payload["questions"] == ["Who may share reports?"]
+    assert payload["questions"] == [
+        "When should sharing expire?",
+        "Who may share reports?",
+    ]
     session_payload = payload["context"]["clarification_session"]
     session = runtime.intent_proposals.session(session_payload["id"])
     assert session.model_dump(mode="json") == session_payload
@@ -1188,6 +1422,51 @@ async def test_production_advisory_ambiguity_opens_exact_persisted_session(
     )
     assert answer.action == "answer_clarification"
     assert answer.arguments["session_id"] == session.id
+    restarted_server = build_server(
+        McpReadServices(restarted),
+        intent_workflow_services=load_intent_workflow_services(restarted),
+    )
+    first_answered = await restarted_server.call_tool(
+        "intent_clarification_answer", dict(answer.arguments)
+    )
+    after_first_answer = {
+        path.relative_to(project).as_posix(): path.read_bytes()
+        for path in sorted((project / ".intent").rglob("*"))
+        if path.is_file() and not path.is_symlink()
+    }
+    retried_answer = await restarted_server.call_tool(
+        "intent_clarification_answer", dict(answer.arguments)
+    )
+    assert retried_answer.structured_content == first_answered.structured_content
+    assert {
+        path.relative_to(project).as_posix(): path.read_bytes()
+        for path in sorted((project / ".intent").rglob("*"))
+        if path.is_file() and not path.is_symlink()
+    } == after_first_answer
+
+    conflicting_route = AdvisoryPromptRouter(restarted).route(
+        PromptEvent(
+            session_id="codex:thread-3",
+            turn_id="turn-9",
+            repository=str(project),
+            actor="local",
+            prompt="Sharing never expires",
+            created_at=datetime(2026, 8, 28, 13, 2, tzinfo=UTC),
+        )
+    )
+    assert conflicting_route.action == "answer_clarification"
+    conflicting_arguments = dict(conflicting_route.arguments)
+    conflicting_arguments["question_id"] = answer.arguments["question_id"]
+    conflicted = await restarted_server.call_tool(
+        "intent_clarification_answer", conflicting_arguments
+    )
+    conflicted_session = conflicted.structured_content["session"]
+    assert len(conflicted_session["answers"]) == 1
+    assert len(conflicted_session["conflicts"]) == 1
+    assert (
+        conflicted_session["conflicts"][0]["conflicting_evidence_ref"]
+        == (conflicting_route.arguments["answer_evidence_ref"])
+    )
 
 
 async def test_advisory_replay_fixed_fails_after_graph_change_without_new_evidence(
@@ -1201,6 +1480,26 @@ async def test_advisory_replay_fixed_fails_after_graph_change_without_new_eviden
     project.mkdir()
     initialize_project(project)
     runtime = load_runtime(project)
+    runtime.graph_store.initialize(
+        Graph(
+            id="graph:advisory-replay",
+            version=1,
+            name="Advisory replay",
+            nodes=(
+                Node(
+                    id="intent:advisory-replay",
+                    type=NodeType.PRODUCT_INTENT,
+                    label="Reject stale advisory replays",
+                    status="active",
+                    created_by="local",
+                    created_at=datetime(2026, 8, 28, 14, 0, tzinfo=UTC),
+                    last_modified_by="local",
+                    last_modified_at=datetime(2026, 8, 28, 14, 0, tzinfo=UTC),
+                ),
+            ),
+            edges=(),
+        )
+    )
     server = build_server(
         McpReadServices(runtime),
         intent_workflow_services=load_intent_workflow_services(
@@ -1208,6 +1507,17 @@ async def test_advisory_replay_fixed_fails_after_graph_change_without_new_eviden
         ),
     )
     arguments = _valid_raw_workflow_arguments("intent_advisory_preflight")
+    route = AdvisoryPromptRouter(runtime).route(
+        PromptEvent(
+            session_id="codex:advisory-replay",
+            turn_id="turn-1",
+            repository=str(project),
+            actor="local",
+            prompt="Format README without changing semantics",
+            created_at=datetime(2026, 8, 28, 14, 0, tzinfo=UTC),
+        )
+    )
+    arguments.update(route.arguments)
     accepted = await server.call_tool("intent_advisory_preflight", arguments)
     graph = runtime.graph_store.load()
     runtime.graph_store.initialize(graph.model_copy(update={"version": graph.version + 1}))
@@ -1228,10 +1538,6 @@ async def test_advisory_authority_race_rolls_back_conversation_pair(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from intent_engineering.integrations.mcp_server.intent_workflow import (
-        load_intent_workflow_services,
-    )
-
     project = tmp_path / "project"
     project.mkdir()
     initialize_project(project)
@@ -1245,8 +1551,25 @@ async def test_advisory_authority_race_rolls_back_conversation_pair(
     }
     policy_path.write_text(yaml.safe_dump(policy, sort_keys=True), encoding="utf-8")
     runtime = load_runtime(project)
-    service = load_intent_workflow_services(
-        runtime, clock=lambda: datetime(2026, 8, 28, 15, 0, tzinfo=UTC)
+    runtime.graph_store.initialize(
+        Graph(
+            id="graph:advisory-authority-race",
+            version=1,
+            name="Advisory authority race",
+            nodes=(
+                Node(
+                    id="intent:advisory-authority-race",
+                    type=NodeType.PRODUCT_INTENT,
+                    label="Bind advisory authority",
+                    status="active",
+                    created_by="local",
+                    created_at=datetime(2026, 8, 28, 15, 0, tzinfo=UTC),
+                    last_modified_by="local",
+                    last_modified_at=datetime(2026, 8, 28, 15, 0, tzinfo=UTC),
+                ),
+            ),
+            edges=(),
+        )
     )
     original = ConversationCapture.record_turn
     raced = False
@@ -1261,19 +1584,21 @@ async def test_advisory_authority_race_rolls_back_conversation_pair(
         return result
 
     monkeypatch.setattr(ConversationCapture, "record_turn", race)
-    server = build_server(McpReadServices(runtime), intent_workflow_services=service)
+    router = AdvisoryPromptRouter(runtime)
 
-    response = await server.call_tool(
-        "intent_advisory_preflight",
-        _valid_raw_workflow_arguments("intent_advisory_preflight"),
-    )
+    with pytest.raises(AdvisoryPromptError):
+        router.route(
+            PromptEvent(
+                session_id="codex:authority-race",
+                turn_id="turn-1",
+                repository=str(project),
+                actor="local",
+                prompt="Format README without semantic changes",
+                created_at=datetime(2026, 8, 28, 15, 0, tzinfo=UTC),
+            )
+        )
 
     assert raced is True
-    assert response.structured_content == {
-        "schema_version": "1",
-        "status": "rejected",
-        "reason": "intent_workflow_unavailable",
-    }
     assert tuple(runtime.evidence_store.ledger("conversation:codex")) == ()
 
 
@@ -1554,11 +1879,12 @@ async def _production_clarification_server(
             "confirmed_node_ids": ["intent:local-export", "requirement:csv-export"],
         },
     )
+    request = "Add authority-bound sharing"
     envelope, classification = _preflight_inputs(
         runtime,
         classification=TaskClassification.NEW_OR_AMBIGUOUS,
-        conversation_ref="codex:authority-race",
-        request="Add authority-bound sharing",
+        conversation_ref=codex_conversation_ref("codex:authority-race", "turn-1", request),
+        request=request,
         questions=("Who may share?",),
     )
     return project, runtime, workflow, server, envelope, classification
@@ -1593,17 +1919,20 @@ async def _clarification_operation_arguments(
         )
     if operation == "propose":
         assert opened is not None
+        answer_route = AdvisoryPromptRouter(runtime).route(
+            PromptEvent(
+                session_id="codex:authority-race",
+                turn_id="turn-2",
+                repository=str(runtime.root),
+                actor=runtime.config.local_actor,
+                prompt="Workspace administrators",
+                created_at=envelope.created_at + timedelta(microseconds=5),
+            )
+        )
+        assert answer_route.action == "answer_clarification"
         await server.call_tool(
             "intent_clarification_answer",
-            {
-                "session_id": opened.structured_content["session"]["id"],
-                "question_id": "audience",
-                "answer": "Workspace administrators",
-                "actor": "local",
-                "answered_at": (envelope.created_at + timedelta(microseconds=5))
-                .isoformat()
-                .replace("+00:00", "Z"),
-            },
+            dict(answer_route.arguments),
         )
     session = (
         None
@@ -1614,17 +1943,125 @@ async def _clarification_operation_arguments(
         return _open_arguments(envelope, classification)
     if operation == "answer":
         assert session is not None
-        return {
-            "session_id": session.id,
-            "question_id": "audience",
-            "answer": "Workspace administrators",
-            "actor": "local",
-            "answered_at": (envelope.created_at + timedelta(microseconds=5))
-            .isoformat()
-            .replace("+00:00", "Z"),
-        }
+        answer_route = AdvisoryPromptRouter(runtime).route(
+            PromptEvent(
+                session_id="codex:authority-race",
+                turn_id="turn-2",
+                repository=str(runtime.root),
+                actor=runtime.config.local_actor,
+                prompt="Workspace administrators",
+                created_at=envelope.created_at + timedelta(microseconds=5),
+            )
+        )
+        assert answer_route.action == "answer_clarification"
+        return dict(answer_route.arguments)
     assert session is not None
     return {"submission": _proposal_submission_for_session(session).model_dump(mode="json")}
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    [
+        "swapped_ref",
+        "connector_id",
+        "connector_type",
+        "source_locator",
+        "external_object_id",
+        "author",
+        "acl",
+        "external_version",
+        "current_version",
+    ],
+)
+async def test_clarification_answer_authenticates_exact_later_hook_ingestion(
+    tmp_path: Path,
+    tamper: str,
+) -> None:
+    (
+        project,
+        runtime,
+        _workflow,
+        server,
+        envelope,
+        classification,
+    ) = await _production_clarification_server(tmp_path)
+    opened = await server.call_tool(
+        "intent_clarification_open", _open_arguments(envelope, classification)
+    )
+    session = runtime.intent_proposals.session(opened.structured_content["session"]["id"])
+    answer_text = "PRIVATE-EXACT-CLARIFICATION-ANSWER"
+    answer_route = AdvisoryPromptRouter(runtime).route(
+        PromptEvent(
+            session_id="codex:authority-race",
+            turn_id="turn-2",
+            repository=str(project),
+            actor="local",
+            prompt=answer_text,
+            created_at=envelope.created_at + timedelta(microseconds=5),
+        )
+    )
+    arguments = dict(answer_route.arguments)
+    answer_ref = str(arguments["answer_evidence_ref"])
+    if tamper == "swapped_ref":
+        arguments["answer_evidence_ref"] = session.request_evidence_ref
+    elif tamper == "current_version":
+        original = runtime.evidence_store.get(answer_ref)
+        ConversationCapture(
+            runtime.evidence_store,
+            connector_id="conversation:codex",
+        ).record_turn(
+            conversation_ref=original.external_object_id,
+            role="human",
+            author=runtime.config.local_actor,
+            content=answer_text,
+            captured_at=original.observed_at + timedelta(microseconds=1),
+            acl=original.acl,
+        )
+    else:
+        evidence_path = project / ".intent/evidence/evidence.jsonl"
+        lines = evidence_path.read_bytes().splitlines()
+        selected = next(
+            index
+            for index, line in enumerate(lines)
+            if json.loads(line)["evidence"]["id"] == answer_ref
+        )
+        row = json.loads(lines[selected])
+        record = row["evidence"]
+        if tamper == "connector_id":
+            row["connector_id"] = "conversation:other"
+            row["sequence"] = 1
+        elif tamper == "connector_type":
+            record["connector_type"] = "conversation-other"
+        elif tamper == "source_locator":
+            record["source_locator"] += ":altered"
+        elif tamper == "external_object_id":
+            record["external_object_id"] = codex_conversation_ref(
+                "codex:other-session", "turn-2", answer_text
+            )
+        elif tamper == "author":
+            record["author"] = "local:other"
+        elif tamper == "acl":
+            record["acl"] = ["local:other"]
+        else:
+            record["external_version"] = "sha256:" + "f" * 64
+        lines[selected] = json.dumps(
+            row,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode()
+        evidence_path.write_bytes(b"\n".join(lines) + b"\n")
+
+    before = _transaction_bytes(runtime)
+    rejected = await server.call_tool("intent_clarification_answer", arguments)
+
+    assert rejected.structured_content == {
+        "schema_version": "1",
+        "status": "rejected",
+        "reason": "intent_workflow_unavailable",
+    }
+    assert _transaction_bytes(runtime) == before
+    assert answer_text not in json.dumps(rejected.model_dump(mode="json"))
 
 
 async def _clarification_confirmation_arguments(
@@ -1786,7 +2223,7 @@ async def test_clarification_authority_change_before_each_write_is_an_exact_noop
             yaml.safe_dump(raced_policy, sort_keys=True), encoding="utf-8"
         )
 
-    if operation in {"open", "answer"}:
+    if operation == "open":
         original_record_turn = ConversationCapture.record_turn
 
         def race_evidence(self, **kwargs: object):
@@ -1794,6 +2231,14 @@ async def test_clarification_authority_change_before_each_write_is_an_exact_noop
             return original_record_turn(self, **kwargs)  # type: ignore[arg-type]
 
         monkeypatch.setattr(ConversationCapture, "record_turn", race_evidence)
+    elif operation == "answer":
+        original_answer_evidence = ClarificationCoordinator.answer_evidence
+
+        def race_answer(self, session_id: str, **kwargs: object):
+            change_authority()
+            return original_answer_evidence(self, session_id, **kwargs)
+
+        monkeypatch.setattr(ClarificationCoordinator, "answer_evidence", race_answer)
     else:
         original_ledger_bytes = runtime.intent_proposals.bytes
 
@@ -2220,7 +2665,7 @@ async def test_clarification_binding_membership_change_before_each_write_is_an_e
         else:
             (connector_directory / "authority.yaml").unlink()
 
-    if operation in {"open", "answer"}:
+    if operation == "open":
         original_record_turn = ConversationCapture.record_turn
 
         def race_evidence(self, **kwargs: object):
@@ -2228,6 +2673,14 @@ async def test_clarification_binding_membership_change_before_each_write_is_an_e
             return original_record_turn(self, **kwargs)  # type: ignore[arg-type]
 
         monkeypatch.setattr(ConversationCapture, "record_turn", race_evidence)
+    elif operation == "answer":
+        original_answer_evidence = ClarificationCoordinator.answer_evidence
+
+        def race_answer(self, session_id: str, **kwargs: object):
+            change_membership()
+            return original_answer_evidence(self, session_id, **kwargs)
+
+        monkeypatch.setattr(ClarificationCoordinator, "answer_evidence", race_answer)
     else:
         original_ledger_bytes = runtime.intent_proposals.bytes
 
@@ -2641,11 +3094,12 @@ async def test_production_clarification_lifecycle_preserves_evidence_and_exact_c
             "confirmed_node_ids": ["intent:local-export", "requirement:csv-export"],
         },
     )
+    request = "Add report sharing"
     envelope, classification = _preflight_inputs(
         runtime,
         classification=TaskClassification.NEW_OR_AMBIGUOUS,
-        conversation_ref="codex:clarification-lifecycle",
-        request="Add report sharing",
+        conversation_ref=codex_conversation_ref("codex:clarification-lifecycle", "turn-1", request),
+        request=request,
         questions=("Who may share reports?",),
     )
     preflight = await server.call_tool(
@@ -2671,15 +3125,21 @@ async def test_production_clarification_lifecycle_preserves_evidence_and_exact_c
         },
     )
     session_id = opened.structured_content["session"]["id"]
+    answer_route = AdvisoryPromptRouter(runtime).route(
+        PromptEvent(
+            session_id="codex:clarification-lifecycle",
+            turn_id="turn-2",
+            repository=str(project),
+            actor="local",
+            prompt=answer_text,
+            created_at=base + timedelta(microseconds=5),
+        )
+    )
+    assert answer_route.action == "answer_clarification"
+    assert answer_route.arguments["session_id"] == session_id
     answered = await server.call_tool(
         "intent_clarification_answer",
-        {
-            "session_id": session_id,
-            "question_id": "audience",
-            "answer": answer_text,
-            "actor": "local",
-            "answered_at": (base + timedelta(microseconds=5)).isoformat().replace("+00:00", "Z"),
-        },
+        dict(answer_route.arguments),
     )
     session = runtime.intent_proposals.session(session_id)
     assert tuple(item.author for item in session.questions) == ("agent:codex",)
@@ -3252,6 +3712,23 @@ async def test_production_port_proposes_shows_and_activates_without_propose_time
             {
                 "envelope": {"unknown": "PRIVATE-UNKNOWN"},
                 "submission": {},
+            },
+        ),
+        (
+            "intent_advisory_preflight",
+            {
+                **_valid_raw_workflow_arguments("intent_advisory_preflight"),
+                "request": "PRIVATE-RAW-HUMAN-PROMPT",
+            },
+        ),
+        (
+            "intent_clarification_answer",
+            {
+                **_valid_raw_workflow_arguments("intent_clarification_answer"),
+                "answer": "PRIVATE-RAW-HUMAN-ANSWER",
+                "actor": "PRIVATE-CALLER-ACTOR",
+                "answered_at": "2026-08-26T12:00:05Z",
+                "acl": ["PRIVATE-CALLER-ACL"],
             },
         ),
         (

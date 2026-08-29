@@ -24,6 +24,7 @@ from intent_engineering.integrations.agent_host.advisory import (
     parse_codex_prompt_event,
     parse_prompt_event,
 )
+from intent_engineering.intent_workflow.conversation import ConversationCapture
 
 NOW = datetime(2026, 8, 28, 12, 0, tzinfo=UTC)
 OFFER = (
@@ -118,7 +119,17 @@ def test_initialized_repository_routes_once_to_public_preflight(tmp_path: Path) 
 
     assert route.action == "classify"
     assert route.mcp_tool == "intent_advisory_preflight"
-    assert route.arguments == {"conversation_ref": TURN_7_CONVERSATION_REF}
+    assert route.arguments == {
+        "conversation_ref": TURN_7_CONVERSATION_REF,
+        "request_evidence_ref": runtime.evidence_store.ledger("conversation:codex")[0].evidence.id,
+    }
+    captured = runtime.evidence_store.ledger("conversation:codex")
+    assert len(captured) == 1
+    assert captured[0].predecessor_id is None
+    assert captured[0].evidence.external_object_id == TURN_7_CONVERSATION_REF
+    assert captured[0].evidence.source_locator == TURN_7_CONVERSATION_REF
+    assert captured[0].evidence.author == "local"
+    assert captured[0].evidence.payload == {"role": "human", "content": event.prompt}
     assert "token" not in json.dumps(route.model_dump(mode="json")).lower()
 
 
@@ -128,13 +139,17 @@ def test_same_host_turn_reuses_ref_while_distinct_turns_do_not(tmp_path: Path) -
     router = AdvisoryPromptRouter(_ready_runtime(project))
 
     first = router.route(_event(project))
+    after_first = _durable_bytes(project)
     retry = router.route(_event(project))
-    altered_same_turn = router.route(_event(project, prompt="Add team export"))
+    assert _durable_bytes(project) == after_first
+    with pytest.raises(AdvisoryPromptError):
+        router.route(_event(project, prompt="Add team export"))
+    assert _durable_bytes(project) == after_first
     identical_next_turn = router.route(_event(project, turn_id="turn-8"))
     changed_next_turn = router.route(_event(project, prompt="Add team export", turn_id="turn-9"))
 
     assert first.arguments["conversation_ref"] == retry.arguments["conversation_ref"]
-    assert altered_same_turn.arguments["conversation_ref"] != first.arguments["conversation_ref"]
+    assert first.arguments["request_evidence_ref"] == retry.arguments["request_evidence_ref"]
     assert identical_next_turn.arguments["conversation_ref"] != first.arguments["conversation_ref"]
     assert changed_next_turn.arguments["conversation_ref"] not in {
         first.arguments["conversation_ref"],
@@ -143,8 +158,16 @@ def test_same_host_turn_reuses_ref_while_distinct_turns_do_not(tmp_path: Path) -
     assert getattr(advisory_module, "CODEX_CONVERSATION_REF_BYTES", None) == 210
     assert tuple(
         len(route.arguments["conversation_ref"].encode("utf-8"))
-        for route in (first, retry, altered_same_turn, identical_next_turn, changed_next_turn)
-    ) == (210, 210, 210, 210, 210)
+        for route in (first, retry, identical_next_turn, changed_next_turn)
+    ) == (210, 210, 210, 210)
+    assert tuple(
+        item.evidence.payload["content"]
+        for item in router._runtime.evidence_store.ledger("conversation:codex")
+    ) == (
+        "Add team sharing",
+        "Add team sharing",
+        "Add team export",
+    )
 
 
 def test_turn_ref_is_bounded_and_delimiter_safe_without_raw_host_identity(
@@ -295,12 +318,15 @@ def test_active_clarification_answer_routes_without_reclassification(
 
     assert route.action == "answer_clarification"
     assert route.mcp_tool == "intent_clarification_answer"
+    evidence = runtime.evidence_store.ledger("conversation:codex")
+    assert len(evidence) == 1
+    answer_ref = evidence[0].evidence.id
+    assert evidence[0].evidence.external_object_id != Session.conversation_ref
+    assert evidence[0].evidence.payload == {"role": "human", "content": answer.prompt}
     assert route.arguments == {
         "session_id": Session.id,
         "question_id": "audience",
-        "answer": answer.prompt,
-        "actor": "local",
-        "answered_at": "2026-08-28T12:00:00Z",
+        "answer_evidence_ref": answer_ref,
     }
 
 
@@ -597,6 +623,36 @@ def test_router_fixed_failure_and_cancellation_tracebacks_drop_prompt(
     with pytest.raises(_CancellationSignal) as cancelled:
         AdvisoryPromptRouter(runtime).route(event)
     assert cancelled.value is signal
+    assert marker not in _repository_traceback_values(cancelled.value)
+
+
+def test_hook_capture_cancellation_rolls_back_and_scrubs_exact_prompt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    runtime = _ready_runtime(project)
+    marker = "PRIVATE-CANCELLED-HOOK-PROMPT-8198"
+    event = _event(project, prompt=marker)
+    before = _durable_bytes(project)
+    original = ConversationCapture.record_turn
+    signal = _CancellationSignal()
+
+    def capture_then_cancel(self: ConversationCapture, **kwargs: object):
+        original(self, **kwargs)  # type: ignore[arg-type]
+        raise signal
+
+    monkeypatch.setattr(ConversationCapture, "record_turn", capture_then_cancel)
+    with pytest.raises(_CancellationSignal) as cancelled:
+        AdvisoryPromptRouter(runtime).route(event)
+
+    assert cancelled.value is signal
+    after = _durable_bytes(project)
+    assert {name: content for name, content in after.items() if not name.endswith(".lock")} == {
+        name: content for name, content in before.items() if not name.endswith(".lock")
+    }
+    assert tuple(runtime.evidence_store.ledger("conversation:codex")) == ()
     assert marker not in _repository_traceback_values(cancelled.value)
 
 

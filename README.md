@@ -24,10 +24,16 @@ same graph model used for a project.
 Requires Python 3.12 or newer.
 
 ```bash
-python -m pip install intent-engineering
-codex plugin marketplace add .
+git clone https://github.com/raviasha/Intent_Engineer.git /absolute/path/to/Intent_Engineer
+python -m pip install /absolute/path/to/Intent_Engineer
+codex plugin marketplace add /absolute/path/to/Intent_Engineer
 codex plugin add intent-advisor@intent-engineering-local
+cd /absolute/path/to/target-repository
 ```
+
+Wheel-only installs such as `python -m pip install intent-engineering` provide the CLI and MCP
+server, but not the repository-shipped plugin marketplace or advisor assets. Use the source
+checkout sequence above when installing the Codex plugin.
 
 Restart the ChatGPT desktop app and start a new task rooted in the target repository. Codex
 launches the plugin-owned MCP server from `plugins/intent-advisor/.mcp.json`; do not start an
@@ -67,9 +73,11 @@ intentionally omits `cwd`: on a local Codex host, `--project .` binds to the act
 working directory. A remote executor must explicitly reproduce or configure that repository
 working directory; it must not assume `.` refers to the user's checkout.
 
-The bundle automatically offers onboarding when no approved baseline exists. After approval it
-asks for `intent_context`, then routes the agent's bounded classification draft through token-free
-`intent_advisory_preflight`.
+The bundle automatically offers onboarding when no approved baseline exists. After approval the
+hook persists the exact human prompt as attributed local evidence, supplies only its opaque
+conversation and evidence references, and routes the agent's bounded classification draft through
+token-free `intent_advisory_preflight`. Raw human prompt and answer text never crosses that MCP
+wire boundary.
 
 The advisory classifications are `no_semantic_impact`, `aligned`, `new_or_ambiguous`, and
 `conflicting`. Continue normal work for the first two. The plugin never receives a mutation

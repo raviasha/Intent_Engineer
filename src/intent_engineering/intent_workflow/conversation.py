@@ -8,7 +8,7 @@ import re
 from datetime import UTC, datetime
 from typing import Literal, cast
 
-from intent_engineering.core.models import EvidenceRecord, JsonValue
+from intent_engineering.core.models import EvidenceIngestion, EvidenceRecord, JsonValue
 from intent_engineering.storage.jsonl.evidence_store import JsonlEvidenceStore
 
 _CONTROL = re.compile(r"[\x00-\x1f\x7f]")
@@ -133,6 +133,136 @@ def _raise_signal(signal: BaseException) -> None:
     raise signal.with_traceback(None)
 
 
+def _turn_record(
+    *,
+    conversation_ref: str,
+    role: Literal["human", "agent"],
+    author: str,
+    content: JsonValue,
+    captured_at: datetime,
+    acl: tuple[str, ...],
+) -> EvidenceRecord:
+    if role not in {"human", "agent"}:
+        raise ValueError("invalid conversation role")
+    locator = _identity(conversation_ref)
+    principal = _identity(author)
+    observed_at = _utc(captured_at)
+    if (
+        type(acl) is not tuple
+        or not acl
+        or len(acl) > _MAX_ACL_ENTRIES
+        or any(type(item) is not str for item in acl)
+    ):
+        raise ValueError("invalid conversation ACL")
+    normalized_acl = tuple(sorted(_identity(item) for item in acl))
+    if len(normalized_acl) != len(set(normalized_acl)):
+        raise ValueError("invalid conversation ACL")
+    normalized_content = _normalize_json(content)
+    encoded_content = _canonical_json(normalized_content)
+    if len(encoded_content) > _MAX_CONTENT_BYTES:
+        raise ValueError("conversation content exceeds maximum size")
+    content_digest = hashlib.sha256(encoded_content).hexdigest()
+    version_material = {
+        "acl": list(normalized_acl),
+        "author": principal,
+        "captured_at": observed_at.isoformat().replace("+00:00", "Z"),
+        "content_hash": f"sha256:{content_digest}",
+        "conversation_ref": locator,
+        "role": role,
+    }
+    version = f"sha256:{hashlib.sha256(_canonical_json(version_material)).hexdigest()}"
+    return EvidenceRecord(
+        id=f"evidence:conversation:{version.removeprefix('sha256:')}",
+        connector_type="conversation",
+        external_object_id=locator,
+        external_version=version,
+        author=principal,
+        observed_at=observed_at,
+        source_locator=locator,
+        content_hash=f"sha256:{content_digest}",
+        payload={"role": role, "content": normalized_content},
+        acl=normalized_acl,
+    )
+
+
+def validate_conversation_record(
+    record: EvidenceRecord,
+    *,
+    conversation_ref: str,
+    role: Literal["human", "agent"],
+    author: str,
+    acl: tuple[str, ...],
+) -> JsonValue:
+    """Authenticate every deterministic field of one persisted conversation turn."""
+    if type(record) is not EvidenceRecord:
+        raise ValueError("invalid conversation evidence")
+    payload = record.model_dump(mode="json").get("payload")
+    if type(payload) is not dict or set(payload) != {"role", "content"}:
+        raise ValueError("invalid conversation evidence")
+    content = cast(dict[str, JsonValue], payload)["content"]
+    expected = _turn_record(
+        conversation_ref=conversation_ref,
+        role=role,
+        author=author,
+        content=content,
+        captured_at=record.observed_at,
+        acl=acl,
+    )
+    offset = record.observed_at.utcoffset()
+    if offset is None or offset.total_seconds() != 0 or record != expected:
+        raise ValueError("invalid conversation evidence")
+    return content
+
+
+def validate_conversation_ingestion(
+    records: tuple[EvidenceRecord, ...],
+    ingestions: tuple[EvidenceIngestion, ...],
+    *,
+    evidence_ref: str,
+    conversation_ref: str | None,
+    author: str,
+    acl: tuple[str, ...],
+    connector_id: str,
+) -> tuple[EvidenceRecord, str]:
+    """Resolve one exact current human turn from its authenticated connector ingestion."""
+    selected = tuple(
+        item
+        for item in ingestions
+        if item.connector_id == connector_id and item.evidence.id == evidence_ref
+    )
+    associations = tuple(item for item in ingestions if item.evidence.id == evidence_ref)
+    if len(selected) != 1 or associations != selected:
+        raise ValueError("invalid conversation evidence")
+    ingestion = selected[0]
+    record = ingestion.evidence
+    indexed = tuple(item for item in records if item.id == evidence_ref)
+    locator = record.external_object_id if conversation_ref is None else conversation_ref
+    content = validate_conversation_record(
+        record,
+        conversation_ref=locator,
+        role="human",
+        author=author,
+        acl=acl,
+    )
+    chain = tuple(
+        item
+        for item in ingestions
+        if item.connector_id == connector_id
+        and item.evidence.connector_type == "conversation"
+        and item.evidence.external_object_id == locator
+    )
+    human_versions = tuple(item for item in chain if item.evidence.payload.get("role") == "human")
+    if (
+        len(indexed) != 1
+        or indexed[0] != record
+        or type(content) is not str
+        or ingestion.predecessor_id is not None
+        or human_versions != selected
+    ):
+        raise ValueError("invalid conversation evidence")
+    return record, content
+
+
 class ConversationCapture:
     """Record exact human and agent turns through the production evidence ledger."""
 
@@ -155,46 +285,13 @@ class ConversationCapture:
         captured_at: datetime,
         acl: tuple[str, ...],
     ) -> EvidenceRecord:
-        if role not in {"human", "agent"}:
-            raise ValueError("invalid conversation role")
-        locator = _identity(conversation_ref)
-        principal = _identity(author)
-        observed_at = _utc(captured_at)
-        if (
-            type(acl) is not tuple
-            or not acl
-            or len(acl) > _MAX_ACL_ENTRIES
-            or any(type(item) is not str for item in acl)
-        ):
-            raise ValueError("invalid conversation ACL")
-        normalized_acl = tuple(sorted(_identity(item) for item in acl))
-        if len(normalized_acl) != len(set(normalized_acl)):
-            raise ValueError("invalid conversation ACL")
-        normalized_content = _normalize_json(content)
-        encoded_content = _canonical_json(normalized_content)
-        if len(encoded_content) > _MAX_CONTENT_BYTES:
-            raise ValueError("conversation content exceeds maximum size")
-        content_digest = hashlib.sha256(encoded_content).hexdigest()
-        version_material = {
-            "acl": list(normalized_acl),
-            "author": principal,
-            "captured_at": observed_at.isoformat().replace("+00:00", "Z"),
-            "content_hash": f"sha256:{content_digest}",
-            "conversation_ref": locator,
-            "role": role,
-        }
-        version = f"sha256:{hashlib.sha256(_canonical_json(version_material)).hexdigest()}"
-        record = EvidenceRecord(
-            id=f"evidence:conversation:{version.removeprefix('sha256:')}",
-            connector_type="conversation",
-            external_object_id=locator,
-            external_version=version,
-            author=principal,
-            observed_at=observed_at,
-            source_locator=locator,
-            content_hash=f"sha256:{content_digest}",
-            payload={"role": role, "content": normalized_content},
-            acl=normalized_acl,
+        record = _turn_record(
+            conversation_ref=conversation_ref,
+            role=role,
+            author=author,
+            content=content,
+            captured_at=captured_at,
+            acl=acl,
         )
         self._store.associate(self.connector_id, record)
         return record
@@ -249,5 +346,7 @@ __all__ = [
     "ConversationCaptureError",
     "codex_conversation_binding",
     "codex_conversation_ref",
+    "validate_conversation_ingestion",
+    "validate_conversation_record",
     "verify_codex_conversation_ref",
 ]

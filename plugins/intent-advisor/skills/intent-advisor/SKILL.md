@@ -16,18 +16,20 @@ request, display, persist, or infer a capability token. Do not weaken or work ar
   `intent onboard --project . --prd <confirmed path> --yes` and follow its proposal/confirmation
   flow. A decline leaves the repository unchanged. A call without `--yes` is only the offer/no-op
   diagnostic and must not be treated as an advancing onboarding command.
-- For `action=classify`, first call public `intent_context` with the current human request for
-  bounded repository context. Form an agent classification draft containing classification, basis,
-  relevant node and evidence references, semantic effects, uncertainties, questions, conflicts,
-  and requested scope. Then call the named public `intent_advisory_preflight` MCP tool with the
-  route's `conversation_ref`, the current human request, and that draft. Never call the
+- For `action=classify`, use public read-only Intent tools as needed for bounded repository context.
+  Form an agent classification draft containing classification, basis, relevant node and evidence
+  references, semantic effects, uncertainties, questions, conflicts, and requested scope. Then
+  call the named public `intent_advisory_preflight` MCP tool with only the route's
+  `conversation_ref`, `request_evidence_ref`, and that draft. The hook has already captured the
+  exact human prompt; never send raw prompt text or caller-supplied attribution through MCP. Never call the
   authorization-producing preflight tool for this advisory flow. Ask every returned clarification
   question before implementation. Use only the persisted clarification session returned by the
   advisory result; show exact graph proposals and obtain human confirmation before any graph change.
   Use exactly the established public classifications: `no_semantic_impact`, `aligned`,
   `new_or_ambiguous`, and `conflicting`.
 - For `action=answer_clarification`, call the named public `intent_clarification_answer` MCP tool
-  with the supplied session metadata and the current human prompt as `answer`.
+  with only the supplied `session_id`, `question_id`, and `answer_evidence_ref`. The hook has already
+  captured the answer; never send raw answer text, actor, timestamp, or ACL through MCP.
   Do not classify the answer again. Continue with `intent_clarification_propose` only when the
   returned session state permits that exact next step.
 - For `action=review_clarification_proposal`, first call the token-free public

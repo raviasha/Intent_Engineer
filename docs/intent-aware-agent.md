@@ -7,16 +7,20 @@ agent, or provider permissions.
 
 ## 1. Install and onboard an existing repository
 
-Python 3.12 or newer is required. From the repository root:
+Python 3.12 or newer is required. Install from an explicit Intent Engineering source checkout,
+then change to the repository you want to govern:
 
 ```bash
-python -m pip install intent-engineering
-codex plugin marketplace add .
+git clone https://github.com/raviasha/Intent_Engineer.git /absolute/path/to/Intent_Engineer
+python -m pip install /absolute/path/to/Intent_Engineer
+codex plugin marketplace add /absolute/path/to/Intent_Engineer
 codex plugin add intent-advisor@intent-engineering-local
+cd /absolute/path/to/target-repository
 ```
 
-For a source checkout, use `python -m pip install -e .` instead. Restart the ChatGPT desktop app and
-start a new task rooted in the target repository. Codex launches the plugin-owned MCP server from
+Wheel-only installs such as `python -m pip install intent-engineering` provide the CLI and MCP
+server, but not the repository-shipped plugin marketplace or advisor assets. Restart the ChatGPT
+desktop app and start a new task rooted in the target repository. Codex launches the plugin-owned MCP server from
 the bundle configuration; do not start an additional process for it. First obtain explicit human consent
 and confirm the exact PRD path; only then run the advancing `intent onboard ... --yes` command
 below. A decline leaves the repository byte-unchanged and disables intent-aware classification only
@@ -70,10 +74,12 @@ Clients other than Codex that launch and connect stdio themselves may run
 `intent mcp --project .`; Codex users rely on the plugin-owned server configuration instead.
 
 For every new human prompt, the hook performs a read-only onboarding check. With an approved
-baseline it supplies an opaque conversation reference and instructs the agent to call
-`intent_context` before submitting its bounded draft to token-free
-`intent_advisory_preflight`. The live held runtime, not caller fields, resolves repository, graph,
-actor, principals, and persistence authority.
+baseline it captures that exact prompt as human-authored evidence and supplies opaque conversation
+and request-evidence references before the agent submits its bounded draft to token-free
+`intent_advisory_preflight`. The agent may use public read-only Intent tools for bounded repository
+context, but never sends raw prompt or answer text through MCP. The live held runtime and captured
+record, not caller fields, resolve repository, graph, text, time, actor, ACL, principals, and
+persistence authority.
 
 - `no_semantic_impact`: continue without graph ceremony.
 - `aligned`: continue with the relevant intent and requirement context.
@@ -102,8 +108,8 @@ The CLI diagnostic does not classify the request and does not mint a capability;
 ## 4. Clarification and review
 
 For `new_or_ambiguous`, the advisory preflight opens a persisted clarification session. Each later
-human answer is routed directly to `intent_clarification_answer`; it is not recursively classified
-as an unrelated requirement. Once required answers exist, the agent may call
+human answer is first captured by the hook and routed to `intent_clarification_answer` only by its
+evidence reference; it is not recursively classified as an unrelated requirement. Once required answers exist, the agent may call
 `intent_clarification_propose`, show the exact graph proposal, and call
 `intent_clarification_confirm` only after human confirmation. These public tools delegate to the
 existing `ClarificationCoordinator` and proposal-confirmation service, preserving author, ACL,

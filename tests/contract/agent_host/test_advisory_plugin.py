@@ -255,7 +255,8 @@ def test_real_hook_routes_ready_prompt_to_preflight_without_secret_or_echo(
 
     context = _additional_context(completed)
     assert "intent_advisory_preflight" in context
-    assert "intent_context" in context
+    assert "request_evidence_ref=" in context
+    assert "current human request" not in context
     expected_ref = codex_conversation_ref("codex:thread-3", "turn-7", marker)
     assert f'conversation_ref="{expected_ref}"' in context
     lowered = completed.stdout.decode().casefold()
@@ -263,7 +264,16 @@ def test_real_hook_routes_ready_prompt_to_preflight_without_secret_or_echo(
     assert "authorization" not in lowered
     assert "capability" not in lowered
     assert "token" not in lowered
-    assert _durable_bytes(project) == before
+    after = _durable_bytes(project)
+    assert after.keys() - before.keys() == {".config.yaml.lock", "evidence/evidence.jsonl"}
+    assert "evidence/evidence.jsonl" not in before
+    assert after["evidence/evidence.jsonl"]
+    for path in before:
+        assert after[path] == before[path]
+    captured = load_runtime(project).evidence_store.ledger("conversation:codex")
+    assert len(captured) == 1
+    assert captured[0].evidence.external_object_id == expected_ref
+    assert captured[0].evidence.payload == {"role": "human", "content": marker}
 
 
 def test_real_hook_uses_retry_stable_turn_specific_ref_without_host_id_leakage(
@@ -294,19 +304,23 @@ def test_real_hook_uses_retry_stable_turn_specific_ref_without_host_id_leakage(
     first_context = _additional_context(
         _run_hook(project, json.dumps(first, separators=(",", ":")).encode())
     )
+    after_first = _durable_bytes(project)
     retry_context = _additional_context(
         _run_hook(project, json.dumps(first, separators=(",", ":")).encode())
     )
+    assert _durable_bytes(project) == after_first
     next_context = _additional_context(
         _run_hook(project, json.dumps(next_turn, separators=(",", ":")).encode())
     )
+    after_next = _durable_bytes(project)
     altered_context = _additional_context(
         _run_hook(project, json.dumps(altered_same_turn, separators=(",", ":")).encode())
     )
 
     assert first_context == retry_context
     assert first_context != next_context
-    assert first_context != altered_context
+    assert altered_context == FALLBACK
+    assert _durable_bytes(project) == after_next
     combined = first_context + retry_context + next_context + altered_context
     assert session_marker not in combined
     assert turn_marker not in combined
@@ -585,7 +599,10 @@ def test_skill_routes_clarifications_and_states_advisory_mcp_failure_boundary() 
     assert "non_requirement" not in skill.casefold()
     assert "ask the user for the PRD path" in skill
     assert "intent onboard --project . --prd <confirmed path> --yes" in skill
-    assert "intent_context" in skill
+    assert "request_evidence_ref" in skill
+    assert "answer_evidence_ref" in skill
+    assert "current human request" not in skill
+    assert "current human prompt as `answer`" not in skill
     assert "intent_advisory_preflight" in skill
     assert "intent_preflight" not in skill.replace("intent_advisory_preflight", "")
     assert "MCP tools are unavailable" in skill

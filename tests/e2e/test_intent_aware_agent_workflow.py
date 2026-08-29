@@ -43,6 +43,7 @@ from tests.helpers.cli import run_intent
 ROOT = Path(__file__).resolve().parents[2]
 PLUGIN_HOOK = ROOT / "plugins/intent-advisor/scripts/prompt-hook"
 _CONVERSATION_REF = re.compile(r'conversation_ref="([^"]+)"')
+_REQUEST_EVIDENCE_REF = re.compile(r'request_evidence_ref="([^"]+)"')
 
 
 @pytest.fixture
@@ -109,11 +110,15 @@ def _conversation_ref(context: str) -> str:
     return matched.group(1)
 
 
-def _clarification_answer_arguments(context: str, answer: str) -> dict[str, object]:
-    encoded = context.partition("with ")[2].partition(" and the current")[0]
-    arguments = cast(dict[str, object], json.loads(encoded))
-    arguments["answer"] = answer
-    return arguments
+def _request_evidence_ref(context: str) -> str:
+    matched = _REQUEST_EVIDENCE_REF.search(context)
+    assert matched is not None
+    return matched.group(1)
+
+
+def _clarification_answer_arguments(context: str) -> dict[str, object]:
+    encoded = context.partition("with ")[2].partition(". The hook")[0]
+    return cast(dict[str, object], json.loads(encoded))
 
 
 def test_guided_onboarding_plugin_and_assurance_share_one_project(
@@ -270,18 +275,11 @@ def test_guided_onboarding_plugin_and_assurance_share_one_project(
     assert "action=classify" in aligned_route
     assert "intent_advisory_preflight" in aligned_route
 
-    context = call_tool(
-        "intent_context",
-        {"task": "Implement CSV export", "format": "json"},
-    )
-    assert cast(list[dict[str, object]], context["relevant_requirements"])[0]["id"] == (
-        "requirement:csv-export"
-    )
     aligned = call_tool(
         "intent_advisory_preflight",
         {
             "conversation_ref": _conversation_ref(aligned_route),
-            "request": "Implement CSV export",
+            "request_evidence_ref": _request_evidence_ref(aligned_route),
             "draft": {
                 "classification": "aligned",
                 "basis": "Matches the confirmed CSV export requirement",
@@ -320,11 +318,12 @@ def test_guided_onboarding_plugin_and_assurance_share_one_project(
     preflight = PreflightResult.model_validate_json(json.dumps(aligned))
     assert envelope.id == preflight.task_id
     post_issuer = AuthorizationIssuer()
+    post_issued_at = max(harness.tick(), human_request.observed_at)
     post_token = post_issuer.issue(
         envelope,
         preflight,
         graph_content=(project / ".intent/graph.yaml").read_bytes(),
-        now=harness.tick(),
+        now=post_issued_at,
     )
 
     base_revision = harness.git("rev-parse", "HEAD")
@@ -368,9 +367,10 @@ def test_guided_onboarding_plugin_and_assurance_share_one_project(
     assert test_credential_name not in os.environ
     captured_outputs.extend((tested.stdout, tested.stderr))
     harness.git("add", "src/export.py", "tests/test_export.py")
+    implementation_at = post_issued_at + timedelta(seconds=1)
     implementation_revision = harness.git_commit(
         "Implement confirmed CSV export",
-        harness.tick(seconds=1),
+        implementation_at,
     )
 
     git_connector = GitConnector(project, repository_id=runtime.config.project_id)
@@ -391,9 +391,12 @@ def test_guided_onboarding_plugin_and_assurance_share_one_project(
             implementation_evidence,
         )
     captured_outputs.append(implementation_evidence.model_dump(mode="json"))
-    test_record = harness.test_evidence(implementation_revision, harness.tick())
+    test_record = harness.test_evidence(
+        implementation_revision,
+        post_issued_at + timedelta(seconds=2),
+    )
     runtime.evidence_store.associate("test-results", test_record)
-    completed_at = harness.tick()
+    completed_at = post_issued_at + timedelta(seconds=3)
     verification = post_issuer.verify(
         post_token,
         actor=actor,
@@ -406,6 +409,12 @@ def test_guided_onboarding_plugin_and_assurance_share_one_project(
         request_digest=("sha256:" + hashlib.sha256(envelope.request.encode("utf-8")).hexdigest()),
     )
     assert verification.authorized, verification
+    harness_now = harness.tick()
+    if harness_now < completed_at:
+        harness.tick(
+            seconds=int((completed_at - harness_now).total_seconds()) + 1,
+            microseconds=0,
+        )
     post_task = harness.post_task_service(post_issuer).evaluate(
         PostTaskSubmission(
             repository_id=runtime.config.project_id,
@@ -442,15 +451,11 @@ def test_guided_onboarding_plugin_and_assurance_share_one_project(
         turn_id="turn-3",
     )
     transcript.extend(("human: Add team sharing", ambiguous_hook_stdout, ambiguous_hook_stderr))
-    call_tool(
-        "intent_context",
-        {"task": "Add team sharing", "format": "json"},
-    )
     ambiguous = call_tool(
         "intent_advisory_preflight",
         {
             "conversation_ref": _conversation_ref(ambiguous_route),
-            "request": "Add team sharing",
+            "request_evidence_ref": _request_evidence_ref(ambiguous_route),
             "draft": {
                 "classification": "new_or_ambiguous",
                 "basis": "Active-agent classification grounded in the current intent graph",
@@ -484,7 +489,7 @@ def test_guided_onboarding_plugin_and_assurance_share_one_project(
         assert "action=answer_clarification" in answer_route
         answered = call_tool(
             "intent_clarification_answer",
-            _clarification_answer_arguments(answer_route, answer),
+            _clarification_answer_arguments(answer_route),
         )
         assert answered["status"] == "open"
 

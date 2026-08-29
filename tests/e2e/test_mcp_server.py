@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import json
+import re
 import sys
 import tempfile
+from datetime import UTC, datetime
 from pathlib import Path
 
 import anyio
@@ -12,8 +15,9 @@ from mcp import MCPError
 from mcp.client.session import ClientSession
 from mcp.client.stdio import StdioServerParameters, stdio_client
 
+from intent_engineering.cli.runtime import load_runtime
+from intent_engineering.core.models import Graph, Node, NodeType
 from intent_engineering.core.policy.project import initialize_project
-from intent_engineering.integrations.agent_host.advisory import codex_conversation_ref
 
 pytestmark = pytest.mark.anyio
 
@@ -39,7 +43,56 @@ async def test_intent_mcp_stdio_is_protocol_clean_and_read_only(tmp_path: Path) 
     project = tmp_path / "project"
     project.mkdir()
     initialize_project(project)
+    runtime = load_runtime(project)
+    now = datetime(2026, 8, 29, 12, 0, tzinfo=UTC)
+    runtime.graph_store.initialize(
+        Graph(
+            id="graph:mcp-stdio",
+            version=1,
+            name="MCP stdio",
+            nodes=(
+                Node(
+                    id="intent:mcp-stdio",
+                    type=NodeType.PRODUCT_INTENT,
+                    label="Keep the public MCP transport clean",
+                    status="active",
+                    created_by="local",
+                    created_at=now,
+                    last_modified_by="local",
+                    last_modified_at=now,
+                ),
+            ),
+            edges=(),
+        )
+    )
     executable = Path(sys.executable).with_name("intent")
+    prompt = "Format README\nwithout changing semantics"
+    hook = await anyio.run_process(
+        [str(executable), "agent-prompt-hook"],
+        cwd=project,
+        env={"LANG": "C.UTF-8", "LC_ALL": "C.UTF-8", "PATH": "/usr/bin:/bin"},
+        input=json.dumps(
+            {
+                "session_id": "codex:stdio-advisory",
+                "transcript_path": None,
+                "cwd": str(project),
+                "hook_event_name": "UserPromptSubmit",
+                "model": "gpt-5.6-sol",
+                "turn_id": "turn-1",
+                "permission_mode": "default",
+                "prompt": prompt,
+            },
+            separators=(",", ":"),
+        ).encode(),
+        check=False,
+    )
+    assert hook.returncode == 0
+    assert hook.stderr == b""
+    hook_context = json.loads(hook.stdout)["hookSpecificOutput"]["additionalContext"]
+    conversation_match = re.search(r'conversation_ref="([^"]+)"', hook_context)
+    evidence_match = re.search(r'request_evidence_ref="([^"]+)"', hook_context)
+    assert conversation_match is not None
+    assert evidence_match is not None
     parameters = StdioServerParameters(
         command=str(executable),
         args=["mcp", "--project", str(project)],
@@ -76,12 +129,8 @@ async def test_intent_mcp_stdio_is_protocol_clean_and_read_only(tmp_path: Path) 
             advisory = await client.call_tool(
                 "intent_advisory_preflight",
                 {
-                    "conversation_ref": codex_conversation_ref(
-                        "codex:stdio-advisory",
-                        "turn-1",
-                        "Format README\nwithout changing semantics",
-                    ),
-                    "request": "Format README\nwithout changing semantics",
+                    "conversation_ref": conversation_match.group(1),
+                    "request_evidence_ref": evidence_match.group(1),
                     "draft": {
                         "classification": "no_semantic_impact",
                         "basis": "Formatting only",

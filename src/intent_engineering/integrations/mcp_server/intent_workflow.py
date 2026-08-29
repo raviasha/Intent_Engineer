@@ -40,6 +40,8 @@ from intent_engineering.intent_workflow.conversation import (
     CODEX_CONVERSATION_REF_BYTES,
     ConversationCapture,
     codex_conversation_binding,
+    validate_conversation_ingestion,
+    validate_conversation_record,
     verify_codex_conversation_ref,
 )
 from intent_engineering.intent_workflow.models import (
@@ -126,9 +128,9 @@ _PROPOSAL_ID = r"^proposal:sha256:[0-9a-f]{64}$"
 _DIGEST = r"^sha256:[0-9a-f]{64}$"
 _TASK_ID = r"^task:sha256:[0-9a-f]{64}$"
 _CLARIFICATION_ID = r"^clarification:sha256:[0-9a-f]{64}$"
+_CONVERSATION_EVIDENCE_ID = r"^evidence:conversation:[0-9a-f]{64}$"
 _CODEX_CONVERSATION_REF = r"^codex-prompt:v1:[0-9a-f]{64}:[0-9a-f]{64}:[0-9a-f]{64}$"
 _CONTROL = re.compile(r"[\x00-\x1f\x7f]")
-_PROMPT_CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 _WINDOWS_DEVICE = re.compile(r"^(?:CON|PRN|AUX|NUL|CLOCK\$|COM[1-9]|LPT[1-9])$", re.IGNORECASE)
 type _ProposalIdInput = Annotated[str, Field(pattern=_PROPOSAL_ID)]
 type _DigestInput = Annotated[str, Field(pattern=_DIGEST)]
@@ -646,7 +648,7 @@ class IntentAdvisoryPreflightRequest(_Request):
             pattern=_CODEX_CONVERSATION_REF,
         ),
     ]
-    request: Annotated[str, Field(min_length=1, max_length=16 * 1024)]
+    request_evidence_ref: Annotated[str, Field(pattern=_CONVERSATION_EVIDENCE_ID)]
     draft: AdvisoryClassificationDraft
 
     @field_validator("conversation_ref")
@@ -660,17 +662,10 @@ class IntentAdvisoryPreflightRequest(_Request):
             raise ValueError("invalid workflow request")
         return value
 
-    @field_validator("request")
+    @field_validator("request_evidence_ref")
     @classmethod
-    def require_request(cls, value: str) -> str:
-        if (
-            type(value) is not str
-            or not value
-            or _PROMPT_CONTROL.search(value)
-            or len(value.encode("utf-8")) > 16 * 1024
-        ):
-            raise ValueError("invalid workflow request")
-        return value
+    def require_request_evidence_ref(cls, value: str) -> str:
+        return _bounded_identity(value)
 
     @field_validator("draft")
     @classmethod
@@ -791,31 +786,12 @@ class ClarificationOpenRequest(_Request):
 class ClarificationAnswerRequest(_Request):
     session_id: Annotated[str, Field(pattern=_CLARIFICATION_ID)]
     question_id: Annotated[str, Field(min_length=1, max_length=256)]
-    answer: Annotated[str, Field(min_length=1)]
-    actor: Annotated[str, Field(min_length=1, max_length=256)]
-    answered_at: datetime
+    answer_evidence_ref: Annotated[str, Field(pattern=_CONVERSATION_EVIDENCE_ID)]
 
-    @field_validator("session_id", "question_id", "actor")
+    @field_validator("session_id", "question_id", "answer_evidence_ref")
     @classmethod
     def require_identity(cls, value: str) -> str:
         return _bounded_identity(value)
-
-    @field_validator("answer")
-    @classmethod
-    def require_bounded_answer(cls, value: str) -> str:
-        if type(value) is not str or len(value.encode("utf-8")) > 16 * 1024:
-            raise ValueError("invalid workflow request")
-        return value
-
-    @field_validator("answered_at", mode="before")
-    @classmethod
-    def parse_answered_at(cls, value: object, info: ValidationInfo) -> object:
-        return _workflow_timestamp(value, info)
-
-    @field_validator("answered_at")
-    @classmethod
-    def require_answered_at_utc(cls, value: datetime) -> datetime:
-        return _require_utc(value)
 
 
 class ClarificationProposeRequest(_Request):
@@ -886,7 +862,7 @@ class IntentWorkflowPort(Protocol):
     async def advisory_preflight(
         self,
         conversation_ref: str,
-        request: str,
+        request_evidence_ref: str,
         draft: AdvisoryClassificationDraft,
     ) -> dict[str, object]: ...
 
@@ -913,9 +889,7 @@ class IntentWorkflowPort(Protocol):
         self,
         session_id: str,
         question_id: str,
-        answer: str,
-        actor: str,
-        answered_at: datetime,
+        answer_evidence_ref: str,
     ) -> dict[str, object]: ...
 
     async def clarification_propose(
@@ -977,7 +951,7 @@ def validate_intent_workflow_call(name: str, arguments: dict[str, object]) -> No
             _task_envelope_input(dict.__getitem__(arguments, "envelope"))
             _classification_input(dict.__getitem__(arguments, "submission"))
         elif name == "intent_advisory_preflight":
-            if set(arguments) != {"conversation_ref", "request", "draft"}:
+            if set(arguments) != {"conversation_ref", "request_evidence_ref", "draft"}:
                 raise ValueError("invalid workflow request")
             IntentAdvisoryPreflightRequest.model_validate_json(_canonical_json(arguments))
         elif name == "intent_authorization_verify":
@@ -1009,7 +983,7 @@ def validate_intent_workflow_call(name: str, arguments: dict[str, object]) -> No
             _task_envelope_input(dict.__getitem__(arguments, "envelope"))
             ClarificationOpenRequest.model_validate_json(_canonical_json(arguments))
         elif name == "intent_clarification_answer":
-            expected = {"session_id", "question_id", "answer", "actor", "answered_at"}
+            expected = {"session_id", "question_id", "answer_evidence_ref"}
             if set(arguments) != expected:
                 raise ValueError("invalid workflow request")
             ClarificationAnswerRequest.model_validate_json(_canonical_json(arguments))
@@ -1350,19 +1324,20 @@ class McpIntentWorkflowServices:
     async def advisory_preflight(
         self,
         conversation_ref: str,
-        request: str,
+        request_evidence_ref: str,
         draft: AdvisoryClassificationDraft,
     ) -> dict[str, object]:
         authority_files: dict[str, SecureFile] = {}
         detached_draft: AdvisoryClassificationDraft | None = None
         try:
             validated = IntentAdvisoryPreflightRequest.model_validate(
-                {"conversation_ref": conversation_ref, "request": request, "draft": draft}
+                {
+                    "conversation_ref": conversation_ref,
+                    "request_evidence_ref": request_evidence_ref,
+                    "draft": draft,
+                }
             )
-            conversation_binding = verify_codex_conversation_ref(
-                validated.conversation_ref,
-                validated.request,
-            )
+            conversation_binding = codex_conversation_binding(validated.conversation_ref)
             detached_draft = AdvisoryClassificationDraft.model_validate_json(
                 validated.draft.model_dump_json()
             )
@@ -1410,15 +1385,35 @@ class McpIntentWorkflowServices:
                         not clarification_authority
                         or _connector_membership_digest(self._clarification_connector_directory)
                         == authority_membership_digest
-                    ) and all(
-                        transaction.read_optional(name) == content
-                        for name, content in authority_preimages.items()
+                    ) and (
+                        _principals(self.runtime, config) == policy_principals
+                        and all(
+                            transaction.read_optional(name) == content
+                            for name, content in authority_preimages.items()
+                        )
                     )
 
                 if not authority_matches():
                     raise ValueError("advisory authority changed")
-                graph = self.runtime.graph_store.load()
-                ledger = tuple(self.runtime.evidence_store.ledger("conversation:codex"))
+                graph = parse_graph(transaction.read("graph"))
+                evidence, ingestions, legacy_ids = parse_evidence_lines(
+                    transaction.read_optional("evidence")
+                )
+                if validated.request_evidence_ref in legacy_ids:
+                    raise ValueError("advisory request evidence unavailable")
+                human, human_request = validate_conversation_ingestion(
+                    evidence,
+                    ingestions,
+                    evidence_ref=validated.request_evidence_ref,
+                    conversation_ref=validated.conversation_ref,
+                    author=config.local_actor,
+                    acl=tuple(sorted(policy_principals)),
+                    connector_id="conversation:codex",
+                )
+                verify_codex_conversation_ref(validated.conversation_ref, human_request)
+                ledger = tuple(
+                    item for item in ingestions if item.connector_id == "conversation:codex"
+                )
                 for item in ledger:
                     if item.evidence.payload.get("role") != "human":
                         continue
@@ -1433,52 +1428,44 @@ class McpIntentWorkflowServices:
                         and item.evidence.external_object_id != validated.conversation_ref
                     ):
                         raise ValueError("advisory host turn changed")
-                human_candidates = tuple(
+                envelope = TaskEnvelope(
+                    repository_id=config.project_id,
+                    actor=config.local_actor,
+                    conversation_ref=validated.conversation_ref,
+                    request=human_request,
+                    request_evidence_ref=human.id,
+                    graph_version=graph.version,
+                    created_at=human.observed_at,
+                    requested_scope=detached_draft.requested_scope,
+                )
+                expected_content = self._advisory_content(envelope, detached_draft)
+                agent_candidates = tuple(
                     item
                     for item in ledger
-                    if item.evidence.external_object_id == validated.conversation_ref
-                    and item.evidence.payload.get("role") == "human"
-                    and item.evidence.payload.get("content") == validated.request
+                    if item.predecessor_id == human.id
+                    and item.evidence.external_object_id == validated.conversation_ref
+                    and item.evidence.payload.get("role") == "agent"
                 )
-                envelope: TaskEnvelope | None = None
-                agent_ref = ""
-                for human_entry in human_candidates:
-                    candidate = TaskEnvelope(
-                        repository_id=config.project_id,
-                        actor=human_entry.evidence.author or "",
+                if len(agent_candidates) > 1:
+                    raise ValueError("divergent advisory replay")
+                if agent_candidates:
+                    agent_entry = agent_candidates[0]
+                    agent_content = validate_conversation_record(
+                        agent_entry.evidence,
                         conversation_ref=validated.conversation_ref,
-                        request=validated.request,
-                        request_evidence_ref=human_entry.evidence.id,
-                        graph_version=graph.version,
-                        created_at=human_entry.evidence.observed_at,
-                        requested_scope=detached_draft.requested_scope,
-                    )
-                    expected_content = self._advisory_content(candidate, detached_draft)
-                    matching_agents = tuple(
-                        item
-                        for item in ledger
-                        if item.predecessor_id == human_entry.evidence.id
-                        and item.evidence.external_object_id == validated.conversation_ref
-                        and item.evidence.author == "agent:codex"
-                        and item.evidence.payload.get("role") == "agent"
+                        role="agent",
+                        author="agent:codex",
+                        acl=human.acl,
                     )
                     if (
-                        len(matching_agents) == 1
-                        and human_entry.evidence.acl == tuple(sorted(policy_principals))
-                        and matching_agents[0].evidence.acl == tuple(sorted(policy_principals))
-                        and matching_agents[0].evidence.payload.get("content") is not None
-                        and cast(
-                            dict[str, object],
-                            matching_agents[0].evidence.model_dump(mode="json")["payload"],
-                        ).get("content")
-                        == expected_content
+                        agent_content != expected_content
+                        or agent_entry.sequence
+                        != next(item.sequence for item in ledger if item.evidence.id == human.id)
+                        + 1
                     ):
-                        envelope = candidate
-                        agent_ref = matching_agents[0].evidence.id
-                        break
-                if envelope is None:
-                    if human_candidates:
                         raise ValueError("divergent advisory replay")
+                    agent_ref = agent_entry.evidence.id
+                else:
                     captured_at = self._clock()
                     if (
                         type(captured_at) is not datetime
@@ -1486,32 +1473,17 @@ class McpIntentWorkflowServices:
                         or captured_at.utcoffset() is None
                     ):
                         raise ValueError("invalid advisory clock")
-                    captured_at = captured_at.astimezone(UTC)
-                    human = capture.record_turn(
-                        conversation_ref=validated.conversation_ref,
-                        role="human",
-                        author=config.local_actor,
-                        content=validated.request,
-                        captured_at=captured_at,
-                        acl=tuple(sorted(policy_principals)),
-                    )
-                    envelope = TaskEnvelope(
-                        repository_id=config.project_id,
-                        actor=config.local_actor,
-                        conversation_ref=validated.conversation_ref,
-                        request=validated.request,
-                        request_evidence_ref=human.id,
-                        graph_version=graph.version,
-                        created_at=captured_at,
-                        requested_scope=detached_draft.requested_scope,
+                    captured_at = max(
+                        captured_at.astimezone(UTC),
+                        human.observed_at + timedelta(microseconds=1),
                     )
                     agent = capture.record_turn(
                         conversation_ref=validated.conversation_ref,
                         role="agent",
                         author="agent:codex",
-                        content=self._advisory_content(envelope, detached_draft),
-                        captured_at=captured_at + timedelta(microseconds=1),
-                        acl=tuple(sorted(policy_principals)),
+                        content=expected_content,
+                        captured_at=captured_at,
+                        acl=human.acl,
                     )
                     agent_ref = agent.id
                 submission = self._advisory_submission(envelope, detached_draft, agent_ref)
@@ -1564,7 +1536,7 @@ class McpIntentWorkflowServices:
             error.__context__ = None
             raise
         finally:
-            conversation_ref = request = ""
+            conversation_ref = request_evidence_ref = ""
             draft = cast(AdvisoryClassificationDraft, None)
             detached_draft = None
             self._close_clarification_authority(authority_files)
@@ -1576,6 +1548,8 @@ class McpIntentWorkflowServices:
                 existing_binding = ("", "", "")
             if "payload" in locals():
                 payload = {}
+            if "human_request" in locals():
+                human_request = ""
 
     async def authorization_verify(
         self,
@@ -1846,9 +1820,7 @@ class McpIntentWorkflowServices:
         self,
         session_id: str,
         question_id: str,
-        answer: str,
-        actor: str,
-        answered_at: datetime,
+        answer_evidence_ref: str,
     ) -> dict[str, object]:
         authority_files: dict[str, SecureFile] = {}
         try:
@@ -1856,9 +1828,7 @@ class McpIntentWorkflowServices:
                 {
                     "session_id": session_id,
                     "question_id": question_id,
-                    "answer": answer,
-                    "actor": actor,
-                    "answered_at": answered_at,
+                    "answer_evidence_ref": answer_evidence_ref,
                 }
             )
             (
@@ -1868,20 +1838,16 @@ class McpIntentWorkflowServices:
                 authority_preimages,
                 authority_membership_digest,
             ) = self._clarification_authority()
-            if request.actor != config.local_actor:
-                return self._rejected()
             session = self._clarification_coordinator(
                 config,
                 authority_files,
                 authority_preimages,
                 authority_membership_digest,
-            ).answer(
+            ).answer_evidence(
                 request.session_id,
-                actor=request.actor,
                 question_id=request.question_id,
-                answer=request.answer,
-                answered_at=request.answered_at,
-                acl=tuple(sorted(principals)),
+                answer_evidence_ref=request.answer_evidence_ref,
+                evidence_acl=tuple(sorted(_principals(self.runtime, config))),
                 principals=principals,
             )
             return {
@@ -1897,8 +1863,7 @@ class McpIntentWorkflowServices:
             error.__context__ = None
             raise
         finally:
-            session_id = question_id = answer = actor = ""
-            answered_at = cast(datetime, None)
+            session_id = question_id = answer_evidence_ref = ""
             self._close_clarification_authority(authority_files)
             if "request" in locals():
                 request = cast(ClarificationAnswerRequest, None)
@@ -2276,26 +2241,30 @@ def register_intent_workflow_tools(
                 pattern=_CODEX_CONVERSATION_REF,
             ),
         ],
-        request: Annotated[str, Field(min_length=1, max_length=16 * 1024)],
+        request_evidence_ref: Annotated[str, Field(pattern=_CONVERSATION_EVIDENCE_ID)],
         draft: _AdvisoryDraftInput,
     ) -> dict[str, object]:
         detached_draft: AdvisoryClassificationDraft | None = None
         try:
             checked = IntentAdvisoryPreflightRequest.model_validate(
-                {"conversation_ref": conversation_ref, "request": request, "draft": draft}
+                {
+                    "conversation_ref": conversation_ref,
+                    "request_evidence_ref": request_evidence_ref,
+                    "draft": draft,
+                }
             )
             detached_draft = AdvisoryClassificationDraft.model_validate_json(
                 checked.draft.model_dump_json()
             )
             return await services.advisory_preflight(
                 checked.conversation_ref,
-                checked.request,
+                checked.request_evidence_ref,
                 detached_draft,
             )
         except Exception:  # noqa: BLE001 - one fixed handler boundary
             _fixed_arguments()
         finally:
-            conversation_ref = request = ""
+            conversation_ref = request_evidence_ref = ""
             draft = cast(AdvisoryClassificationDraft, None)
             detached_draft = None
             checked = cast(IntentAdvisoryPreflightRequest, None)
@@ -2401,32 +2370,25 @@ def register_intent_workflow_tools(
     async def clarification_answer(
         session_id: _ClarificationIdInput,
         question_id: _AuthorizationIdentityInput,
-        answer: Annotated[str, Field(min_length=1)],
-        actor: _AuthorizationIdentityInput,
-        answered_at: datetime,
+        answer_evidence_ref: Annotated[str, Field(pattern=_CONVERSATION_EVIDENCE_ID)],
     ) -> dict[str, object]:
         try:
             request = ClarificationAnswerRequest.model_validate(
                 {
                     "session_id": session_id,
                     "question_id": question_id,
-                    "answer": answer,
-                    "actor": actor,
-                    "answered_at": answered_at,
+                    "answer_evidence_ref": answer_evidence_ref,
                 }
             )
             return await services.clarification_answer(
                 request.session_id,
                 request.question_id,
-                request.answer,
-                request.actor,
-                request.answered_at,
+                request.answer_evidence_ref,
             )
         except Exception:  # noqa: BLE001 - one fixed handler boundary
             _fixed_arguments()
         finally:
-            session_id = question_id = answer = actor = ""
-            answered_at = cast(datetime, None)
+            session_id = question_id = answer_evidence_ref = ""
             request = cast(ClarificationAnswerRequest, None)
 
     @server.tool(

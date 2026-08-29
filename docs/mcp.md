@@ -7,10 +7,16 @@ prompt guidance.
 ## Install and onboard
 
 ```bash
-python -m pip install intent-engineering
-codex plugin marketplace add .
+git clone https://github.com/raviasha/Intent_Engineer.git /absolute/path/to/Intent_Engineer
+python -m pip install /absolute/path/to/Intent_Engineer
+codex plugin marketplace add /absolute/path/to/Intent_Engineer
 codex plugin add intent-advisor@intent-engineering-local
+cd /absolute/path/to/target-repository
 ```
+
+Wheel-only installs such as `python -m pip install intent-engineering` provide the CLI and MCP
+server, but not the repository-shipped plugin marketplace or advisor assets. Install the Codex
+plugin from an explicit source checkout as shown above.
 
 Restart the ChatGPT desktop app and start a new task rooted in the target repository. Codex
 launches the plugin-owned MCP server from the bundle configuration; do not start another process
@@ -44,14 +50,17 @@ Codex host binds the plugin-owned MCP process to the active repository working d
 executor must explicitly reproduce or configure that working directory and must not assume `.` is
 the user's checkout.
 
-The hook automatically offers onboarding when the baseline is absent. Otherwise it tells the agent
-to call read-only `intent_context` and token-free `intent_advisory_preflight`.
+The hook automatically offers onboarding when the baseline is absent. Otherwise it persists the
+exact human prompt as attributed evidence, allows the agent to use public read-only Intent tools
+for repository context, and routes a bounded draft through token-free
+`intent_advisory_preflight`.
 
 The possible classifications are `no_semantic_impact`, `aligned`, `new_or_ambiguous`, and
 `conflicting`. The advisory tool request contains only the opaque conversation reference, the
-current human request, and a bounded classification draft. Repository, graph, actor, principals,
-and persistence authority come from the held runtime. Neither the request nor response contains a
-mutation capability.
+authenticated request-evidence reference, and a bounded classification draft. Repository, graph,
+human text, time, actor, ACL, principals, and persistence authority come from held local state.
+Clarification answers likewise cross MCP only as captured evidence references. Neither request nor
+response contains a mutation capability.
 
 The plugin is not mandatory enforcement. The audited Codex host still returns
 `MandatoryHookUnavailable` with `Codex mandatory mutation hook is unavailable`. To opt out, decline

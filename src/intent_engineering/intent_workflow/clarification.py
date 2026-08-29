@@ -42,7 +42,12 @@ from intent_engineering.core.models import (
 )
 from intent_engineering.core.models._base import StrictModel
 from intent_engineering.core.policy.access import refs_allowed
-from intent_engineering.intent_workflow.conversation import ConversationCapture
+from intent_engineering.intent_workflow.conversation import (
+    ConversationCapture,
+    codex_conversation_binding,
+    validate_conversation_ingestion,
+    verify_codex_conversation_ref,
+)
 from intent_engineering.intent_workflow.models import (
     ClarificationAnswer,
     ClarificationConflict,
@@ -751,6 +756,159 @@ class ClarificationCoordinator:
         try:
             with self._authority_transaction():
                 result = self._answer(session_id, **kwargs)  # type: ignore[arg-type]
+        except Exception:  # noqa: BLE001 - fixed opaque boundary; no logging
+            failed = True
+        except BaseException as caught:  # noqa: BLE001 - preserve exact cancellation identity
+            caught.__traceback__ = None
+            signal = caught
+        finally:
+            session_id = ""
+            kwargs.clear()
+        if signal is not None:
+            caught_signal = signal
+            signal = None
+            raise caught_signal.with_traceback(None)
+        if failed or result is None:
+            raise ClarificationError()
+        return result
+
+    def _answer_evidence(
+        self,
+        session_id: str,
+        *,
+        question_id: str,
+        answer_evidence_ref: str,
+        evidence_acl: tuple[str, ...],
+        principals: frozenset[str],
+    ) -> ClarificationSession:
+        principals = _principals(principals)
+        if (
+            type(evidence_acl) is not tuple
+            or not evidence_acl
+            or tuple(sorted(set(evidence_acl))) != evidence_acl
+            or self._config.local_actor not in principals
+        ):
+            raise ValueError("invalid clarification answer evidence")
+        session = self._store.session(session_id)
+        question = next((item for item in session.questions if item.id == question_id), None)
+        if question is None or session.status != "open":
+            raise ValueError("clarification question unavailable")
+        snapshot = self._transactions.snapshot()
+        graph, evidence, _predecessors = _records(snapshot)
+        _records_again, ingestions, legacy_ids = parse_evidence_lines(
+            snapshot.content.get("evidence")
+        )
+        if answer_evidence_ref in legacy_ids:
+            raise ValueError("unavailable clarification answer")
+        record, answer = validate_conversation_ingestion(
+            evidence,
+            ingestions,
+            evidence_ref=answer_evidence_ref,
+            conversation_ref=None,
+            author=self._config.local_actor,
+            acl=evidence_acl,
+            connector_id=self._capture.connector_id,
+        )
+        session_binding = codex_conversation_binding(session.conversation_ref)
+        answer_binding = codex_conversation_binding(record.external_object_id)
+        verify_codex_conversation_ref(record.external_object_id, answer)
+        if (
+            graph.version != session.baseline_graph_version
+            or session_binding[0] != answer_binding[0]
+            or record.external_object_id == session.conversation_ref
+            or not refs_allowed((record.id,), evidence, principals)
+            or len(answer.encode("utf-8")) > _MAX_ANSWER_BYTES
+        ):
+            raise ValueError("unavailable clarification answer")
+        answer_digest = _digest(answer)
+        existing_answer = next(
+            (item for item in session.answers if item.evidence_ref == record.id),
+            None,
+        )
+        existing_conflict = next(
+            (item for item in session.conflicts if item.conflicting_evidence_ref == record.id),
+            None,
+        )
+        if existing_answer is not None or existing_conflict is not None:
+            if existing_answer is not None and (
+                existing_answer.question_id == question_id
+                and existing_answer.actor == record.author
+                and existing_answer.answered_at == record.observed_at
+                and existing_answer.answer_digest == answer_digest
+            ):
+                return session
+            if existing_conflict is not None and (
+                existing_conflict.question_id == question_id
+                and existing_conflict.actor == record.author
+                and existing_conflict.observed_at == record.observed_at
+                and existing_conflict.conflicting_answer_digest == answer_digest
+            ):
+                return session
+            raise ValueError("clarification answer evidence already used")
+        previous = next((item for item in session.answers if item.question_id == question_id), None)
+        latest_at = (
+            session.conflicts[-1].observed_at
+            if session.conflicts
+            else session.answers[-1].answered_at
+            if session.answers
+            else session.questions[-1].asked_at
+        )
+        if record.observed_at < latest_at:
+            raise ValueError("clarification answer chronology changed")
+        predecessor = (
+            session.conflicts[-1].conflicting_evidence_ref
+            if session.conflicts
+            else session.answers[-1].evidence_ref
+            if session.answers
+            else session.questions[-1].evidence_ref
+        )
+        if previous is not None:
+            conflict = ClarificationConflict(
+                question_id=question_id,
+                actor=self._config.local_actor,
+                observed_at=record.observed_at,
+                original_evidence_ref=previous.evidence_ref,
+                conflicting_evidence_ref=record.id,
+                conflicting_answer_digest=answer_digest,
+                predecessor_evidence_ref=predecessor,
+            )
+            updated = session.model_copy(update={"conflicts": (*session.conflicts, conflict)})
+            event = _event(
+                updated,
+                "conflicted",
+                self._config.local_actor,
+                record.observed_at,
+                session.latest_event_id,
+            )
+            self._store.append_clarification(event)
+            return self._store.session(session_id)
+        answer_record = ClarificationAnswer(
+            question_id=question_id,
+            actor=self._config.local_actor,
+            answered_at=record.observed_at,
+            evidence_ref=record.id,
+            answer_digest=answer_digest,
+            predecessor_evidence_ref=predecessor,
+        )
+        updated = session.model_copy(update={"answers": (*session.answers, answer_record)})
+        event = _event(
+            updated,
+            "answered",
+            self._config.local_actor,
+            record.observed_at,
+            session.latest_event_id,
+        )
+        self._store.append_clarification(event)
+        return self._store.session(session_id)
+
+    def answer_evidence(self, session_id: str, **kwargs: object) -> ClarificationSession:
+        """Append one hook-authenticated human answer without re-capturing raw text."""
+        result: ClarificationSession | None = None
+        signal: BaseException | None = None
+        failed = False
+        try:
+            with self._authority_transaction():
+                result = self._answer_evidence(session_id, **kwargs)  # type: ignore[arg-type]
         except Exception:  # noqa: BLE001 - fixed opaque boundary; no logging
             failed = True
         except BaseException as caught:  # noqa: BLE001 - preserve exact cancellation identity
