@@ -44,6 +44,7 @@ from intent_engineering.intent_workflow.conversation import (
     verify_codex_conversation_ref,
 )
 from intent_engineering.intent_workflow.models import (
+    ClarificationEvent,
     ClarificationIntentProposal,
     ClarificationProposalSubmission,
     ClarificationQuestionInput,
@@ -417,6 +418,29 @@ def _connector_membership_snapshot(
 def _connector_membership_digest(directory: SecureDirectory) -> str:
     records = _connector_membership_records(directory, read_content=False)
     return _connector_records_digest(records)
+
+
+def _active_advisory_clarification(
+    events: tuple[ClarificationEvent, ...],
+    session_digest: str,
+) -> ClarificationSession | None:
+    latest: dict[str, ClarificationSession] = {}
+    for event in events:
+        latest[event.session.id] = event.session
+    active: list[ClarificationSession] = []
+    for session in latest.values():
+        if session.status not in {"open", "proposed"} or not session.conversation_ref.startswith(
+            "codex-prompt:"
+        ):
+            continue
+        if codex_conversation_binding(session.conversation_ref)[0] != session_digest:
+            continue
+        if session.opened_by != "agent:codex":
+            raise ValueError("advisory clarification actor mismatch")
+        active.append(session)
+    if len(active) > 1:
+        raise ValueError("ambiguous advisory clarification")
+    return active[0] if active else None
 
 
 def _require_exact_json(value: object) -> None:
@@ -1418,9 +1442,10 @@ class McpIntentWorkflowServices:
                 )
                 if validated.request_evidence_ref in legacy_ids:
                     raise ValueError("advisory request evidence unavailable")
+                clarification_events = self.runtime.intent_proposals.clarification_events()
                 allowed_question_refs = tuple(
                     question.evidence_ref
-                    for event in self.runtime.intent_proposals.clarification_events()
+                    for event in clarification_events
                     if event.session.conversation_ref == validated.conversation_ref
                     for question in event.session.questions
                 )
@@ -1456,6 +1481,17 @@ class McpIntentWorkflowServices:
                         and item.evidence.external_object_id != validated.conversation_ref
                     ):
                         raise ValueError("advisory host turn changed")
+                active_session = _active_advisory_clarification(
+                    clarification_events,
+                    conversation_binding[0],
+                )
+                if active_session is not None and (
+                    active_session.conversation_ref != validated.conversation_ref
+                    or active_session.request_evidence_ref != request_evidence.id
+                ):
+                    if not authority_matches():
+                        raise ValueError("advisory authority changed")
+                    return self._human_confirmation_required()
                 envelope = TaskEnvelope(
                     repository_id=config.project_id,
                     actor="agent:codex",

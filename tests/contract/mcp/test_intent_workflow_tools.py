@@ -7,10 +7,13 @@ import logging
 import multiprocessing
 import os
 from collections.abc import ItemsView, Iterator
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from multiprocessing.connection import Connection
 from pathlib import Path
+from threading import Barrier
 from typing import Never
 
 import anyio
@@ -1507,6 +1510,24 @@ async def test_production_advisory_ambiguity_opens_exact_persisted_session(
         McpReadServices(restarted),
         intent_workflow_services=load_intent_workflow_services(restarted),
     )
+    before_direct_calls = _transaction_bytes(restarted)
+    restarted_replay = await restarted_server.call_tool("intent_advisory_preflight", arguments)
+    assert restarted_replay.structured_content == payload
+    assert _transaction_bytes(restarted) == before_direct_calls
+    later_arguments = json.loads(json.dumps(arguments))
+    later_arguments.update(
+        {
+            "conversation_ref": answer_ingestion.evidence.external_object_id,
+            "request_evidence_ref": answer_ingestion.evidence.id,
+        }
+    )
+    direct_answer = await restarted_server.call_tool("intent_advisory_preflight", later_arguments)
+    assert direct_answer.structured_content == {
+        "schema_version": "1",
+        "status": "human_confirmation_required",
+        "reason": "authenticated_local_human_evidence_required",
+    }
+    assert _transaction_bytes(restarted) == before_direct_calls
     answer_arguments = {
         "session_id": session.id,
         "question_id": session.questions[0].id,
@@ -1543,6 +1564,189 @@ async def test_production_advisory_ambiguity_opens_exact_persisted_session(
     pending = restarted.intent_proposals.session(session.id)
     assert pending.answers == ()
     assert pending.conflicts == ()
+
+
+async def test_concurrent_direct_advisory_turns_open_one_lineage_session(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from intent_engineering.integrations.mcp_server.intent_workflow import (
+        load_intent_workflow_services,
+    )
+
+    project = tmp_path / "project"
+    project.mkdir()
+    initialize_project(project)
+    (project / ".intent/approvals/policy.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "schema_version": 1,
+                "contributors": ["local"],
+                "approvers": ["local"],
+                "executors": ["local"],
+                "identities": {"local": ["local"]},
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    runtime = load_runtime(project)
+    runtime.graph_store.initialize(
+        Graph(
+            id="graph:clarification-lineage-race",
+            version=1,
+            name="Clarification lineage race",
+            nodes=(
+                Node(
+                    id="intent:clarification-lineage-race",
+                    type=NodeType.PRODUCT_INTENT,
+                    label="Open one clarification per Codex session lineage",
+                    status="active",
+                    created_by="local",
+                    created_at=datetime(2026, 8, 28, 13, 30, tzinfo=UTC),
+                    last_modified_by="local",
+                    last_modified_at=datetime(2026, 8, 28, 13, 30, tzinfo=UTC),
+                ),
+            ),
+            edges=(),
+        )
+    )
+    router = AdvisoryPromptRouter(runtime)
+    initial_route = router.route(
+        PromptEvent(
+            session_id="codex:lineage-race",
+            turn_id="turn-1",
+            repository=str(project),
+            actor="local",
+            prompt="Define the export audience",
+            created_at=datetime(2026, 8, 28, 13, 31, tzinfo=UTC),
+        )
+    )
+    initial_arguments = _valid_raw_workflow_arguments("intent_advisory_preflight")
+    initial_arguments.update(initial_route.arguments)
+    draft = initial_arguments["draft"]
+    assert type(draft) is dict
+    draft.update(
+        {
+            "classification": "new_or_ambiguous",
+            "basis": "Export audience is unresolved",
+            "uncertainties": ["Export audience"],
+            "questions": ["Who may receive exports?"],
+            "requested_scope": [],
+        }
+    )
+    initial_server = build_server(
+        McpReadServices(runtime),
+        intent_workflow_services=load_intent_workflow_services(
+            runtime,
+            clock=lambda: datetime(2026, 8, 28, 13, 32, tzinfo=UTC),
+        ),
+    )
+    accepted = await initial_server.call_tool("intent_advisory_preflight", initial_arguments)
+    assert accepted.structured_content["classification"] == "new_or_ambiguous"
+
+    later_arguments: list[dict[str, object]] = []
+    for index in (2, 3):
+        prompt = f"Use export audience option {index}"
+        route = router.route(
+            PromptEvent(
+                session_id="codex:lineage-race",
+                turn_id=f"turn-{index}",
+                repository=str(project),
+                actor="local",
+                prompt=prompt,
+                created_at=datetime(2026, 8, 28, 13, 30 + index, tzinfo=UTC),
+            )
+        )
+        assert route.action == "human_confirmation_required"
+        request = runtime.evidence_store.ledger("conversation:codex")[-1].evidence
+        item = json.loads(json.dumps(initial_arguments))
+        item.update(
+            {
+                "conversation_ref": request.external_object_id,
+                "request_evidence_ref": request.id,
+            }
+        )
+        later_arguments.append(item)
+    before = _transaction_bytes(runtime)
+    barrier = Barrier(2)
+    servers = []
+    for _index in range(2):
+        contender = load_runtime(project)
+        workflow = load_intent_workflow_services(
+            contender,
+            clock=lambda: datetime(2026, 8, 28, 13, 32, tzinfo=UTC),
+        )
+        original_transaction = contender.transactions.transaction
+        first_entry = [True]
+
+        @contextmanager
+        def synchronized_transaction(
+            *args: object,
+            _original=original_transaction,
+            _entry=first_entry,
+            **kwargs: object,
+        ) -> Iterator[object]:
+            if _entry[0]:
+                _entry[0] = False
+                barrier.wait(timeout=5)
+            with _original(*args, **kwargs) as transaction:
+                yield transaction
+
+        monkeypatch.setattr(contender.transactions, "transaction", synchronized_transaction)
+        servers.append(build_server(McpReadServices(contender), intent_workflow_services=workflow))
+
+    def invoke(index: int) -> dict[str, object]:
+        response = anyio.run(
+            servers[index].call_tool,
+            "intent_advisory_preflight",
+            later_arguments[index],
+        )
+        return response.structured_content
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = tuple(executor.submit(invoke, index) for index in range(2))
+        outcomes = tuple(future.result(timeout=15) for future in futures)
+
+    assert outcomes == (
+        {
+            "schema_version": "1",
+            "status": "human_confirmation_required",
+            "reason": "authenticated_local_human_evidence_required",
+        },
+        {
+            "schema_version": "1",
+            "status": "human_confirmation_required",
+            "reason": "authenticated_local_human_evidence_required",
+        },
+    )
+    checked = load_runtime(project)
+    events = checked.intent_proposals.clarification_events()
+    assert len(events) == 1
+    assert events[0].event_type == "opened"
+    assert events[0].session.conversation_ref == initial_route.arguments["conversation_ref"]
+    assert _transaction_bytes(checked) == before
+    request_refs = {item["request_evidence_ref"] for item in later_arguments}
+    classifications = tuple(
+        item
+        for item in checked.evidence_store.ledger("conversation:codex")
+        if item.predecessor_id in request_refs
+    )
+    assert classifications == ()
+
+    restarted = load_runtime(project)
+    restarted_server = build_server(
+        McpReadServices(restarted),
+        intent_workflow_services=load_intent_workflow_services(restarted),
+    )
+    before_replays = _transaction_bytes(restarted)
+    exact_replay = await restarted_server.call_tool("intent_advisory_preflight", initial_arguments)
+    blocked_replay = await restarted_server.call_tool(
+        "intent_advisory_preflight", later_arguments[0]
+    )
+    assert exact_replay.structured_content == accepted.structured_content
+    assert blocked_replay.structured_content == outcomes[0]
+    assert _transaction_bytes(restarted) == before_replays
 
 
 async def test_advisory_replay_fixed_fails_after_graph_change_without_new_evidence(
