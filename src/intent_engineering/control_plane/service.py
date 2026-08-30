@@ -33,6 +33,7 @@ from intent_engineering.control_plane.webauthn_service import (
     WebAuthnVerifier,
 )
 from intent_engineering.core.models import (
+    EvidenceRecord,
     ProjectConfig,
     ReconciliationStatus,
     ResolutionAction,
@@ -907,6 +908,12 @@ class ControlPlaneService:
         result: dict[str, object] | None = None
         signal: BaseException | None = None
         answer_id: str | None = None
+        coordinator: ClarificationCoordinator | None = None
+        record: EvidenceRecord | None = None
+        pending: _PendingAnswer | None = None
+        existing: _PendingAnswer | None = None
+        payload: HumanDecisionPayload | None = None
+        material: _DecisionMaterial | None = None
         inserted = False
         try:
             authority = self._authority()
@@ -967,11 +974,13 @@ class ControlPlaneService:
             if result is None and inserted and answer_id is not None:
                 self._pending_answers.pop(answer_id, None)
             answer_id = None
+            coordinator = None
+            record = None
+            pending = None
+            existing = None
+            payload = None
+            material = None
             inserted = False
-            if "pending" in locals():
-                pending = cast(_PendingAnswer, None)
-            if "existing" in locals():
-                existing = cast(_PendingAnswer, None)
             if authority is not None:
                 authority.close()
         if signal is not None:

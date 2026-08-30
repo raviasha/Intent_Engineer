@@ -779,6 +779,26 @@ def test_pending_answer_cap_fails_without_evicting_an_active_exact_preview(
     assert result["status"] == "open"
 
 
+def test_pending_answer_cap_failure_scrubs_private_preview_traceback(
+    tmp_path: Path,
+) -> None:
+    """Catches cap rejection retaining the private answer through preview evidence locals."""
+    harness = _harness(tmp_path)
+    _coordinator, session = _open_clarification(harness)
+    for index in range(64):
+        harness.service.answer_preview(session.id, "audience", f"Capacity answer {index}")
+    secret = "PRIVATE-CAP-ANSWER-MARKER-43127"
+
+    with pytest.raises(ControlPlaneError, match="^control plane unavailable$") as caught:
+        harness.service.answer_preview(session.id, "audience", secret)
+
+    assert type(caught.value) is ControlPlaneError
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+    assert len(harness.service._pending_answers) == 64
+    assert secret not in _repository_traceback_locals(caught.value)
+
+
 def test_discard_answer_preview_cleans_up_without_requesting_human_authority(
     tmp_path: Path,
 ) -> None:
