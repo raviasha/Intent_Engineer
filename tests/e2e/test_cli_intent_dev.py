@@ -730,6 +730,87 @@ def test_shutdown_holds_startup_lock_until_runtime_quiesces(
         _assert_runtime_resources_closed(runtime)
 
 
+def test_server_quiescence_cannot_open_pre_cleanup_start_gap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = _project(tmp_path)
+    original_load_runtime = dev_cli.load_runtime
+    runtimes: list[Runtime] = []
+    launch_errors: list[BaseException] = []
+    state_lock = threading.Lock()
+    server_quiesced = threading.Event()
+    allow_owner_wait_return = threading.Event()
+    second_loaded = threading.Event()
+    wait_calls = 0
+    first_closed_when_second_loaded = False
+
+    def tracked_load_runtime(path: Path) -> Runtime:
+        nonlocal first_closed_when_second_loaded
+        runtime = original_load_runtime(path)
+        with state_lock:
+            if runtimes:
+                try:
+                    _ = runtimes[0].project_directory.descriptor
+                except UnsafePathError:
+                    first_closed_when_second_loaded = True
+                second_loaded.set()
+            runtimes.append(runtime)
+        return runtime
+
+    def quiesce_before_owner_cleanup(started: object) -> None:
+        nonlocal wait_calls
+        with state_lock:
+            wait_calls += 1
+            call = wait_calls
+        if call != 1:
+            return
+        assert isinstance(started, dev_cli._Started)
+        owned = started
+        assert owned.server is not None
+        assert owned.thread is not None
+        owned.server.should_exit = True
+        owned.thread.join(timeout=5)
+        assert not owned.thread.is_alive()
+        server_quiesced.set()
+        assert allow_owner_wait_return.wait(timeout=5)
+
+    def launch(prd: Path | None) -> None:
+        try:
+            dev_cli.dev_command(
+                project=project,
+                prd=prd,
+                no_open=True,
+                offline=True,
+                status=False,
+            )
+        except BaseException as error:  # noqa: BLE001 - transferred to the test thread
+            launch_errors.append(error)
+
+    monkeypatch.setattr(dev_cli, "load_runtime", tracked_load_runtime)
+    monkeypatch.setattr(dev_cli, "_wait_for_exit", quiesce_before_owner_cleanup)
+    owner = threading.Thread(target=launch, args=(Path("docs/PRD.md"),), daemon=True)
+    contender = threading.Thread(target=launch, args=(None,), daemon=True)
+    owner.start()
+    try:
+        assert server_quiesced.wait(timeout=10)
+        contender.start()
+        loaded_before_owner_cleanup = second_loaded.wait(timeout=0.5)
+    finally:
+        allow_owner_wait_return.set()
+        owner.join(timeout=10)
+        if contender.ident is not None:
+            contender.join(timeout=10)
+
+    assert not owner.is_alive()
+    assert not contender.is_alive()
+    assert launch_errors == []
+    assert not loaded_before_owner_cleanup
+    assert first_closed_when_second_loaded
+    assert len(runtimes) == 2
+    for runtime in runtimes:
+        _assert_runtime_resources_closed(runtime)
+
+
 def test_browser_open_failure_is_fixed_and_server_cleanup_still_runs(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

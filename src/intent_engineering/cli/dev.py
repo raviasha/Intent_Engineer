@@ -475,22 +475,34 @@ def _ensure_workspace(project: Path, prd: str | None) -> None:
 
 
 @contextmanager
-def _repository_startup_lock(directory: SecureDirectory) -> Iterator[None]:
-    """Serialize first initialization without creating a pre-workspace lock path."""
+def _try_repository_lifecycle_lock(directory: SecureDirectory) -> Iterator[bool]:
+    """Try to acquire the repository lease without blocking attested reuse."""
     identity = os.fstat(directory.descriptor)
     key = (identity.st_dev, identity.st_ino)
     with _REPOSITORY_LOCKS_GUARD:
         thread_lock = _REPOSITORY_LOCKS.setdefault(key, threading.RLock())
-    with thread_lock:
+    if not thread_lock.acquire(blocking=False):
+        yield False
+        return
+    descriptor = -1
+    locked = False
+    try:
         descriptor = os.dup(directory.descriptor)
         try:
-            fcntl.flock(descriptor, fcntl.LOCK_EX)
-            yield
-        finally:
-            try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            yield False
+            return
+        locked = True
+        yield True
+    finally:
+        try:
+            if locked:
                 fcntl.flock(descriptor, fcntl.LOCK_UN)
-            finally:
+        finally:
+            if descriptor >= 0:
                 os.close(descriptor)
+            thread_lock.release()
 
 
 class _ControlPlaneSite:
@@ -781,6 +793,108 @@ def _fixed_error(message: str = "unavailable") -> None:
     raise typer.Exit(1)
 
 
+def _live_repository_process(
+    project_directory: SecureDirectory,
+) -> ControlPlaneProcessMetadata | None:
+    """Optimistically attest a published owner without waiting on its lifecycle lease."""
+    workspace: SecureDirectory | None = None
+    target: SecureFile | None = None
+    config_bytes = b""
+    repository_id = ""
+    current: ControlPlaneProcessMetadata | None = None
+    try:
+        workspace = project_directory.subdirectory(".intent")
+        target = workspace.file(_METADATA_PATH)
+        config, config_bytes = _read_project_config(workspace)
+        repository_id = local_repository_identity(config.project_id, project_directory.identity)
+        current = _read_metadata(target)
+        return current if current is not None and _probe(current, repository_id) else None
+    except (FileNotFoundError, UnsafePathError):
+        return None
+    finally:
+        current = None
+        repository_id = ""
+        del config_bytes
+        if target is not None:
+            target.close()
+        if workspace is not None:
+            workspace.close()
+
+
+def _run_with_repository_lease(
+    root: Path,
+    project_directory: SecureDirectory,
+    *,
+    prd_value: str | None,
+    no_open: bool,
+    status: bool,
+) -> None:
+    """Recheck and own one process until every repository resource is quiescent."""
+    workspace_directory: SecureDirectory | None = None
+    target: SecureFile | None = None
+    runtime: Runtime | None = None
+    started: _Started | None = None
+    origin = ""
+    config_bytes = b""
+    repository_id = ""
+    current: ControlPlaneProcessMetadata | None = None
+    try:
+        _ensure_workspace(root, None if status else prd_value)
+        workspace_directory = project_directory.subdirectory(".intent")
+        target = workspace_directory.file(_METADATA_PATH)
+        with same_path_lock(target):
+            config, config_bytes = _read_project_config(workspace_directory)
+            repository_id = local_repository_identity(config.project_id, project_directory.identity)
+            current = _read_metadata(target)
+            if current is not None and _probe(current, repository_id):
+                if status:
+                    typer.echo(f"intent dev: running at {current.origin}")
+                    return
+                typer.echo(f"intent dev: already running at {current.origin}")
+                return
+            if status:
+                if current is not None:
+                    _discard_stale_metadata(target)
+                _fixed_error("not running")
+            if current is not None:
+                _discard_stale_metadata(target)
+            if prd_value is not None:
+                config = _configure_prd_role(
+                    workspace_directory,
+                    config,
+                    config_bytes,
+                    prd_value,
+                )
+            runtime = load_runtime(root)
+            if runtime.config != config:
+                raise _DevUnavailable()
+            started = _Started(runtime=runtime)
+            runtime = None
+            _start(started, target, repository_id, prd_value)
+        if started.metadata is None:
+            raise _DevUnavailable()
+        origin = started.metadata.origin
+        typer.echo(f"intent dev: ready at {origin}")
+        if not no_open and not _open_browser(origin, started.bootstrap):
+            typer.echo("intent dev: browser unavailable", err=True)
+        _wait_for_exit(started)
+    finally:
+        if started is not None and target is not None:
+            _shutdown_started_locked(started, target)
+        elif runtime is not None:
+            runtime.close()
+        runtime = None
+        started = None
+        origin = ""
+        current = None
+        repository_id = ""
+        del config_bytes
+        if target is not None:
+            target.close()
+        if workspace_directory is not None:
+            workspace_directory.close()
+
+
 def dev_command(
     project: Path = typer.Option(Path("."), "--project"),
     prd: Path | None = typer.Option(None, "--prd"),
@@ -793,62 +907,33 @@ def dev_command(
     root = Path(os.path.abspath(project))
     prd_value = prd.as_posix() if prd is not None else None
     project_directory: SecureDirectory | None = None
-    workspace_directory: SecureDirectory | None = None
-    target: SecureFile | None = None
-    runtime: Runtime | None = None
-    started: _Started | None = None
     signal_error: BaseException | None = None
     try:
         if status and not (root / ".intent").exists():
             _fixed_error("not running")
         project_directory = SecureDirectory.open(root)
-        with _repository_startup_lock(project_directory):
-            _ensure_workspace(root, None if status else prd_value)
-            workspace_directory = project_directory.subdirectory(".intent")
-            target = workspace_directory.file(_METADATA_PATH)
-            with same_path_lock(target):
-                config, config_bytes = _read_project_config(workspace_directory)
-                repository_id = local_repository_identity(
-                    config.project_id, project_directory.identity
-                )
-                current = _read_metadata(target)
-                if current is not None and _probe(current, repository_id):
-                    if status:
-                        typer.echo(f"intent dev: running at {current.origin}")
-                        return
-                    typer.echo(f"intent dev: already running at {current.origin}")
-                    return
+        deadline = time.monotonic() + _STARTUP_TIMEOUT_SECONDS
+        while True:
+            current = _live_repository_process(project_directory)
+            if current is not None:
                 if status:
-                    if current is not None:
-                        _discard_stale_metadata(target)
-                    _fixed_error("not running")
-                if current is not None:
-                    _discard_stale_metadata(target)
-                if prd_value is not None:
-                    config = _configure_prd_role(
-                        workspace_directory,
-                        config,
-                        config_bytes,
-                        prd_value,
+                    typer.echo(f"intent dev: running at {current.origin}")
+                else:
+                    typer.echo(f"intent dev: already running at {current.origin}")
+                return
+            with _try_repository_lifecycle_lock(project_directory) as acquired:
+                if acquired:
+                    _run_with_repository_lease(
+                        root,
+                        project_directory,
+                        prd_value=prd_value,
+                        no_open=no_open,
+                        status=status,
                     )
-                runtime = load_runtime(root)
-                if runtime.config != config:
-                    raise _DevUnavailable()
-                started = _Started(runtime=runtime)
-                runtime = None
-                try:
-                    _start(started, target, repository_id, prd_value)
-                except BaseException:
-                    _shutdown_started_locked(started, target)
-                    started = None
-                    raise
-        if started.metadata is None:
-            raise _DevUnavailable()
-        origin = started.metadata.origin
-        typer.echo(f"intent dev: ready at {origin}")
-        if not no_open and not _open_browser(origin, started.bootstrap):
-            typer.echo("intent dev: browser unavailable", err=True)
-        _wait_for_exit(started)
+                    return
+            if time.monotonic() >= deadline:
+                raise _DevUnavailable()
+            time.sleep(0.01)
     except typer.Exit:
         raise
     except (
@@ -867,32 +952,11 @@ def dev_command(
         error.__context__ = None
         signal_error = error
     finally:
-        if project_directory is not None and target is not None:
-            with _repository_startup_lock(project_directory):
-                if started is not None:
-                    _shutdown_started_locked(started, target)
-                elif runtime is not None:
-                    runtime.close()
-        elif runtime is not None:
-            runtime.close()
-        runtime = None
-        started = None
-        origin = ""
-        if "config_bytes" in locals():
-            config_bytes = b""
         if "current" in locals():
             current = None
-        if "repository_id" in locals():
-            repository_id = ""
         prd_value = None
-        if target is not None:
-            target.close()
-        if workspace_directory is not None:
-            workspace_directory.close()
         if project_directory is not None:
             project_directory.close()
-        target = None
-        workspace_directory = None
         project_directory = None
         root = Path()
     if signal_error is not None:
