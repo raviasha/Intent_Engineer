@@ -20,6 +20,7 @@ from intent_engineering.cli.runtime import Runtime
 from intent_engineering.cli.writes import MutationPolicy, write_workflow
 from intent_engineering.control_plane.models import (
     AttentionRoute,
+    CredentialRecord,
     DecisionAction,
     DecisionSubject,
     DevStatus,
@@ -823,6 +824,115 @@ class ControlPlaneService:
             if authority is not None:
                 authority.close()
         if signal is not None:
+            caught_signal = signal
+            signal = None
+            raise caught_signal.with_traceback(None)
+        if result is None:
+            raise ControlPlaneError() from None
+        return result
+
+    def registration_options(self) -> bytes:
+        """Issue enrollment options for the configured actor at server-owned time."""
+        authority: _Authority | None = None
+        snapshot: LocalTransactionSnapshot | None = None
+        result: bytes | None = None
+        signal: BaseException | None = None
+        try:
+            authority = self._authority()
+            with self._runtime.transactions.transaction(
+                rollback_base_exceptions=True,
+                extras=authority.files,
+                extra_read_policies=authority.policies,
+            ):
+                snapshot = self._runtime.transactions.snapshot(
+                    authority.files,
+                    extra_read_policies=authority.policies,
+                )
+                if self._membership_now() != authority.membership_digest or any(
+                    snapshot.content.get(name) != value
+                    for name, value in authority.preimages.items()
+                ):
+                    raise ValueError("registration authority changed")
+                authority.snapshot = snapshot
+                result = self._webauthn.registration_options(
+                    authority.config.local_actor,
+                    self._origin,
+                    self._now(),
+                )
+                if self._membership_now() != authority.membership_digest:
+                    raise ValueError("registration authority changed")
+        except Exception:  # noqa: BLE001 - fixed opaque authority boundary
+            result = None
+        except BaseException as caught:  # noqa: BLE001 - preserve cancellation identity
+            caught.__traceback__ = None
+            caught.__cause__ = None
+            caught.__context__ = None
+            signal = caught
+        finally:
+            if authority is not None:
+                authority.close()
+            authority = None
+            snapshot = None
+        if signal is not None:
+            result = None
+            caught_signal = signal
+            signal = None
+            raise caught_signal.with_traceback(None)
+        if result is None:
+            raise ControlPlaneError() from None
+        return result
+
+    def register(self, response: bytes) -> CredentialRecord:
+        """Enroll one credential for the configured actor at server-owned time."""
+        authority: _Authority | None = None
+        snapshot: LocalTransactionSnapshot | None = None
+        result: CredentialRecord | None = None
+        signal: BaseException | None = None
+        try:
+            if type(response) is not bytes:
+                raise TypeError("invalid registration response")
+            authority = self._authority()
+            with self._runtime.transactions.transaction(
+                rollback_base_exceptions=True,
+                extras=authority.files,
+                extra_read_policies=authority.policies,
+            ):
+                snapshot = self._runtime.transactions.snapshot(
+                    authority.files,
+                    extra_read_policies=authority.policies,
+                )
+                if self._membership_now() != authority.membership_digest or any(
+                    snapshot.content.get(name) != value
+                    for name, value in authority.preimages.items()
+                ):
+                    raise ValueError("registration authority changed")
+                authority.snapshot = snapshot
+                registered = self._webauthn.register(
+                    response,
+                    authority.config.local_actor,
+                    self._origin,
+                    self._now(),
+                )
+                if self._membership_now() != authority.membership_digest:
+                    raise ValueError("registration authority changed")
+                result = CredentialRecord.model_validate_json(registered.model_dump_json())
+        except Exception:  # noqa: BLE001 - fixed opaque authority boundary
+            result = None
+        except BaseException as caught:  # noqa: BLE001 - preserve cancellation identity
+            caught.__traceback__ = None
+            caught.__cause__ = None
+            caught.__context__ = None
+            signal = caught
+        finally:
+            response = b""
+            if "registered" in locals():
+                registered = cast(CredentialRecord, None)
+            if authority is not None:
+                authority.close()
+            authority = None
+            snapshot = None
+        if signal is not None:
+            result = None
             caught_signal = signal
             signal = None
             raise caught_signal.with_traceback(None)

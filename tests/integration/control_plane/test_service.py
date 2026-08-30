@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import json
 import multiprocessing
 import os
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -66,17 +68,27 @@ ORIGIN = "http://localhost:43127"
 
 @dataclass
 class _Verifier(WebAuthnVerifier):
+    registration_requests: list[RegistrationRequest] = field(default_factory=list)
     authentication_requests: list[AuthenticationRequest] = field(default_factory=list)
+    registration_hook: Callable[[], None] | None = None
+    registration_options_result: bytes = b'{"publicKey":{"userVerification":"required"}}'
 
     def registration_options(self, request: RegistrationRequest) -> bytes:
-        del request
-        raise AssertionError("registration is outside this integration boundary")
+        self.registration_requests.append(request)
+        return self.registration_options_result
 
     def verify_registration(
         self, response: bytes, request: RegistrationRequest
     ) -> VerifiedRegistration:
-        del response, request
-        raise AssertionError("registration is outside this integration boundary")
+        assert response == _registration_response(request)
+        if self.registration_hook is not None:
+            self.registration_hook()
+        return VerifiedRegistration(
+            credential_id=b"new-control-plane-credential",
+            public_key=b"new-public-key",
+            sign_count=0,
+            user_verified=True,
+        )
 
     def authentication_options(self, request: AuthenticationRequest) -> bytes:
         self.authentication_requests.append(request)
@@ -213,6 +225,35 @@ def _preview_digest(preview: dict[str, object]) -> str:
     return f"sha256:{hashlib.sha256(encoded).hexdigest()}"
 
 
+def _b64url(value: bytes) -> str:
+    return base64.urlsafe_b64encode(value).rstrip(b"=").decode("ascii")
+
+
+def _registration_response(request: RegistrationRequest) -> bytes:
+    client_data = json.dumps(
+        {
+            "challenge": _b64url(request.challenge),
+            "origin": request.expected_origin,
+            "type": "webauthn.create",
+        },
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return json.dumps(
+        {
+            "id": _b64url(b"new-control-plane-credential"),
+            "rawId": _b64url(b"new-control-plane-credential"),
+            "response": {
+                "attestationObject": _b64url(b"fake-attestation"),
+                "clientDataJSON": _b64url(client_data),
+            },
+            "type": "public-key",
+        },
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+
+
 def _optional_bytes(path: Path) -> bytes | None:
     return path.read_bytes() if path.exists() else None
 
@@ -287,6 +328,92 @@ def _approval_harness(tmp_path: Path) -> _ApprovalHarness:
     plan = WritePlan.model_validate_json(json.dumps({"id": write_plan_id(material), **material}))
     assert workflow.plans.put(plan)
     return _ApprovalHarness(project, runtime, service, verifier, workflow, plan)
+
+
+def test_registration_wrappers_own_actor_origin_time_and_return_detached_records(
+    tmp_path: Path,
+) -> None:
+    harness = _harness(tmp_path)
+
+    options = harness.service.registration_options()
+    request = harness.verifier.registration_requests[-1]
+    credential = harness.service.register(_registration_response(request))
+
+    assert options == b'{"publicKey":{"userVerification":"required"}}'
+    assert request.actor == harness.runtime.config.local_actor
+    assert request.expected_origin == ORIGIN
+    assert request.project_id == harness.runtime.config.project_id
+    assert request.repository_id == harness.service.repository_id
+    assert credential.actor == harness.runtime.config.local_actor
+    assert credential.created_at == NOW
+    assert credential is not harness.runtime.webauthn_credentials.list()[-1]
+    assert credential == harness.runtime.webauthn_credentials.list()[-1]
+
+
+def test_registration_options_reject_live_configuration_drift_without_issuing_challenge(
+    tmp_path: Path,
+) -> None:
+    harness = _harness(tmp_path)
+    changed = harness.runtime.config.model_copy(update={"local_actor": "local:other"})
+    (harness.project / ".intent/config.yaml").write_text(
+        yaml.safe_dump(changed.model_dump(mode="json"), sort_keys=True),
+        encoding="utf-8",
+    )
+    before = harness.state()
+
+    with pytest.raises(ControlPlaneError, match="^control plane unavailable$") as caught:
+        harness.service.registration_options()
+
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+    assert harness.state() == before
+
+
+def test_registration_rolls_back_when_connector_membership_changes_during_verification(
+    tmp_path: Path,
+) -> None:
+    harness = _harness(tmp_path)
+    harness.service.registration_options()
+    request = harness.verifier.registration_requests[-1]
+    response = _registration_response(request)
+    before = harness.state()
+
+    def change_membership() -> None:
+        (harness.project / ".intent/connectors/drift.yaml").write_text(
+            "schema_version: 1\n", encoding="utf-8"
+        )
+
+    harness.verifier.registration_hook = change_membership
+
+    with pytest.raises(ControlPlaneError, match="^control plane unavailable$") as caught:
+        harness.service.register(response)
+
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+    assert harness.state() == before
+
+
+def test_registration_options_cancellation_rolls_back_and_scrubs_authority_locals(
+    tmp_path: Path,
+) -> None:
+    harness = _harness(tmp_path)
+    secret = b"PRIVATE-CANCELLED-REGISTRATION-OPTIONS"
+    harness.verifier.registration_options_result = b'{"private":"' + secret + b'"}'
+    signal = asyncio.CancelledError("registration options cancelled")
+
+    def cancel_after_commit(stage: str) -> None:
+        if stage == "journal_committed":
+            raise signal
+
+    harness.runtime.transactions._fault_hook = cancel_after_commit
+    before = harness.state()
+
+    with pytest.raises(asyncio.CancelledError) as caught:
+        harness.service.registration_options()
+
+    assert caught.value is signal
+    assert harness.state() == before
+    assert secret.decode("ascii") not in _repository_traceback_locals(caught.value)
 
 
 def _bootstrap_proposal(harness: _Harness) -> tuple[str, str]:
