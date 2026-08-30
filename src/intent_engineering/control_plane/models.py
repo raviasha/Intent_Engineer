@@ -70,6 +70,13 @@ class _ControlPlaneModel(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True, validate_default=True)
 
+    @field_validator("schema_version", mode="before", check_fields=False)
+    @classmethod
+    def require_exact_schema_version(cls, value: object) -> int:
+        if type(value) is not int:
+            raise ValueError("schema_version must be an exact integer")
+        return value
+
 
 def _exact_string(value: object, *, label: str, maximum: int = _MAX_IDENTIFIER_BYTES) -> str:
     if type(value) is not str:

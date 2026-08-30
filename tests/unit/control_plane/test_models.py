@@ -6,6 +6,8 @@ import pytest
 from pydantic import ValidationError
 
 from intent_engineering.control_plane.models import (
+    ChallengeRecord,
+    CredentialRecord,
     DecisionAction,
     DecisionSubject,
     HumanDecisionPayload,
@@ -94,3 +96,47 @@ def test_payload_rejects_string_subclasses_and_is_frozen() -> None:
     payload = _payload()
     with pytest.raises(ValidationError):
         payload.actor = "local:ben"  # type: ignore[misc]
+
+
+@pytest.mark.parametrize(
+    ("record_type", "material"),
+    [
+        (HumanDecisionPayload, _payload().model_dump()),
+        (
+            CredentialRecord,
+            {
+                "schema_version": 1,
+                "id": "credential:asha-laptop",
+                "project_id": "project:alpha",
+                "repository_id": "repo:sha256:" + "a" * 64,
+                "actor": "local:asha",
+                "credential_id": "Y3JlZGVudGlhbA",
+                "public_key": "cHVibGljLWtleQ",
+                "sign_count": 0,
+                "created_at": datetime(2026, 8, 30, tzinfo=UTC),
+            },
+        ),
+        (
+            ChallengeRecord,
+            {
+                "schema_version": 1,
+                "id": "challenge:" + "a" * 64,
+                "project_id": "project:alpha",
+                "repository_id": "repo:sha256:" + "b" * 64,
+                "actor": "local:asha",
+                "ceremony": "authentication",
+                "challenge": "Y2hhbGxlbmdl",
+                "payload_digest": "sha256:" + "c" * 64,
+                "issued_at": datetime(2026, 8, 30, tzinfo=UTC),
+                "expires_at": datetime(2026, 8, 30, 0, 5, tzinfo=UTC),
+            },
+        ),
+    ],
+)
+def test_authority_records_reject_boolean_schema_versions(
+    record_type: type[HumanDecisionPayload] | type[CredentialRecord] | type[ChallengeRecord],
+    material: dict[str, object],
+) -> None:
+    """Catches booleans that Pydantic would otherwise normalize to schema version one."""
+    with pytest.raises(ValidationError, match="schema_version must be an exact integer"):
+        record_type.model_validate({**material, "schema_version": True})
