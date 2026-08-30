@@ -84,6 +84,41 @@ def test_payload_rejects_noncanonical_or_ambiguous_authority_inputs() -> None:
         _payload(actor="a" * 513)
 
 
+@pytest.mark.parametrize(
+    "action",
+    (
+        DecisionAction.ANSWER_CLARIFICATION,
+        DecisionAction.RESOLVE_CONFLICT,
+        DecisionAction.APPROVE_EXTERNAL_WRITE,
+    ),
+)
+def test_non_selection_decisions_accept_an_exact_empty_selection(
+    action: DecisionAction,
+) -> None:
+    """Catches non-proposal authority being blocked by a global selection rule."""
+    subject = {
+        DecisionAction.ANSWER_CLARIFICATION: DecisionSubject(
+            kind="answer", id="answer:" + "1" * 64
+        ),
+        DecisionAction.RESOLVE_CONFLICT: DecisionSubject(kind="case", id="case:conflict"),
+        DecisionAction.APPROVE_EXTERNAL_WRITE: DecisionSubject(
+            kind="write-plan", id="write-plan:" + "2" * 64
+        ),
+    }[action]
+
+    assert _payload(action=action, subject=subject, selected_node_ids=()).selected_node_ids == ()
+
+
+@pytest.mark.parametrize(
+    "action",
+    (DecisionAction.CONFIRM_BASELINE, DecisionAction.CONFIRM_PROPOSAL),
+)
+def test_selection_bound_decisions_still_require_nodes(action: DecisionAction) -> None:
+    """Catches baseline or proposal confirmation losing its exact node binding."""
+    with pytest.raises(ValidationError, match="selected node identifiers are required"):
+        _payload(action=action, selected_node_ids=())
+
+
 def test_payload_rejects_string_subclasses_and_is_frozen() -> None:
     """Catches mutable or subclass-shaped data crossing the signed record boundary."""
 
@@ -140,3 +175,44 @@ def test_authority_records_reject_boolean_schema_versions(
     """Catches booleans that Pydantic would otherwise normalize to schema version one."""
     with pytest.raises(ValidationError, match="schema_version must be an exact integer"):
         record_type.model_validate({**material, "schema_version": True})
+
+
+@pytest.mark.parametrize(
+    ("local_only", "github_account_id", "github_login", "accepted"),
+    (
+        (True, None, None, True),
+        (True, "101", "asha", False),
+        (True, "101", None, False),
+        (True, None, "asha", False),
+        (False, "101", "asha", True),
+        (False, None, None, False),
+        (False, "101", None, False),
+        (False, None, "asha", False),
+    ),
+)
+def test_credential_identity_fields_are_complete_and_match_local_only_mode(
+    local_only: bool,
+    github_account_id: str | None,
+    github_login: str | None,
+    accepted: bool,
+) -> None:
+    """Catches partial or mode-mismatched future team identity enrollment records."""
+    material = {
+        "id": "credential:asha-laptop",
+        "project_id": "project:alpha",
+        "repository_id": "repo:sha256:" + "a" * 64,
+        "actor": "local:asha",
+        "credential_id": "Y3JlZGVudGlhbA",
+        "public_key": "cHVibGljLWtleQ",
+        "sign_count": 0,
+        "created_at": datetime(2026, 8, 30, tzinfo=UTC),
+        "local_only": local_only,
+        "github_account_id": github_account_id,
+        "github_login": github_login,
+    }
+
+    if accepted:
+        assert CredentialRecord(**material).local_only is local_only
+    else:
+        with pytest.raises(ValidationError, match="identity is inconsistent"):
+            CredentialRecord(**material)

@@ -13,7 +13,7 @@ from pydantic import ValidationError
 from starlette.testclient import TestClient
 from starlette.types import Message, Receive, Scope, Send
 
-from intent_engineering.control_plane import build_control_plane_app
+from intent_engineering.control_plane import build_control_plane_app, http_models
 from intent_engineering.control_plane.http_models import RegistrationVerifyRequest
 from intent_engineering.control_plane.models import CredentialRecord, HumanDecisionPayload
 
@@ -76,6 +76,12 @@ class _Service:
                 "payload": _payload(),
             }
         }
+        self.inbox_result: dict[str, object] = {
+            "schema_version": 1,
+            "pending_proposal_ids": [],
+            "open_case_ids": [],
+            "clarification_sessions": [],
+        }
         self.options_result = b'{"publicKey":{"userVerification":"required"}}'
         self.failure: Exception | BaseException | None = None
 
@@ -95,6 +101,39 @@ class _Service:
         if isinstance(result, Exception):
             raise result
         return result
+
+    def inbox(self) -> dict[str, object]:
+        self.calls.append(("inbox", None))
+        self._fail()
+        return self.inbox_result
+
+    def answer_preview(self, session_id: str, question_id: str, answer: str) -> dict[str, object]:
+        self.calls.append(("answer_preview", (session_id, question_id, answer)))
+        self._fail()
+        payload = {
+            **_payload(),
+            "action": "answer_clarification",
+            "subject": {"kind": "answer", "id": "answer:" + "9" * 64},
+            "selected_node_ids": [],
+        }
+        return {
+            "schema_version": 1,
+            "preview_digest": "sha256:" + "8" * 64,
+            "preview": {
+                "kind": "clarification_answer",
+                "session_id": session_id,
+                "question_id": question_id,
+                "answer_digest": "sha256:" + "7" * 64,
+                "result_evidence_id": "evidence:answer",
+                "result_evidence_digest": "sha256:" + "6" * 64,
+            },
+            "payload": payload,
+        }
+
+    def discard_answer_preview(self, answer_id: str) -> dict[str, object]:
+        self.calls.append(("discard_answer_preview", answer_id))
+        self._fail()
+        return {"schema_version": 1, "status": "discarded", "answer_id": answer_id}
 
     def registration_options(self) -> bytes:
         self.calls.append(("registration_options", None))
@@ -166,7 +205,24 @@ def test_exact_routes_delegate_to_the_service_and_return_detached_json() -> None
 
     status = client.get("/api/v1/status", headers={"Origin": ORIGIN})
     inbox = client.get("/api/v1/inbox", headers={"Origin": ORIGIN})
-    proposal = client.get("/api/v1/proposals/case:conflict", headers={"Origin": ORIGIN})
+    proposal = client.get("/api/v1/proposals/case%3Aconflict")
+    answer_preview = client.post(
+        "/api/v1/clarifications/answers/preview",
+        content=_json_bytes(
+            {
+                "session_id": "clarification:" + "4" * 64,
+                "question_id": "audience",
+                "answer": "Workspace owners",
+            }
+        ),
+        headers=_trusted_headers(),
+    )
+    answer_id = "answer:" + "9" * 64
+    answer_discard = client.post(
+        "/api/v1/clarifications/answers/discard",
+        content=_json_bytes({"answer_id": answer_id}),
+        headers=_trusted_headers(),
+    )
     registration_options = client.post(
         "/api/v1/webauthn/register/options", content=b"{}", headers=_trusted_headers()
     )
@@ -196,16 +252,30 @@ def test_exact_routes_delegate_to_the_service_and_return_detached_json() -> None
         "schema_version": 1,
         "pending_proposal_ids": [],
         "open_case_ids": [],
+        "clarification_sessions": [],
     }
     assert proposal.json() == service.previews["case:conflict"]
+    assert answer_preview.json()["payload"]["action"] == "answer_clarification"
+    assert answer_preview.json()["preview"]["answer_digest"] == "sha256:" + "7" * 64
+    assert answer_discard.json() == {
+        "schema_version": 1,
+        "status": "discarded",
+        "answer_id": answer_id,
+    }
     assert registration_options.json() == {"publicKey": {"userVerification": "required"}}
     assert registration.json() == _credential().model_dump(mode="json")
     assert decision_options.json() == {"publicKey": {"userVerification": "required"}}
     assert decision.json()["status"] == "resolved"
     assert service.calls == [
         ("status", None),
-        ("status", None),
+        ("inbox", None),
+        ("inbox", None),
         ("proposal_preview", "case:conflict"),
+        (
+            "answer_preview",
+            ("clarification:" + "4" * 64, "audience", "Workspace owners"),
+        ),
+        ("discard_answer_preview", answer_id),
         ("registration_options", None),
         (
             "register",
@@ -224,6 +294,8 @@ def test_exact_routes_delegate_to_the_service_and_return_detached_json() -> None
         status,
         inbox,
         proposal,
+        answer_preview,
+        answer_discard,
         registration_options,
         registration,
         decision_options,
@@ -237,7 +309,7 @@ def test_starlette_lifespan_starts_without_bypassing_the_http_boundary() -> None
     service = _Service()
 
     with TestClient(_app(service), base_url=ORIGIN) as client:
-        response = client.get("/api/v1/status", headers={"Origin": ORIGIN})
+        response = client.get("/api/v1/status")
 
     assert response.status_code == 200
     assert response.json() == service.status_result
@@ -251,7 +323,6 @@ def test_starlette_lifespan_starts_without_bypassing_the_http_boundary() -> None
         ({"Origin": "http://127.0.0.1:43127"}, 403),
         ({"Origin": "http://localhost:43127/"}, 403),
         ({"Origin": "null"}, 403),
-        ({}, 403),
     ),
 )
 def test_host_and_origin_must_exactly_match_the_canonical_loopback_origin(
@@ -264,6 +335,30 @@ def test_host_and_origin_must_exactly_match_the_canonical_loopback_origin(
     assert response.json() == FIXED_ERROR
     assert service.calls == []
     assert "PRIVATE" not in response.text
+
+
+@pytest.mark.parametrize("path", ("/api/v1/status", "/api/v1/inbox"))
+def test_exact_loopback_read_routes_allow_browser_get_without_origin(path: str) -> None:
+    """Catches same-origin browser GETs being rejected for an un-settable header."""
+    service = _Service()
+
+    response = TestClient(_app(service), base_url=ORIGIN).get(path)
+
+    assert response.status_code == 200
+    assert response.json()["schema_version"] == 1
+
+
+def test_present_origin_on_a_read_route_must_still_match_exactly() -> None:
+    """Catches the absent-Origin exception weakening an explicitly supplied origin."""
+    service = _Service()
+
+    response = TestClient(_app(service), base_url=ORIGIN).get(
+        "/api/v1/status", headers={"Origin": "http://localhost:43128"}
+    )
+
+    assert response.status_code == 403
+    assert response.json() == FIXED_ERROR
+    assert service.calls == []
 
 
 @pytest.mark.parametrize("method", ("POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"))
@@ -420,6 +515,48 @@ def test_extra_decision_payload_fields_fail_before_behavior() -> None:
     assert "PRIVATE" not in response.text
 
 
+def test_clarification_answer_preview_request_is_strict_and_byte_bounded() -> None:
+    """Catches a browser answer route accepting coercion, extra fields, or oversized plaintext."""
+    model = http_models.ClarificationAnswerPreviewRequest
+    valid = {
+        "session_id": "clarification:" + "4" * 64,
+        "question_id": "audience",
+        "answer": "Workspace owners",
+    }
+
+    assert model.model_validate(valid).answer == "Workspace owners"
+    for invalid in (
+        {**valid, "question_id": 7},
+        {**valid, "answer": ""},
+        {**valid, "answer": "é" * 8193},
+        {**valid, "PRIVATE_EXTRA": "secret"},
+    ):
+        with pytest.raises(ValidationError):
+            model.model_validate(invalid)
+
+
+def test_clarification_answer_route_rejects_invalid_json_before_service_behavior() -> None:
+    """Catches raw answer text reaching the service before strict request validation."""
+    service = _Service()
+    response = TestClient(_app(service), base_url=ORIGIN).post(
+        "/api/v1/clarifications/answers/preview",
+        content=_json_bytes(
+            {
+                "session_id": "clarification:" + "4" * 64,
+                "question_id": "audience",
+                "answer": "PRIVATE-ANSWER",
+                "extra": True,
+            }
+        ),
+        headers=_trusted_headers(),
+    )
+
+    assert response.status_code == 400
+    assert response.json() == FIXED_ERROR
+    assert service.calls == []
+    assert "PRIVATE-ANSWER" not in response.text
+
+
 class _DictSubclass(dict[str, object]):
     pass
 
@@ -481,6 +618,12 @@ def test_status_and_inbox_drop_items_the_service_acl_projection_denies() -> None
         "proposal:hidden": ValueError("PRIVATE-HIDDEN-PROPOSAL"),
         "case:hidden": ValueError("PRIVATE-HIDDEN-CASE"),
     }
+    service.inbox_result = {
+        "schema_version": 1,
+        "pending_proposal_ids": ["proposal:visible"],
+        "open_case_ids": ["case:visible"],
+        "clarification_sessions": [],
+    }
     client = TestClient(_app(service), base_url=ORIGIN)
 
     status = client.get("/api/v1/status", headers={"Origin": ORIGIN})
@@ -492,6 +635,7 @@ def test_status_and_inbox_drop_items_the_service_acl_projection_denies() -> None
         "schema_version": 1,
         "pending_proposal_ids": ["proposal:visible"],
         "open_case_ids": ["case:visible"],
+        "clarification_sessions": [],
     }
     assert "hidden" not in status.text
     assert "hidden" not in inbox.text
@@ -504,7 +648,7 @@ def test_invalid_service_output_and_service_errors_have_one_fixed_secret_free_re
     service.previews["case:conflict"] = cast(dict[str, object], {"first": shared, "second": shared})
     client = TestClient(_app(service), base_url=ORIGIN)
 
-    invalid_output = client.get("/api/v1/proposals/case:conflict", headers={"Origin": ORIGIN})
+    invalid_output = client.get("/api/v1/proposals/case%3Aconflict", headers={"Origin": ORIGIN})
     service.failure = ValueError("PRIVATE-SERVICE-FAILURE")
     service_error = client.get("/api/v1/status", headers={"Origin": ORIGIN})
 
@@ -577,6 +721,46 @@ async def _call_asgi(
 
 @pytest.mark.anyio
 @pytest.mark.parametrize(
+    ("raw_path", "expected_status"),
+    (
+        (b"/api/v1/proposals/case%3Aconflict", 200),
+        (b"/api/v1/proposals/case:conflict", 404),
+        (b"/api/v1/proposals/case%3aconflict", 404),
+        (b"/api/v1/proposals/case%253Aconflict", 404),
+        (b"/api/v1/proposals/case%2Fconflict", 404),
+    ),
+)
+async def test_proposal_path_accepts_only_the_shipped_browser_canonical_encoding(
+    raw_path: bytes, expected_status: int
+) -> None:
+    """Catches encoded IDs failing, or alternate spellings/separators reaching behavior."""
+    service = _Service()
+    decoded_path = (
+        "/api/v1/proposals/case/conflict"
+        if raw_path.endswith(b"case%2Fconflict")
+        else "/api/v1/proposals/case:conflict"
+    )
+
+    sent = await _call_asgi(
+        _app(service),
+        path=decoded_path,
+        body=b"",
+        scope_overrides={
+            "method": "GET",
+            "raw_path": raw_path,
+            "headers": [(b"host", b"localhost:43127")],
+        },
+    )
+
+    assert sent[0]["status"] == expected_status
+    if expected_status == 200:
+        assert service.calls == [("proposal_preview", "case:conflict")]
+    else:
+        assert service.calls == []
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
     ("extra_headers", "scope_overrides", "expected_status"),
     (
         ((b"transfer-encoding", b"chunked"), {}, 400),
@@ -628,6 +812,33 @@ async def test_cancellation_preserves_identity_and_scrubs_request_body_and_model
     traceback_locals = _repository_traceback_locals(caught.value)
     assert secret not in traceback_locals
     assert CSRF not in traceback_locals
+
+
+@pytest.mark.anyio
+async def test_answer_preview_cancellation_preserves_identity_and_scrubs_private_answer() -> None:
+    """Catches an abandoned answer surviving in HTTP cancellation traceback locals."""
+    secret = "PRIVATE-CANCELLED-ANSWER-43127"
+    cancellation = asyncio.CancelledError("cancelled")
+    service = _Service()
+    service.failure = cancellation
+    body = _json_bytes(
+        {
+            "session_id": "clarification:" + "4" * 64,
+            "question_id": "audience",
+            "answer": secret,
+        }
+    )
+
+    with pytest.raises(asyncio.CancelledError) as caught:
+        await _call_asgi(
+            _app(service),
+            path="/api/v1/clarifications/answers/preview",
+            body=body,
+        )
+
+    assert caught.value is cancellation
+    assert secret not in _repository_traceback_locals(caught.value)
+    assert CSRF not in _repository_traceback_locals(caught.value)
 
 
 @pytest.mark.anyio

@@ -7,7 +7,7 @@ import re
 import secrets
 from collections.abc import Awaitable, Callable
 from typing import Any, cast
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
@@ -18,6 +18,10 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from intent_engineering.control_plane.http_models import (
     MAX_HTTP_BODY_BYTES,
+    ClarificationAnswerDiscardRequest,
+    ClarificationAnswerDiscardResponse,
+    ClarificationAnswerPreviewRequest,
+    ClarificationAnswerPreviewResponse,
     DecisionOptionsRequest,
     DecisionVerifyRequest,
     InboxResponse,
@@ -55,12 +59,15 @@ _CSP = (
 _STATIC_METHODS = {
     "/api/v1/status": "GET",
     "/api/v1/inbox": "GET",
+    "/api/v1/clarifications/answers/preview": "POST",
+    "/api/v1/clarifications/answers/discard": "POST",
     "/api/v1/webauthn/register/options": "POST",
     "/api/v1/webauthn/register/verify": "POST",
     "/api/v1/decisions/options": "POST",
     "/api/v1/decisions/verify": "POST",
 }
 _PROPOSAL_PATH = re.compile(r"^/api/v1/proposals/([A-Za-z0-9:._-]{1,512})$")
+_PROPOSAL_PREFIX = "/api/v1/proposals/"
 _CSRF_VALUE = re.compile(r"^[A-Za-z0-9_-]{1,512}$")
 
 
@@ -175,6 +182,17 @@ def _expected_method(path: str) -> str:
     raise _HttpBoundaryError(404)
 
 
+def _canonical_raw_path(path: str) -> bytes:
+    proposal = _PROPOSAL_PATH.fullmatch(path)
+    if proposal is None:
+        try:
+            return path.encode("ascii")
+        except UnicodeError:
+            raise _HttpBoundaryError(404) from None
+    identifier = proposal.group(1)
+    return f"{_PROPOSAL_PREFIX}{quote(identifier, safe='._-')}".encode("ascii")
+
+
 def _validate_scope_and_headers(
     scope: Scope,
     *,
@@ -201,12 +219,9 @@ def _validate_scope_and_headers(
             raise _HttpBoundaryError(400)
         if type(scheme) is not str or scheme != "http":
             raise _HttpBoundaryError(403)
-        try:
-            if raw_path != path.encode("ascii"):
-                raise _HttpBoundaryError(404)
-        except UnicodeError:
-            raise _HttpBoundaryError(404) from None
         required_method = _expected_method(path)
+        if raw_path != _canonical_raw_path(path):
+            raise _HttpBoundaryError(404)
         if method != required_method:
             raise _HttpBoundaryError(405)
         raw_headers = scope.get("headers")
@@ -222,11 +237,18 @@ def _validate_scope_and_headers(
                 raise _HttpBoundaryError(400)
             headers.append((pair[0], pair[1]))
         host = _single_header(headers, b"host", status_code=403)
-        origin = _single_header(headers, b"origin", status_code=403)
-        if not secrets.compare_digest(host, expected_host) or not secrets.compare_digest(
-            origin, expected_origin
-        ):
+        if not secrets.compare_digest(host, expected_host):
             raise _HttpBoundaryError(403)
+        origins = _header_values(headers, b"origin")
+        if required_method == "GET":
+            if len(origins) > 1 or (
+                origins and not secrets.compare_digest(origins[0], expected_origin)
+            ):
+                raise _HttpBoundaryError(403)
+        else:
+            origin = _single_header(headers, b"origin", status_code=403)
+            if not secrets.compare_digest(origin, expected_origin):
+                raise _HttpBoundaryError(403)
         if _header_values(headers, b"transfer-encoding"):
             raise _HttpBoundaryError(400)
         length = _content_length(headers)
@@ -538,21 +560,13 @@ def _visible_status(service: ControlPlaneService) -> dict[str, object]:
     status: StatusResponse | None = None
     visible_proposals: list[str] = []
     visible_cases: list[str] = []
-    preview: object = None
+    inbox: InboxResponse | None = None
     try:
         raw = service.status()
         status = StatusResponse.model_validate(raw)
-        for identifier, destination in (
-            *((item, visible_proposals) for item in status.pending_proposal_ids),
-            *((item, visible_cases) for item in status.open_case_ids),
-        ):
-            try:
-                preview = service.proposal_preview(identifier)
-                detach_response_mapping(preview)
-            except Exception:  # noqa: BLE001, S112 - hidden and unavailable are identical
-                continue
-            destination.append(identifier)
-            preview = None
+        inbox = InboxResponse.model_validate(service.inbox())
+        visible_proposals.extend(inbox.pending_proposal_ids)
+        visible_cases.extend(inbox.open_case_ids)
         projected = status.model_dump(mode="json")
         projected["pending_proposal_ids"] = visible_proposals
         projected["open_case_ids"] = visible_cases
@@ -561,13 +575,15 @@ def _visible_status(service: ControlPlaneService) -> dict[str, object]:
             and status.attention_route == "inbox"
             and not visible_proposals
             and not visible_cases
+            and not inbox.clarification_sessions
         ):
             projected["status"] = "local_only"
             projected["attention_route"] = "home"
         return StatusResponse.model_validate(projected).model_dump(mode="json")
     finally:
-        raw = preview = None
+        raw = None
         status = None
+        inbox = None
         visible_proposals.clear()
         visible_cases.clear()
 
@@ -623,11 +639,7 @@ def _make_handlers(
         signal: BaseException | None = None
         result: dict[str, object] | None = None
         try:
-            status = StatusResponse.model_validate(_visible_status(service))
-            result = InboxResponse(
-                pending_proposal_ids=status.pending_proposal_ids,
-                open_case_ids=status.open_case_ids,
-            ).model_dump(mode="json")
+            result = InboxResponse.model_validate(service.inbox()).model_dump(mode="json")
             response = _json_response(result)
         except Exception:  # noqa: BLE001 - fixed browser boundary
             response = _fixed_response(503)
@@ -638,8 +650,6 @@ def _make_handlers(
             signal = caught
         finally:
             result = None
-            if "status" in locals():
-                status = cast(StatusResponse, None)
         return _end_handler(request, signal, response)
 
     async def proposal_endpoint(request: Request) -> Response:
@@ -663,6 +673,64 @@ def _make_handlers(
         finally:
             proposal_id = ""
             result = None
+        return _end_handler(request, signal, response)
+
+    async def clarification_answer_preview_endpoint(request: Request) -> Response:
+        response: Response | None = None
+        signal: BaseException | None = None
+        model: ClarificationAnswerPreviewRequest | None = None
+        result: object = None
+        detached: ClarificationAnswerPreviewResponse | None = None
+        try:
+            model = cast(
+                ClarificationAnswerPreviewRequest,
+                _parse_body(request, ClarificationAnswerPreviewRequest),
+            )
+            result = service.answer_preview(model.session_id, model.question_id, model.answer)
+            detached = ClarificationAnswerPreviewResponse.model_validate(result)
+            response = _json_response(detached.model_dump(mode="json"))
+        except _HandlerRequestError:
+            response = _fixed_response(400)
+        except Exception:  # noqa: BLE001 - fixed browser boundary
+            response = _fixed_response(503)
+        except BaseException as caught:  # noqa: BLE001 - scrub exact cancellation path
+            caught.__traceback__ = None
+            caught.__cause__ = None
+            caught.__context__ = None
+            signal = caught
+        finally:
+            model = None
+            result = None
+            detached = None
+        return _end_handler(request, signal, response)
+
+    async def clarification_answer_discard_endpoint(request: Request) -> Response:
+        response: Response | None = None
+        signal: BaseException | None = None
+        model: ClarificationAnswerDiscardRequest | None = None
+        result: object = None
+        detached: ClarificationAnswerDiscardResponse | None = None
+        try:
+            model = cast(
+                ClarificationAnswerDiscardRequest,
+                _parse_body(request, ClarificationAnswerDiscardRequest),
+            )
+            result = service.discard_answer_preview(model.answer_id)
+            detached = ClarificationAnswerDiscardResponse.model_validate(result)
+            response = _json_response(detached.model_dump(mode="json"))
+        except _HandlerRequestError:
+            response = _fixed_response(400)
+        except Exception:  # noqa: BLE001 - fixed browser boundary
+            response = _fixed_response(503)
+        except BaseException as caught:  # noqa: BLE001 - scrub exact cancellation path
+            caught.__traceback__ = None
+            caught.__cause__ = None
+            caught.__context__ = None
+            signal = caught
+        finally:
+            model = None
+            result = None
+            detached = None
         return _end_handler(request, signal, response)
 
     async def registration_options_endpoint(request: Request) -> Response:
@@ -773,6 +841,8 @@ def _make_handlers(
         "status": status_endpoint,
         "inbox": inbox_endpoint,
         "proposal": proposal_endpoint,
+        "clarification_answer_preview": clarification_answer_preview_endpoint,
+        "clarification_answer_discard": clarification_answer_discard_endpoint,
         "registration_options": registration_options_endpoint,
         "registration_verify": registration_verify_endpoint,
         "decision_options": decision_options_endpoint,
@@ -808,6 +878,16 @@ def build_control_plane_app(
                 "/api/v1/proposals/{proposal_id}",
                 handlers["proposal"],
                 methods=["GET"],
+            ),
+            Route(
+                "/api/v1/clarifications/answers/preview",
+                handlers["clarification_answer_preview"],
+                methods=["POST"],
+            ),
+            Route(
+                "/api/v1/clarifications/answers/discard",
+                handlers["clarification_answer_discard"],
+                methods=["POST"],
             ),
             Route(
                 "/api/v1/webauthn/register/options",

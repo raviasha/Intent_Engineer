@@ -5,6 +5,8 @@
     status: "/api/v1/status",
     inbox: "/api/v1/inbox",
     proposal: "/api/v1/proposals/",
+    clarificationAnswerPreview: "/api/v1/clarifications/answers/preview",
+    clarificationAnswerDiscard: "/api/v1/clarifications/answers/discard",
     registrationOptions: "/api/v1/webauthn/register/options",
     registrationVerify: "/api/v1/webauthn/register/verify",
     decisionOptions: "/api/v1/decisions/options",
@@ -183,9 +185,10 @@
       ...(inbox.pending_proposal_ids || []),
       ...(inbox.open_case_ids || []),
     ];
-    if (items.length === 0) {
-      addText(section, "p", "No visible proposals or open cases need review.");
-    } else {
+    const clarificationSessions = Array.isArray(inbox.clarification_sessions)
+      ? inbox.clarification_sessions
+      : [];
+    if (items.length > 0) {
       const list = document.createElement("ul");
       for (const identifier of items) {
         const entry = document.createElement("li");
@@ -199,17 +202,66 @@
       }
       section.append(list);
     }
+    for (const session of clarificationSessions) {
+      if (!session || typeof session !== "object" || !Array.isArray(session.questions)) {
+        continue;
+      }
+      const clarification = document.createElement("article");
+      addText(clarification, "h3", `Clarification ${session.id}`);
+      addText(clarification, "p", `Task: ${session.task_id}`);
+      for (const question of session.questions) {
+        if (!question || typeof question !== "object") {
+          continue;
+        }
+        const fieldset = document.createElement("fieldset");
+        addText(fieldset, "legend", question.prompt);
+        const label = document.createElement("label");
+        label.textContent = `Answer ${question.id}${question.required ? " (required)" : ""}`;
+        const answer = document.createElement("textarea");
+        answer.maxLength = 16384;
+        answer.required = Boolean(question.required);
+        label.append(answer);
+        fieldset.append(
+          label,
+          actionButton(`Preview answer for ${question.id}`, () =>
+            previewClarificationAnswer(session.id, question.id, answer)
+          )
+        );
+        clarification.append(fieldset);
+      }
+      section.append(clarification);
+    }
+    if (items.length === 0 && clarificationSessions.length === 0) {
+      addText(section, "p", "No visible proposals, cases, or clarification questions need review.");
+    }
     section.append(actionButton("Refresh inbox", loadInbox));
     return section;
   }
 
-  function renderSelectedNodes() {
+  function selectionRequired(payload) {
+    return Boolean(
+      payload &&
+      (payload.action === "confirm_baseline" || payload.action === "confirm_proposal")
+    );
+  }
+
+  function selectionSatisfied(payload) {
+    return !selectionRequired(payload) || state.selectedNodeIds.length > 0;
+  }
+
+  function renderSelectedNodes(payload) {
     const fieldset = document.createElement("fieldset");
     const legend = document.createElement("legend");
     legend.textContent = "Selected nodes bound to this decision";
     fieldset.append(legend);
     if (state.selectedNodeIds.length === 0) {
-      addText(fieldset, "p", "This proposal has no selected nodes and cannot be authorized here.");
+      addText(
+        fieldset,
+        "p",
+        selectionRequired(payload)
+          ? "This decision requires at least one server-bound selected node."
+          : "This action is explicitly bound to an empty node selection."
+      );
       return fieldset;
     }
     for (const nodeId of state.selectedNodeIds) {
@@ -223,6 +275,20 @@
     }
     addText(fieldset, "p", "The server-generated decision payload fixes this selection.");
     return fieldset;
+  }
+
+  function renderDecisionSummary(section, payload) {
+    const summary = document.createElement("dl");
+    summary.className = "decision-summary";
+    const subject = payload && payload.subject;
+    addValue(summary, "Action", payload && payload.action);
+    addValue(
+      summary,
+      "Subject",
+      subject && typeof subject === "object" ? `${subject.kind}: ${subject.id}` : "unavailable"
+    );
+    addValue(summary, "Result digest", payload && payload.result_digest);
+    section.append(summary);
   }
 
   function renderProposal() {
@@ -240,14 +306,18 @@
     addProjection(section, state.preview.preview);
     addText(section, "h3", "Decision binding");
     addProjection(section, state.preview.payload);
-    section.append(renderSelectedNodes());
     const payload = state.preview.payload;
+    renderDecisionSummary(section, payload);
+    section.append(renderSelectedNodes(payload));
     const actions = document.createElement("div");
     actions.className = "actions";
-    actions.append(
-      actionButton(`Authorize ${decisionLabel(payload)} with WebAuthn`, authorizeDecision, "danger"),
-      actionButton("Cancel review without applying a decision", cancelReview)
+    const authorize = actionButton(
+      `Authorize ${decisionLabel(payload)} with WebAuthn`,
+      authorizeDecision,
+      "danger"
     );
+    authorize.disabled = !selectionSatisfied(payload);
+    actions.append(authorize, actionButton("Cancel review without applying a decision", cancelReview));
     section.append(actions);
     return section;
   }
@@ -344,11 +414,79 @@
     return `${actions[action] || action} ${subjectId}`;
   }
 
-  function cancelReview() {
+  function pendingAnswerId(payload) {
+    const subject = payload && payload.subject;
+    return payload &&
+      payload.action === "answer_clarification" &&
+      subject &&
+      subject.kind === "answer" &&
+      typeof subject.id === "string" &&
+      /^answer:[0-9a-f]{64}$/.test(subject.id)
+      ? subject.id
+      : null;
+  }
+
+  async function discardPendingAnswer(payload) {
+    const answerId = pendingAnswerId(payload);
+    if (!answerId) {
+      return;
+    }
+    await fetchJson(api.clarificationAnswerDiscard, {
+      method: "POST",
+      body: JSON.stringify({ answer_id: answerId }),
+    });
+  }
+
+  async function cancelReview() {
+    const payload = state.preview && state.preview.payload;
     discardProposalReview();
     state.view = "inbox";
     render();
     announce("Review cancelled. No decision was sent.");
+    try {
+      await discardPendingAnswer(payload);
+    } catch (_error) {
+      announce("Review cancelled. The private answer will expire without authority.");
+    }
+  }
+
+  async function previewClarificationAnswer(sessionId, questionId, field) {
+    let answer = typeof field.value === "string" ? field.value : "";
+    const inbox = state.inbox;
+    if (!answer) {
+      announce("Enter an answer before requesting an authoritative preview.");
+      return;
+    }
+    try {
+      const preview = await fetchJson(api.clarificationAnswerPreview, {
+        method: "POST",
+        body: JSON.stringify({ session_id: sessionId, question_id: questionId, answer }),
+      });
+      const payload = preview && preview.payload;
+      if (
+        state.view !== "inbox" ||
+        state.inbox !== inbox ||
+        !payload ||
+        payload.action !== "answer_clarification" ||
+        !Array.isArray(payload.selected_node_ids) ||
+        payload.selected_node_ids.length !== 0 ||
+        !pendingAnswerId(payload)
+      ) {
+        throw new Error("Clarification answer preview binding changed.");
+      }
+      discardProposalReview();
+      state.proposalId = payload.subject.id;
+      state.preview = preview;
+      state.selectedNodeIds = [];
+      state.view = "proposal";
+      render();
+      announce("Answer preview loaded. Confirm its digest with WebAuthn to submit it.");
+    } catch (_error) {
+      announce("Answer preview is unavailable. No answer was submitted.");
+    } finally {
+      field.value = "";
+      answer = "";
+    }
   }
 
   async function refreshStatus() {
@@ -583,10 +721,10 @@
     if (
       !proposalId ||
       !preview ||
-      state.selectedNodeIds.length === 0 ||
+      !selectionSatisfied(preview.payload) ||
       !currentReviewMatches(proposalId, generation, preview)
     ) {
-      announce("Select a review item with server-bound nodes before authorizing it.");
+      announce("Review the exact server-bound decision before authorizing it.");
       return;
     }
     let payload = preview.payload;
@@ -618,6 +756,13 @@
           : "The challenge may have expired or changed. Review the proposal again; no decision was applied."
       );
     } finally {
+      if (!applied) {
+        try {
+          await discardPendingAnswer(payload);
+        } catch (_error) {
+          // The server also expires abandoned private previews at the authority deadline.
+        }
+      }
       clearOptionBuffers(options);
       clearSerializedCredential(response);
       result = null;

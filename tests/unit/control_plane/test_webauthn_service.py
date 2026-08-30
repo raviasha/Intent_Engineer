@@ -7,6 +7,7 @@ import json
 import traceback
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from typing import cast
 
 import pytest
@@ -351,6 +352,123 @@ def test_production_options_use_localhost_five_minutes_and_required_uv() -> None
     assert authentication_options["rpId"] == "localhost"
     assert authentication_options["timeout"] == 300_000
     assert authentication_options["userVerification"] == "required"
+
+
+def test_production_registration_verifier_forwards_every_security_binding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catches the production adapter dropping origin, RP, challenge, presence, or UV checks."""
+    verifier = PythonWebAuthnVerifier()
+    request = RegistrationRequest(
+        challenge=b"r" * 32,
+        rp_id="localhost",
+        expected_origin=ORIGIN,
+        project_id=PROJECT_ID,
+        repository_id=REPOSITORY_ID,
+        actor=ACTOR,
+    )
+    response = _registration_response(request)
+    calls: list[dict[str, object]] = []
+
+    def verify(**kwargs: object) -> object:
+        calls.append(kwargs)
+        return SimpleNamespace(
+            credential_id=b"forwarded-credential",
+            credential_public_key=b"forwarded-public-key",
+            sign_count=7,
+            user_verified=True,
+        )
+
+    monkeypatch.setattr(
+        "intent_engineering.control_plane.webauthn_service.verify_registration_response",
+        verify,
+    )
+
+    result = verifier.verify_registration(response, request)
+
+    assert calls == [
+        {
+            "credential": response.decode("utf-8"),
+            "expected_challenge": b"r" * 32,
+            "expected_rp_id": "localhost",
+            "expected_origin": ORIGIN,
+            "require_user_presence": True,
+            "require_user_verification": True,
+        }
+    ]
+    assert result == VerifiedRegistration(
+        credential_id=b"forwarded-credential",
+        public_key=b"forwarded-public-key",
+        sign_count=7,
+        user_verified=True,
+    )
+
+
+def test_production_authentication_verifier_forwards_exact_credential_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catches production assertion verification using the wrong key, counter, or binding."""
+    verifier = PythonWebAuthnVerifier()
+    credential_record = CredentialRecord(
+        id="credential:primary",
+        project_id=PROJECT_ID,
+        repository_id=REPOSITORY_ID,
+        actor=ACTOR,
+        credential_id=_b64(b"credential-primary"),
+        public_key=_b64(b"public-key-primary"),
+        sign_count=9,
+        created_at=NOW,
+    )
+    request = AuthenticationRequest(
+        challenge=b"a" * 32,
+        rp_id="localhost",
+        expected_origin=ORIGIN,
+        project_id=PROJECT_ID,
+        repository_id=REPOSITORY_ID,
+        actor=ACTOR,
+        payload_bytes=b"canonical-payload\n",
+        credentials=(credential_record,),
+    )
+    response = _platform_authentication_response(request, secret=ORIGIN)
+    parsed = SimpleNamespace(raw_id=b"credential-primary")
+    calls: list[dict[str, object]] = []
+
+    monkeypatch.setattr(
+        "intent_engineering.control_plane.webauthn_service.parse_authentication_credential_json",
+        lambda value: parsed if value == response.decode("utf-8") else None,
+    )
+
+    def verify(**kwargs: object) -> object:
+        calls.append(kwargs)
+        return SimpleNamespace(
+            credential_id=b"credential-primary",
+            new_sign_count=10,
+            user_verified=True,
+        )
+
+    monkeypatch.setattr(
+        "intent_engineering.control_plane.webauthn_service.verify_authentication_response",
+        verify,
+    )
+
+    result = verifier.verify_authentication(response, request)
+
+    assert calls == [
+        {
+            "credential": parsed,
+            "expected_challenge": b"a" * 32,
+            "expected_rp_id": "localhost",
+            "expected_origin": ORIGIN,
+            "credential_public_key": b"public-key-primary",
+            "credential_current_sign_count": 9,
+            "require_user_verification": True,
+        }
+    ]
+    assert result == VerifiedAuthentication(
+        credential_id=b"credential-primary",
+        new_sign_count=10,
+        user_verified=True,
+    )
 
 
 @pytest.mark.parametrize("ceremony", ["registration", "authentication"])

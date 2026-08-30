@@ -50,6 +50,8 @@ def test_browser_bundle_uses_the_public_api_and_never_persists_sensitive_materia
         "/api/v1/status",
         "/api/v1/inbox",
         "/api/v1/proposals/",
+        "/api/v1/clarifications/answers/preview",
+        "/api/v1/clarifications/answers/discard",
         "/api/v1/webauthn/register/options",
         "/api/v1/webauthn/register/verify",
         "/api/v1/decisions/options",
@@ -66,6 +68,8 @@ def test_browser_bundle_uses_the_public_api_and_never_persists_sensitive_materia
     assert "sessionStorage" not in javascript
     assert "console." not in javascript
     assert "history.replaceState" in javascript
+    assert "encodeURIComponent" in javascript
+    assert 'headers.set("origin"' not in javascript.lower()
 
 
 def test_browser_bundle_clears_sensitive_ceremony_references_in_finally_blocks() -> None:
@@ -86,8 +90,7 @@ def test_authorization_is_explicitly_destructive_and_cancel_is_safe() -> None:
 
     assert "Authorize ${decisionLabel(payload)} with WebAuthn" in javascript
     assert 'actionButton("Cancel review without applying a decision", cancelReview)' in javascript
-    assert (
-        'actionButton(`Authorize ${decisionLabel(payload)} with WebAuthn`, authorizeDecision, "danger")'
-        in javascript
-    )
+    assert "const authorize = actionButton(" in javascript
+    assert "authorizeDecision," in javascript
+    assert '      "danger"' in javascript
     assert ".danger" in css

@@ -73,6 +73,14 @@ class _PublicService:
             "payload": _payload(),
         }
 
+    def inbox(self) -> dict[str, object]:
+        return {
+            "schema_version": 1,
+            "pending_proposal_ids": ["proposal:review"],
+            "open_case_ids": [],
+            "clarification_sessions": [],
+        }
+
     def registration_options(self) -> bytes:
         self.calls.append(("registration_options", None))
         return json.dumps(
@@ -205,7 +213,7 @@ def test_offline_fake_browser_completes_public_registration_and_decision_ceremon
         content=json.dumps({"response": credential}),
         headers=_headers(),
     )
-    preview = client.get("/api/v1/proposals/proposal:review", headers={"Origin": ORIGIN})
+    preview = client.get("/api/v1/proposals/proposal%3Areview")
     payload = cast(dict[str, object], preview.json()["payload"])
     decision = client.post(
         "/api/v1/decisions/options",
@@ -241,7 +249,7 @@ def test_cancelled_browser_review_performs_no_verify_request() -> None:
         base_url=ORIGIN,
     )
 
-    preview = client.get("/api/v1/proposals/proposal:review", headers={"Origin": ORIGIN})
+    preview = client.get("/api/v1/proposals/proposal%3Areview")
 
     assert preview.status_code == 200
     assert service.calls == []
@@ -254,7 +262,7 @@ def test_expired_browser_challenge_is_rejected_without_a_decision_result() -> No
         build_control_plane_app(cast(Any, service), origin=ORIGIN, csrf_secret=CSRF),
         base_url=ORIGIN,
     )
-    preview = client.get("/api/v1/proposals/proposal:review", headers={"Origin": ORIGIN})
+    preview = client.get("/api/v1/proposals/proposal%3Areview")
     expired_result = client.post(
         "/api/v1/decisions/verify",
         content=json.dumps({"response": {"id": "abandoned"}, "payload": preview.json()["payload"]}),

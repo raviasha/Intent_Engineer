@@ -280,7 +280,13 @@ class CredentialRecord(_ControlPlaneModel):
             self.public_key
         ):
             raise ValueError("credential material must be base64url")
-        if self.local_only != (self.github_account_id is None and self.github_login is None):
+        github_identity_absent = self.github_account_id is None and self.github_login is None
+        github_identity_complete = (
+            self.github_account_id is not None and self.github_login is not None
+        )
+        if (self.local_only and not github_identity_absent) or (
+            not self.local_only and not github_identity_complete
+        ):
             raise ValueError("credential enrollment identity is inconsistent")
         return self
 

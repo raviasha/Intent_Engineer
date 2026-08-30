@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import secrets
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -45,7 +46,10 @@ from intent_engineering.intent_workflow.clarification import (
     ProposalConfirmationStatus,
 )
 from intent_engineering.intent_workflow.clarification import _digest as clarification_digest
-from intent_engineering.intent_workflow.conversation import ConversationCapture
+from intent_engineering.intent_workflow.conversation import (
+    ConversationCapture,
+    validate_conversation_record,
+)
 from intent_engineering.intent_workflow.models import ClarificationIntentProposal, ProposalKind
 from intent_engineering.intent_workflow.onboarding import (
     OnboardingRuntime,
@@ -67,6 +71,9 @@ _MAX_AUTHORITY_FILES = 256
 _MAX_AUTHORITY_DEPTH = 8
 _DECISION_LIFETIME = timedelta(minutes=5)
 _APPROVAL_LIFETIME = timedelta(minutes=15)
+_MAX_PENDING_ANSWERS = 64
+_MAX_VISIBLE_CLARIFICATION_SESSIONS = 64
+_ANSWER_ID = re.compile(r"^answer:[0-9a-f]{64}$")
 
 
 class ControlPlaneError(ValueError):
@@ -87,6 +94,7 @@ class _PendingAnswer:
     evidence_id: str
     subject_digest: str
     result_digest: str
+    expires_at: datetime
 
 
 @dataclass(slots=True)
@@ -234,6 +242,15 @@ class ControlPlaneService:
             raise ValueError("invalid control plane challenge")
         return f"challenge:{value.hex()}"
 
+    def _purge_pending_answers(self, now: datetime) -> None:
+        expired = tuple(
+            identifier
+            for identifier, pending in self._pending_answers.items()
+            if pending.expires_at <= now
+        )
+        for identifier in expired:
+            self._pending_answers.pop(identifier, None)
+
     @staticmethod
     def _read_policies(
         files: Mapping[str, SecureFile],
@@ -343,6 +360,7 @@ class ControlPlaneService:
     def status(self) -> dict[str, object]:
         """Return one detached local readiness projection without granting authority."""
         try:
+            self._purge_pending_answers(self._now())
             onboarding = inspect_onboarding(cast(OnboardingRuntime, self._runtime))
             open_cases = tuple(
                 case.id
@@ -354,9 +372,25 @@ class ControlPlaneService:
                     ReconciliationStatus.FALSE_POSITIVE,
                 }
             )
+            latest_sessions = {
+                event.session.id: event.session
+                for event in self._runtime.intent_proposals.clarification_events()
+            }
+            clarification_attention = any(
+                session.status == "open"
+                and bool(
+                    {question.id for question in session.questions}
+                    - {answer.question_id for answer in session.answers}
+                )
+                for session in latest_sessions.values()
+            )
             if onboarding.state is OnboardingState.REQUIRED:
                 status, route = DevStatus.ONBOARDING_REQUIRED, AttentionRoute.ONBOARDING
-            elif onboarding.state is OnboardingState.REVIEW_REQUIRED or open_cases:
+            elif (
+                onboarding.state is OnboardingState.REVIEW_REQUIRED
+                or open_cases
+                or clarification_attention
+            ):
                 status, route = DevStatus.HUMAN_ATTENTION_REQUIRED, AttentionRoute.INBOX
             else:
                 status, route = DevStatus.LOCAL_ONLY, AttentionRoute.HOME
@@ -372,6 +406,106 @@ class ControlPlaneService:
             }
         except Exception:  # noqa: BLE001 - fixed opaque authority boundary
             raise ControlPlaneError() from None
+
+    def _clarification_inbox(self, authority: _Authority) -> list[dict[str, object]]:
+        actor = authority.config.local_actor
+        principals = self._principals(authority, actor)
+        records = tuple(self._runtime.evidence_store.list())
+        evidence = {record.id: record for record in records}
+        latest_sessions = {
+            event.session.id: event.session
+            for event in self._runtime.intent_proposals.clarification_events()
+        }
+        visible: list[dict[str, object]] = []
+        for session_id in sorted(latest_sessions):
+            if len(visible) >= _MAX_VISIBLE_CLARIFICATION_SESSIONS:
+                break
+            session = latest_sessions[session_id]
+            if session.status != "open":
+                continue
+            answered = {answer.question_id for answer in session.answers}
+            questions: list[dict[str, object]] = []
+            for question in session.questions:
+                if question.id in answered:
+                    continue
+                record = evidence.get(question.evidence_ref)
+                if record is None or not refs_allowed(
+                    (
+                        session.request_evidence_ref,
+                        session.classification_evidence_ref,
+                        question.evidence_ref,
+                    ),
+                    records,
+                    principals,
+                ):
+                    continue
+                try:
+                    prompt = validate_conversation_record(
+                        record,
+                        conversation_ref=session.conversation_ref,
+                        role="agent",
+                        author=question.author,
+                        acl=record.acl,
+                    )
+                except Exception:  # noqa: BLE001, S112 - hidden and invalid are identical
+                    continue
+                if (
+                    type(prompt) is not str
+                    or clarification_digest(prompt) != question.prompt_digest
+                ):
+                    continue
+                questions.append(
+                    {
+                        "id": question.id,
+                        "prompt": prompt,
+                        "required": question.required,
+                    }
+                )
+            if questions:
+                visible.append(
+                    {
+                        "id": session.id,
+                        "task_id": session.task_id,
+                        "questions": questions,
+                    }
+                )
+        return visible
+
+    def inbox(self) -> dict[str, object]:
+        """Return one bounded ACL-filtered browser Inbox projection."""
+        authority: _Authority | None = None
+        try:
+            self._purge_pending_answers(self._now())
+            raw_status = self.status()
+            visible_proposals: list[str] = []
+            visible_cases: list[str] = []
+            for identifier, destination in (
+                *(
+                    (item, visible_proposals)
+                    for item in cast(list[str], raw_status["pending_proposal_ids"])
+                ),
+                *((item, visible_cases) for item in cast(list[str], raw_status["open_case_ids"])),
+            ):
+                try:
+                    self.proposal_preview(identifier)
+                except Exception:  # noqa: BLE001, S112 - hidden and unavailable are identical
+                    continue
+                destination.append(identifier)
+            authority = self._authority()
+            clarification_sessions = self._clarification_inbox(authority)
+            if not self._authority_matches(authority):
+                raise ValueError("inbox authority changed")
+            return {
+                "schema_version": 1,
+                "pending_proposal_ids": visible_proposals,
+                "open_case_ids": visible_cases,
+                "clarification_sessions": clarification_sessions,
+            }
+        except Exception:  # noqa: BLE001 - fixed opaque authority boundary
+            raise ControlPlaneError() from None
+        finally:
+            if authority is not None:
+                authority.close()
 
     def onboard_preview(self, prd: str) -> dict[str, object]:
         """Capture one bounded PRD through the existing held-runtime evidence path."""
@@ -726,6 +860,7 @@ class ControlPlaneService:
         """Reconstruct a proposal, case, or write-plan preview from held descriptors."""
         authority: _Authority | None = None
         try:
+            self._purge_pending_answers(self._now())
             authority = self._authority()
             if proposal_id.startswith("proposal:"):
                 proposal = self._runtime.intent_proposals.get(proposal_id)
@@ -772,9 +907,11 @@ class ControlPlaneService:
         result: dict[str, object] | None = None
         signal: BaseException | None = None
         answer_id: str | None = None
+        inserted = False
         try:
             authority = self._authority()
             at = self._now()
+            self._purge_pending_answers(at)
             actor = authority.config.local_actor
             principals = self._principals(authority, actor)
             acl = tuple(sorted(principals))
@@ -791,7 +928,7 @@ class ControlPlaneService:
             subject_digest = clarification_digest(answer)
             result_digest = _digest(record.model_dump(mode="json"))
             answer_id = f"answer:{_digest({'session': session_id, 'question': question_id, 'answer': subject_digest, 'at': at.isoformat()}).removeprefix('sha256:')}"
-            self._pending_answers[answer_id] = _PendingAnswer(
+            pending = _PendingAnswer(
                 session_id,
                 question_id,
                 answer,
@@ -801,7 +938,16 @@ class ControlPlaneService:
                 record.id,
                 subject_digest,
                 result_digest,
+                at + _DECISION_LIFETIME,
             )
+            existing = self._pending_answers.get(answer_id)
+            if existing is not None and existing != pending:
+                raise ValueError("answer preview collision")
+            if existing is None:
+                if len(self._pending_answers) >= _MAX_PENDING_ANSWERS:
+                    raise ValueError("answer preview capacity unavailable")
+                self._pending_answers[answer_id] = pending
+                inserted = True
             payload, material = self._payload(
                 DecisionAction.ANSWER_CLARIFICATION,
                 answer_id,
@@ -818,9 +964,14 @@ class ControlPlaneService:
             signal = caught
         finally:
             session_id = question_id = answer = ""
-            if result is None and answer_id is not None:
+            if result is None and inserted and answer_id is not None:
                 self._pending_answers.pop(answer_id, None)
             answer_id = None
+            inserted = False
+            if "pending" in locals():
+                pending = cast(_PendingAnswer, None)
+            if "existing" in locals():
+                existing = cast(_PendingAnswer, None)
             if authority is not None:
                 authority.close()
         if signal is not None:
@@ -830,6 +981,23 @@ class ControlPlaneService:
         if result is None:
             raise ControlPlaneError() from None
         return result
+
+    def discard_answer_preview(self, answer_id: str) -> dict[str, object]:
+        """Forget one private preview without creating or requiring human authority."""
+        try:
+            if type(answer_id) is not str or _ANSWER_ID.fullmatch(answer_id) is None:
+                raise ValueError("invalid answer preview")
+            self._purge_pending_answers(self._now())
+            self._pending_answers.pop(answer_id, None)
+            return {
+                "schema_version": 1,
+                "status": "discarded",
+                "answer_id": answer_id,
+            }
+        except Exception:  # noqa: BLE001 - fixed opaque authority boundary
+            raise ControlPlaneError() from None
+        finally:
+            answer_id = ""
 
     def registration_options(self) -> bytes:
         """Issue enrollment options for the configured actor at server-owned time."""
@@ -983,6 +1151,7 @@ class ControlPlaneService:
         result: bytes | None = None
         signal: BaseException | None = None
         try:
+            self._purge_pending_answers(self._now())
             if not isinstance(payload, HumanDecisionPayload):
                 raise TypeError("invalid decision payload")
             payload = HumanDecisionPayload.model_validate_json(payload.model_dump_json())
@@ -1292,6 +1461,7 @@ class ControlPlaneService:
         signal: BaseException | None = None
         failed = False
         try:
+            self._purge_pending_answers(self._now())
             if type(assertion) is not bytes or not isinstance(payload, HumanDecisionPayload):
                 raise TypeError("invalid decision assertion")
             detached = HumanDecisionPayload.model_validate_json(payload.model_dump_json())

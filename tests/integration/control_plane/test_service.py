@@ -705,6 +705,103 @@ def test_authenticated_clarification_answer_captures_exact_human_evidence(
     assert _optional_bytes(history_path) == history_before
 
 
+def test_inbox_surfaces_only_acl_visible_unanswered_clarification_questions(
+    tmp_path: Path,
+) -> None:
+    """Catches the browser Inbox omitting the authoritative clarification workflow."""
+    harness = _harness(tmp_path)
+    _coordinator, session = _open_clarification(harness)
+
+    inbox = harness.service.inbox()
+
+    assert inbox == {
+        "schema_version": 1,
+        "pending_proposal_ids": [],
+        "open_case_ids": [],
+        "clarification_sessions": [
+            {
+                "id": session.id,
+                "task_id": session.task_id,
+                "questions": [
+                    {
+                        "id": "audience",
+                        "prompt": "Who may share reports?",
+                        "required": True,
+                    }
+                ],
+            }
+        ],
+    }
+    _rewrite_evidence_acl(
+        harness.project,
+        session.questions[0].evidence_ref,
+        ("private:unavailable",),
+    )
+
+    assert harness.service.inbox()["clarification_sessions"] == []
+
+
+def test_pending_answer_expires_at_the_decision_lifetime_and_is_purged(
+    tmp_path: Path,
+) -> None:
+    """Catches abandoned private plaintext remaining after its authority window closes."""
+    harness = _harness(tmp_path)
+    _coordinator, session = _open_clarification(harness)
+    preview = harness.service.answer_preview(session.id, "audience", "Private answer")
+    payload = harness.payload(preview)
+    assert len(harness.service._pending_answers) == 1
+
+    harness.service._clock = lambda: NOW + timedelta(minutes=5)
+    harness.service.status()
+
+    assert harness.service._pending_answers == {}
+    with pytest.raises(ControlPlaneError, match="^control plane unavailable$"):
+        harness.service.decision_options(payload)
+
+
+def test_pending_answer_cap_fails_without_evicting_an_active_exact_preview(
+    tmp_path: Path,
+) -> None:
+    """Catches unbounded plaintext growth or capacity handling that drops live authority."""
+    harness = _harness(tmp_path)
+    _coordinator, session = _open_clarification(harness)
+    previews = [
+        harness.service.answer_preview(session.id, "audience", f"Private answer {index}")
+        for index in range(64)
+    ]
+
+    with pytest.raises(ControlPlaneError, match="^control plane unavailable$"):
+        harness.service.answer_preview(session.id, "audience", "Private answer overflow")
+
+    assert len(harness.service._pending_answers) == 64
+    first = previews[0]
+    result = harness.service.apply_decision(b"signed-assertion", harness.sign(first))
+    assert result["status"] == "open"
+
+
+def test_discard_answer_preview_cleans_up_without_requesting_human_authority(
+    tmp_path: Path,
+) -> None:
+    """Catches browser cancel retaining plaintext or accidentally creating authority."""
+    harness = _harness(tmp_path)
+    _coordinator, session = _open_clarification(harness)
+    preview = harness.service.answer_preview(session.id, "audience", "Discard me")
+    payload = harness.payload(preview)
+    answer_id = payload.subject.id
+
+    assert harness.service.discard_answer_preview(answer_id) == {
+        "schema_version": 1,
+        "status": "discarded",
+        "answer_id": answer_id,
+    }
+
+    assert harness.service._pending_answers == {}
+    assert harness.verifier.authentication_requests == []
+    with pytest.raises(ControlPlaneError, match="^control plane unavailable$"):
+        harness.service.decision_options(payload)
+    assert harness.verifier.authentication_requests == []
+
+
 def test_private_answer_cancellation_rolls_back_and_scrubs_traceback(
     tmp_path: Path,
 ) -> None:

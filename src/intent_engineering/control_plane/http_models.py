@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import json
 import math
+import re
 from typing import Literal, cast
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, field_validator, model_validator
 
 from intent_engineering.control_plane.models import HumanDecisionPayload
 
@@ -14,6 +15,10 @@ MAX_HTTP_BODY_BYTES = 256 * 1024
 _MAX_JSON_DEPTH = 128
 _MAX_JSON_NODES = 65_536
 _MAX_RESPONSE_BYTES = 1024 * 1024
+_MAX_IDENTIFIER_BYTES = 512
+_MAX_ANSWER_BYTES = 16 * 1024
+_DIGEST_PATTERN = re.compile(r"^sha256:[0-9a-f]{64}$")
+_ANSWER_ID_PATTERN = re.compile(r"^answer:[0-9a-f]{64}$")
 
 
 def require_exact_json(value: object, *, maximum_bytes: int = MAX_HTTP_BODY_BYTES) -> None:
@@ -174,6 +179,46 @@ class DecisionVerifyRequest(HttpRequestModel):
             encoded = None
 
 
+class ClarificationAnswerPreviewRequest(HttpRequestModel):
+    """One bounded private answer submitted only for authoritative preview."""
+
+    session_id: str = Field(min_length=1, max_length=_MAX_IDENTIFIER_BYTES)
+    question_id: str = Field(min_length=1, max_length=256)
+    answer: str = Field(min_length=1, max_length=_MAX_ANSWER_BYTES)
+
+    @field_validator("session_id", "question_id", "answer", mode="before")
+    @classmethod
+    def require_exact_answer_strings(cls, value: object) -> str:
+        if type(value) is not str:
+            raise ValueError("invalid clarification answer request")
+        return value
+
+    @field_validator("session_id", "question_id", "answer")
+    @classmethod
+    def bound_answer_bytes(cls, value: str, info: ValidationInfo) -> str:
+        maximum = {
+            "answer": _MAX_ANSWER_BYTES,
+            "question_id": 256,
+            "session_id": _MAX_IDENTIFIER_BYTES,
+        }[str(info.field_name)]
+        if not value or len(value.encode("utf-8")) > maximum:
+            raise ValueError("invalid clarification answer request")
+        return value
+
+
+class ClarificationAnswerDiscardRequest(HttpRequestModel):
+    """One opaque pending answer identifier to forget without granting authority."""
+
+    answer_id: str = Field(min_length=71, max_length=71)
+
+    @field_validator("answer_id", mode="before")
+    @classmethod
+    def require_exact_answer_id(cls, value: object) -> str:
+        if type(value) is not str or _ANSWER_ID_PATTERN.fullmatch(value) is None:
+            raise ValueError("invalid clarification answer discard")
+        return value
+
+
 class _HttpResponseModel(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True, validate_default=True)
 
@@ -234,10 +279,23 @@ class StatusResponse(_HttpResponseModel):
         return cast(list[str], value)
 
 
+class ClarificationQuestionResponse(_HttpResponseModel):
+    id: str = Field(min_length=1, max_length=256)
+    prompt: str = Field(min_length=1, max_length=2048)
+    required: bool
+
+
+class ClarificationSessionResponse(_HttpResponseModel):
+    id: str = Field(min_length=1, max_length=_MAX_IDENTIFIER_BYTES)
+    task_id: str = Field(min_length=1, max_length=256)
+    questions: list[ClarificationQuestionResponse] = Field(min_length=1, max_length=16)
+
+
 class InboxResponse(_HttpResponseModel):
     schema_version: Literal[1] = 1
     pending_proposal_ids: list[str] = Field(max_length=256)
     open_case_ids: list[str] = Field(max_length=256)
+    clarification_sessions: list[ClarificationSessionResponse] = Field(max_length=64)
 
     @field_validator("pending_proposal_ids", "open_case_ids", mode="before")
     @classmethod
@@ -245,6 +303,41 @@ class InboxResponse(_HttpResponseModel):
         if type(value) is not list or any(type(item) is not str for item in value):
             raise ValueError("invalid HTTP response")
         return cast(list[str], value)
+
+
+class ClarificationAnswerPreviewProjection(_HttpResponseModel):
+    kind: Literal["clarification_answer"]
+    session_id: str = Field(min_length=1, max_length=_MAX_IDENTIFIER_BYTES)
+    question_id: str = Field(min_length=1, max_length=256)
+    answer_digest: str = Field(pattern=_DIGEST_PATTERN.pattern)
+    result_evidence_id: str = Field(min_length=1, max_length=_MAX_IDENTIFIER_BYTES)
+    result_evidence_digest: str = Field(pattern=_DIGEST_PATTERN.pattern)
+
+
+class ClarificationAnswerPreviewResponse(_HttpResponseModel):
+    schema_version: Literal[1] = 1
+    preview_digest: str = Field(pattern=_DIGEST_PATTERN.pattern)
+    preview: ClarificationAnswerPreviewProjection
+    payload: HumanDecisionPayload
+
+    @field_validator("payload", mode="before")
+    @classmethod
+    def require_canonical_payload(cls, value: object) -> HumanDecisionPayload:
+        encoded: bytes | None = None
+        try:
+            if type(value) is not dict:
+                raise ValueError("invalid HTTP response")
+            encoded = canonical_json_object(value)
+            return HumanDecisionPayload.model_validate_json(encoded)
+        finally:
+            value = None
+            encoded = None
+
+
+class ClarificationAnswerDiscardResponse(_HttpResponseModel):
+    schema_version: Literal[1] = 1
+    status: Literal["discarded"]
+    answer_id: str = Field(pattern=_ANSWER_ID_PATTERN.pattern)
 
 
 def parse_request_bytes[RequestModelT: HttpRequestModel](
@@ -354,6 +447,12 @@ def parse_response_bytes(value: bytes) -> dict[str, object]:
 
 __all__ = [
     "MAX_HTTP_BODY_BYTES",
+    "ClarificationAnswerDiscardRequest",
+    "ClarificationAnswerDiscardResponse",
+    "ClarificationAnswerPreviewRequest",
+    "ClarificationAnswerPreviewResponse",
+    "ClarificationQuestionResponse",
+    "ClarificationSessionResponse",
     "DecisionOptionsRequest",
     "DecisionVerifyRequest",
     "HttpRequestModel",
