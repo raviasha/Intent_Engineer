@@ -21,6 +21,7 @@ from intent_engineering.cli.connectors import (
     connector_catalog,
     connectors_app,
 )
+from intent_engineering.cli.dev import dev_command
 from intent_engineering.cli.github import GitHubDoctorResult, check_github
 from intent_engineering.cli.intent_workflow import (
     bootstrap_command,
@@ -98,6 +99,7 @@ app.add_typer(sources_app, name="sources")
 app.add_typer(proposals_app, name="proposals")
 app.command("bootstrap")(bootstrap_command)
 app.command("onboard")(onboard_command)
+app.command("dev")(dev_command)
 
 _MAX_PROMPT_HOOK_BYTES = 64 * 1024
 

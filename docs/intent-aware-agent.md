@@ -19,19 +19,29 @@ cd /absolute/path/to/target-repository
 ```
 
 Wheel-only installs such as `python -m pip install intent-engineering` provide the CLI and MCP
-server, but not the repository-shipped plugin marketplace or advisor assets. Restart the ChatGPT
-desktop app and start a new task rooted in the target repository. Codex launches the plugin-owned MCP server from
-the bundle configuration; do not start an additional process for it. First obtain explicit human consent
-and confirm the exact PRD path; only then run the advancing `intent onboard ... --yes` command
-below. A decline leaves the repository byte-unchanged and disables intent-aware classification only
-for that task. Running onboarding without `--yes` is only an offer/no-op diagnostic: it does not
-initialize `.intent/`, read the PRD, capture evidence, or assign `declared_intent`. The consented
-first run returns `proposal_required` and names the bootstrap-proposal action; it does not manufacture
-an agent proposal or human approval.
+server, including the packaged local review UI, but not the repository-shipped plugin marketplace
+or advisor assets. Restart the ChatGPT desktop app and start a new task rooted in the target
+repository. Codex launches the plugin-owned MCP server from the bundle configuration; do not start
+an additional process for it. Confirm the exact PRD path, then start the primary local control
+plane:
 
 ```bash
-intent onboard --project . --prd docs/PRD.md --yes
+intent dev --project . --prd docs/PRD.md --offline
 ```
+
+This single foreground process initializes a missing workspace, records the PRD as immutable
+declared-intent evidence, chooses an ephemeral loopback port, and opens the browser review UI.
+Register the local device with WebAuthn. PRD capture still does not manufacture an agent proposal
+or human approval: the active agent submits a typed `BootstrapSubmission`, and the browser presents
+the exact evidence, digest, and selected nodes for explicit activation. Use `--no-open` when needed,
+and check or reuse the repository-bound process with `intent dev --project . --status`.
+
+Milestone 1 is deliberately single-user and local. Team identity enrollment and shared review
+state are Milestone 3 work; the current device credential and process metadata are not shared-team
+identity or synchronization mechanisms.
+
+Existing automation may still use the granular onboarding diagnostic
+`intent onboard --project . --prd docs/PRD.md --yes`.
 
 ## 2. Approve the baseline
 
@@ -44,12 +54,12 @@ intent proposals show <proposal-id> --project . --format json
 intent proposals confirm <proposal-id> --project . --format json
 ```
 
-Confirmation is interactive, shows the complete proposal, and requires its exact digest. The agent,
-`intent onboard --yes`, and the advisory plugin cannot manufacture that human act. Repeating
-onboarding after activation returns `ready` without changing canonical state.
+The browser confirmation is WebAuthn-backed, shows the complete proposal, and binds the exact
+digest and selected node IDs. The agent, PRD capture, and the advisory plugin cannot manufacture
+that human act.
 
-The compatible legacy path remains available and still returns `agent_submission_required` before
-an agent proposes graph content:
+The granular CLI path remains available under advanced diagnostics and still returns
+`agent_submission_required` before an agent proposes graph content:
 
 ```bash
 intent init --project .
@@ -110,13 +120,13 @@ The CLI diagnostic does not classify the request and does not mint a capability;
 
 For `new_or_ambiguous`, the advisory preflight opens a persisted clarification session and the hook
 asks each question. A later hook submission is still agent evidence: it does not satisfy a required
-human answer and is not treated as approval. The route returns `human_confirmation_required`, and
-the public MCP answer and confirmation tools return that same fixed status without changing state.
-An independently authenticated non-MCP local human integration over the existing
-`ClarificationCoordinator` and proposal-confirmation service must record the answer, then approve
-the exact proposal digest and selected node IDs. Intent Engineering ships no CLI command for those
-two authority steps; without a configured host integration, the session or proposal remains
-pending. The agent may show the token-free persisted proposal preview but cannot activate it.
+human answer and is not treated as approval. The route and public MCP answer/confirmation tools
+return `human_confirmation_required` without changing state. The `intent dev` browser is the
+authenticated non-MCP local human integration: via the existing `ClarificationCoordinator`, it
+records the answer through WebAuthn and then presents the exact clarified proposal digest and
+selected node IDs for a second authenticated confirmation. The agent may show the token-free
+persisted preview but cannot activate it, and there is no shipped CLI command for either
+human-authority step.
 
 If there is insufficient evidence, the result remains `new_or_ambiguous` and asks focused
 questions. A `conflicting` request cannot be self-reviewed when policy requires an independent

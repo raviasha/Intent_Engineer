@@ -37,20 +37,34 @@ checkout sequence above when installing the Codex plugin.
 
 Restart the ChatGPT desktop app and start a new task rooted in the target repository. Codex
 launches the plugin-owned MCP server from `plugins/intent-advisor/.mcp.json`; do not start an
-additional server process for the plugin. First obtain explicit human consent and confirm the
-exact PRD path; only then run the advancing
-`intent onboard ... --yes` command below. It captures that PRD as immutable declared-intent evidence
-and returns the public bootstrap-proposal next action. Running the same command without
-`--yes` is only an offer/no-op diagnostic and does not advance onboarding. Onboarding never invents
-or activates canonical intent by itself:
+additional server process for the plugin. Confirm the exact PRD path, then launch the primary
+local review flow:
 
 ```bash
-intent onboard --project . --prd docs/PRD.md --yes
+intent dev --project . --prd docs/PRD.md --offline
 ```
+
+The command initializes a missing `.intent` workspace, captures the PRD as immutable
+`declared_intent` evidence, starts exactly one repository-bound process on an ephemeral loopback
+port, and opens the packaged review UI. It does not invent an agent proposal or approve canonical
+intent. Register the local device with WebAuthn in the UI; when the active agent submits the typed
+bootstrap proposal, review its complete evidence and selected nodes there before activating it.
+Use `--no-open` on a headless terminal and `intent dev --project . --status` to inspect the held
+process. Re-running `intent dev` reuses only a live process that proves the same repository
+identity. The metadata in `.intent/cache/control-plane.json` is a non-authoritative locator and
+contains no WebAuthn credential or decision authority.
+
+`intent dev` is the Milestone 1 single-user local control plane. Team identity enrollment and
+shared review state arrive in Milestone 3; do not treat the current local credential or cache as
+a team identity system.
+
+The compatible granular onboarding diagnostic remains available for existing automation:
+`intent onboard --project . --prd docs/PRD.md --yes`.
 
 ### Approve the baseline
 
-Inspect the exact proposal before confirming it:
+The browser flow is the primary confirmation path. The granular commands remain available as
+advanced diagnostics for automation and recovery:
 
 ```bash
 intent proposals list --project . --format json
@@ -58,7 +72,7 @@ intent proposals show <proposal-id> --project . --format json
 intent proposals confirm <proposal-id> --project . --format json
 ```
 
-Confirmation is interactive and digest-bound; neither `--yes` on onboarding nor the plugin can
+CLI confirmation remains interactive and digest-bound; neither PRD capture nor the plugin can
 manufacture it. Existing automation may still use `intent init --project .`,
 `intent bootstrap --prd docs/prd.md --project . --format json`, and
 `intent sources add markdown docs/prd.md --role declared_intent --project .`.
@@ -96,13 +110,12 @@ Clients other than Codex that launch and connect stdio themselves may run
 ### Clarification and review
 
 For `new_or_ambiguous`, the hook asks every persisted question but cannot authenticate the reply.
-Its prompt route leaves the session pending, and the public MCP answer and confirmation tools
-return `human_confirmation_required` without changing state. An independently authenticated
-non-MCP local human integration over the existing clarification coordinator and proposal
-confirmation service must record the answer and approve the exact digest and selected node IDs.
-Intent Engineering ships no CLI command for those two clarification authority steps; when no host
-integration is configured, the proposal remains pending. For `conflicting`, stop implementation
-and require the configured independent human review before any graph change.
+Its prompt route and public MCP tools return `human_confirmation_required` without changing state.
+The `intent dev` browser is the independent, non-MCP local human integration: it records a
+WebAuthn-backed answer and confirms the exact clarified-proposal digest and selected node IDs. For
+`conflicting`, stop implementation and resolve the complete evidence packet through that same
+authenticated review UI before any graph change. There is no shipped CLI command that performs
+either human-authority act.
 
 ### Scheduled CLI assurance
 
