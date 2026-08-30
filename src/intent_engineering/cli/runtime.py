@@ -198,6 +198,20 @@ class Runtime:
         """Build a fresh, conservative context provider from durable state."""
         return ContextProvider(self.graph_store.load(), self.cases(), self.config, self.evidence())
 
+    def close(self) -> None:
+        """Release every descriptor owned by this assembled runtime after it quiesces."""
+        self.sync.close()
+        self.intent_proposals.close()
+        self.webauthn_credentials.close()
+        self.webauthn_challenges.close()
+        self.checkpoint_store.close()
+        self.case_store.close()
+        self.evidence_store.close()
+        self.graph_store.close()
+        self.transactions.close()
+        self.workspace_directory.close()
+        self.project_directory.close()
+
 
 def load_runtime(root: Path) -> Runtime:
     """Locate one initialized workspace and assemble only reviewed local adapters."""

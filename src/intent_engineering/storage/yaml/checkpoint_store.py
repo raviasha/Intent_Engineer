@@ -58,7 +58,9 @@ class YamlCheckpointStore:
                 for connector_id, checkpoint in sorted(checkpoints.items())
             }
         }
-        content = cast(str, yaml.safe_dump(data, allow_unicode=True, sort_keys=True)).encode("utf-8")
+        content = cast(str, yaml.safe_dump(data, allow_unicode=True, sort_keys=True)).encode(
+            "utf-8"
+        )
         atomic_write_bytes(self._file, content)
 
     def get(self, connector_id: str) -> SyncCheckpoint | None:
@@ -88,3 +90,7 @@ class YamlCheckpointStore:
             checkpoints[connector_id] = checkpoint
             self._write_all(checkpoints)
             return checkpoint
+
+    def close(self) -> None:
+        """Release the store's held descriptor."""
+        self._file.close()

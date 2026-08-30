@@ -60,10 +60,14 @@ class YamlGraphStore:
             f"{self.path.stem}.history.jsonl"
         )
         history_file = coerce_secure_file(resolved_history_path)
-        self._transactions = transactions or LocalTransactionCoordinator(
-            history_file.sibling(".graph-transaction.json"),
-            {"graph": self._file, "history": history_file},
-        )
+        self._owns_transactions = transactions is None
+        if transactions is None:
+            self._transactions = LocalTransactionCoordinator(
+                history_file.sibling(".graph-transaction.json"),
+                {"graph": self._file, "history": history_file},
+            )
+        else:
+            self._transactions = transactions
         # A direct store construction is also safe after an interrupted graph apply.
         self._transactions.recover()
         self._history_store = JsonlHistoryStore(history_file)
@@ -95,3 +99,10 @@ class YamlGraphStore:
     def history(self, subject_id: str) -> Sequence[ChangeSet]:
         """Return durable ChangeSets involving a graph subject."""
         return self._history_store.history(subject_id)
+
+    def close(self) -> None:
+        """Release store-owned descriptors and a directly owned transaction coordinator."""
+        self._history_store.close()
+        self._file.close()
+        if self._owns_transactions:
+            self._transactions.close()

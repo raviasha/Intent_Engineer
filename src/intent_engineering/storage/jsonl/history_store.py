@@ -18,12 +18,15 @@ class HistoryStoreError(ValueError):
 
 def serialize_changeset(changeset: ChangeSet) -> bytes:
     """Return one canonical JSONL representation for a validated ChangeSet."""
-    return json.dumps(
-        changeset.model_dump(mode="json", by_alias=True),
-        ensure_ascii=False,
-        separators=(",", ":"),
-        sort_keys=True,
-    ).encode("utf-8") + b"\n"
+    return (
+        json.dumps(
+            changeset.model_dump(mode="json", by_alias=True),
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        + b"\n"
+    )
 
 
 def _subjects(changeset: ChangeSet) -> Iterable[str]:
@@ -65,9 +68,7 @@ class JsonlHistoryStore:
             try:
                 changeset = ChangeSet.model_validate_json(line)
             except (json.JSONDecodeError, ValueError) as error:
-                raise HistoryStoreError(
-                    f"invalid history record at line {line_number}"
-                ) from error
+                raise HistoryStoreError(f"invalid history record at line {line_number}") from error
             self._index(changeset)
 
     def _index(self, changeset: ChangeSet) -> None:
@@ -87,3 +88,7 @@ class JsonlHistoryStore:
         with same_path_lock(self._file):
             self._rebuild_index_unlocked()
             return tuple(self._by_subject.get(subject_id, ()))
+
+    def close(self) -> None:
+        """Release the store's held descriptor."""
+        self._file.close()

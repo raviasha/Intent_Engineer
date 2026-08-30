@@ -13,12 +13,13 @@ import re
 import secrets
 import socket
 import subprocess
+import sys
 import threading
 import time
 import webbrowser
 from collections.abc import Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Annotated, Any, Literal, cast
 from urllib.parse import urlsplit
@@ -60,6 +61,8 @@ _METADATA_PATH = "cache/control-plane.json"
 _MAX_METADATA_BYTES = 4096
 _STARTUP_TIMEOUT_SECONDS = 10.0
 _PROBE_TIMEOUT_SECONDS = 1.0
+_MAX_PROCESS_INSPECTION_BYTES = 1_048_576
+_INSTANCE_PATH = "/_intent/dev/instance"
 _PROCESS_DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _INSTANCE_ID = re.compile(r"instance:[0-9a-f]{64}\Z")
 _REPOSITORY_ID = re.compile(r"repo:sha256:[0-9a-f]{64}\Z")
@@ -69,6 +72,18 @@ _CSP = (
     "form-action 'self'; object-src 'none'; script-src 'self'; "
     "style-src 'self'; connect-src 'self'"
 )
+_REPOSITORY_LOCKS: dict[tuple[int, int], threading.RLock] = {}
+_REPOSITORY_LOCKS_GUARD = threading.Lock()
+
+
+def _reset_repository_locks_after_fork() -> None:
+    """Discard inherited thread locks before a child acquires a repository lock."""
+    global _REPOSITORY_LOCKS, _REPOSITORY_LOCKS_GUARD
+    _REPOSITORY_LOCKS = {}
+    _REPOSITORY_LOCKS_GUARD = threading.Lock()
+
+
+os.register_at_fork(after_in_child=_reset_repository_locks_after_fork)
 
 
 class ControlPlaneProcessMetadata(StrictModel):
@@ -161,15 +176,16 @@ class _Reuse:
 
 @dataclass(slots=True)
 class _Started:
-    metadata: ControlPlaneProcessMetadata
-    metadata_bytes: bytes
-    bootstrap: str
-    listener: socket.socket
-    server: uvicorn.Server
-    thread: threading.Thread
-    failures: list[BaseException]
-    service: ControlPlaneService
-    site: _ControlPlaneSite
+    runtime: Runtime | None
+    metadata: ControlPlaneProcessMetadata | None = None
+    metadata_bytes: bytes = b""
+    bootstrap: str = ""
+    listener: socket.socket | None = None
+    server: uvicorn.Server | None = None
+    thread: threading.Thread | None = None
+    failures: list[BaseException] = field(default_factory=list)
+    service: ControlPlaneService | None = None
+    site: _ControlPlaneSite | None = None
 
 
 def _strict_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -224,13 +240,93 @@ def _process_start_id(pid: int) -> str | None:
     return f"sha256:{digest}"
 
 
-def _probe(metadata: ControlPlaneProcessMetadata, expected_repository_id: str) -> bool:
-    """Verify OS process birth and a live exact repository projection at the loopback origin."""
-    if (
-        metadata.repository_id != expected_repository_id
-        or _process_start_id(metadata.pid) != metadata.process_start_id
-    ):
+def _darwin_listener_owned_by_process(pid: int, port: int) -> bool:
+    executable = Path("/usr/sbin/lsof")
+    if not executable.is_file():
         return False
+    try:
+        completed = subprocess.run(
+            [
+                str(executable),
+                "-nP",
+                "-a",
+                "-p",
+                str(pid),
+                f"-iTCP:{port}",
+                "-sTCP:LISTEN",
+                "-FpnT",
+            ],
+            env={"LANG": "C", "LC_ALL": "C", "PATH": "/usr/bin:/bin"},
+            check=False,
+            capture_output=True,
+            timeout=1,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    output = completed.stdout
+    try:
+        lines = output.splitlines()
+        return bool(
+            completed.returncode == 0
+            and not completed.stderr
+            and len(output) <= 4096
+            and lines.count(f"p{pid}".encode("ascii")) == 1
+            and f"n127.0.0.1:{port}".encode("ascii") in lines
+            and b"TST=LISTEN" in lines
+        )
+    finally:
+        output = b""
+        lines = []
+
+
+def _linux_listener_owned_by_process(pid: int, port: int) -> bool:
+    inodes: set[str] = set()
+    try:
+        for table in (Path("/proc/net/tcp"), Path("/proc/net/tcp6")):
+            with table.open("rb") as stream:
+                content = stream.read(_MAX_PROCESS_INSPECTION_BYTES + 1)
+            if len(content) > _MAX_PROCESS_INSPECTION_BYTES:
+                return False
+            for line in content.splitlines()[1:]:
+                fields = line.split()
+                if len(fields) < 10 or fields[3] != b"0A":
+                    continue
+                address, separator, encoded_port = fields[1].partition(b":")
+                if (
+                    separator
+                    and int(encoded_port, 16) == port
+                    and address in {b"0100007F", b"00000000000000000000000001000000"}
+                ):
+                    inodes.add(fields[9].decode("ascii"))
+        if not inodes:
+            return False
+        sockets = {f"socket:[{inode}]" for inode in inodes}
+        owned = False
+        with os.scandir(f"/proc/{pid}/fd") as descriptors:
+            for count, descriptor in enumerate(descriptors, start=1):
+                if count > 4096:
+                    return False
+                if os.readlink(descriptor.path) in sockets:
+                    owned = True
+        return owned
+    except (OSError, UnicodeError, ValueError):
+        return False
+    finally:
+        inodes.clear()
+
+
+def _listener_owned_by_process(pid: int, port: int) -> bool:
+    """Fail closed unless the kernel binds the exact listener to the verified process."""
+    if type(pid) is not int or pid < 1 or type(port) is not int or not 1 <= port <= 65535:
+        return False
+    if sys.platform == "darwin":
+        return _darwin_listener_owned_by_process(pid, port)
+    if sys.platform.startswith("linux"):
+        return _linux_listener_owned_by_process(pid, port)
+    return False
+
+
+def _probe_json(metadata: ControlPlaneProcessMetadata, path: str, max_bytes: int) -> object:
     parsed = urlsplit(metadata.origin)
     connection: http.client.HTTPConnection | None = None
     content = b""
@@ -243,7 +339,7 @@ def _probe(metadata: ControlPlaneProcessMetadata, expected_repository_id: str) -
         )
         connection.request(
             "GET",
-            "/api/v1/status",
+            path,
             headers={
                 "Host": parsed.netloc,
                 "Origin": metadata.origin,
@@ -251,23 +347,40 @@ def _probe(metadata: ControlPlaneProcessMetadata, expected_repository_id: str) -
             },
         )
         response = connection.getresponse()
-        content = response.read(65_537)
-        if response.status != 200 or len(content) > 65_536:
-            return False
+        content = response.read(max_bytes + 1)
+        if response.status != 200 or len(content) > max_bytes:
+            return None
         payload = json.loads(content, object_pairs_hook=_strict_json_object)
-        return bool(
-            type(payload) is dict
-            and payload.get("schema_version") == 1
-            and payload.get("project_id") == metadata.project_id
-            and payload.get("repository_id") == expected_repository_id
-        )
+        return payload
     except (OSError, http.client.HTTPException, json.JSONDecodeError, ValueError):
-        return False
+        return None
     finally:
         content = b""
         payload = None
         if connection is not None:
             connection.close()
+
+
+def _probe(metadata: ControlPlaneProcessMetadata, expected_repository_id: str) -> bool:
+    """Verify OS process birth and a live exact repository projection at the loopback origin."""
+    parsed = urlsplit(metadata.origin)
+    port = cast(int, parsed.port)
+    if (
+        metadata.repository_id != expected_repository_id
+        or _process_start_id(metadata.pid) != metadata.process_start_id
+        or not _listener_owned_by_process(metadata.pid, port)
+    ):
+        return False
+    instance = _probe_json(metadata, _INSTANCE_PATH, 512)
+    if instance != {"schema_version": 1, "instance_id": metadata.instance_id}:
+        return False
+    status = _probe_json(metadata, "/api/v1/status", 65_536)
+    return bool(
+        type(status) is dict
+        and status.get("schema_version") == 1
+        and status.get("project_id") == metadata.project_id
+        and status.get("repository_id") == expected_repository_id
+    )
 
 
 def _remove_exact_metadata(target: SecureFile, expected: bytes) -> None:
@@ -364,25 +477,44 @@ def _ensure_workspace(project: Path, prd: str | None) -> None:
 @contextmanager
 def _repository_startup_lock(directory: SecureDirectory) -> Iterator[None]:
     """Serialize first initialization without creating a pre-workspace lock path."""
-    descriptor = os.dup(directory.descriptor)
-    try:
-        fcntl.flock(descriptor, fcntl.LOCK_EX)
-        yield
-    finally:
+    identity = os.fstat(directory.descriptor)
+    key = (identity.st_dev, identity.st_ino)
+    with _REPOSITORY_LOCKS_GUARD:
+        thread_lock = _REPOSITORY_LOCKS.setdefault(key, threading.RLock())
+    with thread_lock:
+        descriptor = os.dup(directory.descriptor)
         try:
-            fcntl.flock(descriptor, fcntl.LOCK_UN)
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            yield
         finally:
-            os.close(descriptor)
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+            finally:
+                os.close(descriptor)
 
 
 class _ControlPlaneSite:
     """Serve three packaged assets and otherwise preserve the strict Task 5 API unchanged."""
 
-    def __init__(self, api: object, *, origin: str, csrf_secret: str) -> None:
+    def __init__(
+        self,
+        api: object,
+        *,
+        origin: str,
+        csrf_secret: str,
+        instance_id: str,
+    ) -> None:
         self._api = cast(Any, api)
         self._origin = origin
         self._host = origin.removeprefix("http://").encode("ascii")
         self._csrf = csrf_secret
+        self._instance = json.dumps(
+            {"schema_version": 1, "instance_id": instance_id},
+            allow_nan=False,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
         self._assets = {
             "/": (control_plane_asset("index.html"), b"text/html; charset=utf-8"),
             "/index.html": (control_plane_asset("index.html"), b"text/html; charset=utf-8"),
@@ -402,6 +534,7 @@ class _ControlPlaneSite:
         body = b'{"schema_version":1,"status":"rejected","reason":"request_unavailable"}'
         media_type = b"application/json"
         trusted = False
+        set_cookie = False
         try:
             headers = scope.get("headers")
             raw_path = scope.get("raw_path")
@@ -421,10 +554,15 @@ class _ControlPlaneSite:
             if hosts != [self._host] or (origins and origins != [self._origin.encode("ascii")]):
                 raise ValueError
             trusted = True
-            asset = self._assets.get(path)
+            asset = (
+                (self._instance, b"application/json")
+                if path == _INSTANCE_PATH
+                else self._assets.get(path)
+            )
             if asset is not None:
                 body, media_type = asset
                 status = 200
+                set_cookie = path != _INSTANCE_PATH
         except (TypeError, ValueError, UnicodeError):
             status = 403
         response_headers = [
@@ -437,7 +575,7 @@ class _ControlPlaneSite:
             (b"cross-origin-opener-policy", b"same-origin"),
             (b"cross-origin-resource-policy", b"same-origin"),
         ]
-        if trusted:
+        if trusted and set_cookie:
             response_headers.append(
                 (
                     b"set-cookie",
@@ -452,6 +590,7 @@ class _ControlPlaneSite:
         self._origin = ""
         self._host = b""
         self._csrf = ""
+        self._instance = b""
         self._assets.clear()
 
 
@@ -498,113 +637,128 @@ def _wait_until_started(server: uvicorn.Server, thread: threading.Thread) -> Non
 
 
 def _start(
-    runtime: Runtime,
+    started: _Started,
     target: SecureFile,
     repository_id: str,
     prd: str | None,
-) -> _Started:
-    listener: socket.socket | None = None
-    service: ControlPlaneService | None = None
-    site: _ControlPlaneSite | None = None
-    bootstrap = ""
-    metadata_bytes = b""
-    try:
-        _provision_local_clarification_policy(runtime, runtime.config)
-        listener = _listener()
-        port = cast(tuple[str, int], listener.getsockname())[1]
-        origin = f"http://localhost:{port}"
-        bootstrap = secrets.token_urlsafe(32)
-        service = ControlPlaneService(runtime, origin=origin)
-        if (
-            prd is not None
-            and inspect_onboarding(cast(OnboardingRuntime, runtime)).state
-            is OnboardingState.REQUIRED
-        ):
-            service.onboard_preview(prd)
-        api = build_control_plane_app(service, origin=origin, csrf_secret=bootstrap)
-        site = _ControlPlaneSite(api, origin=origin, csrf_secret=bootstrap)
-        configuration = uvicorn.Config(
-            site,
-            host="127.0.0.1",
-            port=port,
-            loop="asyncio",
-            lifespan="on",
-            log_config=None,
-            log_level="critical",
-            access_log=False,
-            proxy_headers=False,
-            server_header=False,
-            date_header=False,
-        )
-        server = uvicorn.Server(configuration)
-        thread, failures = _server_thread(server, listener)
-        _wait_until_started(server, thread)
-        process_start_id = _process_start_id(os.getpid())
-        if process_start_id is None:
+) -> None:
+    """Populate caller-owned lifecycle state before publishing its locator."""
+    runtime = started.runtime
+    if runtime is None:
+        raise _DevUnavailable()
+    _provision_local_clarification_policy(runtime, runtime.config)
+    started.listener = _listener()
+    port = cast(tuple[str, int], started.listener.getsockname())[1]
+    origin = f"http://localhost:{port}"
+    started.bootstrap = secrets.token_urlsafe(32)
+    instance_id = f"instance:{secrets.token_hex(32)}"
+    started.service = ControlPlaneService(runtime, origin=origin)
+    if (
+        prd is not None
+        and inspect_onboarding(cast(OnboardingRuntime, runtime)).state is OnboardingState.REQUIRED
+    ):
+        started.service.onboard_preview(prd)
+    api = build_control_plane_app(
+        started.service,
+        origin=origin,
+        csrf_secret=started.bootstrap,
+    )
+    started.site = _ControlPlaneSite(
+        api,
+        origin=origin,
+        csrf_secret=started.bootstrap,
+        instance_id=instance_id,
+    )
+    configuration = uvicorn.Config(
+        started.site,
+        host="127.0.0.1",
+        port=port,
+        loop="asyncio",
+        lifespan="on",
+        log_config=None,
+        log_level="critical",
+        access_log=False,
+        proxy_headers=False,
+        server_header=False,
+        date_header=False,
+    )
+    started.server = uvicorn.Server(configuration)
+    started.thread, started.failures = _server_thread(started.server, started.listener)
+    _wait_until_started(started.server, started.thread)
+    process_start_id = _process_start_id(os.getpid())
+    if process_start_id is None:
+        raise _DevUnavailable()
+    started.metadata = ControlPlaneProcessMetadata(
+        pid=os.getpid(),
+        process_start_id=process_start_id,
+        instance_id=instance_id,
+        project_id=runtime.config.project_id,
+        repository_id=repository_id,
+        origin=origin,
+    )
+    if not _probe(started.metadata, repository_id):
+        raise _DevUnavailable()
+    started.metadata_bytes = started.metadata.canonical_bytes()
+    target.atomic_write(started.metadata_bytes, reject_target_races=True)
+    runtime = None
+
+
+def _shutdown_started_locked(started: _Started, target: SecureFile) -> None:
+    """Quiesce one owned process under its repository lock, then remove its exact locator."""
+    server = started.server
+    thread = started.thread
+    if server is not None:
+        server.should_exit = True
+    if thread is not None:
+        thread.join(timeout=10)
+        if thread.is_alive():
             raise _DevUnavailable()
-        metadata = ControlPlaneProcessMetadata(
-            pid=os.getpid(),
-            process_start_id=process_start_id,
-            instance_id=f"instance:{secrets.token_hex(32)}",
-            project_id=runtime.config.project_id,
-            repository_id=repository_id,
-            origin=origin,
-        )
-        if not _probe(metadata, repository_id):
-            raise _DevUnavailable()
-        metadata_bytes = metadata.canonical_bytes()
-        target.atomic_write(metadata_bytes, reject_target_races=True)
-        return _Started(
-            metadata,
-            metadata_bytes,
-            bootstrap,
-            listener,
-            server,
-            thread,
-            failures,
-            service,
-            site,
-        )
-    except BaseException:
-        if "server" in locals():
-            server.should_exit = True
-        if "thread" in locals():
-            thread.join(timeout=5)
-        if service is not None:
-            service.close()
-        if site is not None:
-            site.close()
-        if listener is not None:
-            try:
-                listener.close()
-            except OSError:
-                pass
-        bootstrap = ""
-        metadata_bytes = b""
-        raise
+    if started.service is not None:
+        started.service.close()
+        started.service = None
+    if started.site is not None:
+        started.site.close()
+        started.site = None
+    if started.runtime is not None:
+        started.runtime.close()
+        started.runtime = None
+    if started.listener is not None:
+        try:
+            started.listener.close()
+        except OSError:
+            pass
+        started.listener = None
+    if started.metadata_bytes:
+        _remove_exact_metadata(target, started.metadata_bytes)
+    started.metadata = None
+    started.metadata_bytes = b""
+    started.bootstrap = ""
+    started.server = None
+    started.thread = None
+    started.failures.clear()
 
 
 def _wait_for_exit(started: _Started) -> None:
     signal_error: BaseException | None = None
+    thread = started.thread
+    server = started.server
+    if thread is None or server is None:
+        raise _DevUnavailable()
     try:
-        while started.thread.is_alive():
-            started.thread.join(timeout=0.25)
+        while thread.is_alive():
+            thread.join(timeout=0.25)
         if started.failures:
             failure = started.failures.pop(0)
             if isinstance(failure, Exception):
                 raise _DevUnavailable() from None
             raise failure.with_traceback(None)
     except KeyboardInterrupt:
-        started.server.should_exit = True
+        return
     except BaseException as error:  # noqa: BLE001 - exact cancellation after owned cleanup
         error.__traceback__ = None
         error.__cause__ = None
         error.__context__ = None
         signal_error = error
-        started.server.should_exit = True
-    finally:
-        started.server.should_exit = True
-        started.thread.join(timeout=10)
     if signal_error is not None:
         caught = signal_error
         signal_error = None
@@ -641,6 +795,7 @@ def dev_command(
     project_directory: SecureDirectory | None = None
     workspace_directory: SecureDirectory | None = None
     target: SecureFile | None = None
+    runtime: Runtime | None = None
     started: _Started | None = None
     signal_error: BaseException | None = None
     try:
@@ -679,9 +834,19 @@ def dev_command(
                 runtime = load_runtime(root)
                 if runtime.config != config:
                     raise _DevUnavailable()
-                started = _start(runtime, target, repository_id, prd_value)
-        typer.echo(f"intent dev: ready at {started.metadata.origin}")
-        if not no_open and not _open_browser(started.metadata.origin, started.bootstrap):
+                started = _Started(runtime=runtime)
+                runtime = None
+                try:
+                    _start(started, target, repository_id, prd_value)
+                except BaseException:
+                    _shutdown_started_locked(started, target)
+                    started = None
+                    raise
+        if started.metadata is None:
+            raise _DevUnavailable()
+        origin = started.metadata.origin
+        typer.echo(f"intent dev: ready at {origin}")
+        if not no_open and not _open_browser(origin, started.bootstrap):
             typer.echo("intent dev: browser unavailable", err=True)
         _wait_for_exit(started)
     except typer.Exit:
@@ -702,20 +867,23 @@ def dev_command(
         error.__context__ = None
         signal_error = error
     finally:
-        if started is not None and target is not None:
-            _remove_exact_metadata(target, started.metadata_bytes)
-            started.server.should_exit = True
-            started.thread.join(timeout=10)
-            started.service.close()
-            started.site.close()
-            try:
-                started.listener.close()
-            except OSError:
-                pass
-            started.bootstrap = ""
-            started.metadata_bytes = b""
-            started.failures.clear()
+        if project_directory is not None and target is not None:
+            with _repository_startup_lock(project_directory):
+                if started is not None:
+                    _shutdown_started_locked(started, target)
+                elif runtime is not None:
+                    runtime.close()
+        elif runtime is not None:
+            runtime.close()
+        runtime = None
         started = None
+        origin = ""
+        if "config_bytes" in locals():
+            config_bytes = b""
+        if "current" in locals():
+            current = None
+        if "repository_id" in locals():
+            repository_id = ""
         prd_value = None
         if target is not None:
             target.close()

@@ -143,10 +143,13 @@ class SyncOrchestrator:
         self._changeset_executor = changeset_executor
         self._assurance_service = assurance_service
         self._transactions = transactions
-        self._snapshot_files = {
-            name: file.duplicate() for name, file in sorted(extras.items())
-        }
+        self._snapshot_files = {name: file.duplicate() for name, file in sorted(extras.items())}
         self._clock = clock
+
+    def close(self) -> None:
+        """Release descriptor-held assurance snapshot inputs."""
+        for file in self._snapshot_files.values():
+            file.close()
 
     async def run(self, run_id: str, connectors: Sequence[Connector]) -> SyncRunResult:
         """Synchronize connectors independently and aggregate their durable outcomes."""
@@ -273,9 +276,7 @@ class SyncOrchestrator:
             try:
                 combined = self._combined_delta(semantic_successes)
                 assurance_snapshot = (
-                    self._combined_snapshot()
-                    if self._assurance_service is not None
-                    else None
+                    self._combined_snapshot() if self._assurance_service is not None else None
                 )
                 case_count, change_count = self._apply_detected_cases(
                     combined,
@@ -468,9 +469,7 @@ class SyncOrchestrator:
             graph_preimage=graph_content,
             evidence_preimage=evidence_content,
             case_preimage=snapshot.content.get("cases"),
-            extra_preimages={
-                name: snapshot.content.get(name) for name in self._snapshot_files
-            },
+            extra_preimages={name: snapshot.content.get(name) for name in self._snapshot_files},
         )
 
     def _apply_detected_cases(
@@ -487,9 +486,7 @@ class SyncOrchestrator:
         ):
             return 0, 0
         graph = (
-            assurance_snapshot.graph
-            if assurance_snapshot is not None
-            else self._graph_store.load()
+            assurance_snapshot.graph if assurance_snapshot is not None else self._graph_store.load()
         )
         cases: list[ReconciliationCase] = []
         observations = list(self._case_detector(delta, graph))
@@ -497,8 +494,7 @@ class SyncOrchestrator:
             self._assurance_service is not None
             and assurance_snapshot is not None
             and any(
-                node.status in {"active", "provisional"}
-                and node.type in _INTENT_BASELINE_TYPES
+                node.status in {"active", "provisional"} and node.type in _INTENT_BASELINE_TYPES
                 for node in graph.nodes
             )
         ):

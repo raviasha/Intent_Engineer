@@ -179,6 +179,10 @@ class WebAuthnCredentialStore:
             raise ValueError("credential ledger unavailable")
         return added
 
+    def close(self) -> None:
+        """Release the credential ledger descriptor."""
+        self._file.close()
+
 
 class WebAuthnChallengeStore:
     """Append-only issue/consume transitions with an exact at-most-once consume."""
@@ -321,6 +325,10 @@ class WebAuthnChallengeStore:
         if unavailable or result is None:
             raise ValueError("challenge unavailable")
         return result
+
+    def close(self) -> None:
+        """Release the challenge ledger descriptor."""
+        self._file.close()
 
 
 def challenge_record_for_timestamp(value: object) -> ChallengeRecord:

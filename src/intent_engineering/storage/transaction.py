@@ -262,6 +262,12 @@ class LocalTransactionCoordinator:
         self._legacy_target_sets = frozenset(legacy_sets)
         self._thread_state = _TransactionThreadState()
 
+    def close(self) -> None:
+        """Release journal and target descriptors after all transactions quiesce."""
+        self._journal.close()
+        for target in self._targets.values():
+            target.close()
+
     def _require_nested_extras(self, extras: Mapping[str, SecureFile]) -> None:
         if not self._thread_state.active:
             return

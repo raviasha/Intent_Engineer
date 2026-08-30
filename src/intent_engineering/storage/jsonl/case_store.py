@@ -36,12 +36,15 @@ class ConflictingCaseFingerprint(CaseStoreError):
 
 def serialize_case(case: ReconciliationCase) -> bytes:
     """Return one canonical JSONL lifecycle version."""
-    return json.dumps(
-        case.model_dump(mode="json"),
-        ensure_ascii=False,
-        separators=(",", ":"),
-        sort_keys=True,
-    ).encode("utf-8") + b"\n"
+    return (
+        json.dumps(
+            case.model_dump(mode="json"),
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        + b"\n"
+    )
 
 
 def _record_version(
@@ -97,9 +100,7 @@ def _parse_versions_with_history(
         if not line.strip():
             raise CaseStoreError(f"blank case record at line {line_number}")
         try:
-            case = ReconciliationCase.model_validate(
-                _migrate_legacy_case_payload(json.loads(line))
-            )
+            case = ReconciliationCase.model_validate(_migrate_legacy_case_payload(json.loads(line)))
             _record_version(
                 latest_by_id,
                 by_fingerprint,
@@ -239,3 +240,7 @@ class JsonlCaseStore:
             if status is not None:
                 cases = tuple(case for case in cases if case.status is status)
             return tuple(sorted(cases, key=lambda case: case.id))
+
+    def close(self) -> None:
+        """Release the store's held descriptor."""
+        self._file.close()
