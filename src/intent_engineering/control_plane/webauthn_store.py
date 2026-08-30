@@ -83,6 +83,10 @@ def _validated_challenge(value: object) -> ChallengeRecord | None:
         return None
 
 
+def _within_open_lifetime(record: ChallengeRecord, consumed_at: datetime) -> bool:
+    return record.issued_at <= consumed_at < record.expires_at
+
+
 class WebAuthnCredentialStore:
     """Immutable credential enrollment records in one canonical JSONL ledger."""
 
@@ -136,27 +140,44 @@ class WebAuthnCredentialStore:
         return records
 
     def list(self) -> tuple[CredentialRecord, ...]:
-        with self._locked():
-            records = self._records_unlocked()
-            if records is None:
-                raise ValueError("credential ledger unavailable") from None
-            return tuple(records.values())
+        result: tuple[CredentialRecord, ...] = ()
+        unavailable = False
+        try:
+            with self._locked():
+                records = self._records_unlocked()
+                if records is None:
+                    unavailable = True
+                else:
+                    result = tuple(records.values())
+        except Exception:  # noqa: BLE001 - fixed public integrity boundary
+            unavailable = True
+        if unavailable:
+            raise ValueError("credential ledger unavailable")
+        return result
 
     def put(self, record: CredentialRecord) -> bool:
         validated = _validated_credential(record)
         if validated is None:
             raise ValueError("credential ledger unavailable") from None
-        with self._locked():
-            records = self._records_unlocked()
-            if records is None:
-                raise ValueError("credential ledger unavailable") from None
-            existing = records.get(validated.id)
-            if existing is not None:
-                if existing != validated:
-                    raise ValueError("credential ledger unavailable") from None
-                return False
-            append_durable_line(self._file, validated.canonical_bytes())
-            return True
+        added = False
+        unavailable = False
+        try:
+            with self._locked():
+                records = self._records_unlocked()
+                if records is None:
+                    unavailable = True
+                else:
+                    existing = records.get(validated.id)
+                    if existing is not None:
+                        unavailable = existing != validated
+                    else:
+                        append_durable_line(self._file, validated.canonical_bytes())
+                        added = True
+        except Exception:  # noqa: BLE001 - fixed public integrity boundary
+            unavailable = True
+        if unavailable:
+            raise ValueError("credential ledger unavailable")
+        return added
 
 
 class WebAuthnChallengeStore:
@@ -213,7 +234,12 @@ class WebAuthnChallengeStore:
                     if record.id in issued:
                         return None
                     issued[record.id] = record
-                elif issued.get(record.id) != record or record.id in consumed:
+                elif (
+                    issued.get(record.id) != record
+                    or record.id in consumed
+                    or frame.consumed_at is None
+                    or not _within_open_lifetime(record, frame.consumed_at)
+                ):
                     return None
                 else:
                     consumed.add(record.id)
@@ -225,23 +251,33 @@ class WebAuthnChallengeStore:
         validated = _validated_challenge(record)
         if validated is None:
             raise ValueError("challenge unavailable") from None
-        frame = _ChallengeFrame.model_validate(
-            {**validated.model_dump(mode="json"), "kind": "issue"}
-        )
-        with self._locked():
-            state = self._records_unlocked()
-            if state is None:
-                raise ValueError("challenge unavailable") from None
-            issued, _ = state
-            existing = issued.get(validated.id)
-            if existing is not None:
-                if existing != validated:
-                    raise ValueError("challenge unavailable") from None
-                return False
-            append_durable_line(self._file, frame.canonical_bytes())
-            return True
+        added = False
+        unavailable = False
+        try:
+            frame = _ChallengeFrame.model_validate(
+                {**validated.model_dump(mode="json"), "kind": "issue"}
+            )
+            with self._locked():
+                state = self._records_unlocked()
+                if state is None:
+                    unavailable = True
+                else:
+                    issued, _ = state
+                    existing = issued.get(validated.id)
+                    if existing is not None:
+                        unavailable = existing != validated
+                    else:
+                        append_durable_line(self._file, frame.canonical_bytes())
+                        added = True
+        except Exception:  # noqa: BLE001 - fixed public integrity boundary
+            unavailable = True
+        if unavailable:
+            raise ValueError("challenge unavailable")
+        return added
 
     def consume(self, challenge_id: str, now: datetime) -> ChallengeRecord:
+        invalid_now = False
+        validated_now: datetime | None = None
         try:
             validated_now = _ChallengeFrame.model_validate(
                 {
@@ -251,26 +287,40 @@ class WebAuthnChallengeStore:
                 }
             ).consumed_at
         except (TypeError, ValidationError, ValueError):
-            raise ValueError("challenge unavailable") from None
-        if type(challenge_id) is not str or validated_now is None:
-            raise ValueError("challenge unavailable") from None
-        with self._locked():
-            state = self._records_unlocked()
-            if state is None:
-                raise ValueError("challenge unavailable") from None
-            issued, consumed = state
-            record = issued.get(challenge_id)
-            if record is None or challenge_id in consumed or validated_now > record.expires_at:
-                raise ValueError("challenge unavailable") from None
-            frame = _ChallengeFrame.model_validate(
-                {
-                    **record.model_dump(mode="json"),
-                    "kind": "consume",
-                    "consumed_at": validated_now,
-                }
-            )
-            append_durable_line(self._file, frame.canonical_bytes())
-            return record
+            invalid_now = True
+        if invalid_now or type(challenge_id) is not str or validated_now is None:
+            raise ValueError("challenge unavailable")
+        result: ChallengeRecord | None = None
+        unavailable = False
+        try:
+            with self._locked():
+                state = self._records_unlocked()
+                if state is None:
+                    unavailable = True
+                else:
+                    issued, consumed = state
+                    record = issued.get(challenge_id)
+                    if (
+                        record is None
+                        or challenge_id in consumed
+                        or not _within_open_lifetime(record, validated_now)
+                    ):
+                        unavailable = True
+                    else:
+                        frame = _ChallengeFrame.model_validate(
+                            {
+                                **record.model_dump(mode="json"),
+                                "kind": "consume",
+                                "consumed_at": validated_now,
+                            }
+                        )
+                        append_durable_line(self._file, frame.canonical_bytes())
+                        result = record
+        except Exception:  # noqa: BLE001 - fixed public integrity boundary
+            unavailable = True
+        if unavailable or result is None:
+            raise ValueError("challenge unavailable")
+        return result
 
 
 def challenge_record_for_timestamp(value: object) -> ChallengeRecord:
