@@ -85,6 +85,24 @@ def test_initialization_creates_and_runtime_exposes_the_shared_intent_proposal_t
     assert "intent_proposals" in runtime.transactions.target_names
 
 
+def test_initialization_creates_and_runtime_exposes_webauthn_ledger_targets(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    initialize_project(project)
+    credentials = project / ".intent/approvals/webauthn-credentials.jsonl"
+    challenges = project / ".intent/approvals/webauthn-challenges.jsonl"
+
+    runtime = load_runtime(project)
+
+    assert credentials.read_bytes() == b""
+    assert challenges.read_bytes() == b""
+    assert runtime.webauthn_credentials.list() == ()
+    assert "webauthn_credentials" in runtime.transactions.target_names
+    assert "webauthn_challenges" in runtime.transactions.target_names
+
+
 def test_runtime_loads_a_legacy_initialized_workspace_without_a_proposal_ledger(
     tmp_path: Path,
 ) -> None:

@@ -25,6 +25,10 @@ from intent_engineering.capture.github.client import GitHubClient
 from intent_engineering.capture.github.connector import GitHubConnector
 from intent_engineering.capture.markdown.connector import MarkdownConnector
 from intent_engineering.context import ContextProvider
+from intent_engineering.control_plane.webauthn_store import (
+    WebAuthnChallengeStore,
+    WebAuthnCredentialStore,
+)
 from intent_engineering.core.models import (
     CandidateAssertion,
     DriftObservation,
@@ -173,6 +177,8 @@ class Runtime:
     evidence_store: JsonlEvidenceStore
     case_store: JsonlCaseStore
     intent_proposals: IntentProposalStore
+    webauthn_credentials: WebAuthnCredentialStore
+    webauthn_challenges: WebAuthnChallengeStore
     checkpoint_store: YamlCheckpointStore
     sync: SyncOrchestrator
     resolution: LocalResolutionService
@@ -219,6 +225,8 @@ def load_runtime(root: Path) -> Runtime:
     evidence_file = workspace_directory.file("evidence/evidence.jsonl")
     receipts_file = workspace_directory.file("approvals/receipts.jsonl")
     intent_proposals_file = workspace_directory.file("history/intent-proposals.jsonl")
+    webauthn_credentials_file = workspace_directory.file("approvals/webauthn-credentials.jsonl")
+    webauthn_challenges_file = workspace_directory.file("approvals/webauthn-challenges.jsonl")
     transactions = LocalTransactionCoordinator(
         workspace_directory.file("history/.local-transaction.json"),
         {
@@ -228,10 +236,13 @@ def load_runtime(root: Path) -> Runtime:
             "evidence": evidence_file,
             "receipts": receipts_file,
             "intent_proposals": intent_proposals_file,
+            "webauthn_credentials": webauthn_credentials_file,
+            "webauthn_challenges": webauthn_challenges_file,
         },
         legacy_target_sets=(
             frozenset({"graph", "history", "cases"}),
             frozenset({"graph", "history", "cases", "evidence", "receipts"}),
+            frozenset({"graph", "history", "cases", "evidence", "receipts", "intent_proposals"}),
         ),
     )
     # Raw preimages must be restored before a torn YAML or JSONL file reaches a parser.
@@ -251,6 +262,16 @@ def load_runtime(root: Path) -> Runtime:
         )
     finally:
         intent_proposals_target.close()
+    credentials_target = transactions.target_file("webauthn_credentials")
+    challenges_target = transactions.target_file("webauthn_challenges")
+    try:
+        webauthn_credentials = WebAuthnCredentialStore(
+            credentials_target, transactions=transactions
+        )
+        webauthn_challenges = WebAuthnChallengeStore(challenges_target, transactions=transactions)
+    finally:
+        credentials_target.close()
+        challenges_target.close()
     checkpoint_store = YamlCheckpointStore(workspace_directory.file("cache/checkpoints.yaml"))
     changeset_executor = LocalChangeSetExecutor(graph_store, case_store, transactions)
     sync = SyncOrchestrator(
@@ -281,6 +302,8 @@ def load_runtime(root: Path) -> Runtime:
         evidence_store=evidence_store,
         case_store=case_store,
         intent_proposals=intent_proposals,
+        webauthn_credentials=webauthn_credentials,
+        webauthn_challenges=webauthn_challenges,
         checkpoint_store=checkpoint_store,
         sync=sync,
         resolution=resolution,

@@ -972,7 +972,14 @@ intent_engineering:
     assert {
         entry.name for entry in workspace.iterdir() if entry.is_dir() and not entry.is_symlink()
     } == initialized_directories
-    assert all(not any((workspace / name).iterdir()) for name in initialized_directories - {"history"})
+    assert {entry.name for entry in (workspace / "approvals").iterdir()} == {
+        "webauthn-challenges.jsonl",
+        "webauthn-credentials.jsonl",
+    }
+    assert all(
+        not any((workspace / name).iterdir())
+        for name in initialized_directories - {"history", "approvals"}
+    )
     assert {entry.name for entry in (workspace / "history").iterdir()} == {"intent-proposals.jsonl"}
     assert (workspace / "history/intent-proposals.jsonl").read_bytes() == b""
     assert not (workspace / "history/.local-transaction.json").exists()
@@ -1018,9 +1025,15 @@ intent_engineering:
     assert len(runtime.graph_store.history("module:release-proof")) >= 1
     assert not (workspace / "history/.local-transaction.json").exists()
     assert {entry.name for entry in (workspace / "approvals").iterdir()} == {
-        ".receipts.jsonl.lock"
+        ".receipts.jsonl.lock",
+        ".webauthn-challenges.jsonl.lock",
+        ".webauthn-credentials.jsonl.lock",
+        "webauthn-challenges.jsonl",
+        "webauthn-credentials.jsonl",
     }
     assert (workspace / "approvals/.receipts.jsonl.lock").read_bytes() == b""
+    assert (workspace / "approvals/.webauthn-challenges.jsonl.lock").read_bytes() == b""
+    assert (workspace / "approvals/.webauthn-credentials.jsonl.lock").read_bytes() == b""
     assert {entry.name for entry in (workspace / "cache").iterdir()} == {
         ".checkpoints.yaml.lock",
         "checkpoints.yaml",
