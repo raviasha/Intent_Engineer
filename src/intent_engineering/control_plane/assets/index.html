@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="referrer" content="no-referrer">
+    <title>Intent Engineering review</title>
+    <link rel="stylesheet" href="styles.css">
+  </head>
+  <body>
+    <a class="skip-link" href="#app">Skip to review content</a>
+    <header class="site-header">
+      <p class="eyebrow">Intent Engineering</p>
+      <h1>Local review</h1>
+      <nav aria-label="Primary review views">
+        <button type="button" data-view="home">Home</button>
+        <button type="button" data-view="onboarding">Onboarding</button>
+        <button type="button" data-view="inbox">Inbox</button>
+        <button type="button" data-view="proposal">Proposal review</button>
+        <button type="button" data-view="team_state">Team state</button>
+      </nav>
+    </header>
+    <p id="status" class="status" role="status" aria-live="polite" aria-atomic="true"></p>
+    <main id="app" tabindex="-1"></main>
+    <script src="app.js" defer></script>
+  </body>
+</html>

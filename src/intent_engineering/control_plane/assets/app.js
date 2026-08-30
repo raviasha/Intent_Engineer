@@ -1,0 +1,558 @@
+(() => {
+  "use strict";
+
+  const api = Object.freeze({
+    status: "/api/v1/status",
+    inbox: "/api/v1/inbox",
+    proposal: "/api/v1/proposals/",
+    registrationOptions: "/api/v1/webauthn/register/options",
+    registrationVerify: "/api/v1/webauthn/register/verify",
+    decisionOptions: "/api/v1/decisions/options",
+    decisionVerify: "/api/v1/decisions/verify",
+  });
+  const viewNames = new Set(["home", "onboarding", "inbox", "proposal", "team_state"]);
+  const app = document.getElementById("app");
+  const statusRegion = document.getElementById("status");
+  const navigation = Array.from(document.querySelectorAll("[data-view]"));
+  const state = {
+    view: "home",
+    status: null,
+    inbox: null,
+    proposalId: null,
+    preview: null,
+    selectedNodeIds: [],
+  };
+  let csrfToken = readCsrfBootstrap();
+
+  function readCsrfBootstrap() {
+    const fragment = new URLSearchParams(window.location.hash.slice(1));
+    const candidate = fragment.get("csrf");
+    history.replaceState(null, "", window.location.pathname);
+    return typeof candidate === "string" && /^[A-Za-z0-9_-]{1,512}$/.test(candidate)
+      ? candidate
+      : "";
+  }
+
+  function announce(message) {
+    statusRegion.textContent = message;
+  }
+
+  function isWrite(method) {
+    return method !== "GET";
+  }
+
+  async function fetchJson(path, options = {}) {
+    const method = options.method || "GET";
+    const headers = new Headers(options.headers || {});
+    headers.set("accept", "application/json");
+    if (isWrite(method)) {
+      headers.set("content-type", "application/json");
+      if (!csrfToken) {
+        throw new Error("Local review bootstrap is unavailable. Restart intent dev.");
+      }
+      headers.set("x-intent-csrf", csrfToken);
+    }
+    const response = await fetch(path, {
+      method,
+      headers,
+      body: options.body,
+      credentials: "same-origin",
+      cache: "no-store",
+      redirect: "error",
+    });
+    let body = "";
+    try {
+      body = await response.text();
+      if (!response.ok) {
+        throw new Error(response.status === 503 ? "challenge_unavailable" : "request_rejected");
+      }
+      return JSON.parse(body);
+    } finally {
+      body = "";
+    }
+  }
+
+  function addText(parent, tag, value) {
+    const element = document.createElement(tag);
+    element.textContent = String(value);
+    parent.append(element);
+    return element;
+  }
+
+  function addValue(parent, label, value) {
+    const term = document.createElement("dt");
+    term.textContent = label;
+    const description = document.createElement("dd");
+    if (Array.isArray(value)) {
+      const list = document.createElement("ul");
+      for (const item of value) {
+        const entry = document.createElement("li");
+        if (item !== null && typeof item === "object") {
+          const nested = document.createElement("dl");
+          for (const [key, nestedValue] of Object.entries(item)) {
+            addValue(nested, key, nestedValue);
+          }
+          entry.append(nested);
+        } else {
+          entry.textContent = String(item);
+        }
+        list.append(entry);
+      }
+      description.append(list);
+    } else if (value !== null && typeof value === "object") {
+      const nested = document.createElement("dl");
+      for (const [key, nestedValue] of Object.entries(value)) {
+        addValue(nested, key, nestedValue);
+      }
+      description.append(nested);
+    } else {
+      description.textContent = String(value);
+    }
+    parent.append(term, description);
+  }
+
+  function addProjection(panel, projection) {
+    const details = document.createElement("dl");
+    for (const [key, value] of Object.entries(projection || {})) {
+      addValue(details, key, value);
+    }
+    panel.append(details);
+  }
+
+  function actionButton(label, handler, className = "") {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.textContent = label;
+    if (className) {
+      button.className = className;
+    }
+    button.addEventListener("click", handler);
+    return button;
+  }
+
+  function panel(title) {
+    const section = document.createElement("section");
+    section.className = "panel";
+    section.setAttribute("aria-labelledby", "view-title");
+    addText(section, "h2", title).id = "view-title";
+    return section;
+  }
+
+  function updateNavigation() {
+    for (const button of navigation) {
+      const selected = button.dataset.view === state.view;
+      if (selected) {
+        button.setAttribute("aria-current", "page");
+      } else {
+        button.removeAttribute("aria-current");
+      }
+    }
+  }
+
+  function renderHome() {
+    const section = panel("Home");
+    if (state.status) {
+      addProjection(section, state.status);
+    } else {
+      addText(section, "p", "Loading local review status.");
+    }
+    section.append(actionButton("Refresh readiness", refreshStatus));
+    return section;
+  }
+
+  function renderOnboarding() {
+    const section = panel("Onboarding");
+    addText(
+      section,
+      "p",
+      "Review submitted onboarding proposals in Inbox, then enroll this device before signing a decision."
+    );
+    section.append(actionButton("Register this device with WebAuthn", registerDevice));
+    return section;
+  }
+
+  function renderInbox() {
+    const section = panel("Inbox");
+    const inbox = state.inbox;
+    if (!inbox) {
+      addText(section, "p", "Loading review items.");
+      return section;
+    }
+    const items = [
+      ...(inbox.pending_proposal_ids || []),
+      ...(inbox.open_case_ids || []),
+    ];
+    if (items.length === 0) {
+      addText(section, "p", "No visible proposals or open cases need review.");
+    } else {
+      const list = document.createElement("ul");
+      for (const identifier of items) {
+        const entry = document.createElement("li");
+        entry.append(
+          actionButton(`Review ${identifier}`, () => {
+            state.proposalId = identifier;
+            showView("proposal");
+          })
+        );
+        list.append(entry);
+      }
+      section.append(list);
+    }
+    section.append(actionButton("Refresh inbox", loadInbox));
+    return section;
+  }
+
+  function renderSelectedNodes() {
+    const fieldset = document.createElement("fieldset");
+    const legend = document.createElement("legend");
+    legend.textContent = "Selected nodes bound to this decision";
+    fieldset.append(legend);
+    if (state.selectedNodeIds.length === 0) {
+      addText(fieldset, "p", "This proposal has no selected nodes and cannot be authorized here.");
+      return fieldset;
+    }
+    for (const nodeId of state.selectedNodeIds) {
+      const label = document.createElement("label");
+      const checkbox = document.createElement("input");
+      checkbox.type = "checkbox";
+      checkbox.checked = true;
+      checkbox.disabled = true;
+      label.append(checkbox, document.createTextNode(` Selected node: ${nodeId}`));
+      fieldset.append(label);
+    }
+    addText(fieldset, "p", "The server-generated decision payload fixes this selection.");
+    return fieldset;
+  }
+
+  function renderProposal() {
+    const section = panel("Proposal review");
+    if (!state.preview) {
+      if (state.proposalId) {
+        addText(section, "p", "Loading the complete proposal and evidence preview.");
+      } else {
+        addText(section, "p", "Choose a proposal or case in Inbox to review its complete preview.");
+        section.append(actionButton("Open inbox", () => showView("inbox")));
+      }
+      return section;
+    }
+    addText(section, "h3", "Exact preview");
+    addProjection(section, state.preview.preview);
+    addText(section, "h3", "Decision binding");
+    addProjection(section, state.preview.payload);
+    section.append(renderSelectedNodes());
+    const actions = document.createElement("div");
+    actions.className = "actions";
+    actions.append(
+      actionButton("Authorize selected review with WebAuthn", authorizeDecision),
+      actionButton("Cancel review without applying a decision", cancelReview, "danger")
+    );
+    section.append(actions);
+    return section;
+  }
+
+  function renderTeamState() {
+    const section = panel("Team state");
+    addText(
+      section,
+      "p",
+      "This local projection shows the available shared-state readiness only; it does not disclose credentials."
+    );
+    if (state.status) {
+      addProjection(section, state.status);
+    }
+    section.append(actionButton("Refresh team-state readiness", refreshStatus));
+    return section;
+  }
+
+  function render() {
+    updateNavigation();
+    let next = null;
+    if (state.view === "onboarding") {
+      next = renderOnboarding();
+    } else if (state.view === "inbox") {
+      next = renderInbox();
+    } else if (state.view === "proposal") {
+      next = renderProposal();
+    } else if (state.view === "team_state") {
+      next = renderTeamState();
+    } else {
+      next = renderHome();
+    }
+    app.replaceChildren(next);
+  }
+
+  function clearPreview() {
+    state.preview = null;
+    state.selectedNodeIds = [];
+    state.proposalId = null;
+  }
+
+  function cancelReview() {
+    clearPreview();
+    state.view = "inbox";
+    render();
+    announce("Review cancelled. No decision was sent.");
+  }
+
+  async function refreshStatus() {
+    try {
+      state.status = await fetchJson(api.status);
+      if (state.view === "home" || state.view === "team_state") {
+        render();
+      }
+      announce("Local review status updated.");
+    } catch (_error) {
+      announce("Local review status is unavailable. No decision was applied.");
+    }
+  }
+
+  async function loadInbox() {
+    try {
+      state.inbox = await fetchJson(api.inbox);
+      if (state.view === "inbox") {
+        render();
+      }
+      announce("Inbox updated.");
+    } catch (_error) {
+      announce("Inbox is unavailable. No decision was applied.");
+    }
+  }
+
+  async function loadPreview() {
+    if (!state.proposalId) {
+      return;
+    }
+    try {
+      state.preview = await fetchJson(`${api.proposal}${encodeURIComponent(state.proposalId)}`);
+      const payload = state.preview && state.preview.payload;
+      state.selectedNodeIds = Array.isArray(payload && payload.selected_node_ids)
+        ? payload.selected_node_ids.filter((value) => typeof value === "string")
+        : [];
+      if (state.view === "proposal") {
+        render();
+      }
+      announce("Complete proposal preview loaded. Review the evidence and selected nodes.");
+    } catch (_error) {
+      clearPreview();
+      render();
+      announce("Proposal preview is unavailable. No decision was applied.");
+    }
+  }
+
+  async function showView(view) {
+    if (!viewNames.has(view)) {
+      return;
+    }
+    state.view = view;
+    render();
+    app.focus();
+    if (view === "inbox") {
+      await loadInbox();
+    } else if (view === "proposal") {
+      await loadPreview();
+    }
+  }
+
+  function base64urlToBuffer(value) {
+    if (typeof value !== "string" || !/^[A-Za-z0-9_-]+$/.test(value)) {
+      throw new Error("Invalid WebAuthn base64url value.");
+    }
+    const padded = value.replace(/-/g, "+").replace(/_/g, "/").padEnd(Math.ceil(value.length / 4) * 4, "=");
+    const binary = atob(padded);
+    const bytes = new Uint8Array(binary.length);
+    for (let index = 0; index < binary.length; index += 1) {
+      bytes[index] = binary.charCodeAt(index);
+    }
+    return bytes.buffer;
+  }
+
+  function bufferToBase64url(buffer) {
+    const bytes = new Uint8Array(buffer);
+    let binary = "";
+    for (const byte of bytes) {
+      binary += String.fromCharCode(byte);
+    }
+    return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+  }
+
+  function clearBuffer(value) {
+    if (value instanceof ArrayBuffer) {
+      new Uint8Array(value).fill(0);
+    }
+  }
+
+  function clearOptionBuffers(options) {
+    const publicKey = options && options.publicKey;
+    if (!publicKey || typeof publicKey !== "object") {
+      return;
+    }
+    clearBuffer(publicKey.challenge);
+    if (publicKey.user) {
+      clearBuffer(publicKey.user.id);
+    }
+    for (const credential of publicKey.excludeCredentials || []) {
+      clearBuffer(credential.id);
+    }
+    for (const credential of publicKey.allowCredentials || []) {
+      clearBuffer(credential.id);
+    }
+  }
+
+  function convertCredentialDescriptors(descriptors) {
+    if (!Array.isArray(descriptors)) {
+      return;
+    }
+    for (const descriptor of descriptors) {
+      if (!descriptor || typeof descriptor !== "object") {
+        throw new Error("Invalid WebAuthn credential descriptor.");
+      }
+      descriptor.id = base64urlToBuffer(descriptor.id);
+    }
+  }
+
+  function creationOptions(options) {
+    const publicKey = options && options.publicKey;
+    if (!publicKey || typeof publicKey !== "object" || !publicKey.user || typeof publicKey.user !== "object") {
+      throw new Error("Invalid registration options.");
+    }
+    publicKey.challenge = base64urlToBuffer(publicKey.challenge);
+    publicKey.user.id = base64urlToBuffer(publicKey.user.id);
+    convertCredentialDescriptors(publicKey.excludeCredentials);
+    publicKey.authenticatorSelection = publicKey.authenticatorSelection || {};
+    publicKey.authenticatorSelection.userVerification = "required";
+    return options;
+  }
+
+  function requestOptions(options) {
+    const publicKey = options && options.publicKey;
+    if (!publicKey || typeof publicKey !== "object") {
+      throw new Error("Invalid authentication options.");
+    }
+    publicKey.challenge = base64urlToBuffer(publicKey.challenge);
+    convertCredentialDescriptors(publicKey.allowCredentials);
+    publicKey.userVerification = "required";
+    return options;
+  }
+
+  function serializeCredential(credential) {
+    if (!credential || credential.type !== "public-key" || !credential.response) {
+      throw new Error("Invalid WebAuthn credential.");
+    }
+    const response = credential.response;
+    const result = {
+      id: credential.id,
+      rawId: bufferToBase64url(credential.rawId),
+      type: credential.type,
+      response: {
+        clientDataJSON: bufferToBase64url(response.clientDataJSON),
+      },
+    };
+    if (response.attestationObject instanceof ArrayBuffer) {
+      result.response.attestationObject = bufferToBase64url(response.attestationObject);
+    } else {
+      result.response.authenticatorData = bufferToBase64url(response.authenticatorData);
+      result.response.signature = bufferToBase64url(response.signature);
+      result.response.userHandle = response.userHandle ? bufferToBase64url(response.userHandle) : null;
+    }
+    return result;
+  }
+
+  function clearSerializedCredential(response) {
+    if (!response || typeof response !== "object") {
+      return;
+    }
+    response.id = "";
+    response.rawId = "";
+    if (response.response) {
+      for (const key of Object.keys(response.response)) {
+        response.response[key] = null;
+      }
+    }
+  }
+
+  function cancellation(error) {
+    return error && (error.name === "AbortError" || error.name === "NotAllowedError");
+  }
+
+  async function registerDevice() {
+    let options = null;
+    let credential = null;
+    let response = null;
+    let result = null;
+    try {
+      options = await fetchJson(api.registrationOptions, { method: "POST", body: "{}" });
+      credential = await navigator.credentials.create({ publicKey: creationOptions(options).publicKey });
+      response = serializeCredential(credential);
+      result = await fetchJson(api.registrationVerify, {
+        method: "POST",
+        body: JSON.stringify({ response }),
+      });
+      announce("Device registration completed. Credential details are not shown or retained.");
+    } catch (error) {
+      announce(
+        cancellation(error)
+          ? "Device registration cancelled. No credential response was sent."
+          : "Device registration could not complete. No decision was applied."
+      );
+    } finally {
+      clearOptionBuffers(options);
+      clearSerializedCredential(response);
+      result = null;
+      response = null;
+      credential = null;
+      options = null;
+    }
+  }
+
+  async function authorizeDecision() {
+    if (!state.preview || state.selectedNodeIds.length === 0) {
+      announce("Select a review item with server-bound nodes before authorizing it.");
+      return;
+    }
+    let payload = state.preview.payload;
+    let options = null;
+    let credential = null;
+    let response = null;
+    let result = null;
+    try {
+      options = await fetchJson(api.decisionOptions, {
+        method: "POST",
+        body: JSON.stringify({ payload }),
+      });
+      credential = await navigator.credentials.get({ publicKey: requestOptions(options).publicKey });
+      response = serializeCredential(credential);
+      result = await fetchJson(api.decisionVerify, {
+        method: "POST",
+        body: JSON.stringify({ response, payload }),
+      });
+      announce("Decision applied after user-verifying WebAuthn confirmation.");
+      await refreshStatus();
+    } catch (error) {
+      announce(
+        cancellation(error)
+          ? "WebAuthn review cancelled. No decision was sent."
+          : "The challenge may have expired or changed. Review the proposal again; no decision was applied."
+      );
+    } finally {
+      clearOptionBuffers(options);
+      clearSerializedCredential(response);
+      result = null;
+      response = null;
+      credential = null;
+      options = null;
+      payload = null;
+      clearPreview();
+      if (state.view === "proposal") {
+        state.view = "inbox";
+      }
+      render();
+    }
+  }
+
+  for (const button of navigation) {
+    button.addEventListener("click", () => showView(button.dataset.view));
+  }
+
+  render();
+  refreshStatus();
+})();

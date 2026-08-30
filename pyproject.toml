@@ -37,10 +37,14 @@ intent = "intent_engineering.cli.app:app"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/intent_engineering"]
+artifacts = ["src/intent_engineering/control_plane/assets/**"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra"
+markers = [
+  "manual_platform_authenticator: release-only probe requiring an explicit platform authenticator",
+]
 
 [tool.ruff]
 target-version = "py312"
