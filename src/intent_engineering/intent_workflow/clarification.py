@@ -44,6 +44,7 @@ from intent_engineering.core.models._base import StrictModel
 from intent_engineering.core.policy.access import refs_allowed
 from intent_engineering.intent_workflow.conversation import (
     ConversationCapture,
+    _turn_record,
     codex_conversation_binding,
     validate_conversation_ingestion,
     verify_codex_conversation_ref,
@@ -749,6 +750,86 @@ class ClarificationCoordinator:
         event = _event(updated, "answered", actor, answered_at, session.latest_event_id)
         self._store.append_clarification(event)
         return self._store.session(session_id)
+
+    def _preview_answer(
+        self,
+        session_id: str,
+        *,
+        actor: str,
+        question_id: str,
+        answer: str,
+        answered_at: datetime,
+        acl: tuple[str, ...],
+        principals: frozenset[str],
+    ) -> EvidenceRecord:
+        """Reconstruct the exact evidence record an authenticated answer would append."""
+        answered_at = _utc(answered_at)
+        principals = _principals(principals)
+        if (
+            type(answer) is not str
+            or not answer
+            or len(answer.encode("utf-8")) > _MAX_ANSWER_BYTES
+            or actor not in principals
+            or tuple(sorted(principals)) != tuple(sorted(acl))
+        ):
+            raise ValueError("invalid clarification answer")
+        session = self._store.session(session_id)
+        question = next((item for item in session.questions if item.id == question_id), None)
+        if question is None or session.status != "open":
+            raise ValueError("clarification question unavailable")
+        latest_at = (
+            session.conflicts[-1].observed_at
+            if session.conflicts
+            else session.answers[-1].answered_at
+            if session.answers
+            else session.questions[-1].asked_at
+        )
+        if answered_at < latest_at:
+            raise ValueError("clarification answer chronology changed")
+        snapshot = self._transactions.snapshot()
+        graph, evidence, _predecessors = _records(snapshot)
+        record = _turn_record(
+            conversation_ref=session.conversation_ref,
+            role="human",
+            author=actor,
+            content=answer,
+            captured_at=answered_at,
+            acl=acl,
+        )
+        if (
+            graph.version != session.baseline_graph_version
+            or record.author != actor
+            or (
+                any(item.id == record.id and item != record for item in evidence)
+                or not refs_allowed((record.id,), (*evidence, record), principals)
+            )
+        ):
+            raise ValueError("unavailable clarification answer")
+        return EvidenceRecord.model_validate_json(record.model_dump_json())
+
+    def preview_answer(self, session_id: str, **kwargs: object) -> EvidenceRecord:
+        """Return a detached exact answer-evidence preview without persisting answer text."""
+        result: EvidenceRecord | None = None
+        signal: BaseException | None = None
+        failed = False
+        try:
+            with self._authority_transaction():
+                result = self._preview_answer(session_id, **kwargs)  # type: ignore[arg-type]
+        except Exception:  # noqa: BLE001 - fixed opaque boundary; no logging
+            failed = True
+        except BaseException as caught:  # noqa: BLE001 - preserve exact cancellation identity
+            caught.__traceback__ = None
+            signal = caught
+        finally:
+            session_id = ""
+            kwargs.clear()
+        if signal is not None:
+            caught_signal = signal
+            signal = None
+            raise caught_signal.with_traceback(None)
+        if failed or result is None:
+            raise ClarificationError()
+        return result
 
     def answer(self, session_id: str, **kwargs: object) -> ClarificationSession:
         result: ClarificationSession | None = None
