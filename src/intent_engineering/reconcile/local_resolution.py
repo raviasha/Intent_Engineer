@@ -44,11 +44,19 @@ class LocalResolutionService:
         actor: str,
         *,
         transactions: LocalTransactionCoordinator | None = None,
+        principals: frozenset[str] | None = None,
     ) -> None:
         self._graph_store = graph_store
         self._evidence_store = evidence_store
         self._case_store = case_store
         self._actor = actor
+        self._principals = frozenset({actor}) if principals is None else principals
+        if (
+            type(self._principals) is not frozenset
+            or actor not in self._principals
+            or any(type(principal) is not str or not principal for principal in self._principals)
+        ):
+            raise ValueError("invalid resolution principals")
         self._transactions = transactions or LocalTransactionCoordinator(
             graph_store._history_store._file.sibling(".local-transaction.json"),
             {
@@ -78,7 +86,7 @@ class LocalResolutionService:
             records = tuple(
                 self._evidence_store.get(reference) for reference in case.all_evidence_refs
             )
-            if not refs_allowed(case.all_evidence_refs, records, self._actor):
+            if not refs_allowed(case.all_evidence_refs, records, self._principals):
                 raise ResolutionUnavailable("resolution unavailable")
             timestamp = at or datetime.now(UTC)
             if case.status is ReconciliationStatus.OPEN and action in {

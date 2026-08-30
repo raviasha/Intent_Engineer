@@ -273,3 +273,7 @@ class JsonlEvidenceStore:
                 for connector_id in sorted(self._ledger_by_connector)
                 for item in self._ledger_by_connector[connector_id]
             )
+
+    def close(self) -> None:
+        """Release the store's held descriptor."""
+        self._file.close()

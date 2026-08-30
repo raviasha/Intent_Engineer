@@ -23,6 +23,8 @@ _STATE_FILES = (
     ("approvals", "plans.jsonl"),
     ("approvals", "approvals.jsonl"),
     ("approvals", "receipts.jsonl"),
+    ("approvals", "webauthn-credentials.jsonl"),
+    ("approvals", "webauthn-challenges.jsonl"),
     ("approvals", "policy.yaml"),
     ("history", "intent-proposals.jsonl"),
 )
@@ -211,10 +213,14 @@ def initialize_project(root: Path, *, force: bool = False) -> InitializedProject
         try:
             if existed and _is_complete_valid(workspace_fd):
                 history_fd = _open_or_create_directory(workspace_fd, "history")
+                approvals_fd = _open_or_create_directory(workspace_fd, "approvals")
                 try:
                     _ensure_regular_file(history_fd, "intent-proposals.jsonl")
+                    _ensure_regular_file(approvals_fd, "webauthn-credentials.jsonl")
+                    _ensure_regular_file(approvals_fd, "webauthn-challenges.jsonl")
                 finally:
                     os.close(history_fd)
+                    os.close(approvals_fd)
                 connector_fd = _open_or_create_directory(workspace_fd, "connectors")
                 os.close(connector_fd)
                 return InitializedProject(
@@ -247,6 +253,8 @@ def initialize_project(root: Path, *, force: bool = False) -> InitializedProject
                     directory_fds["history"],
                     "intent-proposals.jsonl",
                 )
+                _ensure_regular_file(directory_fds["approvals"], "webauthn-credentials.jsonl")
+                _ensure_regular_file(directory_fds["approvals"], "webauthn-challenges.jsonl")
             finally:
                 for descriptor in directory_fds.values():
                     os.close(descriptor)

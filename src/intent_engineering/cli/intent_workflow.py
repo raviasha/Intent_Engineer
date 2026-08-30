@@ -30,6 +30,7 @@ from intent_engineering.cli.output import OutputFormat, emit
 from intent_engineering.cli.runtime import Runtime, github_repository_scope, load_runtime
 from intent_engineering.cli.writes import MutationPolicy, policy_actor_aliases
 from intent_engineering.core.models import (
+    Graph,
     JsonValue,
     ProjectConfig,
     SourceRole,
@@ -715,6 +716,37 @@ def proposal_payload(
     }
 
 
+def confirm_proposal(
+    runtime: Runtime,
+    *,
+    proposal_id: str,
+    proposal_digest: str,
+    selected_node_ids: tuple[str, ...],
+    actor: str,
+    at: datetime,
+) -> Graph:
+    """Apply one already-authenticated bootstrap selection over the exact live preview."""
+    config, config_bytes = _snapshot_config(runtime)
+    if actor != config.local_actor:
+        raise ValueError("proposal authority changed")
+    preview = proposal_payload(runtime, config, proposal_id)
+    if (
+        preview.get("proposal_digest") != proposal_digest
+        or tuple(sorted(selected_node_ids)) != selected_node_ids
+        or not selected_node_ids
+        or not set(selected_node_ids).issubset(set(cast(list[str], preview["core_node_ids"])))
+        or _snapshot_config(runtime) != (config, config_bytes)
+        or proposal_payload(runtime, config, proposal_id) != preview
+    ):
+        raise ValueError("proposal authority changed")
+    return _bootstrap_service(runtime, config).activate(
+        proposal_id,
+        confirmed_node_ids=selected_node_ids,
+        actor=actor,
+        at=at,
+    )
+
+
 def _proposal_result(
     project: Path,
     proposal_id: str | None,
@@ -860,6 +892,7 @@ __all__ = [
     "OnboardingCommandResult",
     "ProposalTerminal",
     "bootstrap_command",
+    "confirm_proposal",
     "onboard_command",
     "proposal_payload",
     "proposals_app",

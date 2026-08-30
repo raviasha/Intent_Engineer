@@ -44,6 +44,7 @@ from intent_engineering.core.models._base import StrictModel
 from intent_engineering.core.policy.access import refs_allowed
 from intent_engineering.intent_workflow.conversation import (
     ConversationCapture,
+    _turn_record,
     codex_conversation_binding,
     validate_conversation_ingestion,
     verify_codex_conversation_ref,
@@ -194,6 +195,20 @@ class ProposalConfirmationResult(StrictModel):
     graph_version: int = Field(ge=0)
     decision_id: str | None = None
     case_id: str | None = None
+
+
+class ProposalConfirmationPreview(StrictModel):
+    """Authenticated, non-mutating material for one pending proposal confirmation."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    schema_version: Literal[1] = 1
+    proposal: ClarificationIntentProposal
+    selected_node_ids: tuple[str, ...]
+    activation_changeset: ChangeSet
+    high_risk: bool
+    risk_reasons: tuple[str, ...]
+    review_case: ReconciliationCase | None = None
 
 
 def _canonical_bytes(value: object) -> bytes:
@@ -749,6 +764,86 @@ class ClarificationCoordinator:
         event = _event(updated, "answered", actor, answered_at, session.latest_event_id)
         self._store.append_clarification(event)
         return self._store.session(session_id)
+
+    def _preview_answer(
+        self,
+        session_id: str,
+        *,
+        actor: str,
+        question_id: str,
+        answer: str,
+        answered_at: datetime,
+        acl: tuple[str, ...],
+        principals: frozenset[str],
+    ) -> EvidenceRecord:
+        """Reconstruct the exact evidence record an authenticated answer would append."""
+        answered_at = _utc(answered_at)
+        principals = _principals(principals)
+        if (
+            type(answer) is not str
+            or not answer
+            or len(answer.encode("utf-8")) > _MAX_ANSWER_BYTES
+            or actor not in principals
+            or tuple(sorted(principals)) != tuple(sorted(acl))
+        ):
+            raise ValueError("invalid clarification answer")
+        session = self._store.session(session_id)
+        question = next((item for item in session.questions if item.id == question_id), None)
+        if question is None or session.status != "open":
+            raise ValueError("clarification question unavailable")
+        latest_at = (
+            session.conflicts[-1].observed_at
+            if session.conflicts
+            else session.answers[-1].answered_at
+            if session.answers
+            else session.questions[-1].asked_at
+        )
+        if answered_at < latest_at:
+            raise ValueError("clarification answer chronology changed")
+        snapshot = self._transactions.snapshot()
+        graph, evidence, _predecessors = _records(snapshot)
+        record = _turn_record(
+            conversation_ref=session.conversation_ref,
+            role="human",
+            author=actor,
+            content=answer,
+            captured_at=answered_at,
+            acl=acl,
+        )
+        if (
+            graph.version != session.baseline_graph_version
+            or record.author != actor
+            or (
+                any(item.id == record.id and item != record for item in evidence)
+                or not refs_allowed((record.id,), (*evidence, record), principals)
+            )
+        ):
+            raise ValueError("unavailable clarification answer")
+        return EvidenceRecord.model_validate_json(record.model_dump_json())
+
+    def preview_answer(self, session_id: str, **kwargs: object) -> EvidenceRecord:
+        """Return a detached exact answer-evidence preview without persisting answer text."""
+        result: EvidenceRecord | None = None
+        signal: BaseException | None = None
+        failed = False
+        try:
+            with self._authority_transaction():
+                result = self._preview_answer(session_id, **kwargs)  # type: ignore[arg-type]
+        except Exception:  # noqa: BLE001 - fixed opaque boundary; no logging
+            failed = True
+        except BaseException as caught:  # noqa: BLE001 - preserve exact cancellation identity
+            caught.__traceback__ = None
+            signal = caught
+        finally:
+            session_id = ""
+            kwargs.clear()
+        if signal is not None:
+            caught_signal = signal
+            signal = None
+            raise caught_signal.with_traceback(None)
+        if failed or result is None:
+            raise ClarificationError()
+        return result
 
     def answer(self, session_id: str, **kwargs: object) -> ClarificationSession:
         result: ClarificationSession | None = None
@@ -1847,6 +1942,128 @@ class ProposalConfirmationService:
             case_id=decision.review_case_id,
         )
 
+    def _preview_confirmation(
+        self,
+        proposal_id: str,
+        *,
+        proposal_digest: str | None,
+        actor: str,
+        at: datetime,
+        selected_node_ids: tuple[str, ...],
+    ) -> ProposalConfirmationPreview:
+        at = _utc(at)
+        if (
+            type(proposal_id) is not str
+            or not proposal_id
+            or (proposal_digest is not None and type(proposal_digest) is not str)
+            or type(actor) is not str
+            or not actor
+            or type(selected_node_ids) is not tuple
+            or any(type(item) is not str or not item for item in selected_node_ids)
+        ):
+            raise ValueError("invalid confirmation preview")
+        snapshot = self._transactions.snapshot(
+            self._extras,
+            extra_read_policies=self._authority_read_policies,
+        )
+        graph, evidence, _ = _records(snapshot)
+        ledger = snapshot.content.get("intent_proposals")
+        if ledger is None or self._store.bytes() != ledger:
+            raise ValueError("proposal ledger changed")
+        proposal = self._store.get(proposal_id)
+        if not isinstance(proposal, ClarificationIntentProposal):
+            raise TypeError("proposal is not clarification-bound")
+        if proposal_digest is not None and proposal.digest != proposal_digest:
+            raise ValueError("proposal digest changed")
+        if self._store.decision_for(proposal.id) is not None:
+            raise ValueError("proposal already decided")
+        added = tuple(sorted(node.id for node in proposal.changeset.nodes_added))
+        selected = tuple(sorted(selected_node_ids or added))
+        if (
+            tuple(sorted(set(selected))) != selected
+            or not set(selected).issubset(added)
+            or (added and not selected)
+            or at < proposal.proposed_at
+            or graph.version != proposal.baseline_graph_version
+        ):
+            raise ValueError("invalid confirmation binding")
+        high_risk, reasons = self._risk(proposal, graph)
+        review_case: ReconciliationCase | None = None
+        if high_risk:
+            _config, policy, provider_principals = self._authority(snapshot)
+            actor_aliases = self._aliases(actor, policy, provider_principals)
+            review_case = self._review_case(
+                proposal,
+                graph,
+                evidence,
+                reasons,
+                frozenset(actor_aliases),
+            )
+        authenticated = self._authenticate_confirmation_snapshot(
+            snapshot,
+            proposal=proposal,
+            actor=actor,
+            high_risk=high_risk,
+            reasons=reasons,
+            review_case=review_case,
+        )
+        activation = self._activation(
+            proposal,
+            actor,
+            at,
+            selected,
+            authenticated.review_case.id if authenticated.review_case is not None else None,
+        )
+        return ProposalConfirmationPreview(
+            proposal=proposal,
+            selected_node_ids=selected,
+            activation_changeset=activation,
+            high_risk=high_risk,
+            risk_reasons=reasons,
+            review_case=authenticated.review_case,
+        )
+
+    def preview_confirmation(
+        self,
+        proposal_id: str,
+        *,
+        proposal_digest: str | None = None,
+        actor: str,
+        at: datetime,
+        selected_node_ids: tuple[str, ...] = (),
+    ) -> ProposalConfirmationPreview:
+        """Authenticate a pending proposal and derive its activation without mutation."""
+        result: ProposalConfirmationPreview | None = None
+        signal: BaseException | None = None
+        failed = False
+        try:
+            with self._authority_transaction():
+                result = self._preview_confirmation(
+                    proposal_id,
+                    proposal_digest=proposal_digest,
+                    actor=actor,
+                    at=at,
+                    selected_node_ids=selected_node_ids,
+                )
+        except Exception:  # noqa: BLE001 - fixed opaque boundary; no logging
+            failed = True
+        except BaseException as caught:  # noqa: BLE001 - preserve exact cancellation identity
+            caught.__traceback__ = None
+            signal = caught
+        finally:
+            proposal_id = ""
+            proposal_digest = None
+            actor = ""
+            at = cast(datetime, None)
+            selected_node_ids = ()
+        if signal is not None:
+            caught_signal = signal
+            signal = None
+            raise caught_signal.with_traceback(None)
+        if failed or result is None:
+            raise ClarificationError()
+        return result
+
     def _confirm(
         self,
         proposal_id: str,
@@ -2096,6 +2313,7 @@ class ProposalConfirmationService:
 __all__ = [
     "ClarificationCoordinator",
     "ClarificationError",
+    "ProposalConfirmationPreview",
     "ProposalConfirmationResult",
     "ProposalConfirmationService",
     "ProposalConfirmationStatus",
