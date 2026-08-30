@@ -78,3 +78,16 @@ def test_browser_bundle_clears_sensitive_ceremony_references_in_finally_blocks()
     assert "options = null" in javascript
     assert "payload = null" in javascript
     assert "app.replaceChildren(next)" in javascript
+
+
+def test_authorization_is_explicitly_destructive_and_cancel_is_safe() -> None:
+    """Catches an ambiguous authority-grant label or a cancel button styled as destructive."""
+    _html, javascript, css = _assets()
+
+    assert "Authorize ${decisionLabel(payload)} with WebAuthn" in javascript
+    assert 'actionButton("Cancel review without applying a decision", cancelReview)' in javascript
+    assert (
+        'actionButton(`Authorize ${decisionLabel(payload)} with WebAuthn`, authorizeDecision, "danger")'
+        in javascript
+    )
+    assert ".danger" in css

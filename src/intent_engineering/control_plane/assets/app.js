@@ -21,6 +21,7 @@
     proposalId: null,
     preview: null,
     selectedNodeIds: [],
+    proposalGeneration: 0,
   };
   let csrfToken = readCsrfBootstrap();
 
@@ -190,7 +191,7 @@
         const entry = document.createElement("li");
         entry.append(
           actionButton(`Review ${identifier}`, () => {
-            state.proposalId = identifier;
+            selectProposal(identifier);
             showView("proposal");
           })
         );
@@ -240,11 +241,12 @@
     addText(section, "h3", "Decision binding");
     addProjection(section, state.preview.payload);
     section.append(renderSelectedNodes());
+    const payload = state.preview.payload;
     const actions = document.createElement("div");
     actions.className = "actions";
     actions.append(
-      actionButton("Authorize selected review with WebAuthn", authorizeDecision),
-      actionButton("Cancel review without applying a decision", cancelReview, "danger")
+      actionButton(`Authorize ${decisionLabel(payload)} with WebAuthn`, authorizeDecision, "danger"),
+      actionButton("Cancel review without applying a decision", cancelReview)
     );
     section.append(actions);
     return section;
@@ -287,8 +289,63 @@
     state.proposalId = null;
   }
 
-  function cancelReview() {
+  function discardProposalReview() {
+    state.proposalGeneration += 1;
     clearPreview();
+  }
+
+  function selectProposal(proposalId) {
+    discardProposalReview();
+    state.proposalId = proposalId;
+  }
+
+  function payloadMatchesProposal(payload, proposalId) {
+    return (
+      payload &&
+      typeof payload === "object" &&
+      payload.subject &&
+      typeof payload.subject === "object" &&
+      payload.subject.id === proposalId
+    );
+  }
+
+  function selectionMatchesPayload(payload, proposalId) {
+    return (
+      payloadMatchesProposal(payload, proposalId) &&
+      Array.isArray(payload.selected_node_ids) &&
+      payload.selected_node_ids.length === state.selectedNodeIds.length &&
+      payload.selected_node_ids.every(
+        (nodeId, index) => nodeId === state.selectedNodeIds[index]
+      )
+    );
+  }
+
+  function currentReviewMatches(proposalId, generation, preview) {
+    return (
+      state.proposalId === proposalId &&
+      state.proposalGeneration === generation &&
+      state.preview === preview &&
+      selectionMatchesPayload(preview && preview.payload, proposalId)
+    );
+  }
+
+  function decisionLabel(payload) {
+    const subject = payload && payload.subject;
+    const subjectId = subject && typeof subject.id === "string" ? subject.id : "unavailable subject";
+    const actions = {
+      confirm_baseline: "confirm baseline",
+      answer_clarification: "answer clarification",
+      confirm_proposal: "confirm proposal",
+      resolve_conflict: "resolve conflict",
+      publish_state: "publish state",
+      approve_external_write: "approve external write",
+    };
+    const action = payload && typeof payload.action === "string" ? payload.action : "authorize";
+    return `${actions[action] || action} ${subjectId}`;
+  }
+
+  function cancelReview() {
+    discardProposalReview();
     state.view = "inbox";
     render();
     announce("Review cancelled. No decision was sent.");
@@ -322,26 +379,41 @@
     if (!state.proposalId) {
       return;
     }
+    const proposalId = state.proposalId;
+    const generation = state.proposalGeneration;
     try {
-      state.preview = await fetchJson(`${api.proposal}${encodeURIComponent(state.proposalId)}`);
-      const payload = state.preview && state.preview.payload;
-      state.selectedNodeIds = Array.isArray(payload && payload.selected_node_ids)
+      const preview = await fetchJson(`${api.proposal}${encodeURIComponent(proposalId)}`);
+      if (state.proposalId !== proposalId || state.proposalGeneration !== generation) {
+        return;
+      }
+      const payload = preview && preview.payload;
+      const selectedNodeIds = Array.isArray(payload && payload.selected_node_ids)
         ? payload.selected_node_ids.filter((value) => typeof value === "string")
         : [];
+      if (!payloadMatchesProposal(payload, proposalId)) {
+        throw new Error("Preview binding does not match the selected review item.");
+      }
+      state.preview = preview;
+      state.selectedNodeIds = selectedNodeIds;
       if (state.view === "proposal") {
         render();
       }
       announce("Complete proposal preview loaded. Review the evidence and selected nodes.");
     } catch (_error) {
-      clearPreview();
-      render();
-      announce("Proposal preview is unavailable. No decision was applied.");
+      if (state.proposalId === proposalId && state.proposalGeneration === generation) {
+        discardProposalReview();
+        render();
+        announce("Proposal preview is unavailable. No decision was applied.");
+      }
     }
   }
 
   async function showView(view) {
     if (!viewNames.has(view)) {
       return;
+    }
+    if (view !== "proposal" && state.view === "proposal") {
+      discardProposalReview();
     }
     state.view = view;
     render();
@@ -505,28 +577,43 @@
   }
 
   async function authorizeDecision() {
-    if (!state.preview || state.selectedNodeIds.length === 0) {
+    const proposalId = state.proposalId;
+    const generation = state.proposalGeneration;
+    const preview = state.preview;
+    if (
+      !proposalId ||
+      !preview ||
+      state.selectedNodeIds.length === 0 ||
+      !currentReviewMatches(proposalId, generation, preview)
+    ) {
       announce("Select a review item with server-bound nodes before authorizing it.");
       return;
     }
-    let payload = state.preview.payload;
+    let payload = preview.payload;
     let options = null;
     let credential = null;
     let response = null;
     let result = null;
+    let applied = false;
     try {
       options = await fetchJson(api.decisionOptions, {
         method: "POST",
         body: JSON.stringify({ payload }),
       });
       credential = await navigator.credentials.get({ publicKey: requestOptions(options).publicKey });
+      if (!currentReviewMatches(proposalId, generation, preview)) {
+        throw new Error("Review selection changed before verification.");
+      }
       response = serializeCredential(credential);
       result = await fetchJson(api.decisionVerify, {
         method: "POST",
         body: JSON.stringify({ response, payload }),
       });
+      if (!currentReviewMatches(proposalId, generation, preview)) {
+        throw new Error("Review selection changed before verification.");
+      }
+      applied = true;
       announce("Decision applied after user-verifying WebAuthn confirmation.");
-      await refreshStatus();
     } catch (error) {
       announce(
         cancellation(error)
@@ -541,11 +628,16 @@
       credential = null;
       options = null;
       payload = null;
-      clearPreview();
-      if (state.view === "proposal") {
-        state.view = "inbox";
+      if (currentReviewMatches(proposalId, generation, preview)) {
+        discardProposalReview();
+        if (state.view === "proposal") {
+          state.view = "inbox";
+        }
+        render();
       }
-      render();
+    }
+    if (applied) {
+      void refreshStatus();
     }
   }
 

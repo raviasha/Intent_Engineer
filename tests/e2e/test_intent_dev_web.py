@@ -4,8 +4,12 @@ from __future__ import annotations
 
 import base64
 import json
+import os
+import sys
+import webbrowser
 from dataclasses import dataclass, field
 from typing import Any, cast
+from urllib.request import urlopen
 
 import pytest
 from starlette.testclient import TestClient
@@ -262,7 +266,21 @@ def test_expired_browser_challenge_is_rejected_without_a_decision_result() -> No
 
 
 @pytest.mark.manual_platform_authenticator
-@pytest.mark.skip(reason="release probe: run manually with a platform authenticator")
 def test_manual_platform_authenticator_release_probe() -> None:
-    """Release-only probe for a real browser/platform authenticator ceremony."""
-    raise AssertionError("manual release probe requires explicit platform-authenticator setup")
+    """Open a real `intent dev` UI so a release operator can complete platform WebAuthn."""
+    origin = os.environ.get("INTENT_DEV_MANUAL_ORIGIN")
+    if not origin:
+        pytest.skip(
+            "manual prerequisite: run `intent dev --no-open`, then set "
+            "INTENT_DEV_MANUAL_ORIGIN=http://localhost:<port> and select this marker"
+        )
+    if not sys.stdin.isatty():
+        pytest.fail("manual platform-authenticator probe requires an interactive terminal")
+    with urlopen(origin, timeout=5) as response:
+        assert response.status == 200
+    assert webbrowser.open(origin), "could not open the supplied local intent dev origin"
+    confirmation = input(
+        "Complete registration and one destructive review in the opened Intent UI using a platform "
+        "authenticator, then type VERIFIED: "
+    )
+    assert confirmation == "VERIFIED"
