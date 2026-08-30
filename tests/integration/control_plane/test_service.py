@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import multiprocessing
+import os
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -40,9 +42,13 @@ from intent_engineering.core.models import (
 )
 from intent_engineering.core.policy.project import initialize_project
 from intent_engineering.intent_workflow.bootstrap import BootstrapService, BootstrapSubmission
-from intent_engineering.intent_workflow.clarification import ClarificationCoordinator
+from intent_engineering.intent_workflow.clarification import (
+    ClarificationCoordinator,
+    ProposalConfirmationPreview,
+)
 from intent_engineering.intent_workflow.conversation import ConversationCapture
 from intent_engineering.intent_workflow.models import (
+    ClarificationIntentProposal,
     ClarificationProposalSubmission,
     ClarificationQuestionInput,
     TaskEnvelope,
@@ -50,6 +56,7 @@ from intent_engineering.intent_workflow.models import (
 from intent_engineering.mutations.models import WritePlan, write_plan_id
 from intent_engineering.reconcile.service import transition_case
 from intent_engineering.storage.executor import LocalChangeSetExecutor
+from intent_engineering.storage.jsonl.approval_store import JsonlApprovalStore
 from tests.e2e.test_cli_write_approval import _approval_project
 from tests.unit.mutations.test_planner import base_plan
 
@@ -130,17 +137,22 @@ class _ApprovalHarness:
         return payload
 
 
-def _policy(actor: str = "local:owner") -> dict[str, object]:
+def _policy(actor: str = "local:owner", *, aliases: tuple[str, ...] = ()) -> dict[str, object]:
     return {
         "schema_version": 1,
         "contributors": [actor],
         "approvers": [actor],
         "executors": [actor],
-        "identities": {actor: [actor]},
+        "identities": {actor: [actor, *aliases]},
     }
 
 
-def _harness(tmp_path: Path, *, actor: str = "local:owner") -> _Harness:
+def _harness(
+    tmp_path: Path,
+    *,
+    actor: str = "local:owner",
+    aliases: tuple[str, ...] = (),
+) -> _Harness:
     project = tmp_path / "project"
     project.mkdir()
     initialize_project(project)
@@ -163,7 +175,7 @@ def _harness(tmp_path: Path, *, actor: str = "local:owner") -> _Harness:
         yaml.safe_dump(config.model_dump(mode="json"), sort_keys=True), encoding="utf-8"
     )
     (project / ".intent/approvals/policy.yaml").write_text(
-        yaml.safe_dump(_policy(actor), sort_keys=True), encoding="utf-8"
+        yaml.safe_dump(_policy(actor, aliases=aliases), sort_keys=True), encoding="utf-8"
     )
     runtime = load_runtime(project)
     verifier = _Verifier()
@@ -213,6 +225,29 @@ def _repository_traceback_locals(error: BaseException) -> str:
             repository_locals.append(repr(traceback.tb_frame.f_locals))
         traceback = traceback.tb_next
     return "".join(repository_locals)
+
+
+def _crash_after_real_approval_put(
+    service: ControlPlaneService,
+    payload: HumanDecisionPayload,
+) -> None:
+    original = JsonlApprovalStore.put
+
+    def crash(store: JsonlApprovalStore, record: object) -> bool:
+        added = original(store, record)  # type: ignore[arg-type]
+        os._exit(73 if added else 74)
+
+    JsonlApprovalStore.put = crash  # type: ignore[method-assign,assignment]
+    service.apply_decision(b"signed-assertion", payload)
+    os._exit(75)
+
+
+def _intent_files(project: Path) -> dict[Path, bytes]:
+    return {
+        path.relative_to(project): path.read_bytes()
+        for path in project.joinpath(".intent").rglob("*")
+        if path.is_file()
+    }
 
 
 def _approval_harness(tmp_path: Path) -> _ApprovalHarness:
@@ -380,11 +415,108 @@ def _open_clarification(harness: _Harness):
     return coordinator, session
 
 
-def _open_conflict_case(harness: _Harness) -> ReconciliationCase:
+def _create_clarified_proposal(harness: _Harness) -> ClarificationIntentProposal:
+    coordinator, session = _open_clarification(harness)
+    answer_preview = harness.service.answer_preview(
+        session.id, "audience", "Workspace owners may share read-only reports."
+    )
+    harness.service.apply_decision(b"signed-assertion", harness.sign(answer_preview))
+    answered = harness.runtime.intent_proposals.session(session.id)
+    evidence_refs = (
+        answered.request_evidence_ref,
+        answered.classification_evidence_ref,
+        *(item.evidence_ref for item in answered.questions),
+        *(item.evidence_ref for item in answered.answers),
+    )
+    proposed = Node(
+        id="req-read-only-sharing",
+        type=NodeType.REQUIREMENT,
+        label="Workspace owners may share read-only reports",
+        status="proposed",
+        created_by="local:owner",
+        created_at=NOW,
+        last_modified_by="local:owner",
+        last_modified_at=NOW,
+        source_mode=SourceMode.INFERRED,
+        intent_fidelity_confidence=0.8,
+        confidence_basis="Clarified human answer",
+        last_reassessed_at=NOW,
+        evidence_refs=evidence_refs,
+    )
+    changeset = ChangeSet(
+        id="",
+        actor="local:owner",
+        timestamp=NOW,
+        baseline_graph_version=answered.baseline_graph_version,
+        evidence_refs=evidence_refs,
+        nodes_added=(proposed,),
+        nodes_updated=(),
+        nodes_superseded=(),
+        edges_added=(),
+        edges_updated=(),
+        edges_superseded=(),
+        confidence_changes=(),
+        implementation_status_changes=(),
+        reconciliation_cases_created=(),
+        reconciliation_cases_resolved=(),
+        validation_status="validated",
+    )
+    return coordinator.propose(
+        ClarificationProposalSubmission(
+            session_id=answered.id,
+            task_id=answered.task_id,
+            baseline_graph_version=answered.baseline_graph_version,
+            actor="local:owner",
+            timestamp=NOW,
+            evidence_refs=evidence_refs,
+            changeset=changeset,
+            core_node_ids=(proposed.id,),
+        ),
+        principals=frozenset({"agent:codex", "local:owner"}),
+    )
+
+
+def _rewrite_evidence_acl(project: Path, evidence_ref: str, acl: tuple[str, ...]) -> None:
+    path = project / ".intent/evidence/evidence.jsonl"
+    frames = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    changed = False
+    for frame in frames:
+        evidence = frame.get("evidence")
+        if isinstance(evidence, dict) and evidence.get("id") == evidence_ref:
+            evidence["acl"] = list(acl)
+            changed = True
+    assert changed
+    path.write_bytes(
+        b"".join(
+            json.dumps(frame, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode(
+                "utf-8"
+            )
+            + b"\n"
+            for frame in frames
+        )
+    )
+
+
+def _open_conflict_case(
+    harness: _Harness, *, evidence_acl: tuple[str, ...] | None = None
+) -> ReconciliationCase:
     proposal_id, evidence_ref = _bootstrap_proposal(harness)
     harness.service.apply_decision(
         b"signed-assertion", harness.sign(harness.service.proposal_preview(proposal_id))
     )
+    if evidence_acl is not None:
+        evidence_ref = (
+            ConversationCapture(harness.runtime.evidence_store)
+            .record_turn(
+                conversation_ref="codex:alias-authority",
+                role="human",
+                author="local:owner",
+                content="Alias-authorized conflict evidence",
+                captured_at=NOW,
+                acl=evidence_acl,
+            )
+            .id
+        )
     case = ReconciliationCase(
         id="case:control-plane-conflict",
         subject_ref="intent-local-export",
@@ -478,64 +610,7 @@ def test_authenticated_clarified_proposal_confirmation_has_one_graph_transition(
     tmp_path: Path,
 ) -> None:
     harness = _harness(tmp_path)
-    coordinator, session = _open_clarification(harness)
-    answer_preview = harness.service.answer_preview(
-        session.id, "audience", "Workspace owners may share read-only reports."
-    )
-    harness.service.apply_decision(b"signed-assertion", harness.sign(answer_preview))
-    answered = harness.runtime.intent_proposals.session(session.id)
-    evidence_refs = (
-        answered.request_evidence_ref,
-        answered.classification_evidence_ref,
-        *(item.evidence_ref for item in answered.questions),
-        *(item.evidence_ref for item in answered.answers),
-    )
-    proposed = Node(
-        id="req-read-only-sharing",
-        type=NodeType.REQUIREMENT,
-        label="Workspace owners may share read-only reports",
-        status="proposed",
-        created_by="local:owner",
-        created_at=NOW,
-        last_modified_by="local:owner",
-        last_modified_at=NOW,
-        source_mode=SourceMode.INFERRED,
-        intent_fidelity_confidence=0.8,
-        confidence_basis="Clarified human answer",
-        last_reassessed_at=NOW,
-        evidence_refs=evidence_refs,
-    )
-    changeset = ChangeSet(
-        id="",
-        actor="local:owner",
-        timestamp=NOW,
-        baseline_graph_version=answered.baseline_graph_version,
-        evidence_refs=evidence_refs,
-        nodes_added=(proposed,),
-        nodes_updated=(),
-        nodes_superseded=(),
-        edges_added=(),
-        edges_updated=(),
-        edges_superseded=(),
-        confidence_changes=(),
-        implementation_status_changes=(),
-        reconciliation_cases_created=(),
-        reconciliation_cases_resolved=(),
-        validation_status="validated",
-    )
-    proposal = coordinator.propose(
-        ClarificationProposalSubmission(
-            session_id=answered.id,
-            task_id=answered.task_id,
-            baseline_graph_version=answered.baseline_graph_version,
-            actor="local:owner",
-            timestamp=NOW,
-            evidence_refs=evidence_refs,
-            changeset=changeset,
-            core_node_ids=(proposed.id,),
-        ),
-        principals=frozenset({"agent:codex", "local:owner"}),
-    )
+    proposal = _create_clarified_proposal(harness)
     preview = harness.service.proposal_preview(proposal.id)
     payload = harness.sign(preview)
     version = harness.runtime.graph_store.load().version
@@ -548,6 +623,50 @@ def test_authenticated_clarified_proposal_confirmation_has_one_graph_transition(
     assert harness.runtime.graph_store.load().version == version + 1
     assert len(history_path.read_bytes().splitlines()) == history_lines + 1
     assert harness.runtime.graph_store.load().nodes[-1].last_modified_by == "local:owner"
+
+
+def test_clarified_proposal_preview_and_options_require_production_evidence_authority(
+    tmp_path: Path,
+) -> None:
+    harness = _harness(tmp_path)
+    proposal = _create_clarified_proposal(harness)
+    payload = harness.payload(harness.service.proposal_preview(proposal.id))
+    _rewrite_evidence_acl(harness.project, proposal.evidence_refs[0], ("agent:codex",))
+    before = harness.state()
+
+    with pytest.raises(ControlPlaneError, match="^control plane unavailable$"):
+        harness.service.decision_options(payload)
+    with pytest.raises(ControlPlaneError, match="^control plane unavailable$"):
+        harness.service.proposal_preview(proposal.id)
+
+    assert harness.state() == before
+
+
+def test_production_confirmation_preview_is_typed_and_non_mutating(tmp_path: Path) -> None:
+    harness = _harness(tmp_path)
+    proposal = _create_clarified_proposal(harness)
+    authority = harness.service._authority()
+    confirmation = harness.service._confirmation_service(authority)
+    before = _intent_files(harness.project)
+    try:
+        preview = confirmation.preview_confirmation(
+            proposal.id,
+            proposal_digest=proposal.digest,
+            actor="local:owner",
+            at=NOW,
+        )
+    finally:
+        confirmation.close()
+        authority.close()
+
+    assert isinstance(preview, ProposalConfirmationPreview)
+    assert preview.proposal == proposal
+    assert preview.selected_node_ids == ("req-read-only-sharing",)
+    assert preview.high_risk is False
+    assert preview.risk_reasons == ()
+    assert preview.review_case is None
+    assert preview.activation_changeset.actor == "local:owner"
+    assert _intent_files(harness.project) == before
 
 
 def test_authenticated_conflict_resolution_binds_case_and_changeset(
@@ -568,6 +687,42 @@ def test_authenticated_conflict_resolution_binds_case_and_changeset(
     assert resolved.status is ReconciliationStatus.RESOLVED
     assert resolved.history[-1].actor == "local:owner"
     assert resolved.resolved_by_changeset == result["changeset_id"]
+
+
+def test_conflict_resolution_uses_the_exact_authenticated_actor_aliases(
+    tmp_path: Path,
+) -> None:
+    alias = "provider:owner-101"
+    harness = _harness(tmp_path, aliases=(alias,))
+    case = _open_conflict_case(harness, evidence_acl=(alias,))
+    payload = harness.sign(harness.service.proposal_preview(case.id))
+
+    result = harness.service.apply_decision(b"signed-assertion", payload)
+
+    assert result["status"] == "resolved"
+    resolved = harness.runtime.case_store.get(case.id)
+    assert resolved.status is ReconciliationStatus.RESOLVED
+    assert resolved.history[-1].actor == "local:owner"
+
+
+def test_conflict_resolution_rejects_authenticated_alias_drift_without_mutation(
+    tmp_path: Path,
+) -> None:
+    alias = "provider:owner-101"
+    harness = _harness(tmp_path, aliases=(alias,))
+    case = _open_conflict_case(harness, evidence_acl=(alias,))
+    payload = harness.sign(harness.service.proposal_preview(case.id))
+    policy_path = harness.project / ".intent/approvals/policy.yaml"
+    policy_path.write_text(
+        yaml.safe_dump(_policy(), sort_keys=True),
+        encoding="utf-8",
+    )
+    before = harness.state()
+
+    with pytest.raises(ControlPlaneError, match="^control plane unavailable$"):
+        harness.service.apply_decision(b"signed-assertion", payload)
+
+    assert harness.state() == before
 
 
 def test_case_transition_interrupt_restores_graph_history_and_case(
@@ -613,34 +768,49 @@ def test_authenticated_guarded_write_approval_appends_only_the_exact_approval(
     assert _optional_bytes(receipts_path) == receipts_before
 
 
-def test_approval_append_cancellation_restores_exact_state_and_identity(
+def test_cancellation_immediately_after_real_approval_put_restores_exact_state_and_identity(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     harness = _approval_harness(tmp_path)
     preview = harness.service.proposal_preview(harness.plan.id)
     payload = harness.sign(preview)
     signal = asyncio.CancelledError()
 
-    def cancel(stage: str) -> None:
-        if stage == "target:approvals":
-            raise signal
+    original = JsonlApprovalStore.put
 
-    harness.runtime.transactions._fault_hook = cancel
-    before = {
-        path: path.read_bytes()
-        for path in harness.project.joinpath(".intent").rglob("*")
-        if path.is_file()
-    }
+    def cancel_after_put(store: JsonlApprovalStore, record: object) -> bool:
+        added = original(store, record)  # type: ignore[arg-type]
+        assert added
+        raise signal
+
+    monkeypatch.setattr(JsonlApprovalStore, "put", cancel_after_put)
+    before = _intent_files(harness.project)
     with pytest.raises(asyncio.CancelledError) as caught:
         harness.service.apply_decision(b"private-assertion-marker", payload)
 
     assert caught.value is signal
-    assert {
-        path: path.read_bytes()
-        for path in harness.project.joinpath(".intent").rglob("*")
-        if path.is_file()
-    } == before
+    assert _intent_files(harness.project) == before
     assert "private-assertion-marker" not in _repository_traceback_locals(caught.value)
+
+
+def test_process_crash_immediately_after_real_approval_put_recovers_exact_bytes(
+    tmp_path: Path,
+) -> None:
+    harness = _approval_harness(tmp_path)
+    payload = harness.sign(harness.service.proposal_preview(harness.plan.id))
+    before = _intent_files(harness.project)
+    process = multiprocessing.get_context("fork").Process(
+        target=_crash_after_real_approval_put,
+        args=(harness.service, payload),
+    )
+
+    process.start()
+    process.join(10)
+    assert process.exitcode == 73
+    recovered = load_runtime(harness.project)
+    assert recovered.graph_store.load() == harness.runtime.graph_store.load()
+    assert _intent_files(harness.project) == before
 
 
 @pytest.mark.parametrize(
@@ -709,3 +879,25 @@ def test_activation_interrupt_rolls_back_exact_state_and_scrubs_assertion(
     assert caught.value is signal
     assert harness.state() == before
     assert "private-assertion-marker" not in _repository_traceback_locals(caught.value)
+
+
+def test_connector_membership_drift_during_commit_rolls_back_all_runtime_targets(
+    tmp_path: Path,
+) -> None:
+    harness = _harness(tmp_path)
+    proposal_id, _evidence_ref = _bootstrap_proposal(harness)
+    payload = harness.sign(harness.service.proposal_preview(proposal_id))
+    connector_path = harness.project / ".intent/connectors/concurrent.yaml"
+
+    def add_connector(stage: str) -> None:
+        if stage == "target:history":
+            connector_path.write_text("schema_version: 1\n", encoding="utf-8")
+
+    harness.runtime.transactions._fault_hook = add_connector
+    before = harness.state()
+
+    with pytest.raises(ControlPlaneError, match="^control plane unavailable$"):
+        harness.service.apply_decision(b"signed-assertion", payload)
+
+    assert connector_path.read_text(encoding="utf-8") == "schema_version: 1\n"
+    assert harness.state() == before

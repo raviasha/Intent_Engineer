@@ -1025,12 +1025,14 @@ intent_engineering:
     assert len(runtime.graph_store.history("module:release-proof")) >= 1
     assert not (workspace / "history/.local-transaction.json").exists()
     assert {entry.name for entry in (workspace / "approvals").iterdir()} == {
+        ".approvals.jsonl.lock",
         ".receipts.jsonl.lock",
         ".webauthn-challenges.jsonl.lock",
         ".webauthn-credentials.jsonl.lock",
         "webauthn-challenges.jsonl",
         "webauthn-credentials.jsonl",
     }
+    assert (workspace / "approvals/.approvals.jsonl.lock").read_bytes() == b""
     assert (workspace / "approvals/.receipts.jsonl.lock").read_bytes() == b""
     assert (workspace / "approvals/.webauthn-challenges.jsonl.lock").read_bytes() == b""
     assert (workspace / "approvals/.webauthn-credentials.jsonl.lock").read_bytes() == b""

@@ -224,6 +224,7 @@ def load_runtime(root: Path) -> Runtime:
     case_file = workspace_directory.file("reconciliation/cases.jsonl")
     evidence_file = workspace_directory.file("evidence/evidence.jsonl")
     receipts_file = workspace_directory.file("approvals/receipts.jsonl")
+    approvals_file = workspace_directory.file("approvals/approvals.jsonl")
     intent_proposals_file = workspace_directory.file("history/intent-proposals.jsonl")
     webauthn_credentials_file = workspace_directory.file("approvals/webauthn-credentials.jsonl")
     webauthn_challenges_file = workspace_directory.file("approvals/webauthn-challenges.jsonl")
@@ -235,6 +236,7 @@ def load_runtime(root: Path) -> Runtime:
             "cases": case_file,
             "evidence": evidence_file,
             "receipts": receipts_file,
+            "approvals": approvals_file,
             "intent_proposals": intent_proposals_file,
             "webauthn_credentials": webauthn_credentials_file,
             "webauthn_challenges": webauthn_challenges_file,
@@ -243,6 +245,18 @@ def load_runtime(root: Path) -> Runtime:
             frozenset({"graph", "history", "cases"}),
             frozenset({"graph", "history", "cases", "evidence", "receipts"}),
             frozenset({"graph", "history", "cases", "evidence", "receipts", "intent_proposals"}),
+            frozenset(
+                {
+                    "graph",
+                    "history",
+                    "cases",
+                    "evidence",
+                    "receipts",
+                    "intent_proposals",
+                    "webauthn_credentials",
+                    "webauthn_challenges",
+                }
+            ),
         ),
     )
     # Raw preimages must be restored before a torn YAML or JSONL file reaches a parser.
@@ -328,9 +342,7 @@ def resolve_connectors(
         if source == "markdown":
             connectors.append(MarkdownConnector(runtime.project_directory, runtime.config))
         elif source == "git":
-            connectors.append(
-                GitConnector(runtime.root, repository_id=runtime.config.project_id)
-            )
+            connectors.append(GitConnector(runtime.root, repository_id=runtime.config.project_id))
         elif source == "github":
             if github_client is None or github_repository is None:
                 raise GitHubConfigurationError()

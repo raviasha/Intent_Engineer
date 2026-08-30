@@ -53,7 +53,6 @@ from intent_engineering.intent_workflow.onboarding import (
 )
 from intent_engineering.mutations.approval import approve_plan
 from intent_engineering.reconcile.local_resolution import LocalResolutionService
-from intent_engineering.storage._atomic import same_path_lock
 from intent_engineering.storage.executor import LocalChangeSetExecutor
 from intent_engineering.storage.secure import SecureDirectory, SecureFile, SecureRead
 from intent_engineering.storage.transaction import (
@@ -116,20 +115,6 @@ class _DecisionMaterial:
     result_digest: str
     selected_node_ids: tuple[str, ...]
     preview: dict[str, object]
-
-
-@dataclass(slots=True)
-class _ApprovalRollback:
-    file: SecureFile | None = None
-    preimage: bytes | None = None
-    postimage: bytes | None = None
-
-    def close(self) -> None:
-        if self.file is not None:
-            self.file.close()
-        self.file = None
-        self.preimage = None
-        self.postimage = None
 
 
 def _canonical_bytes(value: object) -> bytes:
@@ -225,7 +210,6 @@ class ControlPlaneService:
         self._connectors_directory = runtime.workspace_directory.subdirectory("connectors")
         self._policy_file = self._approvals_directory.file("policy.yaml")
         self._plans_file = self._approvals_directory.file("plans.jsonl")
-        self._approvals_file = self._approvals_directory.file("approvals.jsonl")
         self._pending_answers: dict[str, _PendingAnswer] = {}
         self._webauthn = WebAuthnService(
             project_id=runtime.config.project_id,
@@ -281,7 +265,6 @@ class ControlPlaneService:
             "authority_config": self._config_file.duplicate(),
             "authority_policy": self._policy_file.duplicate(),
             "authority_plans": self._plans_file.duplicate(),
-            "authority_approvals": self._approvals_file.duplicate(),
         }
         records: tuple[tuple[PurePosixPath, SecureRead], ...] = ()
         profile_paths: set[str] = set()
@@ -476,30 +459,34 @@ class ControlPlaneService:
         selected: tuple[str, ...],
         authority: _Authority,
     ) -> _DecisionMaterial:
-        proposal = self._runtime.intent_proposals.get(proposal_id)
-        if not isinstance(proposal, ClarificationIntentProposal):
-            raise TypeError("clarification proposal unavailable")
-        graph = self._runtime.graph_store.load()
-        if ProposalConfirmationService._risk(proposal, graph)[0]:
-            raise ValueError("conflicting proposal requires a case decision")
-        if actor not in authority.policy.contributors:
-            raise ValueError("proposal actor unavailable")
-        allowed = tuple(sorted(proposal.core_node_ids))
-        if not selected:
-            selected = allowed
-        if (
-            not selected
-            or tuple(sorted(set(selected))) != selected
-            or not set(selected).issubset(set(allowed))
-        ):
-            raise ValueError("proposal selection unavailable")
-        changeset = ProposalConfirmationService._activation(
-            proposal,
-            actor,
-            at,
-            selected,
-            None,
-        )
+        service = self._confirmation_service(authority)
+        try:
+            proposal = self._runtime.intent_proposals.get(proposal_id)
+            if not isinstance(proposal, ClarificationIntentProposal):
+                raise TypeError("clarification proposal unavailable")
+            allowed = tuple(sorted(proposal.core_node_ids))
+            if not selected:
+                selected = allowed
+            if (
+                not selected
+                or tuple(sorted(set(selected))) != selected
+                or not set(selected).issubset(set(allowed))
+            ):
+                raise ValueError("proposal selection unavailable")
+            authenticated = service.preview_confirmation(
+                proposal_id,
+                proposal_digest=proposal.digest,
+                actor=actor,
+                at=at,
+                selected_node_ids=selected,
+            )
+            if authenticated.high_risk or authenticated.review_case is not None:
+                raise ValueError("conflicting proposal requires a case decision")
+            if authenticated.proposal != proposal or authenticated.selected_node_ids != selected:
+                raise ValueError("proposal confirmation preview changed")
+            changeset = authenticated.activation_changeset
+        finally:
+            service.close()
         body: dict[str, object] = {
             "kind": "clarification_proposal",
             "proposal": {
@@ -541,6 +528,7 @@ class ControlPlaneService:
             self._runtime.case_store,
             actor,
             transactions=self._runtime.transactions,
+            principals=aliases,
         )
         action = ResolutionAction.UPDATE_REQUIREMENT
         changeset = resolution._canonical_changeset(
@@ -1039,6 +1027,7 @@ class ControlPlaneService:
         self,
         payload: HumanDecisionPayload,
         material: _DecisionMaterial,
+        authority: _Authority,
     ) -> dict[str, object]:
         action = ResolutionAction.UPDATE_REQUIREMENT
         resolution = LocalResolutionService(
@@ -1047,6 +1036,7 @@ class ControlPlaneService:
             self._runtime.case_store,
             payload.actor,
             transactions=self._runtime.transactions,
+            principals=self._principals(authority, payload.actor),
         )
         approval_hash = cast(str, material.preview["approval_hash"])
         case, changeset, pending = resolution.resolve(
@@ -1076,7 +1066,6 @@ class ControlPlaneService:
         payload: HumanDecisionPayload,
         material: _DecisionMaterial,
         authority: _Authority,
-        rollback: _ApprovalRollback,
     ) -> dict[str, object]:
         workflow = write_workflow(self._runtime)
         try:
@@ -1098,19 +1087,9 @@ class ControlPlaneService:
             )
             if approval.canonical_hash != material.result_digest:
                 raise ValueError("approval result changed")
-            rollback.file = authority.files["authority_approvals"].duplicate()
-            rollback.preimage = authority.preimages["authority_approvals"]
             if not workflow.approvals.put(approval):
                 raise ValueError("approval replay unavailable")
-            rollback.postimage = rollback.file.read_optional_nonblocking(
-                max_bytes=_MAX_AUTHORITY_FILE_BYTES
-            )
-            try:
-                self._runtime.transactions._fault("target:approvals")
-            except BaseException:
-                self._restore_approval(rollback)
-                rollback.postimage = None
-                raise
+            self._runtime.transactions._fault("target:approvals")
             return {
                 "schema_version": 1,
                 "status": "approved",
@@ -1126,7 +1105,6 @@ class ControlPlaneService:
         payload: HumanDecisionPayload,
         material: _DecisionMaterial,
         authority: _Authority,
-        rollback: _ApprovalRollback,
     ) -> dict[str, object]:
         if payload.action is DecisionAction.CONFIRM_BASELINE:
             return self._apply_baseline(payload, material)
@@ -1135,30 +1113,15 @@ class ControlPlaneService:
         if payload.action is DecisionAction.CONFIRM_PROPOSAL:
             return self._apply_proposal(payload, material, authority)
         if payload.action is DecisionAction.RESOLVE_CONFLICT:
-            return self._apply_case(payload, material)
+            return self._apply_case(payload, material, authority)
         if payload.action is DecisionAction.APPROVE_EXTERNAL_WRITE:
-            return self._apply_plan(payload, material, authority, rollback)
+            return self._apply_plan(payload, material, authority)
         raise ValueError("unsupported control plane decision")
-
-    @staticmethod
-    def _restore_approval(rollback: _ApprovalRollback) -> None:
-        file = rollback.file
-        if file is None or rollback.postimage is None:
-            return
-        with same_path_lock(file):
-            current = file.read_optional_nonblocking(max_bytes=_MAX_AUTHORITY_FILE_BYTES)
-            if current != rollback.postimage:
-                raise ValueError("approval rollback unavailable")
-            if rollback.preimage is None:
-                file.unlink(missing_ok=True)
-            else:
-                file.atomic_write(rollback.preimage, reject_target_races=True)
 
     def _apply_decision(
         self,
         assertion: bytes,
         payload: HumanDecisionPayload,
-        rollback: _ApprovalRollback,
     ) -> dict[str, object]:
         authority = self._authority()
         verified: VerifiedHumanDecision | None = None
@@ -1194,7 +1157,9 @@ class ControlPlaneService:
                     or verified.credential.repository_id != expected.repository_id
                 ):
                     raise ValueError("verified decision changed")
-                result = self._dispatch(expected, material, authority, rollback)
+                result = self._dispatch(expected, material, authority)
+                if self._membership_now() != authority.membership_digest:
+                    raise ValueError("decision authority changed")
             if expected.action is DecisionAction.ANSWER_CLARIFICATION:
                 self._pending_answers.pop(expected.subject.id, None)
             if result is None:
@@ -1215,13 +1180,12 @@ class ControlPlaneService:
         """Verify and atomically apply one exact authoritative human decision."""
         result: dict[str, object] | None = None
         signal: BaseException | None = None
-        rollback = _ApprovalRollback()
         failed = False
         try:
             if type(assertion) is not bytes or not isinstance(payload, HumanDecisionPayload):
                 raise TypeError("invalid decision assertion")
             detached = HumanDecisionPayload.model_validate_json(payload.model_dump_json())
-            result = self._apply_decision(assertion, detached, rollback)
+            result = self._apply_decision(assertion, detached)
         except Exception:  # noqa: BLE001 - fixed opaque authority boundary
             failed = True
         except BaseException as caught:  # noqa: BLE001 - preserve cancellation identity
@@ -1230,13 +1194,6 @@ class ControlPlaneService:
         finally:
             assertion = b""
             payload = cast(HumanDecisionPayload, None)
-            if (failed or signal is not None) and rollback.postimage is not None:
-                try:
-                    self._restore_approval(rollback)
-                except Exception:  # noqa: BLE001 - rollback must fail closed
-                    failed = True
-                    signal = None
-            rollback.close()
             if "detached" in locals():
                 detached = cast(HumanDecisionPayload, None)
         if signal is not None:
@@ -1252,7 +1209,6 @@ class ControlPlaneService:
         self._config_file.close()
         self._policy_file.close()
         self._plans_file.close()
-        self._approvals_file.close()
         self._connectors_directory.close()
         self._approvals_directory.close()
         self._pending_answers.clear()

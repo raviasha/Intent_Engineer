@@ -164,6 +164,7 @@ def test_sync_and_write_share_one_complete_crash_recovery_domain(tmp_path: Path)
         "cases": workspace.file("reconciliation/cases.jsonl"),
         "evidence": workspace.file("evidence/evidence.jsonl"),
         "receipts": workspace.file("approvals/receipts.jsonl"),
+        "approvals": workspace.file("approvals/approvals.jsonl"),
         "intent_proposals": workspace.file("history/intent-proposals.jsonl"),
         "webauthn_credentials": workspace.file("approvals/webauthn-credentials.jsonl"),
         "webauthn_challenges": workspace.file("approvals/webauthn-challenges.jsonl"),
