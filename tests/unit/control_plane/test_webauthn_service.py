@@ -109,6 +109,47 @@ def _authentication_response(
     ).encode("utf-8")
 
 
+def _platform_authentication_response(
+    request: AuthenticationRequest,
+    *,
+    secret: str,
+    credential_id: bytes = b"credential-primary",
+) -> bytes:
+    client_data = json.dumps(
+        {
+            "challenge": _b64(request.challenge),
+            "origin": secret,
+            "type": "webauthn.get",
+        },
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode()
+    return json.dumps(
+        {
+            "id": _b64(credential_id),
+            "rawId": _b64(credential_id),
+            "response": {
+                "authenticatorData": _b64(b"fake-authenticator-data"),
+                "clientDataJSON": _b64(client_data),
+                "signature": _b64(b"fake-signature"),
+                "userHandle": None,
+            },
+            "type": "public-key",
+        },
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode()
+
+
+def _repository_traceback_locals(error: BaseException) -> str:
+    rendered = traceback.TracebackException.from_exception(error, capture_locals=True)
+    return "\n".join(
+        str(frame.locals)
+        for frame in rendered.stack
+        if "/src/intent_engineering/" in frame.filename
+    )
+
+
 class FakeVerifier:
     """Deterministic authenticator boundary; no platform cryptography is emulated."""
 
@@ -310,6 +351,75 @@ def test_production_options_use_localhost_five_minutes_and_required_uv() -> None
     assert authentication_options["rpId"] == "localhost"
     assert authentication_options["timeout"] == 300_000
     assert authentication_options["userVerification"] == "required"
+
+
+@pytest.mark.parametrize("ceremony", ["registration", "authentication"])
+def test_production_verifier_cancellation_clears_raw_and_parsed_response_locals(
+    monkeypatch: pytest.MonkeyPatch,
+    ceremony: str,
+) -> None:
+    class Cancelled(BaseException):
+        pass
+
+    verifier = PythonWebAuthnVerifier()
+    secret = f"PRIVATE-PRODUCTION-{ceremony.upper()}-RESPONSE-7391"
+    cancellation = Cancelled()
+
+    def cancel(**_kwargs: object) -> None:
+        raise cancellation
+
+    if ceremony == "registration":
+        request: RegistrationRequest | AuthenticationRequest = RegistrationRequest(
+            challenge=b"r" * 32,
+            rp_id="localhost",
+            expected_origin=ORIGIN,
+            project_id=PROJECT_ID,
+            repository_id=REPOSITORY_ID,
+            actor=ACTOR,
+        )
+        response_material = cast(dict[str, object], json.loads(_registration_response(request)))
+        response_material["secret"] = secret
+        response = json.dumps(response_material, separators=(",", ":"), sort_keys=True).encode()
+        monkeypatch.setattr(
+            "intent_engineering.control_plane.webauthn_service.verify_registration_response",
+            cancel,
+        )
+        invoke = lambda: verifier.verify_registration(response, cast(RegistrationRequest, request))
+    else:
+        credential = CredentialRecord(
+            id="credential:primary",
+            project_id=PROJECT_ID,
+            repository_id=REPOSITORY_ID,
+            actor=ACTOR,
+            credential_id=_b64(b"credential-primary"),
+            public_key=_b64(b"public-key-primary"),
+            sign_count=0,
+            created_at=NOW,
+        )
+        request = AuthenticationRequest(
+            challenge=b"a" * 32,
+            rp_id="localhost",
+            expected_origin=ORIGIN,
+            project_id=PROJECT_ID,
+            repository_id=REPOSITORY_ID,
+            actor=ACTOR,
+            payload_bytes=b"canonical-payload\n",
+            credentials=(credential,),
+        )
+        response = _platform_authentication_response(request, secret=secret)
+        monkeypatch.setattr(
+            "intent_engineering.control_plane.webauthn_service.verify_authentication_response",
+            cancel,
+        )
+        invoke = lambda: verifier.verify_authentication(
+            response, cast(AuthenticationRequest, request)
+        )
+
+    with pytest.raises(Cancelled) as caught:
+        invoke()
+
+    assert caught.value is cancellation
+    assert secret not in _repository_traceback_locals(caught.value)
 
 
 @pytest.mark.parametrize(
@@ -555,6 +665,7 @@ def test_registration_cancellation_preserves_identity_without_response_in_servic
         WebAuthnCredentialStore,
         WebAuthnChallengeStore,
     ],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class Cancelled(BaseException):
         pass
@@ -568,19 +679,20 @@ def test_registration_cancellation_preserves_identity_without_response_in_servic
     material["secret"] = secret
     response = json.dumps(material, separators=(",", ":"), sort_keys=True).encode()
     cancellation = Cancelled()
-    verifier.registration_cancel = cancellation
+
+    def cancel(_response: str) -> None:
+        raise cancellation
+
+    monkeypatch.setattr(
+        "intent_engineering.control_plane.webauthn_service.parse_registration_credential_json",
+        cancel,
+    )
 
     with pytest.raises(Cancelled) as caught:
         service.register(response, ACTOR, ORIGIN, NOW)
 
-    rendered = traceback.TracebackException.from_exception(caught.value, capture_locals=True)
-    service_locals = "\n".join(
-        str(frame.locals)
-        for frame in rendered.stack
-        if "intent_engineering/control_plane/webauthn_service.py" in frame.filename
-    )
     assert caught.value is cancellation
-    assert secret not in service_locals
+    assert secret not in _repository_traceback_locals(caught.value)
 
 
 def test_public_failure_is_fixed_unchained_and_does_not_retain_response_secret(

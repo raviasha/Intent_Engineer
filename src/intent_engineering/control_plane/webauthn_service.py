@@ -181,12 +181,21 @@ def _validated_payload(value: object) -> HumanDecisionPayload:
 def _registration_challenge(response: bytes) -> bytes:
     if type(response) is not bytes:
         raise ValueError("invalid registration response")
-    credential = parse_registration_credential_json(response.decode("utf-8"))
-    client_data = parse_client_data_json(credential.response.client_data_json)
-    challenge = client_data.challenge
-    if type(challenge) is not bytes or len(challenge) != _CHALLENGE_BYTES:
-        raise ValueError("invalid registration challenge")
-    return challenge
+    credential = None
+    client_data = None
+    challenge = b""
+    try:
+        credential = parse_registration_credential_json(response.decode("utf-8"))
+        client_data = parse_client_data_json(credential.response.client_data_json)
+        challenge = client_data.challenge
+        if type(challenge) is not bytes or len(challenge) != _CHALLENGE_BYTES:
+            raise ValueError("invalid registration challenge")
+        return challenge
+    finally:
+        response = b""
+        credential = None
+        client_data = None
+        challenge = b""
 
 
 class PythonWebAuthnVerifier:
@@ -213,20 +222,28 @@ class PythonWebAuthnVerifier:
     def verify_registration(
         self, response: bytes, request: RegistrationRequest
     ) -> VerifiedRegistration:
-        verified = verify_registration_response(
-            credential=response.decode("utf-8"),
-            expected_challenge=request.challenge,
-            expected_rp_id=request.rp_id,
-            expected_origin=request.expected_origin,
-            require_user_presence=True,
-            require_user_verification=True,
-        )
-        return VerifiedRegistration(
-            credential_id=verified.credential_id,
-            public_key=verified.credential_public_key,
-            sign_count=verified.sign_count,
-            user_verified=verified.user_verified,
-        )
+        encoded_response = ""
+        verified = None
+        try:
+            encoded_response = response.decode("utf-8")
+            verified = verify_registration_response(
+                credential=encoded_response,
+                expected_challenge=request.challenge,
+                expected_rp_id=request.rp_id,
+                expected_origin=request.expected_origin,
+                require_user_presence=True,
+                require_user_verification=True,
+            )
+            return VerifiedRegistration(
+                credential_id=verified.credential_id,
+                public_key=verified.credential_public_key,
+                sign_count=verified.sign_count,
+                user_verified=verified.user_verified,
+            )
+        finally:
+            response = b""
+            encoded_response = ""
+            verified = None
 
     def authentication_options(self, request: AuthenticationRequest) -> bytes:
         options = generate_authentication_options(
@@ -244,31 +261,43 @@ class PythonWebAuthnVerifier:
     def verify_authentication(
         self, response: bytes, request: AuthenticationRequest
     ) -> VerifiedAuthentication:
-        credential = parse_authentication_credential_json(response.decode("utf-8"))
-        current = next(
-            (
-                record
-                for record in request.credentials
-                if _credential_material(record.credential_id) == credential.raw_id
-            ),
-            None,
-        )
-        if current is None:
-            raise ValueError("unknown credential")
-        verified = verify_authentication_response(
-            credential=credential,
-            expected_challenge=request.challenge,
-            expected_rp_id=request.rp_id,
-            expected_origin=request.expected_origin,
-            credential_public_key=_credential_material(current.public_key),
-            credential_current_sign_count=current.sign_count,
-            require_user_verification=True,
-        )
-        return VerifiedAuthentication(
-            credential_id=verified.credential_id,
-            new_sign_count=verified.new_sign_count,
-            user_verified=verified.user_verified,
-        )
+        encoded_response = ""
+        credential = None
+        current = None
+        verified = None
+        try:
+            encoded_response = response.decode("utf-8")
+            credential = parse_authentication_credential_json(encoded_response)
+            current = next(
+                (
+                    record
+                    for record in request.credentials
+                    if _credential_material(record.credential_id) == credential.raw_id
+                ),
+                None,
+            )
+            if current is None:
+                raise ValueError("unknown credential")
+            verified = verify_authentication_response(
+                credential=credential,
+                expected_challenge=request.challenge,
+                expected_rp_id=request.rp_id,
+                expected_origin=request.expected_origin,
+                credential_public_key=_credential_material(current.public_key),
+                credential_current_sign_count=current.sign_count,
+                require_user_verification=True,
+            )
+            return VerifiedAuthentication(
+                credential_id=verified.credential_id,
+                new_sign_count=verified.new_sign_count,
+                user_verified=verified.user_verified,
+            )
+        finally:
+            response = b""
+            encoded_response = ""
+            credential = None
+            current = None
+            verified = None
 
 
 class WebAuthnService:
@@ -402,10 +431,12 @@ class WebAuthnService:
     def _register(
         self, response: bytes, actor: str, origin: str, now: datetime
     ) -> CredentialRecord:
-        verified_now = self._valid_actor_call(actor, origin, now)
-        challenge = _registration_challenge(response)
-        request = self._registration_request(challenge, actor)
+        challenge = b""
+        request = None
         try:
+            verified_now = self._valid_actor_call(actor, origin, now)
+            challenge = _registration_challenge(response)
+            request = self._registration_request(challenge, actor)
             with self._transactions.transaction(rollback_base_exceptions=True):
                 challenge_record = self._challenges.consume(
                     f"challenge:{challenge.hex()}", verified_now
@@ -450,6 +481,8 @@ class WebAuthnService:
                 return credential
         finally:
             response = b""
+            challenge = b""
+            request = None
 
     def register(self, response: bytes, actor: str, origin: str, now: datetime) -> CredentialRecord:
         """Verify and persist one repository-bound credential enrollment."""
