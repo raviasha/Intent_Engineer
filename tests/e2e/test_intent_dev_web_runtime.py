@@ -232,6 +232,33 @@ process.stdout.write(JSON.stringify({ app: app.textContent, status: status.textC
     assert result["pendingStatus"] == "/api/v1/status"
 
 
+def test_successful_verify_after_switching_to_b_reports_applied_and_preserves_b_review() -> None:
+    """Catches a successful A mutation being reported as unapplied after B becomes current."""
+    result = _run(
+        r"""
+await settle(); respond(take("/api/v1/status"), statusProjection); await settle();
+nav.find((item) => item.dataset.view === "inbox").click(); await settle();
+respond(take("/api/v1/inbox"), { schema_version: 1, pending_proposal_ids: ["proposal:a", "proposal:b"], open_case_ids: [] }); await settle();
+button("Review proposal:a").click(); await settle(); respond(take("/api/v1/proposals/proposal%3Aa"), proposal("proposal:a")); await settle();
+button("Authorize confirm proposal proposal:a with WebAuthn").click(); await settle();
+const options = take("/api/v1/decisions/options");
+respond(options, { publicKey: { challenge: "Y2hhbGxlbmdl", allowCredentials: [{ id: "Y3JlZGVudGlhbA", type: "public-key" }] } }); await settle();
+const verifyA = take("/api/v1/decisions/verify");
+nav.find((item) => item.dataset.view === "inbox").click(); await settle();
+respond(take("/api/v1/inbox"), { schema_version: 1, pending_proposal_ids: ["proposal:b"], open_case_ids: [] }); await settle();
+button("Review proposal:b").click(); await settle(); respond(take("/api/v1/proposals/proposal%3Ab"), proposal("proposal:b")); await settle();
+respond(verifyA, { schema_version: 1, status: "resolved" }); await settle();
+const statusRequest = take("/api/v1/status");
+process.stdout.write(JSON.stringify({ app: app.textContent, status: status.textContent, statusPath: statusRequest.path }));
+"""
+    )
+
+    assert "PRIVATE-proposal:b" in result["app"]
+    assert "PRIVATE-proposal:a" not in result["app"]
+    assert "Decision applied after user-verifying WebAuthn confirmation" in result["status"]
+    assert result["statusPath"] == "/api/v1/status"
+
+
 def test_shipped_browser_cancellation_and_expiry_clear_the_review_without_verify_replay() -> None:
     """Catches a cancelled ceremony verifying anyway or an expired ceremony retaining its preview."""
     result = _run(

@@ -609,9 +609,6 @@
         method: "POST",
         body: JSON.stringify({ response, payload }),
       });
-      if (!currentReviewMatches(proposalId, generation, preview)) {
-        throw new Error("Review selection changed before verification.");
-      }
       applied = true;
       announce("Decision applied after user-verifying WebAuthn confirmation.");
     } catch (error) {
