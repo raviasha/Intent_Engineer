@@ -83,7 +83,8 @@ def _valid_configuration(origin: object, csrf_secret: object) -> tuple[str, int,
         parsed = urlsplit(origin)
         port = parsed.port
         if (
-            parsed.scheme != "http"
+            origin != f"http://localhost:{port}"
+            or parsed.scheme != "http"
             or parsed.hostname != "localhost"
             or port is None
             or not 1 <= port <= 65535
@@ -404,6 +405,7 @@ class _StrictLoopbackMiddleware:
         downstream_send = send
         body = bytearray()
         headers: list[tuple[bytes, bytes]] = []
+        raw_state: object = None
         state: dict[str, object] | None = None
         secured_send: Send | None = None
         signal: BaseException | None = None
@@ -451,6 +453,7 @@ class _StrictLoopbackMiddleware:
             receive = cast(Receive, None)
             send = cast(Send, None)
             secured_send = None
+            raw_state = None
             state = None
         if signal is not None:
             caught_signal = signal
@@ -462,10 +465,21 @@ class _StrictLoopbackMiddleware:
                 self._csrf_secret,
                 set_cookie=trusted,
             )
+            error_signal: BaseException | None = None
             try:
                 await _send_fixed(error_send, failure_status)
+            except BaseException as caught:  # noqa: BLE001 - scrub fixed-error cancellation
+                caught.__traceback__ = None
+                caught.__cause__ = None
+                caught.__context__ = None
+                error_signal = caught
             finally:
+                error_send = cast(Send, None)
                 downstream_send = cast(Send, None)
+            if error_signal is not None:
+                caught_signal = error_signal
+                error_signal = None
+                raise caught_signal.with_traceback(None)
 
 
 def _request_bytes(request: Request) -> bytes:

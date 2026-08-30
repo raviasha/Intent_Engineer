@@ -657,6 +657,62 @@ async def test_send_cancellation_scrubs_detached_response_locals() -> None:
     assert CSRF not in traceback_locals
 
 
+@pytest.mark.anyio
+async def test_fixed_error_send_cancellation_scrubs_request_response_and_csrf_locals() -> None:
+    request_secret = "PRIVATE-FIXED-ERROR-REQUEST-43127"
+    cancellation = asyncio.CancelledError("fixed error send cancelled")
+    service = _Service()
+    app = _app(service)
+
+    async def cancel_fixed_body(message: Message) -> None:
+        if message["type"] == "http.response.body":
+            raise cancellation
+
+    with pytest.raises(asyncio.CancelledError) as caught:
+        await _call_asgi(
+            app,
+            path="/api/v1/webauthn/register/options",
+            body=_json_bytes({"response": request_secret}),
+            send=cancel_fixed_body,
+            extra_headers=((b"origin", ORIGIN.encode("ascii")),),
+        )
+
+    assert caught.value is cancellation
+    assert service.calls == []
+    traceback_locals = _repository_traceback_locals(caught.value)
+    assert request_secret not in traceback_locals
+    assert "request_unavailable" not in traceback_locals
+    assert CSRF not in traceback_locals
+
+
+@pytest.mark.anyio
+async def test_post_body_fixed_error_cancellation_scrubs_hostile_scope_state() -> None:
+    request_secret = "PRIVATE-FIXED-ERROR-STATE-43127"
+    cancellation = asyncio.CancelledError("post-body fixed error send cancelled")
+    service = _Service()
+    app = _app(service)
+
+    async def cancel_fixed_body(message: Message) -> None:
+        if message["type"] == "http.response.body":
+            raise cancellation
+
+    with pytest.raises(asyncio.CancelledError) as caught:
+        await _call_asgi(
+            app,
+            path="/api/v1/webauthn/register/options",
+            body=_json_bytes({"response": request_secret}),
+            send=cancel_fixed_body,
+            scope_overrides={"state": _StringSubclass(request_secret)},
+        )
+
+    assert caught.value is cancellation
+    assert service.calls == []
+    traceback_locals = _repository_traceback_locals(caught.value)
+    assert request_secret not in traceback_locals
+    assert "request_unavailable" not in traceback_locals
+    assert CSRF not in traceback_locals
+
+
 def test_builder_rejects_noncanonical_origin_and_invalid_csrf_secret() -> None:
     service = _Service()
 
@@ -666,12 +722,39 @@ def test_builder_rejects_noncanonical_origin_and_invalid_csrf_secret() -> None:
         "http://LOCALHOST:43127",
         "http://localhost",
         "http://localhost:43127/",
+        "HTTP://localhost:43127",
+        " http://localhost:43127",
+        "\thttp://localhost:43127",
+        "\x00http://localhost:43127",
+        "http://localhost:43127 ",
+        "http://localhost:43127\x00",
+        "http://localhost:043127",
+        "http://user@localhost:43127",
+        "http://localhost:43127/path",
+        "http://localhost:43127?query",
+        "http://localhost:43127#fragment",
     ):
         with pytest.raises(ValueError, match="^invalid control plane HTTP configuration$"):
             build_control_plane_app(cast(Any, service), origin=origin, csrf_secret=CSRF)
     secret = "PRIVATE invalid CSRF secret"
     with pytest.raises(ValueError, match="^invalid control plane HTTP configuration$") as caught:
         build_control_plane_app(cast(Any, service), origin=ORIGIN, csrf_secret=secret)
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+    assert secret not in _repository_traceback_locals(caught.value)
+
+
+def test_noncanonical_origin_failure_scrubs_a_valid_supplied_csrf_secret() -> None:
+    service = _Service()
+    secret = "PRIVATE_CONFIGURATION_SECRET_43127"
+
+    with pytest.raises(ValueError, match="^invalid control plane HTTP configuration$") as caught:
+        build_control_plane_app(
+            cast(Any, service),
+            origin="HTTP://localhost:43127",
+            csrf_secret=secret,
+        )
+
     assert caught.value.__cause__ is None
     assert caught.value.__context__ is None
     assert secret not in _repository_traceback_locals(caught.value)
