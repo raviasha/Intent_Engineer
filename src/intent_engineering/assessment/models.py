@@ -495,7 +495,9 @@ class AssessmentReport(_AssessmentModel):
         if not set(self.project.contributing_node_ids).issubset(visible_nodes):
             raise ValueError("project contributors must reference visible nodes")
         for branch in self.branches:
-            if not set(branch.node_ids).issubset(visible_nodes):
+            if branch.root_node_id not in visible_nodes or not set(branch.node_ids).issubset(
+                visible_nodes
+            ):
                 raise ValueError("branch contributors must reference visible nodes")
         return self
 

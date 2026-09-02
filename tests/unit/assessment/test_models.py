@@ -84,7 +84,7 @@ def report_fixture(*, node_ids: tuple[str, ...]) -> AssessmentReport:
         branches=(
             BranchScorecard(
                 branch_id="intent:export",
-                root_node_id="intent:export",
+                root_node_id=min(node_ids),
                 node_ids=tuple(sorted(node_ids)),
                 robustness=80,
                 confidence=90,
@@ -188,5 +188,19 @@ def test_report_rejects_invisible_or_mismatched_references() -> None:
                     **material["project"],
                     "contributing_node_ids": ("req:hidden",),
                 },
+            }
+        )
+
+
+def test_report_rejects_a_branch_root_missing_from_visible_nodes() -> None:
+    """Catches a branch root leaking a node identifier absent from the visible scorecards."""
+    report = report_fixture(node_ids=("req:public",))
+    material = report.model_dump()
+
+    with pytest.raises(ValidationError, match="visible node"):
+        AssessmentReport.model_validate(
+            {
+                **material,
+                "branches": ({**material["branches"][0], "root_node_id": "req:hidden"},),
             }
         )
