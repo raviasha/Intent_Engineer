@@ -23,10 +23,15 @@ from intent_engineering.core.models import (
     ReconciliationCase,
 )
 from intent_engineering.core.policy.access import evidence_allowed
-from intent_engineering.intent_workflow import ClarificationEvent
+from intent_engineering.intent_workflow import (
+    ClarificationEvent,
+    IntentProposal,
+    ProposalDecisionRecord,
+    ProposalDecisionV2,
+    ProposalDecisionV3,
+)
 from intent_engineering.intent_workflow.proposal_store import (
-    IntentLedgerRecord,
-    serialize_intent_ledger_record,
+    parse_intent_ledger,
 )
 from intent_engineering.storage.jsonl.case_store import parse_case_versions
 from intent_engineering.storage.jsonl.evidence_store import parse_evidence_lines
@@ -67,6 +72,8 @@ class _ParsedSnapshot:
     evidence: tuple[EvidenceRecord, ...]
     ingestions: tuple[EvidenceIngestion, ...]
     cases: tuple[ReconciliationCase, ...]
+    proposals: tuple[IntentProposal, ...]
+    decisions: tuple[ProposalDecisionRecord, ...]
     clarifications: tuple[ClarificationEvent, ...]
     history: tuple[ChangeSet, ...]
 
@@ -119,31 +126,6 @@ def _parse_history(content: bytes | None) -> tuple[ChangeSet, ...]:
     return tuple(history)
 
 
-def _parse_clarifications(content: bytes | None) -> tuple[ClarificationEvent, ...]:
-    if content is None or not content:
-        return ()
-    if not content.endswith(b"\n"):
-        raise ValueError("invalid assessment intent ledger")
-    clarifications: list[ClarificationEvent] = []
-    for expected_sequence, encoded in enumerate(content.splitlines(keepends=True)):
-        if not encoded.endswith(b"\n") or not encoded.strip():
-            raise ValueError("invalid assessment intent ledger")
-        payload = loads_strict_object(encoded[:-1].decode("utf-8"))
-        if _canonical_json(payload) + b"\n" != encoded:
-            raise ValueError("invalid assessment intent ledger")
-        record = IntentLedgerRecord.model_validate_json(encoded[:-1])
-        if (
-            record.sequence != expected_sequence
-            or serialize_intent_ledger_record(record) != encoded
-        ):
-            raise ValueError("invalid assessment intent ledger")
-        if record.clarification is not None:
-            clarifications.append(record.clarification)
-    if len({item.id for item in clarifications}) != len(clarifications):
-        raise ValueError("duplicate assessment clarification identity")
-    return tuple(clarifications)
-
-
 def _parse_held(held: LocalTransactionSnapshot) -> _ParsedSnapshot:
     graph_content = held.content.get("graph")
     if graph_content is None:
@@ -154,7 +136,9 @@ def _parse_held(held: LocalTransactionSnapshot) -> _ParsedSnapshot:
     evidence, ingestions, _legacy = parse_evidence_lines(held.content.get("evidence"))
     case_versions = parse_case_versions(held.content.get("cases"))
     latest_cases = {case.id: case for case in case_versions}
-    clarifications = _parse_clarifications(held.content.get("intent_proposals"))
+    ledger = parse_intent_ledger(held.content.get("intent_proposals") or b"")
+    if ledger is None:
+        raise ValueError("invalid assessment intent ledger")
     history = _parse_history(held.content.get("history"))
     return _ParsedSnapshot(
         config=config,
@@ -162,7 +146,9 @@ def _parse_held(held: LocalTransactionSnapshot) -> _ParsedSnapshot:
         evidence=evidence,
         ingestions=ingestions,
         cases=tuple(latest_cases[item] for item in sorted(latest_cases)),
-        clarifications=clarifications,
+        proposals=tuple(ledger.proposals.values()),
+        decisions=tuple(ledger.decisions.values()),
+        clarifications=ledger.clarification_events,
         history=history,
     )
 
@@ -237,21 +223,37 @@ def _changeset_subjects(changeset: ChangeSet) -> frozenset[str]:
     )
 
 
+def _changeset_evidence_refs(changeset: ChangeSet) -> frozenset[str]:
+    return frozenset(
+        {
+            *changeset.evidence_refs,
+            *(ref for change in changeset.confidence_changes for ref in change.evidence_refs),
+            *(
+                ref
+                for change in changeset.implementation_status_changes
+                for ref in change.evidence_refs
+            ),
+            *(
+                ref
+                for node in (
+                    *changeset.nodes_added,
+                    *(update.replacement for update in changeset.nodes_updated),
+                )
+                for ref in node.evidence_refs
+            ),
+        }
+    )
+
+
 def _history_visible(
     changeset: ChangeSet,
     *,
     visible_evidence_ids: frozenset[str],
     visible_references: frozenset[str],
 ) -> bool:
-    if not set(changeset.evidence_refs).issubset(visible_evidence_ids):
+    if not _changeset_evidence_refs(changeset).issubset(visible_evidence_ids):
         return False
     if not _changeset_subjects(changeset).issubset(visible_references):
-        return False
-    embedded_nodes = (
-        *changeset.nodes_added,
-        *(update.replacement for update in changeset.nodes_updated),
-    )
-    if any(not set(node.evidence_refs).issubset(visible_evidence_ids) for node in embedded_nodes):
         return False
     embedded_edges = (
         *changeset.edges_added,
@@ -264,6 +266,79 @@ def _history_visible(
     )
 
 
+def _proposal_visible(
+    proposal: IntentProposal,
+    *,
+    visible_evidence_ids: frozenset[str],
+    visible_references: frozenset[str],
+) -> bool:
+    changeset = proposal.changeset
+    embedded_references = frozenset(
+        {
+            *(node.id for node in changeset.nodes_added),
+            *(edge.id for edge in changeset.edges_added),
+            *changeset.reconciliation_cases_created,
+        }
+    )
+    if not set(proposal.evidence_refs).issubset(visible_evidence_ids):
+        return False
+    if not {*proposal.core_node_ids, *proposal.provisional_node_ids}.issubset(
+        {*visible_references, *(node.id for node in changeset.nodes_added)}
+    ):
+        return False
+    return _history_visible(
+        changeset,
+        visible_evidence_ids=visible_evidence_ids,
+        visible_references=frozenset({*visible_references, *embedded_references}),
+    )
+
+
+def _decision_visible(
+    decision: ProposalDecisionRecord,
+    *,
+    visible_proposal_ids: frozenset[str],
+    visible_graph_ids: frozenset[str],
+    visible_case_ids: frozenset[str],
+    visible_history_ids: frozenset[str],
+) -> bool:
+    if decision.proposal_id not in visible_proposal_ids:
+        return False
+    if isinstance(decision, ProposalDecisionV2):
+        return (
+            set(decision.confirmed_node_ids).issubset(visible_graph_ids)
+            and decision.activation_changeset_id in visible_history_ids
+        )
+    if isinstance(decision, ProposalDecisionV3):
+        return (
+            set(decision.selected_node_ids).issubset(visible_graph_ids)
+            and decision.activation_changeset_id in visible_history_ids
+            and (decision.review_case_id is None or decision.review_case_id in visible_case_ids)
+        )
+    return True
+
+
+def _clarification_visible(
+    event: ClarificationEvent,
+    *,
+    visible_clarification_ids: frozenset[str],
+    visible_proposal_ids: frozenset[str],
+    visible_decision_ids: frozenset[str],
+    visible_history_ids: frozenset[str],
+) -> bool:
+    return (
+        (
+            event.predecessor_event_id is None
+            or event.predecessor_event_id in visible_clarification_ids
+        )
+        and (event.proposal_id is None or event.proposal_id in visible_proposal_ids)
+        and (event.decision_id is None or event.decision_id in visible_decision_ids)
+        and (
+            event.activation_changeset_id is None
+            or event.activation_changeset_id in visible_history_ids
+        )
+    )
+
+
 def _visible_projection(
     *,
     config: ProjectConfig,
@@ -271,6 +346,8 @@ def _visible_projection(
     evidence: Sequence[EvidenceRecord],
     ingestions: Sequence[EvidenceIngestion],
     cases: Sequence[ReconciliationCase],
+    proposals: Sequence[IntentProposal],
+    decisions: Sequence[ProposalDecisionRecord],
     clarifications: Sequence[ClarificationEvent],
     history: Sequence[ChangeSet],
     actor: str,
@@ -305,7 +382,7 @@ def _visible_projection(
     edge_ids = frozenset(edge.id for edge in edges)
     graph_projection = graph.model_copy(update={"nodes": nodes, "edges": edges})
     base_references = frozenset({*visible_evidence_ids, *node_ids, *edge_ids})
-    visible_cases = tuple(
+    case_candidates = tuple(
         sorted(
             (
                 case
@@ -317,8 +394,7 @@ def _visible_projection(
             key=lambda case: case.id,
         )
     )
-    visible_case_ids = frozenset(case.id for case in visible_cases)
-    visible_clarifications = tuple(
+    clarification_candidates = tuple(
         sorted(
             (
                 event
@@ -328,28 +404,99 @@ def _visible_projection(
             key=lambda event: event.id,
         )
     )
-    visible_clarification_ids = frozenset(event.id for event in visible_clarifications)
-    visible_references = frozenset(
-        {
-            *base_references,
-            *visible_case_ids,
-            *visible_clarification_ids,
-        }
-    )
-    visible_history = tuple(
-        sorted(
-            (
-                changeset
-                for changeset in history
-                if _history_visible(
-                    changeset,
-                    visible_evidence_ids=visible_evidence_ids,
-                    visible_references=visible_references,
-                )
-            ),
-            key=lambda changeset: changeset.id,
+    visible_cases = case_candidates
+    visible_proposals = tuple(proposals)
+    visible_decisions = tuple(decisions)
+    visible_clarifications = clarification_candidates
+    visible_history = tuple(history)
+    while True:
+        visible_history_ids = frozenset(changeset.id for changeset in visible_history)
+        closed_cases = tuple(
+            case
+            for case in case_candidates
+            if case.resolved_by_changeset is None
+            or case.resolved_by_changeset in visible_history_ids
         )
-    )
+        visible_case_ids = frozenset(case.id for case in closed_cases)
+        visible_clarification_ids = frozenset(event.id for event in visible_clarifications)
+        visible_references = frozenset(
+            {
+                *base_references,
+                *visible_case_ids,
+                *visible_clarification_ids,
+            }
+        )
+        closed_proposals = tuple(
+            sorted(
+                (
+                    proposal
+                    for proposal in proposals
+                    if _proposal_visible(
+                        proposal,
+                        visible_evidence_ids=visible_evidence_ids,
+                        visible_references=visible_references,
+                    )
+                ),
+                key=lambda proposal: proposal.id,
+            )
+        )
+        visible_proposal_ids = frozenset(proposal.id for proposal in closed_proposals)
+        closed_history = tuple(
+            sorted(
+                (
+                    changeset
+                    for changeset in history
+                    if _history_visible(
+                        changeset,
+                        visible_evidence_ids=visible_evidence_ids,
+                        visible_references=visible_references,
+                    )
+                ),
+                key=lambda changeset: changeset.id,
+            )
+        )
+        closed_history_ids = frozenset(changeset.id for changeset in closed_history)
+        closed_decisions = tuple(
+            sorted(
+                (
+                    decision
+                    for decision in decisions
+                    if _decision_visible(
+                        decision,
+                        visible_proposal_ids=visible_proposal_ids,
+                        visible_graph_ids=node_ids,
+                        visible_case_ids=visible_case_ids,
+                        visible_history_ids=closed_history_ids,
+                    )
+                ),
+                key=lambda decision: decision.id,
+            )
+        )
+        visible_decision_ids = frozenset(decision.id for decision in closed_decisions)
+        closed_clarifications = tuple(
+            event
+            for event in clarification_candidates
+            if _clarification_visible(
+                event,
+                visible_clarification_ids=visible_clarification_ids,
+                visible_proposal_ids=visible_proposal_ids,
+                visible_decision_ids=visible_decision_ids,
+                visible_history_ids=closed_history_ids,
+            )
+        )
+        if (
+            closed_cases == visible_cases
+            and closed_proposals == visible_proposals
+            and closed_decisions == visible_decisions
+            and closed_clarifications == visible_clarifications
+            and closed_history == visible_history
+        ):
+            break
+        visible_cases = closed_cases
+        visible_proposals = closed_proposals
+        visible_decisions = closed_decisions
+        visible_clarifications = closed_clarifications
+        visible_history = closed_history
     return _VisibleSnapshot(
         graph=graph_projection,
         evidence=visible_evidence,
@@ -467,6 +614,8 @@ def _build_assessment_snapshot(runtime: Runtime, actor: str) -> AssessmentSnapsh
             evidence=parsed.evidence,
             ingestions=parsed.ingestions,
             cases=parsed.cases,
+            proposals=parsed.proposals,
+            decisions=parsed.decisions,
             clarifications=parsed.clarifications,
             history=parsed.history,
             actor=actor,

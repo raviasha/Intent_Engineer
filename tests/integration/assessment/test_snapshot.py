@@ -7,7 +7,7 @@ import json
 import os
 import signal
 import traceback
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 import yaml  # type: ignore[import-untyped]
@@ -17,18 +17,29 @@ from intent_engineering.assessment.snapshot import (
     build_assessment_snapshot,
 )
 from intent_engineering.core.models import (
+    ChangeKind,
     ChangeSet,
+    ClassificationEvent,
+    ConfidenceChange,
     EvidenceIngestion,
     EvidenceSide,
+    ImplementationStatus,
+    ImplementationStatusChange,
     ReconciliationCase,
     ReconciliationCaseType,
+    ReconciliationStatus,
+    ResolutionAction,
     SourceMode,
 )
 from intent_engineering.intent_workflow import (
+    ClarificationAnswer,
     ClarificationEvent,
+    ClarificationIntentProposal,
     ClarificationQuestion,
     ClarificationSession,
+    ProposalDecisionV3,
 )
+from intent_engineering.intent_workflow.clarification import _event
 from intent_engineering.intent_workflow.proposal_store import (
     IntentLedgerRecord,
     serialize_intent_ledger_record,
@@ -237,23 +248,13 @@ def _digest(material: object) -> str:
     return "sha256:" + hashlib.sha256(_canonical_json(material)).hexdigest()
 
 
-def test_clarification_with_hidden_question_evidence_is_not_visible(
-    assessment_runtime,
-) -> None:
-    """Catches question evidence being omitted from clarification reference closure."""
-    question = ClarificationQuestion(
-        id="question:private",
-        prompt_digest="sha256:" + "1" * 64,
-        evidence_ref="evidence:hidden",
-        author="agent:codex",
-        asked_at=datetime(2026, 9, 2, 12, 0, tzinfo=UTC),
-        predecessor_evidence_ref="evidence:public-requirement",
-        required=True,
-    )
+def _opened_event(
+    question: ClarificationQuestion, *, predecessor_event_id: str | None = None
+) -> ClarificationEvent:
     opened_at = question.asked_at
     session_material = {
         "schema_version": 1,
-        "task_id": "task:private-question",
+        "task_id": f"task:{question.id}",
         "conversation_ref": "conversation:assessment",
         "request_evidence_ref": "evidence:public-intent",
         "classification_evidence_ref": "evidence:public-requirement",
@@ -264,7 +265,7 @@ def test_clarification_with_hidden_question_evidence_is_not_visible(
     }
     bare_session = ClarificationSession(
         id="clarification:" + _digest(session_material),
-        task_id="task:private-question",
+        task_id=f"task:{question.id}",
         conversation_ref="conversation:assessment",
         request_evidence_ref="evidence:public-intent",
         classification_evidence_ref="evidence:public-requirement",
@@ -279,7 +280,7 @@ def test_clarification_with_hidden_question_evidence_is_not_visible(
         "session": bare_session.model_dump(mode="json", exclude={"latest_event_id"}),
         "actor": "agent:codex",
         "at": opened_at.isoformat().replace("+00:00", "Z"),
-        "predecessor_event_id": None,
+        "predecessor_event_id": predecessor_event_id,
         "proposal_id": None,
         "decision_id": None,
         "activation_changeset_id": None,
@@ -291,7 +292,135 @@ def test_clarification_with_hidden_question_evidence_is_not_visible(
         session=bare_session.model_copy(update={"latest_event_id": event_id}),
         actor="agent:codex",
         at=opened_at,
+        predecessor_event_id=predecessor_event_id,
     )
+    return event
+
+
+def _clarification_ledger_with_missing_activation(
+    *, proposal_evidence_ref: str = "evidence:public-requirement"
+) -> tuple[bytes, bytes, bytes, str, str]:
+    at = datetime(2026, 9, 2, 12, 0, tzinfo=UTC)
+    question = ClarificationQuestion(
+        id="question:activation",
+        prompt_digest="sha256:" + "3" * 64,
+        evidence_ref="evidence:public-requirement",
+        author="agent:codex",
+        asked_at=at,
+        predecessor_evidence_ref="evidence:public-requirement",
+        required=True,
+    )
+    opened = _opened_event(question)
+    answer = ClarificationAnswer(
+        question_id=question.id,
+        actor="local:asha",
+        answered_at=at + timedelta(microseconds=1),
+        evidence_ref="evidence:public-intent",
+        answer_digest="sha256:" + "4" * 64,
+        predecessor_evidence_ref=question.evidence_ref,
+    )
+    answered = _event(
+        opened.session.model_copy(update={"answers": (answer,)}),
+        "answered",
+        answer.actor,
+        answer.answered_at,
+        opened.id,
+    )
+    changeset = _changeset(
+        "changeset:proposal-payload",
+        "req:public",
+        proposal_evidence_ref,
+    )
+    proposal_material = {
+        "schema_version": 2,
+        "kind": "requirement",
+        "proposed_by": "local:asha",
+        "proposed_at": (at + timedelta(microseconds=2)).isoformat().replace("+00:00", "Z"),
+        "baseline_graph_version": 7,
+        "evidence_refs": [proposal_evidence_ref],
+        "source_roles": [],
+        "changeset": changeset.model_dump(mode="json"),
+        "core_node_ids": [],
+        "provisional_node_ids": [],
+        "assumptions": [],
+        "unanswered_questions": [],
+        "conflicting_authors": [],
+        "destructive": False,
+        "clarification_session_id": opened.session.id,
+        "task_id": opened.session.task_id,
+    }
+    proposal = ClarificationIntentProposal.model_validate_json(
+        json.dumps({"id": "proposal:" + _digest(proposal_material), **proposal_material})
+    )
+    proposed = _event(
+        answered.session.model_copy(update={"status": "proposed"}),
+        "proposed",
+        answer.actor,
+        proposal.proposed_at,
+        answered.id,
+        proposal.id,
+    )
+    activation_changeset_id = "changeset:not-retained-activation"
+    decision_material = {
+        "schema_version": 3,
+        "proposal_id": proposal.id,
+        "proposal_digest": proposal.digest,
+        "actor": "local:asha",
+        "actor_aliases": ["local:asha"],
+        "decided_at": (at + timedelta(microseconds=3)).isoformat().replace("+00:00", "Z"),
+        "action": "confirm",
+        "baseline_graph_version": 7,
+        "selected_node_ids": [],
+        "activation_changeset_id": activation_changeset_id,
+        "activation_graph_effect_digest": "sha256:" + "5" * 64,
+        "review_case_id": None,
+        "review_case_preimage_digest": None,
+        "proposal_author_aliases": ["local:asha"],
+        "conflicting_author_aliases": [],
+    }
+    decision = ProposalDecisionV3.model_validate_json(
+        json.dumps({"id": "proposal-decision:" + _digest(decision_material), **decision_material})
+    )
+    closed = _event(
+        proposed.session.model_copy(update={"status": "closed"}),
+        "closed",
+        decision.actor,
+        decision.decided_at,
+        proposed.id,
+        proposal.id,
+        decision.id,
+        activation_changeset_id,
+    )
+    records = (
+        IntentLedgerRecord(sequence=0, clarification=opened),
+        IntentLedgerRecord(sequence=1, clarification=answered),
+        IntentLedgerRecord(sequence=2, clarification=proposed),
+        IntentLedgerRecord(sequence=3, proposal=proposal),
+    )
+    answered_baseline = b"".join(serialize_intent_ledger_record(record) for record in records[:2])
+    baseline = b"".join(serialize_intent_ledger_record(record) for record in records)
+    full = (
+        baseline
+        + serialize_intent_ledger_record(IntentLedgerRecord(sequence=4, decision=decision))
+        + serialize_intent_ledger_record(IntentLedgerRecord(sequence=5, clarification=closed))
+    )
+    return full, baseline, answered_baseline, closed.id, proposal.id
+
+
+def test_clarification_with_hidden_question_evidence_is_not_visible(
+    assessment_runtime,
+) -> None:
+    """Catches question evidence being omitted from clarification reference closure."""
+    question = ClarificationQuestion(
+        id="question:private",
+        prompt_digest="sha256:" + "1" * 64,
+        evidence_ref="evidence:hidden",
+        author="agent:codex",
+        asked_at=datetime(2026, 9, 2, 12, 0, tzinfo=UTC),
+        predecessor_evidence_ref="evidence:public-requirement",
+        required=True,
+    )
+    event = _opened_event(question)
     assessment_runtime.paths["intent_proposals"].write_bytes(
         serialize_intent_ledger_record(IntentLedgerRecord(sequence=0, clarification=event))
     )
@@ -300,6 +429,59 @@ def test_clarification_with_hidden_question_evidence_is_not_visible(
 
     assert snapshot.clarifications == ()
     assert "question:private" not in snapshot.model_dump_json()
+
+
+def test_structurally_invalid_intent_ledger_fails_fixed(assessment_runtime) -> None:
+    """Catches assessment accepting a frame-valid ledger with an illegal predecessor."""
+    question = ClarificationQuestion(
+        id="question:invalid-predecessor",
+        prompt_digest="sha256:" + "2" * 64,
+        evidence_ref="evidence:public-requirement",
+        author="agent:codex",
+        asked_at=datetime(2026, 9, 2, 12, 0, tzinfo=UTC),
+        predecessor_evidence_ref="evidence:public-requirement",
+        required=True,
+    )
+    event = _opened_event(question, predecessor_event_id="clarification-event:missing")
+    assessment_runtime.paths["intent_proposals"].write_bytes(
+        serialize_intent_ledger_record(IntentLedgerRecord(sequence=0, clarification=event))
+    )
+
+    with pytest.raises(AssessmentUnavailable, match="^assessment unavailable$"):
+        build_assessment_snapshot(assessment_runtime.runtime, "local:asha")
+
+
+def test_clarification_with_unretained_activation_is_indistinguishable_from_absent(
+    assessment_runtime,
+) -> None:
+    """Catches a clarification disclosing decision and absent activation identities."""
+    full, baseline, _answered, closed_id, _proposal_id = (
+        _clarification_ledger_with_missing_activation()
+    )
+    assessment_runtime.paths["intent_proposals"].write_bytes(full)
+    unresolved_reference = build_assessment_snapshot(assessment_runtime.runtime, "local:asha")
+    assessment_runtime.paths["intent_proposals"].write_bytes(baseline)
+    absent = build_assessment_snapshot(assessment_runtime.runtime, "local:asha")
+
+    assert unresolved_reference == absent
+    assert closed_id not in unresolved_reference.model_dump_json()
+    assert "changeset:not-retained-activation" not in unresolved_reference.model_dump_json()
+
+
+def test_clarification_with_hidden_proposal_is_indistinguishable_from_absent(
+    assessment_runtime,
+) -> None:
+    """Catches a proposed event disclosing an ACL-hidden bound proposal identity."""
+    _full, proposal_ledger, answered_ledger, _closed_id, proposal_id = (
+        _clarification_ledger_with_missing_activation(proposal_evidence_ref="evidence:hidden")
+    )
+    assessment_runtime.paths["intent_proposals"].write_bytes(proposal_ledger)
+    hidden = build_assessment_snapshot(assessment_runtime.runtime, "local:asha")
+    assessment_runtime.paths["intent_proposals"].write_bytes(answered_ledger)
+    absent = build_assessment_snapshot(assessment_runtime.runtime, "local:asha")
+
+    assert hidden == absent
+    assert proposal_id not in hidden.model_dump_json()
 
 
 def _case(case_id: str, subject: str, evidence_ref: str, marker: str) -> ReconciliationCase:
@@ -366,6 +548,105 @@ def test_cases_and_history_require_closed_visible_references(assessment_runtime)
     assert tuple(case.id for case in snapshot.cases) == ("case:public",)
     assert tuple(changeset.id for changeset in snapshot.history) == ("changeset:public",)
     assert "PRIVATE-HIDDEN-CASE" not in snapshot.model_dump_json()
+
+
+@pytest.mark.parametrize("nested_change", ("confidence", "implementation"))
+def test_history_nested_evidence_is_indistinguishable_from_absent(
+    assessment_runtime, nested_change: str
+) -> None:
+    """Catches nested mutation evidence bypassing the history ACL closure."""
+    changeset = _changeset(
+        f"changeset:hidden-{nested_change}",
+        "req:public",
+        "evidence:public-requirement",
+    ).model_copy(update={"nodes_superseded": ()})
+    if nested_change == "confidence":
+        changeset = changeset.model_copy(
+            update={
+                "confidence_changes": (
+                    ConfidenceChange(
+                        change_id="confidence:hidden",
+                        timestamp=datetime(2026, 9, 2, 12, 0, tzinfo=UTC),
+                        actor="local:asha",
+                        subject_ref="req:public",
+                        change_kind=ChangeKind.REFINE,
+                        prior_confidence=0.7,
+                        new_confidence=0.8,
+                        evidence_refs=("evidence:hidden",),
+                        reason="PRIVATE-NESTED-CONFIDENCE",
+                    ),
+                )
+            }
+        )
+    else:
+        changeset = changeset.model_copy(
+            update={
+                "implementation_status_changes": (
+                    ImplementationStatusChange(
+                        claim_id="req:public",
+                        prior=ImplementationStatus.NOT_STARTED,
+                        new=ImplementationStatus.PARTIAL,
+                        evidence_refs=("evidence:hidden",),
+                    ),
+                )
+            }
+        )
+    assessment_runtime.paths["history"].write_bytes(serialize_changeset(changeset))
+
+    hidden = build_assessment_snapshot(assessment_runtime.runtime, "local:asha")
+    assessment_runtime.paths["history"].write_bytes(b"")
+    absent = build_assessment_snapshot(assessment_runtime.runtime, "local:asha")
+
+    assert hidden == absent
+    assert hidden.history == ()
+    assert "evidence:hidden" not in hidden.model_dump_json()
+
+
+def test_case_with_unretained_resolution_is_indistinguishable_from_absent(
+    assessment_runtime,
+) -> None:
+    """Catches a visible case disclosing a changeset omitted from retained history."""
+    at = datetime(2026, 9, 2, 12, 0, tzinfo=UTC)
+    case = _case(
+        "case:orphan-resolution",
+        "req:public",
+        "evidence:public-requirement",
+        "PUBLIC-CASE",
+    ).model_copy(
+        update={
+            "status": ReconciliationStatus.RESOLVED,
+            "resolution": ResolutionAction.UPDATE_REQUIREMENT,
+            "resolved_by_changeset": "changeset:not-retained",
+            "history": (
+                ClassificationEvent(
+                    actor="local:asha",
+                    at=at,
+                    prior=ReconciliationStatus.OPEN,
+                    new=ReconciliationStatus.PROPOSED,
+                ),
+                ClassificationEvent(
+                    actor="local:asha",
+                    at=at,
+                    prior=ReconciliationStatus.PROPOSED,
+                    new=ReconciliationStatus.NEEDS_HUMAN,
+                ),
+                ClassificationEvent(
+                    actor="local:asha",
+                    at=at,
+                    prior=ReconciliationStatus.NEEDS_HUMAN,
+                    new=ReconciliationStatus.RESOLVED,
+                ),
+            ),
+        }
+    )
+    assessment_runtime.paths["cases"].write_bytes(serialize_case(case))
+
+    unresolved_reference = build_assessment_snapshot(assessment_runtime.runtime, "local:asha")
+    assessment_runtime.paths["cases"].write_bytes(b"")
+    absent = build_assessment_snapshot(assessment_runtime.runtime, "local:asha")
+
+    assert unresolved_reference == absent
+    assert "changeset:not-retained" not in unresolved_reference.model_dump_json()
 
 
 @pytest.mark.parametrize("target", ("evidence", "cases", "history", "intent_proposals"))
