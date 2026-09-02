@@ -13,12 +13,14 @@ from intent_engineering.assessment.models import (
     RubricCheck,
 )
 from intent_engineering.assessment.policy import AssessmentPolicy
+from intent_engineering.assessment.service import AssessmentComparison, GraphAssessmentService
 from intent_engineering.assessment.snapshot import (
     AssessmentUnavailable,
     build_assessment_snapshot,
 )
 
 __all__ = [
+    "AssessmentComparison",
     "AssessmentDimension",
     "AssessmentHealth",
     "AssessmentPolicy",
@@ -28,6 +30,7 @@ __all__ = [
     "BranchScorecard",
     "DimensionApplicability",
     "DimensionResult",
+    "GraphAssessmentService",
     "NodeScorecard",
     "ProjectScorecard",
     "RubricCheck",
