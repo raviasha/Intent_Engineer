@@ -19,11 +19,14 @@ _BRANCH_ROOT_TYPES = frozenset({NodeType.PRODUCT_INTENT, NodeType.DESIRED_OUTCOM
 
 
 def _health(scorecards: tuple[NodeScorecard | BranchScorecard, ...]) -> AssessmentHealth:
-    if any(scorecard.health is AssessmentHealth.UNASSESSED for scorecard in scorecards):
-        return AssessmentHealth.UNASSESSED
     if any(scorecard.health is AssessmentHealth.RED for scorecard in scorecards):
         return AssessmentHealth.RED
-    if all(scorecard.health is AssessmentHealth.GREEN for scorecard in scorecards):
+    assessed = tuple(
+        scorecard for scorecard in scorecards if scorecard.health is not AssessmentHealth.UNASSESSED
+    )
+    if not assessed:
+        return AssessmentHealth.UNASSESSED
+    if all(scorecard.health is AssessmentHealth.GREEN for scorecard in assessed):
         return AssessmentHealth.GREEN
     return AssessmentHealth.ORANGE
 
@@ -70,15 +73,19 @@ def _branch_scorecard(
     scorecards: Mapping[str, NodeScorecard],
     policy: AssessmentPolicy,
 ) -> BranchScorecard:
-    node_ids = tuple(
+    path_ids = tuple(
         node_id
         for node_id in _branch_members(snapshot.graph, root_id, policy)
         if node_id in scorecards
     )
-    contributors = tuple(scorecards[node_id] for node_id in node_ids)
-    if not contributors or any(
-        scorecard.robustness is None or scorecard.confidence is None for scorecard in contributors
-    ):
+    path_scorecards = tuple(scorecards[node_id] for node_id in path_ids)
+    assessed = tuple(
+        scorecard
+        for scorecard in path_scorecards
+        if scorecard.robustness is not None and scorecard.confidence is not None
+    )
+    node_ids = tuple(scorecard.node_id for scorecard in assessed)
+    if not assessed:
         return BranchScorecard(
             branch_id=root_id,
             root_node_id=root_id,
@@ -89,9 +96,9 @@ def _branch_scorecard(
             contribution_weights={node_id: 1 for node_id in node_ids},
         )
 
-    robustness = sum(_robustness(scorecard) for scorecard in contributors) // len(contributors)
-    confidence = sum(_confidence(scorecard) for scorecard in contributors) // len(contributors)
-    health = _health(contributors)
+    robustness = sum(_robustness(scorecard) for scorecard in assessed) // len(assessed)
+    confidence = sum(_confidence(scorecard) for scorecard in assessed) // len(assessed)
+    health = _health(path_scorecards)
     if health is AssessmentHealth.RED:
         robustness = min(robustness, 49)
     return BranchScorecard(
@@ -118,9 +125,12 @@ def _project_scorecard(
         branch_id: policy.branch_weights.get(branch_id, policy.default_branch_weight)
         for branch_id in branch_ids
     }
-    if not branches or any(
-        branch.robustness is None or branch.confidence is None for branch in branches
-    ):
+    assessed = tuple(
+        branch
+        for branch in branches
+        if branch.robustness is not None and branch.confidence is not None
+    )
+    if not assessed:
         return ProjectScorecard(
             project_id=snapshot.project_id,
             robustness=None,
@@ -131,12 +141,12 @@ def _project_scorecard(
             contribution_weights=weights,
         )
 
-    total_weight = sum(weights.values())
+    total_weight = sum(weights[branch.branch_id] for branch in assessed)
     robustness = (
-        sum(weights[branch.branch_id] * _robustness(branch) for branch in branches) // total_weight
+        sum(weights[branch.branch_id] * _robustness(branch) for branch in assessed) // total_weight
     )
     confidence = (
-        sum(weights[branch.branch_id] * _confidence(branch) for branch in branches) // total_weight
+        sum(weights[branch.branch_id] * _confidence(branch) for branch in assessed) // total_weight
     )
     health = _health(branches)
     if health is AssessmentHealth.RED:

@@ -128,3 +128,55 @@ def test_project_uses_published_custom_branch_weights() -> None:
     assert [branch.robustness for branch in branches] == [91, 80]
     assert project.robustness == 82
     assert dict(project.contribution_weights) == {"intent:export": 1, "outcome:empty": 3}
+
+
+def test_red_critical_path_outranks_an_unassessed_member() -> None:
+    """Catches one unsupported critical member downgrading a known red path to unassessed."""
+    snapshot = _snapshot()
+    graph = snapshot.graph
+    requirement = next(node for node in graph.nodes if node.id == "req:csv")
+    capability = requirement.model_copy(
+        update={"id": "capability:export", "type": NodeType.CAPABILITY}
+    )
+    root_edge = graph.edges[0].model_copy(
+        update={"id": "edge:intent-capability", "to_id": capability.id}
+    )
+    requirement_edge = graph.edges[0].model_copy(
+        update={
+            "id": "edge:capability-requirement",
+            "from_id": capability.id,
+            "to_id": requirement.id,
+        }
+    )
+    changed = graph.model_copy(
+        update={
+            "nodes": (*graph.nodes, capability),
+            "edges": (*graph.edges, root_edge, requirement_edge),
+        }
+    )
+    changed_snapshot = snapshot.model_copy(update={"graph": changed})
+    baseline = AssessmentPolicy.v1()
+    policy = AssessmentPolicy.model_validate(
+        {
+            **baseline.model_dump(),
+            "critical_node_types": (*baseline.critical_node_types, NodeType.CAPABILITY),
+        }
+    )
+
+    project, branches = roll_up(changed_snapshot, _scorecards(changed_snapshot, policy), policy)
+
+    assert branches[0].node_ids == ("intent:export", "req:csv")
+    assert dict(branches[0].contribution_weights) == {
+        "intent:export": 1,
+        "req:csv": 1,
+    }
+    assert (branches[0].robustness, branches[0].confidence, branches[0].health) == (
+        49,
+        85,
+        AssessmentHealth.RED,
+    )
+    assert (project.robustness, project.confidence, project.health) == (
+        49,
+        85,
+        AssessmentHealth.RED,
+    )

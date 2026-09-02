@@ -99,7 +99,11 @@ def _canonical_scorecard(scorecard: NodeScorecard) -> NodeScorecard:
         result
         for result in scorecard.dimensions
         if result.applicability
-        in {DimensionApplicability.REQUIRED, DimensionApplicability.INHERITED}
+        in {
+            DimensionApplicability.REQUIRED,
+            DimensionApplicability.INHERITED,
+            DimensionApplicability.OPTIONAL,
+        }
     )
     if not contributors:
         return scorecard

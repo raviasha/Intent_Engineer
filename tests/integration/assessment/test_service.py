@@ -10,7 +10,11 @@ from pathlib import Path
 import pytest
 import yaml  # type: ignore[import-untyped]
 
-from intent_engineering.assessment.models import AssessmentDimension, AssessmentSnapshot
+from intent_engineering.assessment.models import (
+    AssessmentDimension,
+    AssessmentHealth,
+    AssessmentSnapshot,
+)
 from intent_engineering.assessment.policy import AssessmentPolicy
 from intent_engineering.assessment.service import GraphAssessmentService
 from intent_engineering.assessment.snapshot import AssessmentUnavailable
@@ -111,6 +115,65 @@ def test_report_chooses_the_worst_dimension_by_health_severity_and_stable_id(
     scorecard = service.assess(snapshot).node(requirement.id)
 
     assert scorecard.worst_dimension is AssessmentDimension.INTENT_CLARITY
+
+
+def test_report_includes_optional_dimensions_in_worst_selection_without_scoring_them(
+    service: GraphAssessmentService,
+    complete_snapshot: AssessmentSnapshot,
+) -> None:
+    """Catches an applicable optional red gap disappearing from the worst-dimension field."""
+    scorecard = service.assess(complete_snapshot).node("file:export")
+
+    assert scorecard.robustness == 100
+    assert scorecard.worst_dimension is AssessmentDimension.TEST_VERIFICATION
+
+
+def test_unassessed_critical_member_marks_report_incomplete_without_hiding_red(
+    service: GraphAssessmentService,
+    complete_snapshot: AssessmentSnapshot,
+) -> None:
+    """Catches report completeness replacing a known red critical-path result."""
+    graph = complete_snapshot.graph
+    requirement = next(node for node in graph.nodes if node.id == "req:csv")
+    capability = requirement.model_copy(
+        update={"id": "capability:export", "type": NodeType.CAPABILITY}
+    )
+    root_edge = graph.edges[0].model_copy(
+        update={"id": "edge:intent-capability", "to_id": capability.id}
+    )
+    requirement_edge = graph.edges[0].model_copy(
+        update={
+            "id": "edge:capability-requirement",
+            "from_id": capability.id,
+            "to_id": requirement.id,
+        }
+    )
+    changed = graph.model_copy(
+        update={
+            "nodes": (*graph.nodes, capability),
+            "edges": (*graph.edges, root_edge, requirement_edge),
+        }
+    )
+    snapshot = complete_snapshot.model_copy(
+        update={"graph": changed, "aggregate_digest": _digest("mixed critical path")}
+    )
+    baseline = AssessmentPolicy.v1()
+    policy = AssessmentPolicy.model_validate(
+        {
+            **baseline.model_dump(),
+            "critical_node_types": (*baseline.critical_node_types, NodeType.CAPABILITY),
+        }
+    )
+
+    report = service.assess(snapshot, policy)
+
+    assert report.assessment_complete is False
+    assert report.node(capability.id).health.value == "unassessed"
+    assert (report.branch("intent:export").robustness, report.project.robustness) == (49, 49)
+    assert (report.branch("intent:export").health, report.project.health) == (
+        AssessmentHealth.RED,
+        AssessmentHealth.RED,
+    )
 
 
 def test_snapshot_principal_and_policy_changes_never_share_cache_entries(
