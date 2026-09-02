@@ -8,7 +8,14 @@ from collections.abc import Mapping
 from types import MappingProxyType
 from typing import Literal
 
-from pydantic import ConfigDict, ValidationInfo, field_serializer, field_validator, model_validator
+from pydantic import (
+    ConfigDict,
+    Field,
+    ValidationInfo,
+    field_serializer,
+    field_validator,
+    model_validator,
+)
 
 from intent_engineering.assessment.models import AssessmentDimension
 from intent_engineering.core.models import NodeType, RelationType
@@ -26,6 +33,8 @@ class AssessmentPolicy(StrictModel):
     green_at: int = 75
     green_confidence_at: int = 75
     dimension_weights: Mapping[AssessmentDimension, int]
+    default_branch_weight: int = 1
+    branch_weights: Mapping[str, int] = Field(default_factory=dict)
     critical_node_types: tuple[NodeType, ...]
     critical_relations: tuple[RelationType, ...]
 
@@ -52,7 +61,12 @@ class AssessmentPolicy(StrictModel):
         )
 
     @field_validator(
-        "schema_version", "red_below", "green_at", "green_confidence_at", mode="before"
+        "schema_version",
+        "red_below",
+        "green_at",
+        "green_confidence_at",
+        "default_branch_weight",
+        mode="before",
     )
     @classmethod
     def require_exact_integers(cls, value: object, info: ValidationInfo) -> int:
@@ -64,7 +78,9 @@ class AssessmentPolicy(StrictModel):
     @classmethod
     def require_exact_weights(cls, value: object) -> object:
         if not isinstance(value, Mapping):
-            raise TypeError("dimension_weights must be a mapping")
+            raise ValueError(  # noqa: TRY004 - Pydantic wraps ValueError
+                "dimension_weights must be a mapping"
+            )
         for dimension, weight in value.items():
             if not isinstance(dimension, AssessmentDimension) and type(dimension) is not str:
                 raise ValueError("dimension_weights must use assessment dimensions")
@@ -92,6 +108,31 @@ class AssessmentPolicy(StrictModel):
     ) -> dict[AssessmentDimension, int]:
         return dict(value)
 
+    @field_validator("branch_weights", mode="before")
+    @classmethod
+    def require_exact_branch_weights(cls, value: object) -> object:
+        if not isinstance(value, Mapping):
+            raise ValueError(  # noqa: TRY004 - Pydantic wraps ValueError
+                "branch_weights must be a mapping"
+            )
+        for branch_id, weight in value.items():
+            if type(branch_id) is not str or not branch_id:
+                raise ValueError("branch weights must use exact branch identifiers")
+            if type(weight) is not int:
+                raise ValueError("branch weights must be exact integers")
+        return dict(value)
+
+    @field_validator("branch_weights")
+    @classmethod
+    def freeze_branch_weights(cls, value: Mapping[str, int]) -> Mapping[str, int]:
+        if any(weight <= 0 for weight in value.values()):
+            raise ValueError("branch weights must be positive")
+        return MappingProxyType({branch_id: value[branch_id] for branch_id in sorted(value)})
+
+    @field_serializer("branch_weights")
+    def serialize_branch_weights(self, value: Mapping[str, int]) -> dict[str, int]:
+        return dict(value)
+
     @field_validator("critical_node_types")
     @classmethod
     def canonicalize_critical_node_types(cls, value: tuple[NodeType, ...]) -> tuple[NodeType, ...]:
@@ -110,6 +151,8 @@ class AssessmentPolicy(StrictModel):
             raise ValueError("health thresholds must satisfy 0 <= red_below < green_at <= 100")
         if not 0 <= self.green_confidence_at <= 100:
             raise ValueError("green confidence threshold must be within 0 to 100")
+        if self.default_branch_weight <= 0:
+            raise ValueError("default branch weight must be positive")
         return self
 
     def canonical_bytes(self) -> bytes:

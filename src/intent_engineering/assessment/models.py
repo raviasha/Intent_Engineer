@@ -5,11 +5,20 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from collections.abc import Mapping
 from datetime import datetime
 from enum import StrEnum
+from types import MappingProxyType
 from typing import Literal
 
-from pydantic import ConfigDict, Field, ValidationInfo, field_validator, model_validator
+from pydantic import (
+    ConfigDict,
+    Field,
+    ValidationInfo,
+    field_serializer,
+    field_validator,
+    model_validator,
+)
 
 from intent_engineering.core.models import (
     ChangeSet,
@@ -77,6 +86,31 @@ def _canonical_references(value: tuple[str, ...], *, label: str) -> tuple[str, .
     if any(type(item) is not str or not item for item in value):
         raise ValueError(f"{label} must contain exact non-empty strings")
     return tuple(sorted(set(value)))
+
+
+def _exact_weight_mapping(value: object, *, label: str) -> dict[str, int]:
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{label} must be a mapping")  # noqa: TRY004 - Pydantic wraps ValueError
+    copied: dict[str, int] = {}
+    for reference, weight in value.items():
+        copied[_exact_string(reference, label=f"{label} key")] = _exact_score(
+            weight, label=f"{label} value"
+        )
+    return copied
+
+
+def _canonical_contribution_weights(
+    value: Mapping[str, int],
+    *,
+    contributor_ids: tuple[str, ...],
+    label: str,
+) -> Mapping[str, int]:
+    weights = dict(value) or {identifier: 1 for identifier in contributor_ids}
+    if set(weights) != set(contributor_ids):
+        raise ValueError(f"{label} must exactly cover contributors")
+    if any(weight <= 0 for weight in weights.values()):
+        raise ValueError(f"{label} must be positive")
+    return MappingProxyType({identifier: weights[identifier] for identifier in sorted(weights)})
 
 
 def _canonical_json(value: object) -> bytes:
@@ -260,6 +294,7 @@ class BranchScorecard(_AssessmentModel):
     robustness: int | None = Field(default=None, ge=0, le=100)
     confidence: int | None = Field(default=None, ge=0, le=100)
     health: AssessmentHealth
+    contribution_weights: Mapping[str, int] = Field(default_factory=dict)
 
     @field_validator("branch_id", "root_node_id", mode="before")
     @classmethod
@@ -277,6 +312,29 @@ class BranchScorecard(_AssessmentModel):
         if value is None:
             return None
         return _exact_score(value, label=str(info.field_name))
+
+    @field_validator("contribution_weights", mode="before")
+    @classmethod
+    def require_exact_contribution_weights(cls, value: object) -> dict[str, int]:
+        return _exact_weight_mapping(value, label="contribution_weights")
+
+    @field_validator("contribution_weights")
+    @classmethod
+    def canonicalize_contribution_weights(
+        cls, value: Mapping[str, int], info: ValidationInfo
+    ) -> Mapping[str, int]:
+        node_ids = info.data.get("node_ids")
+        if not isinstance(node_ids, tuple):
+            raise ValueError(  # noqa: TRY004 - Pydantic wraps ValueError
+                "contribution weights require node identifiers"
+            )
+        return _canonical_contribution_weights(
+            value, contributor_ids=node_ids, label="contribution_weights"
+        )
+
+    @field_serializer("contribution_weights")
+    def serialize_contribution_weights(self, value: Mapping[str, int]) -> dict[str, int]:
+        return dict(value)
 
     @model_validator(mode="after")
     def validate_rollup(self) -> BranchScorecard:
@@ -298,6 +356,7 @@ class ProjectScorecard(_AssessmentModel):
     health: AssessmentHealth
     branch_ids: tuple[str, ...]
     contributing_node_ids: tuple[str, ...]
+    contribution_weights: Mapping[str, int] = Field(default_factory=dict)
 
     @field_validator("project_id", mode="before")
     @classmethod
@@ -315,6 +374,29 @@ class ProjectScorecard(_AssessmentModel):
         if value is None:
             return None
         return _exact_score(value, label=str(info.field_name))
+
+    @field_validator("contribution_weights", mode="before")
+    @classmethod
+    def require_exact_contribution_weights(cls, value: object) -> dict[str, int]:
+        return _exact_weight_mapping(value, label="contribution_weights")
+
+    @field_validator("contribution_weights")
+    @classmethod
+    def canonicalize_contribution_weights(
+        cls, value: Mapping[str, int], info: ValidationInfo
+    ) -> Mapping[str, int]:
+        branch_ids = info.data.get("branch_ids")
+        if not isinstance(branch_ids, tuple):
+            raise ValueError(  # noqa: TRY004 - Pydantic wraps ValueError
+                "contribution weights require branch identifiers"
+            )
+        return _canonical_contribution_weights(
+            value, contributor_ids=branch_ids, label="contribution_weights"
+        )
+
+    @field_serializer("contribution_weights")
+    def serialize_contribution_weights(self, value: Mapping[str, int]) -> dict[str, int]:
+        return dict(value)
 
     @model_validator(mode="after")
     def validate_rollup(self) -> ProjectScorecard:
@@ -401,6 +483,21 @@ class AssessmentReport(_AssessmentModel):
     @classmethod
     def canonicalize_warnings(cls, value: tuple[str, ...]) -> tuple[str, ...]:
         return _canonical_references(value, label="warnings")
+
+    @model_validator(mode="after")
+    def validate_visible_reference_closure(self) -> AssessmentReport:
+        if self.project.project_id != self.project_id:
+            raise ValueError("report project identity must match project scorecard")
+        visible_branches = {branch.branch_id for branch in self.branches}
+        if set(self.project.branch_ids) != visible_branches:
+            raise ValueError("project branch references must exactly match visible branches")
+        visible_nodes = {node.node_id for node in self.nodes}
+        if not set(self.project.contributing_node_ids).issubset(visible_nodes):
+            raise ValueError("project contributors must reference visible nodes")
+        for branch in self.branches:
+            if not set(branch.node_ids).issubset(visible_nodes):
+                raise ValueError("branch contributors must reference visible nodes")
+        return self
 
     def semantic_bytes(self) -> bytes:
         """Return canonical report content excluding the presentation timestamp."""

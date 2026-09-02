@@ -138,3 +138,55 @@ def test_scores_reject_booleans_and_out_of_range_values() -> None:
         NodeScorecard.model_validate({**material, "robustness": True})
     with pytest.raises(ValidationError):
         NodeScorecard.model_validate({**material, "confidence": 101})
+
+
+def test_report_publishes_canonical_applied_contribution_weights() -> None:
+    """Catches rollups that expose contributors without the weights used to combine them."""
+    report = report_fixture(node_ids=("req:z", "req:a"))
+
+    assert dict(report.branches[0].contribution_weights) == {"req:a": 1, "req:z": 1}
+    assert dict(report.project.contribution_weights) == {"intent:export": 1}
+    assert tuple(report.branches[0].contribution_weights) == ("req:a", "req:z")
+
+
+def test_report_rejects_invisible_or_mismatched_references() -> None:
+    """Catches report data that names hidden or unrelated project, branch, or node identifiers."""
+    report = report_fixture(node_ids=("req:public",))
+    material = report.model_dump()
+
+    with pytest.raises(ValidationError, match="project identity"):
+        AssessmentReport.model_validate({**material, "project_id": "project:other"})
+    with pytest.raises(ValidationError, match="project branch"):
+        AssessmentReport.model_validate(
+            {
+                **material,
+                "project": {
+                    **material["project"],
+                    "branch_ids": ("intent:hidden",),
+                    "contribution_weights": {"intent:hidden": 1},
+                },
+            }
+        )
+    with pytest.raises(ValidationError, match="visible node"):
+        AssessmentReport.model_validate(
+            {
+                **material,
+                "branches": (
+                    {
+                        **material["branches"][0],
+                        "node_ids": ("req:hidden",),
+                        "contribution_weights": {"req:hidden": 1},
+                    },
+                ),
+            }
+        )
+    with pytest.raises(ValidationError, match="visible node"):
+        AssessmentReport.model_validate(
+            {
+                **material,
+                "project": {
+                    **material["project"],
+                    "contributing_node_ids": ("req:hidden",),
+                },
+            }
+        )

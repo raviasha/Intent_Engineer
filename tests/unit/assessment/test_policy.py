@@ -38,3 +38,30 @@ def test_policy_normalizes_reference_order_and_rejects_boolean_weights() -> None
             critical_node_types=(),
             critical_relations=(),
         )
+
+
+def test_policy_publishes_canonical_default_and_custom_branch_weights() -> None:
+    """Catches custom branch rollup weights being absent from policy identity or reports."""
+    baseline = AssessmentPolicy.v1()
+    custom = AssessmentPolicy.model_validate(
+        {
+            **baseline.model_dump(),
+            "branch_weights": {"intent:z": 3, "intent:a": 2},
+        }
+    )
+
+    assert baseline.default_branch_weight == 1
+    assert dict(baseline.branch_weights) == {}
+    assert tuple(custom.branch_weights) == ("intent:a", "intent:z")
+    assert dict(custom.branch_weights) == {"intent:a": 2, "intent:z": 3}
+    assert custom.digest != baseline.digest
+    with pytest.raises(TypeError):
+        custom.branch_weights["intent:a"] = 7  # type: ignore[index]
+
+
+def test_policy_rejects_non_mapping_weights_as_a_validation_error() -> None:
+    """Catches public policy validation leaking a raw TypeError for malformed input."""
+    policy = AssessmentPolicy.v1()
+
+    with pytest.raises(ValidationError, match="dimension_weights must be a mapping"):
+        AssessmentPolicy.model_validate({**policy.model_dump(), "dimension_weights": ()})
