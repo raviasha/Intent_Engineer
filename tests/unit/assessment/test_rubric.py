@@ -13,15 +13,18 @@ from intent_engineering.assessment.models import (
     AssessmentDimension,
     AssessmentHealth,
     AssessmentSnapshot,
+    DimensionApplicability,
 )
 from intent_engineering.assessment.policy import AssessmentPolicy
 from intent_engineering.assessment.rubric import applicability, assess_node
 from intent_engineering.core.models import (
     Edge,
+    EvidenceIngestion,
     EvidenceRecord,
     EvidenceSide,
     Graph,
     Node,
+    NodeType,
     ReconciliationCase,
     ReconciliationCaseType,
     ReconciliationStatus,
@@ -83,12 +86,14 @@ def _with_snapshot(
     *,
     graph: Graph | None = None,
     evidence: tuple[EvidenceRecord, ...] | None = None,
+    ingestions: tuple[EvidenceIngestion, ...] | None = None,
     cases: tuple[ReconciliationCase, ...] | None = None,
 ) -> AssessmentSnapshot:
     return fixture.snapshot.model_copy(
         update={
             "graph": fixture.graph if graph is None else graph,
             "evidence": fixture.snapshot.evidence if evidence is None else evidence,
+            "ingestions": fixture.snapshot.ingestions if ingestions is None else ingestions,
             "cases": fixture.snapshot.cases if cases is None else cases,
         }
     )
@@ -112,6 +117,7 @@ def _replace_edges(graph: Graph, edges: tuple[Edge, ...]) -> Graph:
         ("intent:export", AssessmentDimension.TEST_VERIFICATION, "inherited"),
         ("req:csv", AssessmentDimension.TEST_VERIFICATION, "required"),
         ("file:export", AssessmentDimension.INTENT_CLARITY, "not_applicable"),
+        ("file:export", AssessmentDimension.IMPLEMENTATION_TRACEABILITY, "optional"),
     ],
 )
 def test_v1_applicability_is_explicit(
@@ -134,6 +140,18 @@ def test_failed_rules_deduct_once_and_explain_the_score(rubric_snapshot: RubricF
         "rubric:v1:test_verification:no_current_test_evidence"
     ]
     assert scorecard.health is AssessmentHealth.RED
+
+
+def test_implementation_traceability_is_optional_and_uses_incoming_requirement_link(
+    rubric_snapshot: RubricFixture,
+) -> None:
+    """Catches implementation nodes ignoring their typed requirement-to-code relation."""
+    result = assess_node(rubric_snapshot.snapshot, "file:export", AssessmentPolicy.v1()).dimension(
+        AssessmentDimension.IMPLEMENTATION_TRACEABILITY
+    )
+
+    assert result.applicability is DimensionApplicability.OPTIONAL
+    assert (result.score, result.failed) == (100, ())
 
 
 @pytest.mark.parametrize(
@@ -184,9 +202,28 @@ def test_v1_dimension_boundaries_are_literal(
     if dimension is AssessmentDimension.FRESHNESS:
         current = next(item for item in rubric_snapshot.snapshot.evidence if item.id == "evidence:req")
         newer = current.model_copy(
-            update={"id": "evidence:req:new", "external_version": "2", "observed_at": datetime(2026, 9, 2, tzinfo=UTC)}
+            update={
+                "id": "evidence:req:new",
+                "external_version": "2",
+                "content_hash": "sha256:req-new",
+                "parent_ref": current.id,
+                "observed_at": datetime(2026, 9, 2, tzinfo=UTC),
+            }
         )
-        snapshot = _with_snapshot(rubric_snapshot, graph=graph, evidence=(*rubric_snapshot.snapshot.evidence, newer))
+        snapshot = _with_snapshot(
+            rubric_snapshot,
+            graph=graph,
+            evidence=(*rubric_snapshot.snapshot.evidence, newer),
+            ingestions=(
+                EvidenceIngestion(connector_id="fixture:main", sequence=1, evidence=current),
+                EvidenceIngestion(
+                    connector_id="fixture:main",
+                    sequence=2,
+                    predecessor_id=current.id,
+                    evidence=newer,
+                ),
+            ),
+        )
     else:
         snapshot = _with_snapshot(rubric_snapshot, graph=graph)
 
@@ -235,6 +272,83 @@ def test_missing_visible_evidence_lowers_confidence_without_using_labels(
     )
 
     assert (result.score, result.confidence) == (50, 0)
+
+
+def test_later_recapture_of_the_same_provider_revision_is_not_stale(
+    rubric_snapshot: RubricFixture,
+) -> None:
+    """Catches a later observation time being mistaken for a new provider revision."""
+    original = next(item for item in rubric_snapshot.snapshot.evidence if item.id == "evidence:req")
+    recapture = original.model_copy(
+        update={"id": "evidence:req:recapture", "observed_at": datetime(2026, 9, 2, tzinfo=UTC)}
+    )
+    ingestions = (
+        EvidenceIngestion(connector_id="fixture:main", sequence=1, evidence=original),
+        EvidenceIngestion(connector_id="fixture:main", sequence=2, predecessor_id=original.id, evidence=recapture),
+    )
+
+    freshness = assess_node(
+        _with_snapshot(
+            rubric_snapshot,
+            evidence=(*rubric_snapshot.snapshot.evidence, recapture),
+            ingestions=ingestions,
+        ),
+        "req:csv",
+        AssessmentPolicy.v1(),
+    ).dimension(AssessmentDimension.FRESHNESS)
+
+    assert freshness.score == 100
+
+
+def test_newer_provider_revision_at_the_same_time_is_stale_for_freshness_and_tests(
+    rubric_snapshot: RubricFixture,
+) -> None:
+    """Catches wall-clock ties hiding a newer visible revision from rubric rules."""
+    original = next(item for item in rubric_snapshot.snapshot.evidence if item.id == "evidence:req")
+    newer = original.model_copy(
+        update={
+            "id": "evidence:req:v2",
+            "external_version": "2",
+            "content_hash": "sha256:req-v2",
+            "parent_ref": original.id,
+        }
+    )
+    test = rubric_snapshot.node("file:export").model_copy(
+        update={"id": "test:csv", "type": NodeType.TEST, "evidence_refs": (original.id,)}
+    )
+    verification = rubric_snapshot.graph.edges[1].model_copy(
+        update={"id": "edge:verified-by", "relation": RelationType.VERIFIED_BY, "to_id": test.id}
+    )
+    graph = rubric_snapshot.graph.model_copy(
+        update={"nodes": (*rubric_snapshot.graph.nodes, test), "edges": (*rubric_snapshot.graph.edges, verification)}
+    )
+    ingestions = (
+        EvidenceIngestion(connector_id="fixture:main", sequence=1, evidence=original),
+        EvidenceIngestion(connector_id="fixture:main", sequence=2, predecessor_id=original.id, evidence=newer),
+    )
+
+    scorecard = assess_node(
+        _with_snapshot(
+            rubric_snapshot,
+            graph=graph,
+            evidence=(*rubric_snapshot.snapshot.evidence, newer),
+            ingestions=ingestions,
+        ),
+        "req:csv",
+        AssessmentPolicy.v1(),
+    )
+
+    assert scorecard.dimension(AssessmentDimension.FRESHNESS).score == 75
+    assert scorecard.dimension(AssessmentDimension.TEST_VERIFICATION).score == 40
+
+
+def test_dimension_health_uses_the_active_policy_thresholds(rubric_snapshot: RubricFixture) -> None:
+    """Catches a custom policy yielding contradictory node and dimension health colors."""
+    policy = AssessmentPolicy.model_validate({**AssessmentPolicy.v1().model_dump(), "red_below": 40})
+    scorecard = assess_node(rubric_snapshot.snapshot, "req:csv", policy)
+
+    assert scorecard.dimension(AssessmentDimension.TEST_VERIFICATION).health is AssessmentHealth.ORANGE
+    assert scorecard.health is AssessmentHealth.ORANGE
 
 
 def test_external_relation_without_a_visible_target_is_ignored(rubric_snapshot: RubricFixture) -> None:

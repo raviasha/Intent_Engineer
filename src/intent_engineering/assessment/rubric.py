@@ -16,6 +16,7 @@ from intent_engineering.assessment.models import (
 )
 from intent_engineering.assessment.policy import AssessmentPolicy
 from intent_engineering.core.models import (
+    EvidenceIngestion,
     EvidenceRecord,
     Graph,
     Node,
@@ -40,6 +41,7 @@ class RubricContext:
 
     dimension: AssessmentDimension
     applicability: DimensionApplicability
+    policy: AssessmentPolicy
     node: Node
     snapshot: AssessmentSnapshot
     related_nodes: tuple[Node, ...]
@@ -136,7 +138,7 @@ def assess_node(
         return _unassessed_scorecard(node, matrix)
 
     results = tuple(
-        _dimension_result(snapshot, node, dimension, matrix[dimension])
+        _dimension_result(snapshot, node, dimension, matrix[dimension], policy)
         for dimension in AssessmentDimension
     )
     contributors = tuple(
@@ -186,7 +188,7 @@ def score_dimension(rules: tuple[Rule, ...], context: RubricContext) -> Dimensio
     resolved = sum(item.resolved_inputs for item in context.input_checks)
     required = sum(item.required_inputs for item in context.input_checks)
     confidence = 0 if required == 0 else resolved * 100 // required
-    health = _dimension_health(score, confidence)
+    health = _dimension_health(score, confidence, context.policy)
     return DimensionResult(
         dimension=context.dimension,
         applicability=context.applicability,
@@ -206,6 +208,7 @@ def _dimension_result(
     node: Node,
     dimension: AssessmentDimension,
     dimension_applicability: DimensionApplicability,
+    policy: AssessmentPolicy,
 ) -> DimensionResult:
     if dimension_applicability is DimensionApplicability.NOT_APPLICABLE:
         return DimensionResult(
@@ -215,7 +218,7 @@ def _dimension_result(
             health=AssessmentHealth.UNASSESSED,
             confidence=None,
         )
-    context = _context(snapshot, node, dimension, dimension_applicability)
+    context = _context(snapshot, node, dimension, dimension_applicability, policy)
     return score_dimension(_rules_for(dimension), context)
 
 
@@ -224,6 +227,7 @@ def _context(
     node: Node,
     dimension: AssessmentDimension,
     dimension_applicability: DimensionApplicability,
+    policy: AssessmentPolicy,
 ) -> RubricContext:
     nodes = _node_index(snapshot.graph)
     subject_ids = _subject_ids(snapshot.graph, node, dimension_applicability)
@@ -246,6 +250,7 @@ def _context(
     return RubricContext(
         dimension=dimension,
         applicability=dimension_applicability,
+        policy=policy,
         node=node,
         snapshot=snapshot,
         related_nodes=related_nodes,
@@ -359,7 +364,7 @@ def _blocking_conflict(context: RubricContext) -> RubricCheck | None:
 def _stale_evidence(context: RubricContext) -> RubricCheck | None:
     evidence = _evidence_index(context.snapshot)
     referenced = tuple(evidence[reference] for reference in context.evidence_refs if reference in evidence)
-    if not referenced or not _has_newer_visible_version(referenced, tuple(evidence.values())):
+    if not referenced or not _has_newer_visible_revision(referenced, context.snapshot.ingestions):
         return None
     return _failed(context, "stale_evidence", 25, "Refresh evidence from the newest visible revision.")
 
@@ -374,18 +379,27 @@ def _failed(context: RubricContext, name: str, points: int, explanation: str) ->
     )
 
 
-def _has_newer_visible_version(
-    referenced: tuple[EvidenceRecord, ...], evidence: tuple[EvidenceRecord, ...]
+def _has_newer_visible_revision(
+    referenced: tuple[EvidenceRecord, ...], ingestions: tuple[EvidenceIngestion, ...]
 ) -> bool:
     for record in referenced:
-        for candidate in evidence:
-            if (
-                candidate.connector_type == record.connector_type
-                and candidate.external_object_id == record.external_object_id
-                and candidate.observed_at > record.observed_at
-            ):
-                return True
+        associations = tuple(item for item in ingestions if item.evidence.id == record.id)
+        for association in associations:
+            for candidate in ingestions:
+                if (
+                    candidate.connector_id == association.connector_id
+                    and candidate.evidence.connector_type == record.connector_type
+                    and candidate.evidence.external_object_id == record.external_object_id
+                    and candidate.sequence > association.sequence
+                    and _revision_identity(candidate.evidence) != _revision_identity(record)
+                ):
+                    return True
     return False
+
+
+def _revision_identity(record: EvidenceRecord) -> tuple[str, str, str | None]:
+    """Return provider revision fields, excluding wall-clock recapture time."""
+    return (record.external_version, record.content_hash, record.parent_ref)
 
 
 def _node_index(graph: Graph) -> dict[str, Node]:
@@ -451,11 +465,20 @@ def _has_intent_coverage(graph: Graph, node: Node) -> bool:
 
 def _has_implementation_link(graph: Graph, subject_ids: set[str], nodes: Mapping[str, Node]) -> bool:
     return any(
-        edge.status == _ACTIVE
-        and edge.from_id in subject_ids
-        and edge.relation in {RelationType.IMPLEMENTED_BY, RelationType.REALIZED_BY}
-        and edge.to_id in nodes
-        and nodes[edge.to_id].type in _IMPLEMENTATION_TYPES
+        (
+            edge.status == _ACTIVE
+            and edge.from_id in subject_ids
+            and edge.relation in {RelationType.IMPLEMENTED_BY, RelationType.REALIZED_BY}
+            and edge.to_id in nodes
+            and nodes[edge.to_id].type in _IMPLEMENTATION_TYPES
+        )
+        or (
+            edge.status == _ACTIVE
+            and edge.to_id in subject_ids
+            and edge.relation in {RelationType.IMPLEMENTED_BY, RelationType.REALIZED_BY}
+            and edge.from_id in nodes
+            and nodes[edge.from_id].type in {NodeType.REQUIREMENT, NodeType.ACCEPTANCE_CRITERION}
+        )
         for edge in graph.edges
     )
 
@@ -477,7 +500,7 @@ def _has_current_test_link(
             refs = nodes[edge.to_id].evidence_refs
             if refs and all(reference in evidence for reference in refs):
                 test_evidence = tuple(evidence[reference] for reference in refs)
-                if not _has_newer_visible_version(test_evidence, tuple(evidence.values())):
+                if not _has_newer_visible_revision(test_evidence, snapshot.ingestions):
                     return True
     return False
 
@@ -496,10 +519,10 @@ def _blocking_cases(cases: tuple[ReconciliationCase, ...], subject_ids: set[str]
     )
 
 
-def _dimension_health(score: int, confidence: int) -> AssessmentHealth:
-    if score < 50:
+def _dimension_health(score: int, confidence: int, policy: AssessmentPolicy) -> AssessmentHealth:
+    if score < policy.red_below:
         return AssessmentHealth.RED
-    if score < 75 or confidence < 75:
+    if score < policy.green_at or confidence < policy.green_confidence_at:
         return AssessmentHealth.ORANGE
     return AssessmentHealth.GREEN
 
