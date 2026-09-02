@@ -2,7 +2,7 @@
 
 Date: 2026-09-02
 
-Status: Approved in conversation; written specification pending user review
+Status: Approved
 
 Scope: Explainable graph robustness, gap visualization, voluntary enrichment, and simpler requirement alternatives
 
