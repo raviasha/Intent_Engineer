@@ -8,7 +8,7 @@ import re
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import anyio
 import yaml  # type: ignore[import-untyped]
@@ -58,6 +58,9 @@ from intent_engineering.storage.yaml.checkpoint_store import YamlCheckpointStore
 from intent_engineering.storage.yaml.graph_store import YamlGraphStore
 from intent_engineering.sync import SyncOrchestrator
 from intent_engineering.sync.models import SyncRunResult
+
+if TYPE_CHECKING:
+    from intent_engineering.assessment import AssessmentSnapshot
 
 _GITHUB_OWNER = re.compile(r"(?!-)(?!.*--)[A-Za-z0-9-]{1,39}(?<!-)\Z")
 _GITHUB_REPOSITORY = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}\Z")
@@ -197,6 +200,12 @@ class Runtime:
     def context(self) -> ContextProvider:
         """Build a fresh, conservative context provider from durable state."""
         return ContextProvider(self.graph_store.load(), self.cases(), self.config, self.evidence())
+
+    def assessment_snapshot(self, actor: str) -> AssessmentSnapshot:
+        """Build one descriptor-held ACL projection for deterministic assessment."""
+        from intent_engineering.assessment.snapshot import build_assessment_snapshot
+
+        return build_assessment_snapshot(self, actor)
 
     def close(self) -> None:
         """Release every descriptor owned by this assembled runtime after it quiesces."""

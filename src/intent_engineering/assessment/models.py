@@ -547,6 +547,7 @@ class AssessmentSnapshot(_AssessmentModel):
     config_digest: str = Field(pattern=_DIGEST_PATTERN.pattern)
     principal_projection_digest: str = Field(pattern=_DIGEST_PATTERN.pattern)
     aggregate_digest: str = Field(pattern=_DIGEST_PATTERN.pattern)
+    omitted_count: None = None
 
     @field_validator(
         "project_id",

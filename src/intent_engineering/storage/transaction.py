@@ -6,7 +6,7 @@ import base64
 import json
 import re
 import secrets
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from hashlib import sha256
@@ -189,6 +189,8 @@ class LocalTransaction:
         target = self._read_target(name)
         if name in self._extras:
             return self._extra_read_budget.read_optional(name, target)
+        if self._read_only:
+            return target.read_optional_nonblocking()
         return target.read_optional()
 
     def read(self, name: str) -> bytes:
@@ -328,7 +330,7 @@ class LocalTransactionCoordinator:
                 if name in policies:
                     value = reads.read_optional(name, files[name])
                 else:
-                    value = files[name].read_optional()
+                    value = files[name].read_optional_nonblocking()
                 content[name] = value
                 value = None
             succeeded = True
@@ -490,26 +492,38 @@ class LocalTransactionCoordinator:
         extras: Mapping[str, SecureFile] | None = None,
         *,
         extra_read_policies: Mapping[str, LocalTransactionExtraReadPolicy] | None = None,
+        target_names: Collection[str] | None = None,
     ) -> LocalTransactionSnapshot:
-        """Recover, then read every canonical target under one deterministic lock set."""
+        """Recover, then read selected canonical targets under one deterministic lock set."""
         extra_files = dict(extras or {})
         policies = self._extra_read_policies(extra_files, extra_read_policies)
+        selected_names = (
+            frozenset(self._targets) if target_names is None else frozenset(target_names)
+        )
+        if any(type(name) is not str for name in selected_names) or not selected_names.issubset(
+            self._targets
+        ):
+            raise ValueError("invalid local snapshot target selection")
         if any(not _TARGET_PATTERN.fullmatch(name) for name in extra_files):
             raise ValueError("invalid local snapshot targets")
         if set(extra_files) & set(self._targets):
             raise ValueError("duplicate local snapshot target")
         all_files = {**self._targets, **extra_files}
+        selected_files = {
+            **{name: self._targets[name] for name in selected_names},
+            **extra_files,
+        }
         lock_keys = [self._journal.lock_key, *(item.lock_key for item in all_files.values())]
         if len(lock_keys) != len(set(lock_keys)):
             raise ValueError("duplicate local snapshot target")
         if self._thread_state.active:
             self._require_nested_extras(extra_files)
             policies, budget = self._nested_extra_read_state(extra_files, policies)
-            content = self._read_files(all_files, policies, budget=budget)
+            content = self._read_files(selected_files, policies, budget=budget)
             return LocalTransactionSnapshot(MappingProxyType(content), False)
         with self._locks(extra_files):
             recovered = self._recover_unlocked()
-            content = self._read_files(all_files, policies)
+            content = self._read_files(selected_files, policies)
         return LocalTransactionSnapshot(MappingProxyType(content), recovered)
 
     @contextmanager
