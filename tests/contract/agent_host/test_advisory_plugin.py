@@ -340,7 +340,13 @@ def test_real_hook_blocks_capture_for_a_pending_proposal_on_an_approved_graph(
 
 
 @pytest.mark.parametrize(
-    "path", ("evidence/evidence.jsonl", "history/changesets.jsonl", "cache/checkpoints.yaml")
+    "path",
+    (
+        "evidence/evidence.jsonl",
+        "history/changesets.jsonl",
+        "approvals/receipts.jsonl",
+        "cache/checkpoints.yaml",
+    ),
 )
 def test_real_hook_blocks_capture_for_corrupt_canonical_state(tmp_path: Path, path: str) -> None:
     """Catches the actual prompt hook classifying while canonical validation has failed."""
@@ -348,10 +354,11 @@ def test_real_hook_blocks_capture_for_corrupt_canonical_state(tmp_path: Path, pa
     project.mkdir()
     ready_project(project)
     marker = "PRIVATE-CORRUPT-CANONICAL-8197"
-    (project / ".intent" / path).write_text(f"{marker}: [", encoding="utf-8")
+    (project / ".intent" / path).write_text(f'{{"{marker}":', encoding="utf-8")
     before = _durable_bytes(project)
 
     completed = _run_official_hook(project, prompt=marker)
+    replay = _run_official_hook(project, prompt=marker)
 
     assert _additional_context(completed) == (
         "action=human_attention_required. Intent Engineering cannot verify local readiness. "
@@ -359,6 +366,7 @@ def test_real_hook_blocks_capture_for_corrupt_canonical_state(tmp_path: Path, pa
         "resolve intent work automatically."
     )
     assert marker.encode() not in completed.stdout + completed.stderr
+    assert replay.stdout == completed.stdout
     assert _durable_bytes(project) == before
 
 

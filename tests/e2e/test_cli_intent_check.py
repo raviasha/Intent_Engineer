@@ -6,10 +6,13 @@ import hashlib
 import json
 import os
 import shutil
+import stat
 import subprocess
+import sys
 from datetime import UTC, datetime
 from pathlib import Path
 
+import pytest
 import yaml  # type: ignore[import-untyped]
 from typer.testing import CliRunner
 
@@ -210,6 +213,54 @@ def test_check_emits_one_strict_versioned_json_result_for_an_aligned_project(
         "exit_code": 0,
     }
     assert "Consolidated checks preserve" not in result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("path", ("config.yaml", "graph.yaml", "history/.local-transaction.json"))
+def test_check_authenticates_readiness_before_opening_mutable_stores(
+    tmp_path: Path, path: str
+) -> None:
+    """Catches config, graph or recovery FIFOs blocking the real check before readiness."""
+    repo = init_git_repo(tmp_path)
+    _ready(repo)
+    workspace = repo / ".intent"
+    target = workspace / path
+    target.unlink(missing_ok=True)
+    os.mkfifo(target)
+    before = {path: path.read_bytes() for path in workspace.rglob("*") if path.is_file()}
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "from intent_engineering.cli.app import app; app()",
+            "check",
+            "--project",
+            str(repo),
+            "--format",
+            "json",
+        ],
+        capture_output=True,
+        timeout=2,
+        check=False,
+    )
+
+    assert completed.returncode == 1
+    assert completed.stderr == b""
+    assert json.loads(completed.stdout) == {
+        "version": "1",
+        "schema_version": 1,
+        "status": "failed",
+        "reason": "readiness_required",
+        "exit_code": 1,
+        "readiness_status": None,
+        "capture_status": None,
+        "validation_valid": None,
+        "test_evidence_id": None,
+        "review_case_count": 0,
+        "drift_report": "",
+    }
+    assert stat.S_ISFIFO(target.lstat().st_mode)
+    assert {path: path.read_bytes() for path in workspace.rglob("*") if path.is_file()} == before
 
 
 def test_ci_check_never_initializes_an_unonboarded_repository(tmp_path: Path) -> None:

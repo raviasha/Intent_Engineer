@@ -59,6 +59,66 @@ def test_store_keeps_the_held_parent_when_the_path_is_swapped(tmp_path: Path) ->
     assert not (attacker / "evidence.jsonl").exists()
 
 
+@pytest.mark.parametrize("target", ("parent", "child"))
+def test_relative_read_closes_directory_descriptors_when_authentication_is_cancelled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, target: str
+) -> None:
+    """Catches duplicated or newly opened ancestors leaking before a relative file read."""
+
+    class Cancelled(BaseException):
+        pass
+
+    child = tmp_path / "child"
+    child.mkdir()
+    (child / "value.json").write_bytes(b"{}")
+    directory = SecureDirectory.open(tmp_path)
+    inode = (tmp_path if target == "parent" else child).stat().st_ino
+    original_open, original_dup, original_close, original_fstat = (
+        os.open,
+        os.dup,
+        os.close,
+        os.fstat,
+    )
+    live: set[int] = set()
+    signal = Cancelled("cancelled")
+
+    def record_open(*args, **kwargs):
+        descriptor = original_open(*args, **kwargs)
+        live.add(descriptor)
+        return descriptor
+
+    def record_dup(descriptor: int) -> int:
+        duplicated = original_dup(descriptor)
+        live.add(duplicated)
+        return duplicated
+
+    def record_close(descriptor: int) -> None:
+        original_close(descriptor)
+        live.discard(descriptor)
+
+    def authenticate(descriptor: int) -> os.stat_result:
+        metadata = original_fstat(descriptor)
+        if metadata.st_ino == inode:
+            raise signal
+        return metadata
+
+    monkeypatch.setattr(secure.os, "open", record_open)
+    monkeypatch.setattr(secure.os, "dup", record_dup)
+    monkeypatch.setattr(secure.os, "close", record_close)
+    monkeypatch.setattr(secure.os, "fstat", authenticate)
+    try:
+        with pytest.raises(Cancelled) as caught:
+            directory.read_relative("child/value.json", nonblocking=True, max_bytes=1024)
+        leaked = set(live)
+    finally:
+        directory.close()
+        for descriptor in tuple(live):
+            record_close(descriptor)
+
+    assert caught.value is signal
+    assert not leaked, f"leaked {len(leaked)} directory descriptors"
+
+
 def test_membership_scan_stat_to_fifo_swap_fails_without_blocking_or_mutation(
     tmp_path: Path,
 ) -> None:

@@ -121,6 +121,12 @@ def _decode_content(
     return claims, receipts
 
 
+def validate_receipt_ledger(content: bytes | None) -> None:
+    """Check immutable claim/receipt bytes with the canonical store's integrity rules."""
+    if _decode_content(content) is None:
+        raise ReceiptStoreError("invalid receipt store") from None
+
+
 def validate_receipt_completion(
     content: bytes | None,
     receipt: ExecutionReceipt,

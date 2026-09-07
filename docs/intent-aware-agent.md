@@ -134,6 +134,13 @@ commands pass, and validates its repository, commit, timestamp and ACL before wr
 intent check --ci --require-review --test-results .intent-ci/test-results.json
 ```
 
+Both local and CI checks run bounded, read-only readiness before opening ordinary mutable
+stores, capturing evidence, or running reviewed tests. Unsafe canonical files and any existing
+local transaction journal fail closed with `readiness_required`. The check does not repair a
+torn graph, replay a journal, or remove recovery state; use the explicit trusted recovery or
+control-plane workflow before retrying. Signed shared-state restoration still precedes readiness
+in CI.
+
 Restore preserves unpublished local graph decisions, ChangeSet history, proposals and reviewed
 configuration. A semantic extension or divergence returns `diverged`; the check reports
 `human_attention_required` and exits 4 before capture. Reconcile that state explicitly. Repeating

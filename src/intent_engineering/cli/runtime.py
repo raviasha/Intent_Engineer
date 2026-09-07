@@ -284,7 +284,6 @@ class _ReadinessCapture:
 
     def __init__(self, project: SecureDirectory, workspace: SecureDirectory) -> None:
         self.project = project
-        self.directories = {"": workspace.duplicate()}
         self.files: dict[str, int | None] = {}
         self.tokens: dict[int, tuple[int, ...]] = {
             project.descriptor: _readiness_change_token(os.fstat(project.descriptor)),
@@ -294,6 +293,9 @@ class _ReadinessCapture:
             (project.descriptor, ".intent", self.tokens[workspace.descriptor])
         ]
         self.total_bytes = 0
+        # Acquire ownership only after fallible metadata setup completes: a failed
+        # constructor has no caller to close this duplicate.
+        self.directories = {"": workspace.duplicate()}
 
     def pin(self, path: str, *, optional: bool = False) -> None:
         parts = Path(path).parts
@@ -700,7 +702,8 @@ class CheckRuntimeAdapter:
                 return SharedStateRestoreResult(status=SharedStateRestoreStatus.INVALID)
             if result.status is not SharedStateRestoreStatus.VERIFIED:
                 return result
-        self._opened()
+        # CheckService runs the bounded immutable readiness guard next. Opening
+        # mutable stores here would read/recover unverified local state first.
         return SharedStateRestoreResult(
             status=(
                 SharedStateRestoreStatus.VERIFIED

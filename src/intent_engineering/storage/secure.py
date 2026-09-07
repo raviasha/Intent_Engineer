@@ -256,12 +256,16 @@ class SecureDirectory:
                         _DIRECTORY_FLAGS,
                         dir_fd=descriptor,
                     )
-                _require_directory(os.fstat(next_descriptor))
+                try:
+                    _require_directory(os.fstat(next_descriptor))
+                except BaseException:
+                    os.close(next_descriptor)
+                    raise
                 os.close(descriptor)
                 descriptor = next_descriptor
         except BaseException as error:
             os.close(descriptor)
-            if isinstance(error, UnsafePathError):
+            if not isinstance(error, Exception) or isinstance(error, UnsafePathError):
                 raise
             raise UnsafePathError() from error
         return cls(descriptor, absolute)
@@ -318,13 +322,17 @@ class SecureDirectory:
                         _DIRECTORY_FLAGS,
                         dir_fd=descriptor,
                     )
-                _require_directory(os.fstat(next_descriptor))
+                try:
+                    _require_directory(os.fstat(next_descriptor))
+                except BaseException:
+                    os.close(next_descriptor)
+                    raise
                 os.close(descriptor)
                 descriptor = next_descriptor
                 traversed /= component
         except BaseException as error:
             os.close(descriptor)
-            if isinstance(error, UnsafePathError):
+            if not isinstance(error, Exception) or isinstance(error, UnsafePathError):
                 raise
             raise UnsafePathError() from error
         return SecureDirectory(descriptor, traversed)
@@ -363,8 +371,8 @@ class SecureDirectory:
             raise UnsafePathError()
         parts = _relative_parts(relative)
         descriptor = os.dup(self.descriptor)
-        identities: list[FileIdentity] = [self.identity]
         try:
+            identities: list[FileIdentity] = [self.identity]
             for component in parts[:-1]:
                 try:
                     next_descriptor = os.open(
@@ -374,9 +382,13 @@ class SecureDirectory:
                     )
                 except OSError as error:
                     raise UnsafePathError() from error
-                metadata = os.fstat(next_descriptor)
-                _require_directory(metadata)
-                identities.append(_identity(metadata))
+                try:
+                    metadata = os.fstat(next_descriptor)
+                    _require_directory(metadata)
+                    identities.append(_identity(metadata))
+                except BaseException:
+                    os.close(next_descriptor)
+                    raise
                 os.close(descriptor)
                 descriptor = next_descriptor
             reader = _read_named_nonblocking if nonblocking else _read_named

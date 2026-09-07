@@ -39,6 +39,10 @@ from intent_engineering.storage.jsonl.case_store import (
     parse_case_versions,
 )
 from intent_engineering.storage.jsonl.evidence_store import parse_evidence_lines
+from intent_engineering.storage.jsonl.receipt_store import (
+    ReceiptStoreError,
+    validate_receipt_ledger,
+)
 from intent_engineering.storage.jsonl.strict import loads_strict_json
 from intent_engineering.storage.secure import (
     SecureDirectory,
@@ -1075,6 +1079,10 @@ class WorkspaceValidationService:
             history = _parse_history(captured.content["history"])
         except (UnicodeError, json.JSONDecodeError, ValidationError, TypeError, ValueError):
             diagnostics.append(_diagnostic("history.invalid", "history"))
+        try:
+            validate_receipt_ledger(captured.content["receipts"])
+        except ReceiptStoreError:
+            diagnostics.append(_diagnostic("receipts.invalid", "receipts"))
         try:
             checkpoints = _parse_checkpoints(captured.content["checkpoints"])
         except (UnicodeError, ValidationError, TypeError, ValueError, yaml.YAMLError):

@@ -117,3 +117,77 @@ The full offline gate retains the established deselection of
 `test_installed_codex_contract_refuses_incomplete_mandatory_coverage`: the installed host reports
 Codex 0.153.4, while that existing test pins 0.148.0-alpha.9. No GitHub operation, push or external
 provider mutation was performed.
+
+## Review round 1 — boundary corrections
+
+The next review identified three holes in the initial remediation. This round supersedes the
+earlier completeness claims at those boundaries; the limits, no-authority policy and approved
+proposal routing above remain unchanged.
+
+1. **Receipt semantics:** Capturing `approvals/receipts.jsonl` did not validate its contents.
+   Both immutable and local canonical validation now invoke a public, pure validation wrapper
+   around the existing receipt store decoder. This preserves its exact canonical-record,
+   newline-completeness, unique-claim, claim-before-completion, single-completion and actor-binding
+   rules without a second parser. Failures produce the fixed `receipts.invalid` diagnostic.
+   Real `ensure` and bundled prompt-hook tests cover truncated receipt contents; the hook returns
+   fixed Team state guidance without classification or capture and is a byte-identical replay.
+2. **Directory ownership and cancellation:** `SecureDirectory.open` and `subdirectory` now
+   close a newly opened descriptor if its `fstat`/directory authentication fails, as well as
+   closing the held parent. They no longer translate a `BaseException` cancellation into an
+   ordinary unsafe-path failure. The readiness boundary preserves the exact cancellation object
+   and scrubs inner plaintext traceback frames. Capture construction acquires its duplicated
+   workspace descriptor only after fallible metadata setup. The related `read_relative` traversal
+   also closes its duplicated parent and untransferred child when authentication is cancelled.
+   Tests count all live `open`/`dup` descriptors and retain real wrappers so cleanup cannot pass
+   merely because Python happened to collect them.
+3. **Check startup order:** `CheckRuntimeAdapter.restore` no longer calls the ordinary runtime
+   opener. Verified shared restoration keeps its existing order and statuses; bounded readiness
+   runs next, before mutable stores, capture or reviewed tests. Existing local transaction journals
+   fail closed with `readiness_required` and are not recovered or removed automatically. The
+   compatibility test and adoption guide now explicitly preserve a prepared/torn transaction for
+   the trusted recovery/control-plane workflow. Actual CLI subprocesses enforce a two-second
+   deadline for config, graph and journal FIFO inputs and require unchanged local state.
+
+### Review-round tests-first evidence
+
+- Receipt validation: **7 failed, 1 passed** before the fix. Truncated, duplicated, orphaned and
+  actor-mismatched receipts were accepted; `ensure` returned ready and the real hook classified.
+  Receipt/store focused verification after the fix: **18 passed**.
+- Directory readiness: **16 failed, 6 passed** before the fix, demonstrating both leaked
+  descriptors and cancellation rewritten as readiness/project-not-initialized errors. Relative
+  traversal added **2 failing** authentication-cleanup cases. The complete secure-path and
+  readiness-snapshot modules then passed: **93 passed**.
+- Check startup: **4 failed** before the fix: all three FIFO subprocesses timed out and the
+  prepared journal was replayed into changed canonical state. The complete check CLI and service
+  modules then passed: **43 passed**.
+- The actual hook additionally passed all **4** canonical-corruption cases on repeated execution,
+  with exact fixed output and no canonical writes or prompt leakage.
+
+### Review-round verification history
+
+All runs use the absolute source/root `PYTHONPATH` described above. The existing virtualenv was
+rebuilt from an offline regular wheel, and the installed runtime's SHA256 matched the source.
+
+- The broad storage, validation, workflow, shared-state, CLI, hook and automation run initially
+  completed with **946 passed, 1 failed, 1 deselected**. The failure was the existing fork-based
+  case-store concurrency test: one child received `ENOENT` creating `.cases.jsonl.lock`, leaving
+  its peer waiting at a barrier. The whole case-store module immediately passed unchanged
+  (**10 passed**). Only the inspected leftover child of that failed pytest run was terminated.
+- The first full uninstrumented run completed with **2,333 passed, 13 failed, 1 skipped,
+  1 deselected** in 203.73s. All 13 failures were successful external-write commit paths exposing
+  their fixed `execution_unavailable` boundary. The same receipt/authorship integration case
+  passed alone, with full-suite collection, after the complete check CLI module, and under six
+  explicit Python hash seeds. No mutation implementation or test expectation was changed.
+- A separate diagnostic full run wrapped only the local committer in a temporary in-process
+  trace (no repository file edits). It passed **2,346 tests**, with the same manual skip and host
+  deselection, in 201.83s. It observed successful normal commits and only expected injected
+  failures. This diagnostic run is not substituted for the ordinary final gate. The precise cause
+  of the earlier intermittent failures has not been established.
+- The final ordinary, uninstrumented full offline command passed: **2,346 passed, 1 manual skip,
+  1 established host-version deselection, 31 existing warnings**, in **203.12s**. No production
+  code or mutation-test changes were made between the failing and passing full runs.
+- The exact broad command was then repeated unchanged and passed: **947 passed, 1 established
+  host-version deselection, 16 existing warnings**, in **122.20s**.
+- Repository Ruff checks passed with the same pre-existing `dogfood 2.py` filename exclusion;
+  all **10 changed Python files** passed formatting. Full source mypy passed for **140 files**.
+  Plugin validation, both `ensure` and `check` help commands, and `git diff --check` passed.

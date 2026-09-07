@@ -467,8 +467,11 @@ async def test_malformed_restore_result_is_a_fixed_readiness_failure() -> None:
     assert runtime.events == []
 
 
-def test_local_restore_recovers_a_prepared_transaction_before_readiness(tmp_path: Path) -> None:
-    """Catches the restore boundary reading a torn graph before local recovery."""
+@pytest.mark.anyio
+async def test_local_check_preserves_a_prepared_transaction_for_explicit_recovery(
+    tmp_path: Path,
+) -> None:
+    """Catches ordinary-runtime recovery running before the bounded readiness guard."""
     project = tmp_path / "project"
     project.mkdir()
     initialize_project(project)
@@ -496,16 +499,23 @@ def test_local_restore_recovers_a_prepared_transaction_before_readiness(tmp_path
 
     journal = project / ".intent/history/.local-transaction.json"
     assert journal.exists()
+    before = {
+        path: path.read_bytes() for path in (project / ".intent").rglob("*") if path.is_file()
+    }
     adapter = CheckRuntimeAdapter(project)
     try:
-        restored = adapter.restore(require_shared=False)
-        readiness = adapter.ensure()
+        result = await CheckService(adapter, clock=lambda: NOW).run(CheckRequest())
     finally:
         adapter.close()
 
-    assert restored.status is SharedStateRestoreStatus.NOT_REQUIRED
-    assert readiness.status is EnsureStatus.ONBOARDING_REQUIRED
-    assert not journal.exists()
+    assert (result.status, result.reason, result.exit_code) == (
+        CheckStatus.FAILED,
+        CheckReason.READINESS_REQUIRED,
+        1,
+    )
+    assert {
+        path: path.read_bytes() for path in (project / ".intent").rglob("*") if path.is_file()
+    } == before
 
 
 @pytest.mark.anyio

@@ -70,6 +70,7 @@ def project(tmp_path: Path) -> Path:
     (
         ("evidence/evidence.jsonl", b'{"PRIVATE-EVIDENCE-8197":'),
         ("history/changesets.jsonl", b'{"PRIVATE-HISTORY-8197":'),
+        ("approvals/receipts.jsonl", b'{"PRIVATE-RECEIPT-8197":'),
         ("cache/checkpoints.yaml", b"PRIVATE-CHECKPOINT-8197: ["),
         ("history/intent-proposals.jsonl", b'{"PRIVATE-DECISION-8197":'),
     ),
@@ -285,6 +286,125 @@ def test_readiness_cancellation_preserves_identity_and_releases_content_and_desc
     for descriptor in opened:
         with pytest.raises(OSError):
             os.fstat(descriptor)
+
+
+@pytest.mark.parametrize("failure", ("cancel", "ordinary"))
+@pytest.mark.parametrize(
+    "operation,target,occurrence",
+    (
+        ("open", "project", 1),
+        ("open", ".intent", 1),
+        ("open", "evidence", 1),
+        ("open", "project", 2),
+        ("fstat", "project", 1),
+        ("fstat", ".intent", 1),
+        ("fstat", "project", 2),
+        ("fstat", ".intent", 2),
+        ("fstat", "evidence", 1),
+        ("fstat", "evidence", 2),
+        ("fstat", "project", 3),
+    ),
+)
+def test_directory_readiness_failure_closes_every_descriptor_and_preserves_cancellation(
+    project: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+    target: str,
+    occurrence: int,
+    failure: str,
+) -> None:
+    """Catches untransferred directory FDs or cancellation hidden by readiness errors."""
+
+    class Cancelled(BaseException):
+        pass
+
+    marker = "PRIVATE-DIRECTORY-SNAPSHOT-8197"
+    config = project / ".intent/config.yaml"
+    config.write_bytes(config.read_bytes() + f"\n# {marker}\n".encode())
+    target_path = {
+        "project": project,
+        ".intent": project / ".intent",
+        "evidence": project / ".intent/evidence",
+    }[target]
+    target_inode = target_path.stat().st_ino
+    signal = Cancelled("cancelled") if failure == "cancel" else OSError(marker)
+    observed: BaseException | None = None
+    original_open, original_dup, original_close, original_fstat = (
+        os.open,
+        os.dup,
+        os.close,
+        os.fstat,
+    )
+    original_duplicate = secure.SecureDirectory.duplicate
+    live: set[int] = set()
+    # Keep real wrappers alive: deterministic cleanup must not depend on garbage collection.
+    retained: list[secure.SecureDirectory] = []
+    hits = 0
+
+    def maybe_fail() -> None:
+        nonlocal hits
+        hits += 1
+        if hits == occurrence:
+            raise signal
+
+    def record_open(path, *args, **kwargs):
+        if operation == "open" and path == target:
+            maybe_fail()
+        descriptor = original_open(path, *args, **kwargs)
+        live.add(descriptor)
+        return descriptor
+
+    def record_dup(descriptor: int) -> int:
+        duplicated = original_dup(descriptor)
+        live.add(duplicated)
+        return duplicated
+
+    def record_close(descriptor: int) -> None:
+        original_close(descriptor)
+        live.discard(descriptor)
+
+    def authenticate(descriptor: int) -> os.stat_result:
+        metadata = original_fstat(descriptor)
+        if operation == "fstat" and metadata.st_ino == target_inode:
+            maybe_fail()
+        return metadata
+
+    def retain_duplicate(directory: secure.SecureDirectory) -> secure.SecureDirectory:
+        duplicated = original_duplicate(directory)
+        retained.append(duplicated)
+        return duplicated
+
+    monkeypatch.setattr(secure.os, "open", record_open)
+    monkeypatch.setattr(secure.os, "dup", record_dup)
+    monkeypatch.setattr(secure.os, "close", record_close)
+    monkeypatch.setattr(secure.os, "fstat", authenticate)
+    monkeypatch.setattr(secure.SecureDirectory, "duplicate", retain_duplicate)
+    try:
+        if failure == "ordinary":
+            assert _ensure(project) == INVALID
+        else:
+            try:
+                load_readiness_runtime(project)
+            except BaseException as caught:  # noqa: BLE001 - inspect cancellation identity
+                observed = caught
+        leaked = set(live)
+    finally:
+        for directory in retained:
+            directory.close()
+        for descriptor in tuple(live):
+            record_close(descriptor)
+
+    assert hits == occurrence
+    assert leaked == set(), f"leaked {len(leaked)} directory descriptors"
+    if failure == "cancel":
+        assert observed is signal
+        assert observed.__context__ is None and observed.__cause__ is None
+        traceback = observed.__traceback__
+        while traceback is not None:
+            frame = traceback.tb_frame
+            if "/src/intent_engineering/" in frame.f_code.co_filename:
+                assert marker not in repr(frame.f_locals)
+            traceback = traceback.tb_next
 
 
 def test_dangling_workspace_symlink_is_invalid_not_onboarding(tmp_path: Path) -> None:

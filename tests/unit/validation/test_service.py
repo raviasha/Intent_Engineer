@@ -24,9 +24,11 @@ from intent_engineering.core.models import (
 )
 from intent_engineering.core.policy.project import initialize_project
 from intent_engineering.intent_workflow.conversation import ConversationCapture
+from intent_engineering.mutations.models import ExecutionReceipt, receipt_id
 from intent_engineering.storage.executor import LocalChangeSetExecutor
 from intent_engineering.storage.jsonl.case_store import serialize_case
 from intent_engineering.storage.jsonl.history_store import serialize_changeset
+from intent_engineering.storage.jsonl.receipt_store import JsonlReceiptStore
 from intent_engineering.storage.secure import SecureDirectory
 from intent_engineering.storage.transaction import LocalTransactionCoordinator
 from intent_engineering.storage.yaml.graph_store import serialize_graph
@@ -169,6 +171,61 @@ def test_canonical_snapshot_validation_uses_the_supplied_bytes_without_reopening
     invalid = validation_service.validate_canonical_snapshot(snapshot)
     assert not invalid.valid
     assert "history.invalid" in {item.code for item in invalid.diagnostics}
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ("none", "truncated", "duplicate_claim", "duplicate_receipt", "orphan", "actor_mismatch"),
+)
+def test_canonical_validation_reuses_receipt_claim_and_completion_integrity(
+    tmp_path: Path, mutation: str
+) -> None:
+    """Catches byte capture alone accepting an invalid at-most-once receipt ledger."""
+    seeded = _seed(tmp_path)
+    target = seeded.root / ".intent/approvals/receipts.jsonl"
+    material = {
+        "schema_version": 1,
+        "plan_id": "write-plan:sha256:" + "a" * 64,
+        "plan_hash": "sha256:" + "a" * 64,
+        "approval_id": "approval:sha256:" + "b" * 64,
+        "target_version": "v1",
+        "executed_by": "local:reviewer",
+        "status": "failed",
+        "attempted_at": "2026-08-25T12:00:00Z",
+        "completed_at": "2026-08-25T12:00:00Z",
+        "resulting_version": None,
+        "evidence_ref": None,
+        "redacted_error": "provider_failure",
+    }
+    receipt = ExecutionReceipt.model_validate_json(
+        json.dumps({**material, "id": receipt_id(material)})
+    )
+    store = JsonlReceiptStore(target)
+    assert store.claim(receipt.plan_id, receipt.approval_id, receipt.executed_by, NOW)
+    assert store.complete(receipt)
+    claim_line, receipt_line = target.read_bytes().splitlines(keepends=True)
+    content = claim_line + receipt_line
+    if mutation == "truncated":
+        content = content[:-1]
+    elif mutation == "duplicate_claim":
+        content += claim_line
+    elif mutation == "duplicate_receipt":
+        content += receipt_line
+    elif mutation == "orphan":
+        content = receipt_line
+    elif mutation == "actor_mismatch":
+        content = claim_line.replace(b"local:reviewer", b"local:other") + receipt_line
+    target.write_bytes(content)
+
+    immutable = validation_service.validate_canonical_snapshot(_canonical_snapshot(seeded.root))
+    local = validate_project(seeded.root)
+
+    assert immutable.valid is (mutation == "none")
+    assert immutable == local
+    assert tuple(item.code for item in immutable.diagnostics) == (
+        () if mutation == "none" else ("receipts.invalid",)
+    )
+    assert target.read_bytes() == content
 
 
 @pytest.mark.parametrize("invalid", ["missing", "type", "file_size", "total_size"])
