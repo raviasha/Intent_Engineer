@@ -242,6 +242,26 @@ def test_real_hook_offers_onboarding_without_writes_or_prompt_echo(tmp_path: Pat
     assert _durable_bytes(project) == before
 
 
+def test_real_hook_blocks_implementation_when_local_readiness_is_invalid(tmp_path: Path) -> None:
+    """Catches corrupt local state weakening the developer preset into bare advisory fallback."""
+    project = tmp_path / "project"
+    project.mkdir()
+    initialize_project(project)
+    marker = "PRIVATE-INVALID-READINESS-8197"
+    (project / ".intent" / "config.yaml").write_text(f"local_actor: [{marker}", encoding="utf-8")
+    before = _durable_bytes(project)
+
+    completed = _run_official_hook(project, prompt=marker)
+
+    assert _additional_context(completed) == (
+        "action=human_attention_required. Intent Engineering cannot verify local readiness. "
+        "Do not implement or resolve governed intent work automatically. Review local Intent "
+        "state before continuing."
+    )
+    assert marker.encode() not in completed.stdout + completed.stderr
+    assert _durable_bytes(project) == before
+
+
 def test_real_hook_routes_ready_prompt_to_preflight_without_secret_or_echo(
     tmp_path: Path,
 ) -> None:
@@ -477,7 +497,16 @@ def test_special_project_files_fail_promptly_without_replacement(
 
     completed = _run_official_hook(project, timeout=3)
 
-    assert _additional_context(completed) == FALLBACK
+    expected = (
+        FALLBACK
+        if attack == "fifo"
+        else (
+            "action=human_attention_required. Intent Engineering cannot verify local readiness. "
+            "Do not implement or resolve governed intent work automatically. Review local Intent "
+            "state before continuing."
+        )
+    )
+    assert _additional_context(completed) == expected
     after = os.lstat(config)
     assert stat.S_IFMT(after.st_mode) == stat.S_IFMT(before.st_mode)
 

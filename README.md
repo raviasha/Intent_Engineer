@@ -87,12 +87,15 @@ intentionally omits `cwd`: on a local Codex host, `--project .` binds to the act
 working directory. A remote executor must explicitly reproduce or configure that repository
 working directory; it must not assume `.` refers to the user's checkout.
 
-The bundle automatically offers onboarding when no approved baseline exists. After approval the
-hook persists its exact stdin prompt as untrusted `agent:codex` context, supplies only opaque
-conversation and evidence references, and routes the agent's bounded classification draft through
-token-free `intent_advisory_preflight`. The hook boundary is callable by the coding agent, so it
-never claims local-human attribution or approval. Raw prompt text never crosses that MCP wire
-boundary.
+The bundle first runs the same non-authoritative readiness check as
+`intent ensure --project . --preset developer --format json`. It automatically offers onboarding
+when no approved baseline exists. If an approved graph has pending proposal review, an open
+reconciliation case, or unanswered clarification, it stops before capturing or classifying the
+prompt and directs the developer to the local Inbox. Otherwise, it persists the exact stdin prompt
+as untrusted `agent:codex` context, supplies only opaque conversation and evidence references, and
+routes the agent's bounded classification draft through token-free `intent_advisory_preflight`. The
+hook boundary is callable by the coding agent, so it never claims local-human attribution or
+approval. Raw prompt text never crosses that MCP wire boundary.
 
 The advisory classifications are `no_semantic_impact`, `aligned`, `new_or_ambiguous`, and
 `conflicting`. Continue normal work for the first two. The plugin never receives a mutation
@@ -100,9 +103,11 @@ capability and does not provide mandatory mutation enforcement. Mandatory Codex 
 truthfully unavailable through `MandatoryHookUnavailable` with the message
 `Codex mandatory mutation hook is unavailable`.
 
-To opt out, decline the onboarding offer or disable/uninstall `intent-advisor`. A decline leaves
-the repository unchanged for that task; disabling the plugin leaves ordinary coding behavior
-unchanged. The CLI and MCP services remain usable independently.
+To inspect the machine-facing gate directly, run
+`intent ensure --project . --preset developer --format json`. To opt out, decline the onboarding
+offer or disable/uninstall `intent-advisor`. A decline leaves the repository unchanged for that
+task; disabling the plugin leaves ordinary coding behavior unchanged. The CLI and MCP services
+remain usable independently.
 
 Clients other than Codex that launch and connect stdio themselves may run
 `intent mcp --project .`; that is a client-managed process, not an extra Codex setup step.

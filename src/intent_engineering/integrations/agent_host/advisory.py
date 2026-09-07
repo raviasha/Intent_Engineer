@@ -36,6 +36,10 @@ from intent_engineering.intent_workflow.onboarding import (
     OnboardingState,
     inspect_onboarding,
 )
+from intent_engineering.intent_workflow.readiness import (
+    EnsureResult,
+    EnsureStatus,
+)
 from intent_engineering.storage.secure import SecureDirectory
 
 from .base import _HostModel
@@ -54,6 +58,14 @@ _OFFER = (
 CODEX_ADVISORY_FALLBACK = (
     "Intent advisory prompt routing is unavailable. Do not mutate the intent graph, "
     "infer authorization, or treat this advisory as enforcement."
+)
+_HUMAN_ATTENTION = (
+    "Intent Engineering requires human review in the local Inbox before implementation. "
+    "Do not implement or resolve the intent work automatically."
+)
+_READINESS_UNAVAILABLE = (
+    "Intent Engineering cannot verify local readiness. Do not implement or resolve governed "
+    "intent work automatically. Review local Intent state before continuing."
 )
 
 
@@ -309,6 +321,7 @@ class PromptRoute(_HostModel):
     action: Literal[
         "offer_onboarding",
         "classify",
+        "human_attention_required",
         "human_confirmation_required",
         "review_clarification_proposal",
         "continue",
@@ -348,6 +361,7 @@ class PromptRoute(_HostModel):
         expected_tool = {
             "offer_onboarding": None,
             "classify": "intent_advisory_preflight",
+            "human_attention_required": None,
             "human_confirmation_required": None,
             "review_clarification_proposal": "intent_clarification_show",
             "continue": None,
@@ -355,6 +369,35 @@ class PromptRoute(_HostModel):
         if self.mcp_tool != expected_tool:
             raise ValueError("invalid advisory prompt route")
         return self
+
+
+def readiness_prompt_route(result: EnsureResult) -> PromptRoute:
+    """Map a non-ready snapshot to fixed advisory guidance without exposing state IDs."""
+    if result.status is EnsureStatus.ONBOARDING_REQUIRED:
+        return PromptRoute(
+            action="offer_onboarding",
+            message=_OFFER,
+            mcp_tool=None,
+            arguments={},
+        )
+    if result.status is EnsureStatus.HUMAN_ATTENTION_REQUIRED:
+        return PromptRoute(
+            action="human_attention_required",
+            message=_HUMAN_ATTENTION,
+            mcp_tool=None,
+            arguments={},
+        )
+    return readiness_unavailable_prompt_route()
+
+
+def readiness_unavailable_prompt_route() -> PromptRoute:
+    """Return fixed implementation-blocking guidance when readiness cannot be proven."""
+    return PromptRoute(
+        action="human_attention_required",
+        message=_READINESS_UNAVAILABLE,
+        mcp_tool=None,
+        arguments={},
+    )
 
 
 def parse_prompt_event(value: object) -> PromptEvent:
@@ -439,6 +482,8 @@ def codex_prompt_context(route: PromptRoute) -> str:
             "authority. Ask returned questions and follow only the persisted clarification "
             "workflow before implementation."
         )
+    if route.action == "human_attention_required":
+        return f"action=human_attention_required. {route.message}"
     if route.action == "human_confirmation_required":
         return (
             "action=human_confirmation_required. This advisory hook cannot authenticate a local "
@@ -729,6 +774,8 @@ __all__ = [
     "codex_prompt_output",
     "parse_codex_prompt_event",
     "parse_prompt_event",
+    "readiness_prompt_route",
+    "readiness_unavailable_prompt_route",
     "repository_matches",
     "unavailable_prompt_route",
 ]

@@ -21,7 +21,7 @@ from intent_engineering.cli.connectors import (
     connector_catalog,
     connectors_app,
 )
-from intent_engineering.cli.dev import dev_command
+from intent_engineering.cli.dev import dev_command, ensure_command
 from intent_engineering.cli.github import GitHubDoctorResult, check_github
 from intent_engineering.cli.intent_workflow import (
     bootstrap_command,
@@ -34,6 +34,7 @@ from intent_engineering.cli.runtime import (
     GitHubConfigurationError,
     Runtime,
     github_repository_scope,
+    load_readiness_runtime,
     load_runtime,
     new_run_id,
     parse_sources,
@@ -67,6 +68,8 @@ from intent_engineering.integrations.agent_host.advisory import (
     codex_prompt_output,
     parse_codex_prompt_event,
     parse_prompt_event,
+    readiness_prompt_route,
+    readiness_unavailable_prompt_route,
     repository_matches,
     unavailable_prompt_route,
 )
@@ -74,6 +77,12 @@ from intent_engineering.intent_workflow.onboarding import (
     OnboardingRuntime,
     OnboardingState,
     inspect_onboarding,
+)
+from intent_engineering.intent_workflow.readiness import (
+    EnsureRequest,
+    EnsureStatus,
+    ReadinessError,
+    ReadinessService,
 )
 from intent_engineering.reconcile import ResolutionUnavailable
 from intent_engineering.render import GraphRenderer, render_drift_report
@@ -100,6 +109,7 @@ app.add_typer(proposals_app, name="proposals")
 app.command("bootstrap")(bootstrap_command)
 app.command("onboard")(onboard_command)
 app.command("dev")(dev_command)
+app.command("ensure")(ensure_command)
 
 _MAX_PROMPT_HOOK_BYTES = 64 * 1024
 
@@ -119,6 +129,42 @@ def _prompt_hook_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
             raise ValueError("invalid advisory prompt event")
         result[key] = value
     return result
+
+
+def _onboarding_prompt_route() -> PromptRoute:
+    """Return the established no-write offer for an uninitialized repository."""
+    return PromptRoute(
+        action="offer_onboarding",
+        message=(
+            "This repository has not been onboarded into Intent Engineering. "
+            "Start guided onboarding now?"
+        ),
+        mcp_tool=None,
+        arguments={},
+    )
+
+
+def _prompt_readiness_route(project: Path) -> PromptRoute | None:
+    """Return a fixed blocking route unless a no-recovery readiness snapshot is ready."""
+    runtime = None
+    try:
+        runtime = load_readiness_runtime(project)
+    except ProjectNotInitialized:
+        if (project / ".intent").exists():
+            return readiness_unavailable_prompt_route()
+        return _onboarding_prompt_route()
+    except Exception:  # noqa: BLE001 - readiness errors must block implementation
+        return readiness_unavailable_prompt_route()
+    try:
+        result = ReadinessService(runtime).ensure(EnsureRequest())
+    except ReadinessError:
+        return readiness_unavailable_prompt_route()
+    finally:
+        if runtime is not None:
+            runtime.close()
+    if result.status is EnsureStatus.READY:
+        return None
+    return readiness_prompt_route(result)
 
 
 @app.command("agent-prompt-hook", hidden=True)
@@ -154,51 +200,39 @@ def agent_prompt_hook_command() -> None:
             codex_event = parse_codex_prompt_event(parsed)
             if not repository_matches(current, codex_event.cwd):
                 raise ValueError("advisory repository mismatch")
-            try:
-                runtime = load_runtime(Path.cwd())
-            except ProjectNotInitialized:
-                if (Path.cwd() / ".intent").exists():
-                    raise
-                route = PromptRoute(
-                    action="offer_onboarding",
-                    message=(
-                        "This repository has not been onboarded into Intent Engineering. "
-                        "Start guided onboarding now?"
-                    ),
-                    mcp_tool=None,
-                    arguments={},
-                )
+            route = _prompt_readiness_route(Path.cwd())
+            if route is None:
+                try:
+                    runtime = load_runtime(Path.cwd())
+                except Exception:  # noqa: BLE001 - a post-readiness race must block work
+                    route = readiness_unavailable_prompt_route()
+                else:
+                    event = PromptEvent(
+                        session_id=codex_event.session_id,
+                        turn_id=codex_event.turn_id,
+                        repository=codex_event.cwd,
+                        actor=runtime.config.local_actor,
+                        prompt=codex_event.prompt,
+                        created_at=datetime.now(UTC),
+                    )
+                    route = AdvisoryPromptRouter(runtime).route(event)
             else:
-                event = PromptEvent(
-                    session_id=codex_event.session_id,
-                    turn_id=codex_event.turn_id,
-                    repository=codex_event.cwd,
-                    actor=runtime.config.local_actor,
-                    prompt=codex_event.prompt,
-                    created_at=datetime.now(UTC),
-                )
-                route = AdvisoryPromptRouter(runtime).route(event)
+                event = None
             output = codex_prompt_output(codex_prompt_context(route))
         else:
             event = parse_prompt_event(parsed)
             if not repository_matches(current, event.repository):
                 raise ValueError("advisory repository mismatch")
-            try:
-                runtime = load_runtime(Path.cwd())
-            except ProjectNotInitialized:
-                if (Path.cwd() / ".intent").exists():
-                    raise
-                route = PromptRoute(
-                    action="offer_onboarding",
-                    message=(
-                        "This repository has not been onboarded into Intent Engineering. "
-                        "Start guided onboarding now?"
-                    ),
-                    mcp_tool=None,
-                    arguments={},
-                )
+            route = _prompt_readiness_route(Path.cwd())
+            if route is None:
+                try:
+                    runtime = load_runtime(Path.cwd())
+                except Exception:  # noqa: BLE001 - a post-readiness race must block work
+                    route = readiness_unavailable_prompt_route()
+                else:
+                    route = AdvisoryPromptRouter(runtime).route(event)
             else:
-                route = AdvisoryPromptRouter(runtime).route(event)
+                event = None
         ok = True
     except Exception:  # noqa: BLE001 - one fixed prompt-hook denial
         if official:
@@ -212,6 +246,8 @@ def agent_prompt_hook_command() -> None:
         caught.__context__ = None
         signal = caught
     finally:
+        if runtime is not None:
+            runtime.close()
         if current is not None:
             current.close()
         raw = None
@@ -439,6 +475,9 @@ def mcp_command(
     project: Path = typer.Option(Path("."), "--project"),
 ) -> None:
     """Serve authorized local Intent context over the protocol-clean MCP stdio transport."""
+    if not (project / ".intent").exists():
+        typer.echo("intent error: MCP server failed", err=True)
+        raise typer.Exit(1) from None
     from intent_engineering.integrations.mcp_server import run_stdio
 
     abort: BaseException | None = None

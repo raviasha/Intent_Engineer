@@ -8,6 +8,7 @@ import re
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, cast
 
 import anyio
@@ -42,11 +43,19 @@ from intent_engineering.core.policy.access import refs_allowed
 from intent_engineering.core.policy.project import ProjectNotInitialized, workspace_path
 from intent_engineering.extract.deterministic import DeterministicReasoner
 from intent_engineering.intent_workflow.assurance import AssuranceService
-from intent_engineering.intent_workflow.proposal_store import IntentProposalStore
+from intent_engineering.intent_workflow.models import (
+    ClarificationEvent,
+    IntentProposal,
+    ProposalDecisionRecord,
+)
+from intent_engineering.intent_workflow.proposal_store import (
+    IntentProposalStore,
+    parse_intent_ledger,
+)
 from intent_engineering.reconcile import LocalResolutionService
 from intent_engineering.reconcile.evidence_detection import detect_evidence_drift
 from intent_engineering.storage.executor import LocalChangeSetExecutor
-from intent_engineering.storage.jsonl.case_store import JsonlCaseStore
+from intent_engineering.storage.jsonl.case_store import JsonlCaseStore, parse_case_versions
 from intent_engineering.storage.jsonl.evidence_store import JsonlEvidenceStore
 from intent_engineering.storage.secure import (
     SecureDirectory,
@@ -55,7 +64,7 @@ from intent_engineering.storage.secure import (
 )
 from intent_engineering.storage.transaction import LocalTransactionCoordinator
 from intent_engineering.storage.yaml.checkpoint_store import YamlCheckpointStore
-from intent_engineering.storage.yaml.graph_store import YamlGraphStore
+from intent_engineering.storage.yaml.graph_store import YamlGraphStore, parse_graph
 from intent_engineering.sync import SyncOrchestrator
 from intent_engineering.sync.models import SyncRunResult
 
@@ -220,6 +229,152 @@ class Runtime:
         self.transactions.close()
         self.workspace_directory.close()
         self.project_directory.close()
+
+
+@dataclass(frozen=True)
+class _ReadinessSnapshot:
+    """One raw, no-write read of every readiness input."""
+
+    config: bytes
+    graph: bytes
+    cases: bytes | None
+    intent_proposals: bytes | None
+    journal: bytes | None
+
+
+@dataclass(frozen=True)
+class _ReadinessGraphStore:
+    """Detached graph reader backed only by one validated readiness snapshot."""
+
+    graph: Graph
+
+    def load(self) -> Graph:
+        return self.graph
+
+
+@dataclass(frozen=True)
+class _ReadinessProposalStore:
+    """Detached proposal reader backed only by one validated readiness snapshot."""
+
+    proposals: tuple[IntentProposal, ...]
+    decisions: Mapping[str, ProposalDecisionRecord]
+    events: tuple[ClarificationEvent, ...]
+
+    def list(self) -> tuple[IntentProposal, ...]:
+        return self.proposals
+
+    def decision_for(self, proposal_id: str) -> ProposalDecisionRecord | None:
+        return self.decisions.get(proposal_id)
+
+    def clarification_events(self) -> tuple[ClarificationEvent, ...]:
+        return self.events
+
+
+@dataclass(frozen=True)
+class ReadinessRuntime:
+    """Detached coherent snapshot used by the read-only readiness gate."""
+
+    graph_store: _ReadinessGraphStore
+    intent_proposals: _ReadinessProposalStore
+    case_items: tuple[ReconciliationCase, ...]
+
+    def cases(self) -> tuple[ReconciliationCase, ...]:
+        return self.case_items
+
+    def close(self) -> None:
+        """Match the ordinary runtime lifecycle; detached snapshots own no descriptors."""
+
+
+def _read_readiness_file(
+    workspace_directory: SecureDirectory,
+    relative_path: str,
+    *,
+    optional: bool = False,
+) -> bytes | None:
+    secure_file = workspace_directory.file(relative_path)
+    try:
+        return secure_file.read_optional() if optional else secure_file.read_bytes()
+    finally:
+        secure_file.close()
+
+
+def _capture_readiness_snapshot(
+    workspace_directory: SecureDirectory,
+) -> _ReadinessSnapshot:
+    """Read all readiness inputs once without recovery, locking, or local writes."""
+    config = _read_readiness_file(workspace_directory, "config.yaml")
+    if config is None:  # pragma: no cover - required file invariant
+        raise ValueError("project configuration is unavailable")
+    loaded = yaml.safe_load(config.decode("utf-8"))
+    if not isinstance(loaded, dict):
+        raise TypeError("project configuration is invalid")
+    project_config = ProjectConfig.model_validate_json(
+        json.dumps(cast(dict[str, Any], loaded), ensure_ascii=False, separators=(",", ":"))
+    )
+    graph_relative = configured_graph_relative(project_config.graph_path).as_posix()
+    graph = _read_readiness_file(workspace_directory, graph_relative)
+    if graph is None:  # pragma: no cover - required file invariant
+        raise ValueError("graph is unavailable")
+    return _ReadinessSnapshot(
+        config=config,
+        graph=graph,
+        cases=_read_readiness_file(
+            workspace_directory, "reconciliation/cases.jsonl", optional=True
+        ),
+        intent_proposals=_read_readiness_file(
+            workspace_directory,
+            "history/intent-proposals.jsonl",
+            optional=True,
+        ),
+        journal=_read_readiness_file(
+            workspace_directory,
+            "history/.local-transaction.json",
+            optional=True,
+        ),
+    )
+
+
+def load_readiness_runtime(root: Path) -> ReadinessRuntime:
+    """Return a stable no-write snapshot or fail closed when local state changes."""
+    project_directory: SecureDirectory | None = None
+    workspace_directory: SecureDirectory | None = None
+    snapshot: _ReadinessSnapshot | None = None
+    try:
+        root = Path(os.path.abspath(root))
+        try:
+            project_directory = SecureDirectory.open(root)
+            workspace_directory = project_directory.subdirectory(".intent")
+        except UnsafePathError as error:
+            raise ProjectNotInitialized("local project is not initialized") from error
+        for _ in range(2):
+            first = _capture_readiness_snapshot(workspace_directory)
+            second = _capture_readiness_snapshot(workspace_directory)
+            if first.journal is not None or second.journal is not None:
+                raise ValueError("unrecovered local transaction")
+            if first == second:
+                snapshot = second
+                break
+        if snapshot is None:
+            raise ValueError("unstable readiness snapshot")
+        graph = parse_graph(snapshot.graph)
+        latest_cases = {case.id: case for case in parse_case_versions(snapshot.cases)}
+        ledger = parse_intent_ledger(snapshot.intent_proposals or b"")
+        if ledger is None:
+            raise ValueError("intent proposal ledger is invalid")
+        return ReadinessRuntime(
+            graph_store=_ReadinessGraphStore(graph),
+            intent_proposals=_ReadinessProposalStore(
+                proposals=tuple(ledger.proposals.values()),
+                decisions=MappingProxyType(ledger.decisions),
+                events=ledger.clarification_events,
+            ),
+            case_items=tuple(sorted(latest_cases.values(), key=lambda case: case.id)),
+        )
+    finally:
+        if workspace_directory is not None:
+            workspace_directory.close()
+        if project_directory is not None:
+            project_directory.close()
 
 
 def load_runtime(root: Path) -> Runtime:

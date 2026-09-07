@@ -11,6 +11,7 @@ import structlog
 from pydantic import ValidationError
 from typer.testing import CliRunner
 
+import intent_engineering.cli.app as app_module
 import intent_engineering.integrations.agent_host.advisory as advisory_module
 from intent_engineering.cli.app import app
 from intent_engineering.cli.runtime import load_runtime
@@ -21,10 +22,18 @@ from intent_engineering.integrations.agent_host.advisory import (
     AdvisoryPromptRouter,
     PromptEvent,
     PromptRoute,
+    codex_prompt_context,
     parse_codex_prompt_event,
     parse_prompt_event,
+    readiness_prompt_route,
 )
 from intent_engineering.intent_workflow.conversation import ConversationCapture
+from intent_engineering.intent_workflow.readiness import (
+    EnsureRequest,
+    EnsureResult,
+    EnsureStatus,
+    ReadinessTarget,
+)
 
 NOW = datetime(2026, 8, 28, 12, 0, tzinfo=UTC)
 OFFER = (
@@ -107,6 +116,72 @@ def test_uninitialized_repository_returns_onboarding_offer_without_writes(
     assert route.mcp_tool is None
     assert route.arguments == {}
     assert _durable_bytes(project) == before
+
+
+def test_readiness_attention_routes_to_a_fixed_human_review_instruction() -> None:
+    """Catches open intent review work being bypassed by an advisory prompt hook."""
+    route = readiness_prompt_route(
+        EnsureResult(
+            status=EnsureStatus.HUMAN_ATTENTION_REQUIRED,
+            attention_route=ReadinessTarget.INBOX,
+            graph_version=7,
+            pending_proposal_ids=("proposal:private",),
+            open_case_ids=("case:private",),
+        )
+    )
+
+    assert route == PromptRoute(
+        action="human_attention_required",
+        message=(
+            "Intent Engineering requires human review in the local Inbox before "
+            "implementation. Do not implement or resolve the intent work automatically."
+        ),
+        mcp_tool=None,
+        arguments={},
+    )
+    rendered = route.model_dump_json()
+    assert "proposal:private" not in rendered
+    assert "case:private" not in rendered
+
+
+def test_readiness_onboarding_reuses_the_guided_onboarding_offer() -> None:
+    """Catches the first-prompt readiness gate giving a different onboarding journey."""
+    route = readiness_prompt_route(
+        EnsureResult(
+            status=EnsureStatus.ONBOARDING_REQUIRED,
+            attention_route=ReadinessTarget.ONBOARDING,
+            graph_version=0,
+            pending_proposal_ids=(),
+            open_case_ids=(),
+        )
+    )
+
+    assert route.action == "offer_onboarding"
+    assert route.message == OFFER
+    assert route.mcp_tool is None
+    assert route.arguments == {}
+
+
+def test_readiness_state_failure_blocks_implementation_in_official_hook_context() -> None:
+    """Catches an invalid future readiness result degrading to bare advisory fallback."""
+    route = readiness_prompt_route(
+        EnsureResult(
+            status=EnsureStatus.SHARED_STATE_INVALID,
+            attention_route=ReadinessTarget.TEAM_STATE,
+            graph_version=0,
+            pending_proposal_ids=(),
+            open_case_ids=(),
+        )
+    )
+
+    assert route.action == "human_attention_required"
+    assert route.mcp_tool is None
+    assert route.arguments == {}
+    assert codex_prompt_context(route) == (
+        "action=human_attention_required. Intent Engineering cannot verify local readiness. "
+        "Do not implement or resolve governed intent work automatically. Review local Intent "
+        "state before continuing."
+    )
 
 
 def test_initialized_repository_routes_once_to_public_preflight(tmp_path: Path) -> None:
@@ -693,6 +768,55 @@ def test_hidden_cli_reads_one_bounded_object_and_emits_fixed_secret_free_denial(
     oversized = runner.invoke(app, ["agent-prompt-hook"], input="x" * 70_000)
     assert oversized.exit_code == 1
     assert "x" * 64 not in oversized.stdout + oversized.stderr
+
+
+def test_hidden_cli_blocks_prompt_capture_when_readiness_needs_human_review(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
+) -> None:
+    """Catches the developer preset classifying a prompt before an existing review gate."""
+    structlog.reset_defaults()
+    request.addfinalizer(structlog.reset_defaults)
+    monkeypatch.setattr("intent_engineering.cli.app._configure_logging", lambda: None)
+    project = tmp_path / "project"
+    project.mkdir()
+    runtime = _ready_runtime(project)
+    runtime.close()
+    before = _durable_bytes(project)
+    calls: list[EnsureRequest] = []
+
+    class AttentionReadinessService:
+        def __init__(self, _runtime: object) -> None:
+            pass
+
+        def ensure(self, request_value: EnsureRequest) -> EnsureResult:
+            calls.append(request_value)
+            return EnsureResult(
+                status=EnsureStatus.HUMAN_ATTENTION_REQUIRED,
+                attention_route=ReadinessTarget.INBOX,
+                graph_version=1,
+                pending_proposal_ids=(),
+                open_case_ids=("case:private",),
+            )
+
+    monkeypatch.setattr(app_module, "ReadinessService", AttentionReadinessService, raising=False)
+    monkeypatch.chdir(project)
+
+    result = CliRunner().invoke(app, ["agent-prompt-hook"], input=_event(project).model_dump_json())
+
+    assert result.exit_code == 0
+    assert json.loads(result.stdout) == PromptRoute(
+        action="human_attention_required",
+        message=(
+            "Intent Engineering requires human review in the local Inbox before "
+            "implementation. Do not implement or resolve the intent work automatically."
+        ),
+        mcp_tool=None,
+        arguments={},
+    ).model_dump(mode="json")
+    assert calls == [EnsureRequest()]
+    assert _durable_bytes(project) == before
 
 
 def test_hidden_cli_leaves_structlog_usable_for_later_library_calls(capsys) -> None:

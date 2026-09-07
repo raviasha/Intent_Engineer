@@ -35,7 +35,8 @@ from intent_engineering.cli.intent_workflow import (
     _canonical_scope,
     _provision_local_clarification_policy,
 )
-from intent_engineering.cli.runtime import Runtime, load_runtime
+from intent_engineering.cli.output import OutputFormat, emit
+from intent_engineering.cli.runtime import Runtime, load_readiness_runtime, load_runtime
 from intent_engineering.control_plane import (
     ControlPlaneService,
     build_control_plane_app,
@@ -53,6 +54,15 @@ from intent_engineering.intent_workflow.onboarding import (
     OnboardingRuntime,
     OnboardingState,
     inspect_onboarding,
+)
+from intent_engineering.intent_workflow.readiness import (
+    EnsurePreset,
+    EnsureRequest,
+    EnsureResult,
+    EnsureStatus,
+    ReadinessError,
+    ReadinessService,
+    ReadinessTarget,
 )
 from intent_engineering.storage._atomic import same_path_lock
 from intent_engineering.storage.secure import SecureDirectory, SecureFile, UnsafePathError
@@ -893,6 +903,54 @@ def _run_with_repository_lease(
             target.close()
         if workspace_directory is not None:
             workspace_directory.close()
+
+
+def ensure_command(
+    project: Path = typer.Option(Path("."), "--project"),
+    preset: EnsurePreset = typer.Option(EnsurePreset.DEVELOPER, "--preset"),
+    output_format: OutputFormat = typer.Option(OutputFormat.TEXT, "--format"),
+) -> None:
+    """Return a bounded readiness result without initializing or approving state."""
+    root = Path(os.path.abspath(project))
+    if not (root / ".intent").exists():
+        emit(
+            EnsureResult(
+                status=EnsureStatus.ONBOARDING_REQUIRED,
+                attention_route=ReadinessTarget.ONBOARDING,
+                graph_version=0,
+                pending_proposal_ids=(),
+                open_case_ids=(),
+            ),
+            output_format,
+        )
+        return
+    try:
+        runtime = load_readiness_runtime(root)
+    except Exception:  # noqa: BLE001 - fixed secret-free readiness result
+        emit(
+            EnsureResult(
+                status=EnsureStatus.SHARED_STATE_INVALID,
+                attention_route=ReadinessTarget.TEAM_STATE,
+                graph_version=0,
+                pending_proposal_ids=(),
+                open_case_ids=(),
+            ),
+            output_format,
+        )
+        return
+    try:
+        result = ReadinessService(runtime).ensure(EnsureRequest(preset=preset))
+    except ReadinessError:
+        result = EnsureResult(
+            status=EnsureStatus.SHARED_STATE_INVALID,
+            attention_route=ReadinessTarget.TEAM_STATE,
+            graph_version=0,
+            pending_proposal_ids=(),
+            open_case_ids=(),
+        )
+    finally:
+        runtime.close()
+    emit(result, output_format)
 
 
 def dev_command(
