@@ -21,6 +21,7 @@ from intent_engineering.validation import validate_project
 from tests.helpers.shared_state import (
     artifacts,
     canonical_files,
+    git,
     init_repository,
     install_state_ref,
     keys,
@@ -398,3 +399,148 @@ def test_restore_recovers_the_existing_runtime_journal_before_replacement(tmp_pa
     assert result.status is SharedStateRestoreStatus.VERIFIED
     assert validate_project(target).valid
     assert not (target / ".intent/history/.local-transaction.json").exists()
+
+
+def test_authentic_cache_advances_across_two_skipped_signed_releases(tmp_path: Path) -> None:
+    """Catches ancestry validation accepting only the tip's immediate parent."""
+    source = _approved_source(tmp_path)
+    target = init_repository(tmp_path / "target" / "project")
+    recipient, signer, trust = keys()
+    files = canonical_files(source)
+    release_a = artifacts(files, recipient, signer)
+    commit_a = install_state_ref(target, release_a)
+    restorer = GitSharedStateRestorer(StaticTrustProvider(trust))
+    assert (
+        restorer.verify_and_restore_approved_baseline(target).status
+        is SharedStateRestoreStatus.VERIFIED
+    )
+    release_b = artifacts(
+        files,
+        recipient,
+        signer,
+        parent_bundle_digest=json.loads(release_a.manifest)["bundle_digest"],
+    )
+    commit_b = install_state_ref(target, release_b, parent=commit_a)
+    release_c = artifacts(
+        files,
+        recipient,
+        signer,
+        parent_bundle_digest=json.loads(release_b.manifest)["bundle_digest"],
+    )
+    commit_c = install_state_ref(target, release_c, parent=commit_b)
+
+    result = restorer.verify_and_restore_approved_baseline(target)
+
+    assert result.status is SharedStateRestoreStatus.VERIFIED
+    marker = json.loads((target / ".intent/cache/shared-state.json").read_bytes())
+    assert marker["ref_commit"] == commit_c
+    assert marker["bundle_digest"] == json.loads(release_c.manifest)["bundle_digest"]
+
+
+def test_skipped_release_fails_closed_when_an_intermediate_signature_is_invalid(
+    tmp_path: Path,
+) -> None:
+    """Catches traversal trusting an intermediate parent link before its signature."""
+    source = _approved_source(tmp_path)
+    target = init_repository(tmp_path / "target" / "project")
+    recipient, signer, trust = keys()
+    files = canonical_files(source)
+    release_a = artifacts(files, recipient, signer)
+    commit_a = install_state_ref(target, release_a)
+    restorer = GitSharedStateRestorer(StaticTrustProvider(trust))
+    assert (
+        restorer.verify_and_restore_approved_baseline(target).status
+        is SharedStateRestoreStatus.VERIFIED
+    )
+    before = _state_snapshot(target)
+    release_b = artifacts(
+        files,
+        recipient,
+        signer,
+        parent_bundle_digest=json.loads(release_a.manifest)["bundle_digest"],
+    )
+    signature = json.loads(release_b.signatures)
+    signature["signatures"][0]["signature"] = (
+        "A" if signature["signatures"][0]["signature"][0] != "A" else "B"
+    ) + signature["signatures"][0]["signature"][1:]
+    release_b = replace(release_b, signatures=_canonical(signature))
+    commit_b = install_state_ref(target, release_b, parent=commit_a)
+    release_c = artifacts(
+        files,
+        recipient,
+        signer,
+        parent_bundle_digest=json.loads(release_b.manifest)["bundle_digest"],
+    )
+    install_state_ref(target, release_c, parent=commit_b)
+
+    result = restorer.verify_and_restore_approved_baseline(target)
+
+    assert result.status is SharedStateRestoreStatus.INVALID
+    assert _state_snapshot(target) == before
+
+
+def test_divergent_signed_fork_and_rollback_to_an_older_tip_remain_stale(tmp_path: Path) -> None:
+    """Catches any authentic release being accepted without descending from the cache."""
+    source = _approved_source(tmp_path)
+    target = init_repository(tmp_path / "target" / "project")
+    recipient, signer, trust = keys()
+    files = canonical_files(source)
+    release_a = artifacts(files, recipient, signer)
+    commit_a = install_state_ref(target, release_a)
+    release_b = artifacts(
+        files,
+        recipient,
+        signer,
+        parent_bundle_digest=json.loads(release_a.manifest)["bundle_digest"],
+    )
+    install_state_ref(target, release_b, parent=commit_a)
+    restorer = GitSharedStateRestorer(StaticTrustProvider(trust))
+    assert (
+        restorer.verify_and_restore_approved_baseline(target).status
+        is SharedStateRestoreStatus.VERIFIED
+    )
+    before = _state_snapshot(target)
+
+    git(target, "update-ref", "refs/remotes/origin/intent-state", commit_a)
+    rollback = restorer.verify_and_restore_approved_baseline(target)
+
+    assert rollback.status is SharedStateRestoreStatus.STALE
+    assert _state_snapshot(target) == before
+
+    release_fork = artifacts(
+        files,
+        recipient,
+        signer,
+        parent_bundle_digest=json.loads(release_a.manifest)["bundle_digest"],
+    )
+    install_state_ref(target, release_fork, parent=commit_a)
+    divergence = restorer.verify_and_restore_approved_baseline(target)
+
+    assert divergence.status is SharedStateRestoreStatus.STALE
+    assert _state_snapshot(target) == before
+
+
+def test_fresh_restore_rejects_signed_history_beyond_the_fixed_bound(tmp_path: Path) -> None:
+    """Catches unbounded ancestry walks over attacker-amplified Git history."""
+    source = _approved_source(tmp_path)
+    target = init_repository(tmp_path / "target" / "project")
+    recipient, signer, trust = keys()
+    files = canonical_files(source)
+    parent_digest: str | None = None
+    parent_commit: str | None = None
+    for _ in range(65):
+        release = artifacts(
+            files,
+            recipient,
+            signer,
+            parent_bundle_digest=parent_digest,
+        )
+        parent_commit = install_state_ref(target, release, parent=parent_commit)
+        parent_digest = json.loads(release.manifest)["bundle_digest"]
+
+    result = GitSharedStateRestorer(
+        StaticTrustProvider(trust)
+    ).verify_and_restore_approved_baseline(target)
+
+    assert result.status is SharedStateRestoreStatus.STALE
+    assert not (target / ".intent").exists()

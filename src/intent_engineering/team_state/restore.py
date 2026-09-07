@@ -71,6 +71,7 @@ MAX_STATE_FILES = 32
 MAX_TRUST_BYTES = 32 * 1024
 MAX_GIT_TEXT_BYTES = 4096
 MAX_CLOCK_SKEW = timedelta(minutes=5)
+MAX_ANCESTRY_COMMITS = 64
 
 CANONICAL_STATE_PATHS = (
     "approvals/approvals.jsonl",
@@ -775,6 +776,106 @@ class _GitRefReader:
         return content
 
 
+@dataclass(frozen=True)
+class _VerifiedRelease:
+    manifest: SharedStateManifest
+
+
+def _release_name(manifest: SharedStateManifest) -> str:
+    digest_hex = manifest.bundle_digest.removeprefix("sha256:")
+    return f"{manifest.graph_version}-{digest_hex}"
+
+
+def _verify_release_manifest(
+    reader: _GitRefReader,
+    commit: str,
+    trust: SharedStateTrust,
+    now: datetime,
+) -> _VerifiedRelease:
+    manifest_bytes = reader.blob(commit, "manifest.json", MAX_MANIFEST_BYTES)
+    parsed = _parse_canonical_model(
+        manifest_bytes,
+        SharedStateManifest,
+        MAX_MANIFEST_BYTES,
+    )
+    assert isinstance(parsed, SharedStateManifest)
+    if parsed.project_id != trust.project_id or parsed.repository_id != trust.repository_id:
+        raise ValueError("shared-state identity mismatch")
+    if parsed.created_at > now + MAX_CLOCK_SKEW:
+        raise ValueError("invalid shared-state time")
+    signature_bytes = reader.blob(
+        commit,
+        f"signatures/{_release_name(parsed)}.json",
+        MAX_SIGNATURE_BYTES,
+    )
+    signature_envelope = _parse_canonical_model(
+        signature_bytes,
+        StateSignatureEnvelope,
+        MAX_SIGNATURE_BYTES,
+    )
+    assert isinstance(signature_envelope, StateSignatureEnvelope)
+    if (
+        signature_envelope.manifest_digest != _digest(manifest_bytes)
+        or signature_envelope.bundle_digest != parsed.bundle_digest
+        or tuple(item.signature_id for item in signature_envelope.signatures)
+        != parsed.required_signature_ids
+    ):
+        raise ValueError("shared-state signatures mismatch")
+    trusted = {item.signature_id: item.public_key for item in trust.signing_keys}
+    if tuple(sorted(trusted)) != parsed.required_signature_ids:
+        raise ValueError("shared-state signer policy mismatch")
+    signed = _canonical_json(
+        {
+            "schema_version": 1,
+            "manifest_digest": _digest(manifest_bytes),
+            "bundle_digest": parsed.bundle_digest,
+        }
+    )
+    for signature in signature_envelope.signatures:
+        Ed25519PublicKey.from_public_bytes(trusted[signature.signature_id]).verify(
+            _b64decode(signature.signature, expected_size=64),
+            signed,
+        )
+    return _VerifiedRelease(parsed)
+
+
+def _verify_release_lineage(
+    reader: _GitRefReader,
+    tip_commit: str,
+    trust: SharedStateTrust,
+    now: datetime,
+    marker: Mapping[str, object] | None,
+) -> _VerifiedRelease:
+    """Authenticate a bounded first-parent chain to the cached release or genesis."""
+    commit = tip_commit
+    expected_digest: str | None = None
+    tip: _VerifiedRelease | None = None
+    for _depth in range(MAX_ANCESTRY_COMMITS):
+        release = _verify_release_manifest(reader, commit, trust, now)
+        if tip is None:
+            tip = release
+        if expected_digest is not None and release.manifest.bundle_digest != expected_digest:
+            raise _Stale("divergent shared-state lineage")
+        if (
+            marker is not None
+            and marker["bundle_digest"] == release.manifest.bundle_digest
+            and marker["ref_commit"] == commit
+        ):
+            return tip
+        parents = reader.parents(commit)
+        if not parents:
+            if release.manifest.parent_bundle_digest is not None:
+                raise _Stale("invalid shared-state genesis")
+            if marker is not None:
+                raise _Stale("local shared-state lineage diverged")
+            return tip
+        if release.manifest.parent_bundle_digest is None:
+            raise _Stale("invalid shared-state parent")
+        expected_digest = release.manifest.parent_bundle_digest
+        commit = parents[0]
+    raise _Stale("shared-state history exceeds traversal bound")
+
+
 def _marker_bytes(manifest: SharedStateManifest, commit: str) -> bytes:
     return _canonical_json(
         {
@@ -1017,84 +1118,16 @@ class GitSharedStateRestorer:
                 raise ValueError("repository identity mismatch")
             reader = _GitRefReader(root)
             commit = reader.commit()
-            manifest_bytes = reader.blob(commit, "manifest.json", MAX_MANIFEST_BYTES)
-            manifest = _parse_canonical_model(
-                manifest_bytes,
-                SharedStateManifest,
-                MAX_MANIFEST_BYTES,
-            )
-            assert isinstance(manifest, SharedStateManifest)
-            if (
-                manifest.project_id != trust.project_id
-                or manifest.repository_id != trust.repository_id
-            ):
-                raise ValueError("shared-state identity mismatch")
             now = self._clock()
-            if (
-                now.tzinfo is None
-                or now.utcoffset() != timedelta(0)
-                or manifest.created_at > now + MAX_CLOCK_SKEW
-            ):
+            if now.tzinfo is None or now.utcoffset() != timedelta(0):
                 raise ValueError("invalid shared-state time")
-            parents = reader.parents(commit)
-            if not parents:
-                if manifest.parent_bundle_digest is not None:
-                    raise _Stale("invalid shared-state genesis")
-            else:
-                parent_bytes = reader.blob(parents[0], "manifest.json", MAX_MANIFEST_BYTES)
-                parent_manifest = _parse_canonical_model(
-                    parent_bytes,
-                    SharedStateManifest,
-                    MAX_MANIFEST_BYTES,
-                )
-                assert isinstance(parent_manifest, SharedStateManifest)
-                if manifest.parent_bundle_digest != parent_manifest.bundle_digest:
-                    raise _Stale("divergent shared-state lineage")
             marker = _read_local_marker(root)
-            if (
-                marker is not None
-                and marker["bundle_digest"] != manifest.bundle_digest
-                and marker["bundle_digest"] != manifest.parent_bundle_digest
-            ):
-                raise _Stale("local shared-state lineage diverged")
-            digest_hex = manifest.bundle_digest.removeprefix("sha256:")
-            name = f"{manifest.graph_version}-{digest_hex}"
+            tip = _verify_release_lineage(reader, commit, trust, now, marker)
+            manifest = tip.manifest
+            name = _release_name(manifest)
             bundle = reader.blob(commit, f"bundles/{name}.intent", MAX_BUNDLE_BYTES)
             if len(bundle) != manifest.bundle_size or _digest(bundle) != manifest.bundle_digest:
                 raise ValueError("shared-state bundle mismatch")
-            signature_bytes = reader.blob(
-                commit,
-                f"signatures/{name}.json",
-                MAX_SIGNATURE_BYTES,
-            )
-            signature_envelope = _parse_canonical_model(
-                signature_bytes,
-                StateSignatureEnvelope,
-                MAX_SIGNATURE_BYTES,
-            )
-            assert isinstance(signature_envelope, StateSignatureEnvelope)
-            if (
-                signature_envelope.manifest_digest != _digest(manifest_bytes)
-                or signature_envelope.bundle_digest != manifest.bundle_digest
-                or tuple(item.signature_id for item in signature_envelope.signatures)
-                != manifest.required_signature_ids
-            ):
-                raise ValueError("shared-state signatures mismatch")
-            trusted = {item.signature_id: item.public_key for item in trust.signing_keys}
-            if tuple(sorted(trusted)) != manifest.required_signature_ids:
-                raise ValueError("shared-state signer policy mismatch")
-            signed = _canonical_json(
-                {
-                    "schema_version": 1,
-                    "manifest_digest": _digest(manifest_bytes),
-                    "bundle_digest": manifest.bundle_digest,
-                }
-            )
-            for signature in signature_envelope.signatures:
-                Ed25519PublicKey.from_public_bytes(trusted[signature.signature_id]).verify(
-                    _b64decode(signature.signature, expected_size=64),
-                    signed,
-                )
             bundle_model = _parse_canonical_model(
                 bundle,
                 EncryptedStateBundle,
