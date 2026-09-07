@@ -486,6 +486,7 @@ def check_command(
     require_review: bool = typer.Option(False, "--require-review"),
     sources: str = typer.Option("markdown,git", "--sources"),
     test_results: Path | None = typer.Option(None, "--test-results"),
+    run_test: str | None = typer.Option(None, "--run-test"),
     output_format: OutputFormat = typer.Option(OutputFormat.JSON, "--format"),
 ) -> None:
     """Run readiness, capture, validation, assurance, and bounded drift reporting."""
@@ -503,6 +504,7 @@ def check_command(
                 require_review=require_review,
                 sources=parse_sources(sources),
                 test_results=test_results,
+                run_test=run_test,
             )
         )
 

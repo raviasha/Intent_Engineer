@@ -54,7 +54,8 @@ def _safe_relative_path(value: str) -> PurePosixPath:
         raise ValueError("invalid reviewed test path")
     path = PurePosixPath(value)
     if (
-        path.is_absolute()
+        value != path.as_posix()
+        or path.is_absolute()
         or not path.parts
         or any(part in {"", ".", ".."} for part in path.parts)
         or path.parts[0].casefold() == "dev"

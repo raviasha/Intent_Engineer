@@ -45,6 +45,7 @@ class CheckReason(StrEnum):
     READINESS_REQUIRED = "readiness_required"
     TEST_RESULTS_REQUIRED = "test_results_required"
     TEST_RESULTS_INVALID = "test_results_invalid"
+    TEST_RUN_FAILED = "test_run_failed"
     CAPTURE_PARTIAL = "capture_partial"
     CAPTURE_FAILED = "capture_failed"
     VALIDATION_FAILED = "validation_failed"
@@ -205,6 +206,7 @@ class CheckRequest(_CheckModel):
     require_review: bool = False
     sources: tuple[str, ...] = ("markdown", "git")
     test_results: Path | None = None
+    run_test: str | None = None
 
     @field_validator("schema_version", mode="before")
     @classmethod
@@ -238,6 +240,19 @@ class CheckRequest(_CheckModel):
             raise ValueError("invalid test result path")
         return value
 
+    @field_validator("run_test")
+    @classmethod
+    def require_reviewed_command_id(cls, value: str | None) -> str | None:
+        if value is not None and re.fullmatch(r"test:sha256:[0-9a-f]{64}", value) is None:
+            raise ValueError("invalid reviewed test command id")
+        return value
+
+    @model_validator(mode="after")
+    def reject_ambiguous_test_execution(self) -> CheckRequest:
+        if self.run_test is not None and (self.ci or self.test_results is not None):
+            raise ValueError("reviewed test execution is incompatible with CI or result input")
+        return self
+
 
 class CheckResult(_CheckModel):
     """Bounded aggregate result with one stable exit-code selection."""
@@ -270,6 +285,8 @@ class CheckRuntime(Protocol):
     def read_test_results(self, path: Path) -> bytes: ...
 
     def current_revision(self) -> str: ...
+
+    async def run_reviewed_tests(self, command_id: str, *, at: datetime) -> TestResultArtifact: ...
 
     async def capture(
         self,
@@ -420,7 +437,28 @@ class CheckService:
                 1,
                 readiness=readiness.status,
             )
-        if request.test_results is not None:
+        if request.run_test is not None:
+            try:
+                now = self._clock()
+                executed = await self._runtime.run_reviewed_tests(request.run_test, at=now)
+                if type(executed) is not TestResultArtifact:
+                    raise ValueError("invalid reviewed test result")
+                artifact = validate_test_result_artifact(
+                    executed.canonical_bytes(),
+                    repository_id=self._runtime.repository_id,
+                    commit_sha=self._runtime.current_revision(),
+                    at=now,
+                    principals=self._runtime.principals,
+                )
+                evidence_id = artifact.evidence().id
+            except Exception:  # noqa: BLE001 - fixed explicit-test failure boundary
+                return self._result(
+                    CheckStatus.FAILED,
+                    CheckReason.TEST_RUN_FAILED,
+                    1,
+                    readiness=readiness.status,
+                )
+        elif request.test_results is not None:
             try:
                 artifact = self._parse_test_result(request.test_results)
                 evidence_id = artifact.evidence().id

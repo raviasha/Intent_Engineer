@@ -8,6 +8,7 @@ import re
 import subprocess
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, cast
@@ -52,6 +53,7 @@ from intent_engineering.intent_workflow.check import (
     SharedStateRestoreStatus,
     TestResultArtifact,
 )
+from intent_engineering.intent_workflow.dev_observer import DevObserver, TestRunStatus
 from intent_engineering.intent_workflow.models import (
     ClarificationEvent,
     IntentProposal,
@@ -607,6 +609,22 @@ class CheckRuntimeAdapter:
         if re.fullmatch(r"[0-9a-f]{40}(?:[0-9a-f]{24})?", revision) is None:
             raise ValueError("repository revision is unavailable")
         return revision
+
+    async def run_reviewed_tests(self, command_id: str, *, at: datetime) -> TestResultArtifact:
+        runtime = self._opened()
+        observer = DevObserver(
+            runtime.root,
+            runtime.config,
+            repository_id=self.repository_id,
+            principals=self.principals,
+        )
+        try:
+            result = await observer.run_reviewed_tests(command_id, at=at)
+        finally:
+            observer.close()
+        if result.status is not TestRunStatus.PASSED or result.artifact is None:
+            raise ValueError("reviewed test execution failed")
+        return result.artifact
 
     async def capture(
         self,

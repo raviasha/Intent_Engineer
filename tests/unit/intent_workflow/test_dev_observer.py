@@ -9,6 +9,7 @@ import anyio
 import pytest
 import yaml  # type: ignore[import-untyped]
 
+import intent_engineering.intent_workflow.dev_observer as observer_module
 from intent_engineering.cli.runtime import load_runtime
 from intent_engineering.control_plane.service import ControlPlaneService
 from intent_engineering.core.models import EvidenceRecord, ProjectConfig
@@ -81,6 +82,52 @@ def test_observer_rejects_a_git_worktree_owned_by_a_parent_repository(tmp_path: 
             repository_id=REPOSITORY_ID,
             principals=frozenset({"local:asha"}),
         )
+
+
+def test_git_observation_ignores_hostile_ambient_repository_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo, revision = _repo(tmp_path)
+    foreign = tmp_path / "foreign"
+    foreign.mkdir()
+    _git(foreign, "init", "-q")
+    monkeypatch.setenv("GIT_DIR", str(foreign / ".git"))
+    monkeypatch.setenv("GIT_WORK_TREE", str(foreign))
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(tmp_path / "hostile.gitconfig"))
+
+    result = _observer(repo).poll(at=NOW)
+
+    assert result.current_revision == revision
+
+
+def test_git_path_observation_fails_at_the_fixed_path_count_bound(tmp_path: Path) -> None:
+    repo, _revision = _repo(tmp_path)
+    observer = _observer(repo)
+    for index in range(4097):
+        (repo / f"untracked-{index:04d}").touch()
+
+    with pytest.raises(DevObserverError, match="development observation unavailable"):
+        observer.poll(at=NOW)
+
+
+def test_bounded_git_runner_stops_oversized_output_and_timeouts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake_git = tmp_path / "fake-git"
+    fake_git.write_text("#!/usr/bin/python3\nprint('x' * 70000)\n", encoding="utf-8")
+    fake_git.chmod(0o755)
+    monkeypatch.setattr(observer_module, "_GIT_EXECUTABLE", fake_git)
+    with pytest.raises(ValueError, match="oversized"):
+        observer_module._run_git_bounded(tmp_path, ("status",), max_bytes=1024)
+
+    fake_git.write_text(
+        "#!/usr/bin/python3\nimport pathlib,time\ntime.sleep(1)\npathlib.Path('late').touch()\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(observer_module, "GIT_TIMEOUT_SECONDS", 0.1)
+    with pytest.raises(TimeoutError, match="timed out"):
+        observer_module._run_git_bounded(tmp_path, ("status",), max_bytes=1024)
+    assert not (tmp_path / "late").exists()
 
 
 def test_poll_emits_only_evidence_candidates_for_git_changes_and_is_idempotent(
@@ -184,6 +231,29 @@ async def test_unreviewed_command_id_and_changed_executable_never_run(tmp_path: 
     assert unknown.status is TestRunStatus.REJECTED
     assert not (repo / "ran").exists()
 
+
+@pytest.mark.anyio
+async def test_executable_swap_during_launch_cannot_execute_unreviewed_bytes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo, _revision = _repo(tmp_path)
+    _runner(repo, "from pathlib import Path\nPath('reviewed').write_text('yes')\n")
+    observer = _observer(repo)
+    original_open_process = anyio.open_process
+
+    async def swap_then_open(*args: object, **kwargs: object) -> anyio.abc.Process:
+        _runner(repo, "from pathlib import Path\nPath('unreviewed').write_text('bad')\n")
+        return await original_open_process(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(observer_module.anyio, "open_process", swap_then_open)
+
+    result = await observer.run_reviewed_tests(observer.command_ids[0], at=NOW)
+
+    assert result.status is TestRunStatus.REJECTED
+    assert not (repo / "unreviewed").exists()
+    assert (repo / "reviewed").exists()
+    assert result.artifact is None
+
     _runner(repo, "from pathlib import Path\nPath('ran').write_text('changed')\n")
     changed = await observer.run_reviewed_tests(observer.command_ids[0], at=NOW)
     assert changed.status is TestRunStatus.REJECTED
@@ -214,6 +284,59 @@ async def test_output_limit_and_cancellation_clean_up_the_child(tmp_path: Path) 
     await anyio.sleep(0.1)
     assert (repo / "started").exists()
     assert not (repo / "finished").exists()
+
+
+@pytest.mark.anyio
+async def test_cancellation_kills_a_real_grandchild_process_tree(tmp_path: Path) -> None:
+    repo, _revision = _repo(tmp_path)
+    _runner(
+        repo,
+        "import pathlib, subprocess, time\n"
+        "subprocess.Popen(['/usr/bin/python3', '-c', "
+        "'import pathlib,signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+        'pathlib.Path("grandchild-started").touch(); time.sleep(1); '
+        'pathlib.Path("grandchild-finished").write_text("bad")\'])\n'
+        "pathlib.Path('parent-started').touch()\n"
+        "time.sleep(30)\n",
+    )
+    observer = _observer(repo)
+
+    with anyio.move_on_after(0.4) as scope:
+        await observer.run_reviewed_tests(observer.command_ids[0], at=NOW)
+
+    assert scope.cancel_called
+    assert (repo / "parent-started").exists()
+    assert (repo / "grandchild-started").exists()
+    await anyio.sleep(1)
+    assert not (repo / "grandchild-finished").exists()
+
+
+@pytest.mark.anyio
+async def test_missing_process_group_ownership_fails_closed_before_running_grandchild(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo, _revision = _repo(tmp_path)
+    _runner(
+        repo,
+        "import subprocess, time\n"
+        "subprocess.Popen(['/usr/bin/python3', '-c', "
+        '\'import pathlib,time; time.sleep(1); pathlib.Path("grandchild-finished").write_text("bad")\'])\n'
+        "time.sleep(30)\n",
+    )
+    observer = _observer(repo)
+    monkeypatch.setattr(
+        observer_module.os,
+        "killpg",
+        lambda _pid, _signal: (_ for _ in ()).throw(PermissionError()),
+    )
+
+    result = None
+    with anyio.move_on_after(0.2) as scope:
+        result = await observer.run_reviewed_tests(observer.command_ids[0], at=NOW)
+    await anyio.sleep(1.2)
+    assert not scope.cancel_called
+    assert result is not None and result.status is TestRunStatus.REJECTED
+    assert not (repo / "grandchild-finished").exists()
 
 
 @pytest.mark.anyio

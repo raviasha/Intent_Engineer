@@ -6,9 +6,12 @@ import hashlib
 import json
 import os
 import re
+import selectors
 import signal
 import stat
 import subprocess
+import tempfile
+import time
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -21,7 +24,6 @@ from anyio import BrokenResourceError, ClosedResourceError, EndOfStream
 from pydantic import ConfigDict, Field
 
 from intent_engineering.capture.base import RawSourceObject, normalize_raw_source
-from intent_engineering.capture.git.connector import run_git
 from intent_engineering.core.models import EvidenceRecord, JsonValue, ProjectConfig
 from intent_engineering.core.models._base import StrictModel
 from intent_engineering.intent_workflow.check import (
@@ -37,12 +39,68 @@ MAX_EXECUTABLE_BYTES = 16 * 1024 * 1024
 MAX_CHANGED_PATHS = 4096
 MAX_CHANGED_PATH_BYTES = 4096
 MAX_CHANGED_PATH_OUTPUT_BYTES = 1024 * 1024
+GIT_TIMEOUT_SECONDS = 5
 _REVISION = re.compile(r"^[0-9a-f]{40}(?:[0-9a-f]{24})?$")
+_GIT_EXECUTABLE = Path("/usr/bin/git")
 _FIXED_ENVIRONMENT: Mapping[str, str] = {
     "LANG": "C.UTF-8",
     "LC_ALL": "C.UTF-8",
     "PATH": "/usr/bin:/bin",
 }
+_GIT_ENVIRONMENT: Mapping[str, str] = {
+    **_FIXED_ENVIRONMENT,
+    "GIT_CONFIG_GLOBAL": "/dev/null",
+    "GIT_CONFIG_NOSYSTEM": "1",
+    "GIT_TERMINAL_PROMPT": "0",
+}
+_VETTED_INTERPRETERS = frozenset({"/bin/sh", "/usr/bin/python3"})
+_PROCESS_SUPERVISOR = """\
+import os
+import signal
+import subprocess
+import sys
+import time
+
+child = None
+
+def stop_tree(sig=signal.SIGTERM):
+    if child is None:
+        return
+    try:
+        os.killpg(child.pid, sig)
+    except ProcessLookupError:
+        pass
+
+def interrupted(sig, _frame):
+    stop_tree(signal.SIGTERM)
+    time.sleep(0.05)
+    stop_tree(signal.SIGKILL)
+    raise SystemExit(128 + sig)
+
+signal.signal(signal.SIGTERM, interrupted)
+probe = subprocess.Popen(
+    ['/usr/bin/python3', '-c', 'import time; time.sleep(30)'],
+    stdin=subprocess.DEVNULL,
+    stdout=subprocess.DEVNULL,
+    stderr=subprocess.DEVNULL,
+    start_new_session=True,
+)
+try:
+    if os.getpgid(probe.pid) != probe.pid:
+        raise RuntimeError('process group unavailable')
+    os.killpg(probe.pid, signal.SIGTERM)
+    probe.wait(timeout=1)
+except BaseException:
+    probe.kill()
+    probe.wait()
+    raise SystemExit(125)
+child = subprocess.Popen(sys.argv[1:], start_new_session=True)
+code = child.wait()
+stop_tree(signal.SIGTERM)
+time.sleep(0.05)
+stop_tree(signal.SIGKILL)
+raise SystemExit(code if code >= 0 else 128 - code)
+"""
 
 
 class DevObserverError(ValueError):
@@ -96,6 +154,125 @@ class _ExecutablePin:
     identities: tuple[tuple[int, int], ...]
     modified_ns: int
     digest: str
+    content: bytes
+    interpreter: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class _GitPin:
+    identity: tuple[int, int]
+    modified_ns: int
+    digest: str
+
+
+def _pin_git_executable() -> _GitPin:
+    descriptor = os.open(
+        _GIT_EXECUTABLE,
+        os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0),
+    )
+    try:
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != 0
+            or metadata.st_mode & 0o022
+            or metadata.st_size > MAX_EXECUTABLE_BYTES
+        ):
+            raise ValueError("Git executable is unavailable")
+        content = bytearray()
+        while chunk := os.read(descriptor, 64 * 1024):
+            content.extend(chunk)
+        return _GitPin(
+            identity=(metadata.st_dev, metadata.st_ino),
+            modified_ns=metadata.st_mtime_ns,
+            digest=hashlib.sha256(content).hexdigest(),
+        )
+    finally:
+        os.close(descriptor)
+        if "content" in locals():
+            content.clear()
+
+
+def _git_pin_matches(pin: _GitPin) -> bool:
+    try:
+        return _pin_git_executable() == pin
+    except (OSError, ValueError):
+        return False
+
+
+def _terminate_fixed_process(process: subprocess.Popen[bytes]) -> None:
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except (PermissionError, ProcessLookupError):
+        try:
+            process.kill()
+        except ProcessLookupError:
+            pass
+    process.wait()
+
+
+def _run_git_bounded(root: Path, args: tuple[str, ...], *, max_bytes: int) -> str:
+    """Run one fixed Git argv with sanitized state, deadline, and streaming cap."""
+    if type(args) is not tuple or not args or type(max_bytes) is not int or max_bytes < 1:
+        raise ValueError("invalid bounded Git invocation")
+    process = subprocess.Popen(
+        [
+            str(_GIT_EXECUTABLE),
+            "--no-pager",
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "core.hooksPath=/dev/null",
+            *args,
+        ],
+        cwd=root,
+        env=dict(_GIT_ENVIRONMENT),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+        shell=False,
+        bufsize=0,
+    )
+    selector = selectors.DefaultSelector()
+    stdout = bytearray()
+    total = 0
+    deadline = time.monotonic() + GIT_TIMEOUT_SECONDS
+    succeeded = False
+    try:
+        assert process.stdout is not None
+        assert process.stderr is not None
+        selector.register(process.stdout, selectors.EVENT_READ, True)
+        selector.register(process.stderr, selectors.EVENT_READ, False)
+        while selector.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("bounded Git invocation timed out")
+            events = selector.select(remaining)
+            if not events:
+                raise TimeoutError("bounded Git invocation timed out")
+            for key, _mask in events:
+                file_object = key.fileobj
+                descriptor = file_object if isinstance(file_object, int) else file_object.fileno()
+                chunk = os.read(descriptor, 64 * 1024)
+                if not chunk:
+                    selector.unregister(key.fileobj)
+                    continue
+                total += len(chunk)
+                if total > max_bytes:
+                    raise ValueError("bounded Git output is oversized")
+                if key.data:
+                    stdout.extend(chunk)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0 or process.wait(timeout=remaining) != 0:
+            raise ValueError("bounded Git invocation failed")
+        succeeded = True
+        return stdout.decode("utf-8")
+    finally:
+        selector.close()
+        if not succeeded and process.poll() is None:
+            _terminate_fixed_process(process)
+        stdout.clear()
 
 
 def _canonical_bytes(value: object) -> bytes:
@@ -170,9 +347,10 @@ class DevObserver:
                 raise ValueError("invalid development observer")
             root = Path(os.path.abspath(project_root))
             directory = SecureDirectory.open(root)
-            self._require_repository_root(root)
             self._root = root
             self._directory = directory
+            self._git_pin = _pin_git_executable()
+            self._require_repository_root(root)
             self._config = config
             self._repository_id = repository_id
             self._principals = principals
@@ -196,26 +374,33 @@ class DevObserver:
         """Return stable content-derived identifiers for configured argv entries."""
         return tuple(self._commands)
 
-    @staticmethod
-    def _require_repository_root(root: Path) -> None:
-        top = run_git(root, ["rev-parse", "--show-toplevel"]).strip()
+    def _git(self, args: tuple[str, ...], *, max_bytes: int) -> str:
+        if not _git_pin_matches(self._git_pin):
+            raise ValueError("Git executable changed")
+        result = _run_git_bounded(self._root, args, max_bytes=max_bytes)
+        if not _git_pin_matches(self._git_pin):
+            raise ValueError("Git executable changed")
+        return result
+
+    def _require_repository_root(self, root: Path) -> None:
+        top = self._git(("rev-parse", "--show-toplevel"), max_bytes=8192).strip()
         if Path(top).resolve(strict=True) != root.resolve(strict=True):
             raise ValueError("foreign Git repository")
 
     def _current_revision(self) -> str:
-        revision = run_git(
-            self._root,
-            ["rev-parse", "--verify", "--quiet", "HEAD"],
-        ).strip()
+        revision = self._git(("rev-parse", "--verify", "--quiet", "HEAD"), max_bytes=256).strip()
         if _REVISION.fullmatch(revision) is None:
             raise ValueError("invalid Git revision")
         return revision
 
     def _changed_paths(self) -> tuple[str, ...]:
-        tracked = run_git(self._root, ["diff", "--name-only", "-z", "HEAD"])
-        untracked = run_git(
-            self._root,
-            ["ls-files", "--others", "--exclude-standard", "-z"],
+        tracked = self._git(
+            ("diff", "--no-ext-diff", "--name-only", "-z", "HEAD"),
+            max_bytes=MAX_CHANGED_PATH_OUTPUT_BYTES,
+        )
+        untracked = self._git(
+            ("ls-files", "--others", "--exclude-standard", "-z"),
+            max_bytes=MAX_CHANGED_PATH_OUTPUT_BYTES,
         )
         encoded_bytes = len(tracked.encode("utf-8")) + len(untracked.encode("utf-8"))
         paths = tuple(sorted({item for item in (tracked + untracked).split("\x00") if item}))
@@ -238,11 +423,29 @@ class DevObserver:
         metadata = os.stat(self._root / relative, follow_symlinks=False)
         if not stat.S_ISREG(metadata.st_mode) or not metadata.st_mode & 0o111:
             raise ValueError("test executable is unavailable")
+        interpreter: str | None = None
+        if source.content.startswith(b"#!"):
+            first_line = source.content.partition(b"\n")[0]
+            try:
+                interpreter = first_line.removeprefix(b"#!").decode("ascii")
+            except UnicodeError as error:
+                raise ValueError("test interpreter is unavailable") from error
+            if interpreter not in _VETTED_INTERPRETERS:
+                raise ValueError("test interpreter is unavailable")
+            interpreter_metadata = os.stat(interpreter, follow_symlinks=False)
+            if (
+                not stat.S_ISREG(interpreter_metadata.st_mode)
+                or interpreter_metadata.st_uid != 0
+                or interpreter_metadata.st_mode & 0o022
+            ):
+                raise ValueError("test interpreter is unavailable")
         return _ExecutablePin(
             relative=relative,
             identities=source.identities,
             modified_ns=source.modified_ns,
             digest=hashlib.sha256(source.content).hexdigest(),
+            content=source.content,
+            interpreter=interpreter,
         )
 
     def _pin_executable_if_present(self, relative: str) -> _ExecutablePin | None:
@@ -361,23 +564,47 @@ class DevObserver:
                 self._stop_process(process)
 
     async def _execute(
-        self, argv: tuple[str, ...]
+        self, argv: tuple[str, ...], pin: _ExecutablePin
     ) -> tuple[TestRunStatus, int | None, bytes, bytes]:
+        if not await self._process_group_available():
+            raise ValueError("test process containment is unavailable")
         stdout = bytearray()
         stderr = bytearray()
         budget = [MAX_TEST_OUTPUT_BYTES]
         overflow = [False]
         timed_out = False
-        process = await anyio.open_process(
-            argv,
-            cwd=self._root,
-            env=dict(_FIXED_ENVIRONMENT),
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            start_new_session=True,
+        temporary = tempfile.TemporaryDirectory(prefix="intent-reviewed-test-")
+        copied = Path(temporary.name) / "executable"
+        descriptor = os.open(
+            copied,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0),
+            0o500,
         )
         try:
+            written = 0
+            while written < len(pin.content):
+                written += os.write(descriptor, pin.content[written:])
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        os.chmod(temporary.name, 0o500)
+        reviewed_argv = (
+            (pin.interpreter, str(copied), *argv[1:])
+            if pin.interpreter is not None
+            else (str(copied), *argv[1:])
+        )
+        execution_argv = ("/usr/bin/python3", "-c", _PROCESS_SUPERVISOR, *reviewed_argv)
+        process: anyio.abc.Process | None = None
+        try:
+            process = await anyio.open_process(
+                execution_argv,
+                cwd=self._root,
+                env=dict(_FIXED_ENVIRONMENT),
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                start_new_session=True,
+            )
             assert process.stdout is not None
             assert process.stderr is not None
             try:
@@ -412,7 +639,7 @@ class DevObserver:
                 status = TestRunStatus.FAILED
             return status, process.returncode, bytes(stdout), bytes(stderr)
         finally:
-            if process.returncode is None:
+            if process is not None and process.returncode is None:
                 with anyio.CancelScope(shield=True):
                     self._stop_process(process)
                     with anyio.move_on_after(1):
@@ -420,7 +647,10 @@ class DevObserver:
                     if process.returncode is None:
                         self._stop_process(process, force=True)
                         await process.wait()
-            await process.aclose()
+            if process is not None:
+                await process.aclose()
+            os.chmod(temporary.name, 0o700)
+            temporary.cleanup()
             stdout.clear()
             stderr.clear()
             budget.clear()
@@ -429,14 +659,52 @@ class DevObserver:
     @staticmethod
     def _stop_process(process: anyio.abc.Process, *, force: bool = False) -> None:
         try:
-            os.killpg(process.pid, signal.SIGKILL if force else signal.SIGTERM)
+            process.kill() if force else process.terminate()
         except ProcessLookupError:
             pass
-        except PermissionError:
-            try:
-                process.kill() if force else process.terminate()
-            except ProcessLookupError:
-                pass
+
+    @staticmethod
+    async def _process_group_available() -> bool:
+        """Prove owned group signaling before any reviewed command can start."""
+        probe: anyio.abc.Process | None = None
+        group_signal_sent = False
+        try:
+            probe = await anyio.open_process(
+                ["/usr/bin/python3", "-c", "import time; time.sleep(30)"],
+                cwd="/",
+                env=dict(_FIXED_ENVIRONMENT),
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+            if os.getpgid(probe.pid) != probe.pid:
+                return False
+            os.killpg(probe.pid, signal.SIGTERM)
+            group_signal_sent = True
+            with anyio.fail_after(1):
+                await probe.wait()
+            return probe.returncode is not None
+        except (OSError, TimeoutError):
+            return False
+        finally:
+            if probe is not None and probe.returncode is None:
+                # The probe is fixed internal code and has no descendants; this is cleanup,
+                # never a fallback for a reviewed command tree.
+                if group_signal_sent:
+                    try:
+                        os.killpg(probe.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                else:
+                    try:
+                        probe.kill()
+                    except ProcessLookupError:
+                        pass
+                with anyio.CancelScope(shield=True):
+                    await probe.wait()
+            if probe is not None:
+                await probe.aclose()
 
     def _write_artifact(self, artifact: TestResultArtifact) -> None:
         if not self._config.test_result_paths or self._directory is None:
@@ -459,12 +727,13 @@ class DevObserver:
                 type(at) is not datetime
                 or at.tzinfo is None
                 or at.utcoffset() != timedelta(0)
+                or pin is None
                 or not self._executable_matches(pin)
             ):
                 return TestRunResult(command_id=command_id, status=TestRunStatus.REJECTED)
             self._require_repository_root(self._root)
             before = self._current_revision()
-            status, exit_code, stdout, stderr = await self._execute(argv)
+            status, exit_code, stdout, stderr = await self._execute(argv, pin)
             after = self._current_revision()
             if before != after or not self._executable_matches(pin):
                 return TestRunResult(command_id=command_id, status=TestRunStatus.REJECTED)

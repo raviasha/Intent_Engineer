@@ -10,6 +10,7 @@ import subprocess
 from datetime import UTC, datetime
 from pathlib import Path
 
+import yaml  # type: ignore[import-untyped]
 from typer.testing import CliRunner
 
 from intent_engineering.capture.base import RawSourceObject, normalize_raw_source
@@ -39,6 +40,27 @@ from tests.helpers.shared_state import (
 )
 
 NOW = datetime(2026, 9, 7, 10, tzinfo=UTC)
+
+
+def _reviewed_command_id(argv: list[str]) -> str:
+    encoded = json.dumps(argv, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode()
+    return f"test:sha256:{hashlib.sha256(encoded).hexdigest()}"
+
+
+def _configure_reviewed_test(repo: Path) -> str:
+    runner = repo / "tools/test-runner"
+    runner.parent.mkdir(exist_ok=True)
+    runner.write_text(
+        "#!/usr/bin/python3\nfrom pathlib import Path\nPath('reviewed-ran').write_text('yes')\n",
+        encoding="utf-8",
+    )
+    runner.chmod(0o755)
+    config_path = repo / ".intent/config.yaml"
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    config["test_commands"] = [["tools/test-runner"]]
+    config["test_result_paths"] = [".intent/cache/reviewed-test.json"]
+    config_path.write_text(yaml.safe_dump(config, sort_keys=True), encoding="utf-8")
+    return _reviewed_command_id(["tools/test-runner"])
 
 
 def _ready(repo: Path) -> None:
@@ -402,3 +424,60 @@ def test_test_result_path_is_descriptor_safe_and_fails_without_evidence_mutation
     assert result.exit_code == 1
     assert json.loads(result.stdout)["reason"] == "test_results_invalid"
     assert (evidence_path.read_bytes() if evidence_path.exists() else None) == before
+
+
+def test_check_explicitly_runs_one_reviewed_command_and_ingests_its_artifact(
+    tmp_path: Path,
+) -> None:
+    repo = init_git_repo(tmp_path)
+    _ready(repo)
+    command_id = _configure_reviewed_test(repo)
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "check",
+            "--project",
+            str(repo),
+            "--run-test",
+            command_id,
+            "--format",
+            "json",
+        ],
+    )
+
+    assert result.exit_code == 0, (result.stdout, result.stderr, repr(result.exception))
+    payload = json.loads(result.stdout)
+    assert payload["reason"] == "checks_passed"
+    assert payload["test_evidence_id"].startswith("evidence:sha256:")
+    assert (repo / "reviewed-ran").read_text(encoding="utf-8") == "yes"
+    artifact = json.loads((repo / ".intent/cache/reviewed-test.json").read_bytes())
+    assert artifact["test_ids"] == [command_id]
+    stored = load_runtime(repo)
+    try:
+        assert any(record.id == payload["test_evidence_id"] for record in stored.evidence())
+    finally:
+        stored.close()
+
+
+def test_check_rejects_unreviewed_or_ambiguous_test_execution_without_running(
+    tmp_path: Path,
+) -> None:
+    repo = init_git_repo(tmp_path)
+    _ready(repo)
+    command_id = _configure_reviewed_test(repo)
+    invalid_invocations = (
+        ["--run-test", "test:sha256:" + "f" * 64],
+        ["--ci", "--run-test", command_id],
+        ["--run-test", command_id, "--test-results", "external.json"],
+    )
+
+    for options in invalid_invocations:
+        (repo / "reviewed-ran").unlink(missing_ok=True)
+        result = CliRunner().invoke(
+            app,
+            ["check", "--project", str(repo), *options, "--format", "json"],
+        )
+        assert result.exit_code == 1
+        assert json.loads(result.stdout)["reason"] in {"operation_failed", "test_run_failed"}
+        assert not (repo / "reviewed-ran").exists()

@@ -50,6 +50,20 @@ def test_project_config_rejects_absolute_parent_and_device_result_paths(path: st
         _config(test_result_paths=(path,))
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("test_commands", (("./tools/test-runner",),)),
+        ("test_commands", (("tools/./test-runner",),)),
+        ("test_result_paths", ("./results.json",)),
+        ("test_result_paths", ("reports/./results.json",)),
+    ],
+)
+def test_project_config_rejects_noncanonical_path_aliases(field: str, value: object) -> None:
+    with pytest.raises(ValidationError):
+        _config(**{field: value})
+
+
 def test_project_config_rejects_duplicate_and_oversized_test_configuration() -> None:
     with pytest.raises(ValidationError):
         _config(test_commands=(("tools/test-runner",), ("tools/test-runner",)))
