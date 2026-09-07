@@ -11,6 +11,7 @@ from datetime import UTC
 from enum import StrEnum
 from hashlib import sha256
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any, Literal, cast
 
 import yaml  # type: ignore[import-untyped]
@@ -1028,6 +1029,10 @@ class WorkspaceValidationService:
             captured = self._capture()
         except _CaptureFailure as error:
             return _report((_diagnostic(error.code, error.scope),))
+        return self._validate_snapshot(captured)
+
+    @staticmethod
+    def _validate_snapshot(captured: _CapturedWorkspace) -> ValidationReport:
         diagnostics: list[ValidationDiagnostic] = []
         if captured.recovered:
             diagnostics.append(
@@ -1092,6 +1097,38 @@ class WorkspaceValidationService:
                 _checkpoint_diagnostics(checkpoints, evidence, ingestions, legacy_ids)
             )
         return _report(diagnostics, graph)
+
+
+def validate_canonical_snapshot(content: Mapping[str, bytes | None]) -> ValidationReport:
+    """Validate one bounded immutable canonical snapshot without any filesystem reads."""
+    try:
+        snapshot = dict(content)
+        if set(snapshot) != {
+            "config",
+            "graph",
+            "history",
+            "cases",
+            "evidence",
+            "receipts",
+            "checkpoints",
+        }:
+            raise ValueError("invalid canonical snapshot")
+        if any(value is not None and type(value) is not bytes for value in snapshot.values()):
+            raise ValueError("invalid canonical snapshot")
+        sizes = [len(value) for value in snapshot.values() if value is not None]
+        if any(size > 8 * 1024 * 1024 for size in sizes) or sum(sizes) > 16 * 1024 * 1024:
+            raise ValueError("oversized canonical snapshot")
+    except (TypeError, ValueError):
+        return _report((_diagnostic("workspace.snapshot_invalid", "workspace"),))
+    try:
+        if snapshot["config"] is None:
+            raise ValueError("missing config")
+        config = _parse_config(snapshot["config"])
+    except (UnicodeError, TypeError, ValueError, yaml.YAMLError):
+        return _report((_diagnostic("config.invalid", "config"),))
+    return WorkspaceValidationService._validate_snapshot(
+        _CapturedWorkspace(config, MappingProxyType(snapshot), False)
+    )
 
 
 def validate_project(root: Path) -> ValidationReport:

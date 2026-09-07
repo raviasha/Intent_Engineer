@@ -62,6 +62,7 @@ class SharedStateRestoreStatus(StrEnum):
     UNAVAILABLE = "unavailable"
     INVALID = "invalid"
     STALE = "stale"
+    DIVERGED = "diverged"
     UPGRADE_REQUIRED = "upgrade_required"
 
 
@@ -404,15 +405,17 @@ class CheckService:
             SharedStateRestoreStatus.UNAVAILABLE: EnsureStatus.SHARED_STATE_UNAVAILABLE,
             SharedStateRestoreStatus.INVALID: EnsureStatus.SHARED_STATE_INVALID,
             SharedStateRestoreStatus.STALE: EnsureStatus.OFFLINE_STALE,
+            SharedStateRestoreStatus.DIVERGED: EnsureStatus.HUMAN_ATTENTION_REQUIRED,
             SharedStateRestoreStatus.UPGRADE_REQUIRED: EnsureStatus.UPGRADE_REQUIRED,
         }.get(restored.status)
         if request.ci and restored.status is SharedStateRestoreStatus.NOT_REQUIRED:
             failure_status = EnsureStatus.SHARED_STATE_UNAVAILABLE
         if failure_status is not None:
+            needs_review = failure_status is EnsureStatus.HUMAN_ATTENTION_REQUIRED
             return self._result(
-                CheckStatus.FAILED,
+                CheckStatus.REVIEW_REQUIRED if needs_review else CheckStatus.FAILED,
                 CheckReason.READINESS_REQUIRED,
-                1,
+                4 if needs_review else 1,
                 readiness=failure_status,
             )
         try:

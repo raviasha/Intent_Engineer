@@ -10,12 +10,14 @@ path is ever passed to a filesystem API before that allowlist check.
 from __future__ import annotations
 
 import base64
+import ctypes
 import hashlib
 import json
 import os
 import re
 import selectors
 import shutil
+import stat
 import subprocess
 import tempfile
 import time
@@ -43,20 +45,23 @@ from pydantic import ConfigDict, Field, ValidationInfo, field_validator, model_v
 
 from intent_engineering.capture.mcp.profile_loader import load_strict_yaml_mapping_bytes
 from intent_engineering.cli.writes import MutationPolicy
-from intent_engineering.core.models import ProjectConfig
+from intent_engineering.core.models import ChangeSet, ProjectConfig
 from intent_engineering.core.models._base import StrictModel
 from intent_engineering.intent_workflow.check import (
     SharedStateRestoreResult,
     SharedStateRestoreStatus,
 )
-from intent_engineering.storage.jsonl.approval_store import (
-    JsonlApprovalStore,
-    JsonlWritePlanStore,
-)
+from intent_engineering.mutations.models import ApprovalRecord, WritePlan
+from intent_engineering.storage.jsonl.approval_store import parse_immutable_records
 from intent_engineering.storage.jsonl.strict import loads_strict_object
-from intent_engineering.storage.secure import SecureDirectory, UnsafePathError
+from intent_engineering.storage.secure import (
+    SecureDirectory,
+    UnsafePathError,
+    configured_graph_relative,
+)
 from intent_engineering.storage.transaction import LocalTransactionCoordinator
-from intent_engineering.validation import validate_project
+from intent_engineering.storage.yaml.graph_store import parse_graph
+from intent_engineering.validation import validate_canonical_snapshot
 
 ALGORITHM: Final = "x25519-hkdf-sha256-aes256gcm-v1"
 SIGNATURE_ALGORITHM: Final = "ed25519-v1"
@@ -616,6 +621,10 @@ class _Stale(ValueError):
     pass
 
 
+class _Diverged(ValueError):
+    pass
+
+
 def _parse_canonical_model(
     content: bytes, model: type[_RestoreModel], maximum: int
 ) -> _RestoreModel:
@@ -633,7 +642,7 @@ def _parse_canonical_model(
 
 def _run_git(repo: Path, arguments: tuple[str, ...], *, maximum: int) -> bytes:
     process = subprocess.Popen(
-        ("git", "-C", str(repo), *arguments),
+        ("git", "--no-replace-objects", "-C", str(repo), *arguments),
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
     )
@@ -706,25 +715,16 @@ class _GitRefReader:
         return commit
 
     def parents(self, commit: str) -> tuple[str, ...]:
-        raw = (
-            _run_git(
-                self._root,
-                ("rev-list", "--parents", "-n", "1", commit),
-                maximum=256,
-            )
-            .decode("ascii")
-            .strip()
-        )
-        parts = tuple(raw.split())
-        if (
-            not parts
-            or parts[0] != commit
-            or any(_GIT_COMMIT.fullmatch(item) is None for item in parts)
-        ):
+        # Read the immutable object itself: rev-list hides parents at shallow
+        # boundaries and may apply local history grafts.
+        raw = _run_git(self._root, ("cat-file", "commit", commit), maximum=MAX_MANIFEST_BYTES)
+        header = raw.split(b"\n\n", 1)[0].decode("ascii").splitlines()
+        parents = tuple(line[7:] for line in header if line.startswith("parent "))
+        if not header or any(_GIT_COMMIT.fullmatch(item) is None for item in parents):
             raise ValueError("invalid shared-state lineage")
-        if len(parts) > 2:
+        if len(parents) > 1:
             raise ValueError("shared-state merges are unsupported")
-        return parts[1:]
+        return parents
 
     def blob(self, commit: str, path: str, maximum: int) -> bytes:
         if (
@@ -779,6 +779,13 @@ class _GitRefReader:
 @dataclass(frozen=True)
 class _VerifiedRelease:
     manifest: SharedStateManifest
+    commit: str
+
+
+@dataclass(frozen=True)
+class _VerifiedLineage:
+    tip: _VerifiedRelease
+    baseline: _VerifiedRelease | None
 
 
 def _release_name(manifest: SharedStateManifest) -> str:
@@ -836,7 +843,7 @@ def _verify_release_manifest(
             _b64decode(signature.signature, expected_size=64),
             signed,
         )
-    return _VerifiedRelease(parsed)
+    return _VerifiedRelease(parsed, commit)
 
 
 def _verify_release_lineage(
@@ -845,37 +852,46 @@ def _verify_release_lineage(
     trust: SharedStateTrust,
     now: datetime,
     marker: Mapping[str, object] | None,
-) -> _VerifiedRelease:
-    """Authenticate a bounded first-parent chain to the cached release or genesis."""
+) -> _VerifiedLineage:
+    """Authenticate the complete bounded chain; an unsigned marker is not a checkpoint."""
     commit = tip_commit
     expected_digest: str | None = None
     tip: _VerifiedRelease | None = None
+    baseline: _VerifiedRelease | None = None
+    seen: set[str] = set()
+    maximum_graph_version: int | None = None
     for _depth in range(MAX_ANCESTRY_COMMITS):
         release = _verify_release_manifest(reader, commit, trust, now)
+        if (
+            maximum_graph_version is not None
+            and release.manifest.graph_version > maximum_graph_version
+        ):
+            raise _Stale("shared-state graph version rollback")
+        maximum_graph_version = release.manifest.graph_version
         if tip is None:
             tip = release
+        if release.manifest.bundle_digest in seen:
+            raise _Stale("replayed shared-state release")
+        seen.add(release.manifest.bundle_digest)
         if expected_digest is not None and release.manifest.bundle_digest != expected_digest:
             raise _Stale("divergent shared-state lineage")
         marker_matches = (
             marker is not None
             and marker["bundle_digest"] == release.manifest.bundle_digest
             and marker["ref_commit"] == commit
+            and marker["graph_version"] == release.manifest.graph_version
         )
+        if marker_matches:
+            baseline = release
         parents = reader.parents(commit)
         if not parents:
             if release.manifest.parent_bundle_digest is not None:
                 raise _Stale("invalid shared-state genesis")
-            if marker is not None and not marker_matches:
+            if marker is not None and baseline is None:
                 raise _Stale("local shared-state lineage diverged")
-            return tip
+            return _VerifiedLineage(tip, baseline)
         if release.manifest.parent_bundle_digest is None:
             raise _Stale("invalid shared-state parent")
-        if marker_matches:
-            # The unsigned marker cannot vouch for the endpoint's signed parent link.
-            parent = _verify_release_manifest(reader, parents[0], trust, now)
-            if parent.manifest.bundle_digest != release.manifest.parent_bundle_digest:
-                raise _Stale("divergent shared-state lineage")
-            return tip
         expected_digest = release.manifest.parent_bundle_digest
         commit = parents[0]
     raise _Stale("shared-state history exceeds traversal bound")
@@ -892,13 +908,10 @@ def _marker_bytes(manifest: SharedStateManifest, commit: str) -> bytes:
     )
 
 
-def _read_local_marker(root: Path) -> dict[str, object] | None:
-    try:
-        project = SecureDirectory.open(root)
-        workspace = project.subdirectory(".intent")
-        marker = workspace.file("cache/shared-state.json")
-    except (FileNotFoundError, UnsafePathError):
+def _read_local_marker(workspace: SecureDirectory | None) -> dict[str, object] | None:
+    if workspace is None:
         return None
+    marker = workspace.file("cache/shared-state.json")
     try:
         raw = marker.read_optional_nonblocking(max_bytes=4096)
         if raw is None:
@@ -919,90 +932,311 @@ def _read_local_marker(root: Path) -> dict[str, object] | None:
         return loaded
     finally:
         marker.close()
-        workspace.close()
-        project.close()
 
 
-def _local_state_matches(root: Path, files: Mapping[str, bytes]) -> bool:
-    """Authenticate an equal-state fast path against every decrypted canonical byte."""
-    try:
-        project = SecureDirectory.open(root)
-        workspace = project.subdirectory(".intent")
-    except (FileNotFoundError, OSError, UnsafePathError):
-        return False
-    try:
-        for path in CANONICAL_STATE_PATHS:
-            target = workspace.file(path)
-            try:
-                if target.read_optional_nonblocking(max_bytes=MAX_FILE_BYTES) != files[path]:
+def _decrypt_release_payload(
+    reader: _GitRefReader, release: _VerifiedRelease, trust: SharedStateTrust
+) -> dict[str, bytes]:
+    manifest = release.manifest
+    bundle = reader.blob(
+        release.commit, f"bundles/{_release_name(manifest)}.intent", MAX_BUNDLE_BYTES
+    )
+    if len(bundle) != manifest.bundle_size or _digest(bundle) != manifest.bundle_digest:
+        raise ValueError("shared-state bundle mismatch")
+    bundle_model = _parse_canonical_model(bundle, EncryptedStateBundle, MAX_BUNDLE_BYTES)
+    assert isinstance(bundle_model, EncryptedStateBundle)
+    wrapped = {item.recipient_key_id: item for item in bundle_model.wrapped_keys}
+    if (
+        tuple(sorted(wrapped)) != manifest.recipient_key_ids
+        or trust.recipient_key_id not in wrapped
+    ):
+        raise ValueError("shared-state recipient mismatch")
+    aad = _manifest_aad(
+        project_id=manifest.project_id,
+        repository_id=manifest.repository_id,
+        graph_version=manifest.graph_version,
+        parent_bundle_digest=manifest.parent_bundle_digest,
+        created_at=manifest.created_at,
+        recipient_key_ids=manifest.recipient_key_ids,
+        required_signature_ids=manifest.required_signature_ids,
+    )
+    private = X25519PrivateKey.from_private_bytes(trust.recipient_private_key)
+    shared = private.exchange(
+        X25519PublicKey.from_public_bytes(
+            _b64decode(bundle_model.ephemeral_public_key, expected_size=32)
+        )
+    )
+    selected = wrapped[trust.recipient_key_id]
+    wrapping_key = _derive_wrapping_key(shared, aad, trust.recipient_key_id)
+    content_key = AESGCM(wrapping_key).decrypt(
+        _b64decode(selected.nonce, expected_size=12),
+        _b64decode(selected.ciphertext),
+        aad + b"\0" + trust.recipient_key_id.encode(),
+    )
+    plaintext = AESGCM(content_key).decrypt(
+        _b64decode(bundle_model.nonce, expected_size=12),
+        _b64decode(bundle_model.ciphertext),
+        aad,
+    )
+    return _parse_payload(plaintext)
+
+
+def _same_semantic_baseline(current: Mapping[str, bytes], baseline: Mapping[str, bytes]) -> bool:
+    """Compare interpreted graph and complete decision ledgers, not cache-marker claims."""
+    for path in CANONICAL_STATE_PATHS:
+        if path == "evidence/evidence.jsonl" or current[path] == baseline[path]:
+            continue
+        if path == "graph.yaml":
+            if parse_graph(current[path]) != parse_graph(baseline[path]):
+                return False
+        elif path.endswith(".yaml"):
+            if yaml.safe_load(current[path]) != yaml.safe_load(baseline[path]):
+                return False
+        else:
+            local = tuple(
+                loads_strict_object(line)
+                for line in current[path].decode().splitlines()
+                if line.strip()
+            )
+            approved = tuple(
+                loads_strict_object(line)
+                for line in baseline[path].decode().splitlines()
+                if line.strip()
+            )
+            if path == "history/changesets.jsonl":
+                if tuple(ChangeSet.model_validate(item) for item in local) != tuple(
+                    ChangeSet.model_validate(item) for item in approved
+                ):
                     return False
-            finally:
-                target.close()
-        return True
-    except (OSError, UnsafePathError):
-        return False
-    finally:
-        workspace.close()
-        project.close()
+                continue
+            if local != approved:
+                return False
+    return True
 
 
-def _write_staged_state(stage: Path, files: Mapping[str, bytes], marker: bytes) -> None:
-    from intent_engineering.core.policy.project import initialize_project
-
-    initialize_project(stage)
-    project = SecureDirectory.open(stage)
-    workspace = project.subdirectory(".intent")
+def _assert_named_directory(parent: SecureDirectory, name: str, expected: SecureDirectory) -> None:
+    observed = parent.subdirectory(name)
     try:
-        for path in sorted(files):
+        if observed.identity != expected.identity:
+            raise UnsafePathError()
+    finally:
+        observed.close()
+
+
+def _assert_project_binding(project: SecureDirectory) -> None:
+    observed = SecureDirectory.open(project.path)
+    try:
+        if observed.identity != project.identity:
+            raise UnsafePathError()
+    finally:
+        observed.close()
+
+
+class _PinnedState:
+    """Bind immutable authenticated bytes to the directory and file identities used."""
+
+    def __init__(self, workspace: SecureDirectory, files: Mapping[str, bytes]) -> None:
+        self.workspace = workspace
+        self.files = dict(files)
+        self.identities: dict[str, tuple[tuple[int, int], ...]] = {}
+        self.inventory_sealed = False
+        for path, content in self.files.items():
+            observed = workspace.read_relative(path, nonblocking=True, max_bytes=MAX_FILE_BYTES)
+            if observed.content != content:
+                raise UnsafePathError()
+            self.identities[path] = observed.identities
+
+    def _inventory(self) -> tuple[tuple[str, bytes, tuple[tuple[int, int], ...]], ...]:
+        entries: list[tuple[str, bytes, tuple[tuple[int, int], ...]]] = []
+        total_bytes = 0
+
+        def walk(directory: SecureDirectory, prefix: str, depth: int) -> None:
+            nonlocal total_bytes
+            if depth > 4:
+                raise UnsafePathError()
+            with os.scandir(directory.descriptor) as children:
+                for child in children:
+                    if len(entries) >= 64:
+                        raise UnsafePathError()
+                    path = prefix + child.name
+                    metadata = child.stat(follow_symlinks=False)
+                    if stat.S_ISDIR(metadata.st_mode):
+                        opened = directory.subdirectory(child.name)
+                        try:
+                            if opened.identity != (metadata.st_dev, metadata.st_ino):
+                                raise UnsafePathError()
+                            entries.append((path + "/", b"", (opened.identity,)))
+                            walk(opened, path + "/", depth + 1)
+                        finally:
+                            opened.close()
+                    else:
+                        observed = self.workspace.read_relative(
+                            path, nonblocking=True, max_bytes=MAX_FILE_BYTES
+                        )
+                        total_bytes += len(observed.content)
+                        if total_bytes > MAX_STATE_BYTES + 4096:
+                            raise UnsafePathError()
+                        entries.append((path, observed.content, observed.identities))
+
+        walk(self.workspace, "", 0)
+        return tuple(entries)
+
+    def seal_inventory(self) -> None:
+        """Only empty generated runtime files may accompany the authenticated payload."""
+        auxiliary = {
+            "approvals/webauthn-credentials.jsonl",
+            "approvals/webauthn-challenges.jsonl",
+            "cache/checkpoints.yaml",
+            "history/.local-transaction.json",
+        }
+        directories = {
+            "approvals/",
+            "cache/",
+            "connectors/",
+            "evidence/",
+            "history/",
+            "reconciliation/",
+            "renders/",
+        }
+        lock_paths = {
+            str(Path(path).with_name(f".{Path(path).name}.lock"))
+            for path in {*self.files, *auxiliary}
+        }
+        for path, content, identities in self._inventory():
+            if path not in self.files:
+                if path not in auxiliary | lock_paths | directories or content:
+                    raise UnsafePathError()
+                self.files[path] = b""
+                self.identities[path] = identities
+        self.inventory_sealed = True
+        self.verify()
+
+    def verify(self) -> None:
+        if self.inventory_sealed:
+            inventory = self._inventory()
+            if {path for path, _, _ in inventory} != set(self.files):
+                raise UnsafePathError()
+            for path, content, identities in inventory:
+                if content != self.files[path] or identities != self.identities[path]:
+                    raise UnsafePathError()
+            return
+        for path, content in self.files.items():
+            observed = self.workspace.read_relative(
+                path,
+                expected_identities=self.identities[path],
+                nonblocking=True,
+                max_bytes=MAX_FILE_BYTES,
+            )
+            if observed.content != content:
+                raise UnsafePathError()
+
+
+def _rename_directory_exclusive(source: SecureDirectory, destination: SecureDirectory) -> None:
+    """Promote only into an absent name, using the already held parent descriptors."""
+    library = ctypes.CDLL(None, use_errno=True)
+    try:
+        function = library.renameat2
+        flag = 1  # RENAME_NOREPLACE
+    except AttributeError:
+        try:
+            function = library.renameatx_np
+            flag = 4  # RENAME_EXCL
+        except AttributeError as error:
+            raise UnsafePathError() from error
+    function.argtypes = (
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    )
+    function.restype = ctypes.c_int
+    if function(source.descriptor, b".intent", destination.descriptor, b".intent", flag) != 0:
+        number = ctypes.get_errno()
+        raise OSError(number, os.strerror(number))
+
+
+def _discard_stage(project: SecureDirectory, stage: SecureDirectory) -> None:
+    """Clean through the owned descriptor, never through a substituted staging root."""
+    for name in os.listdir(stage.descriptor):
+        metadata = os.stat(name, dir_fd=stage.descriptor, follow_symlinks=False)
+        if stat.S_ISDIR(metadata.st_mode):
+            shutil.rmtree(name, dir_fd=stage.descriptor)
+        else:
+            os.unlink(name, dir_fd=stage.descriptor)
+    try:
+        _assert_named_directory(project, stage.path.name, stage)
+    except (OSError, UnsafePathError):
+        return
+    os.rmdir(stage.path.name, dir_fd=project.descriptor)
+
+
+def _write_staged_state(stage: SecureDirectory, files: Mapping[str, bytes], marker: bytes) -> None:
+    workspace = stage.subdirectory(".intent", create=True)
+    try:
+        for name in ("approvals", "cache", "connectors", "evidence", "history", "reconciliation"):
+            directory = workspace.subdirectory(name, create=True)
+            directory.close()
+        payload = {
+            **files,
+            "approvals/webauthn-credentials.jsonl": b"",
+            "approvals/webauthn-challenges.jsonl": b"",
+            "cache/shared-state.json": marker,
+        }
+        for path in sorted(payload):
             target = workspace.file(path)
             try:
-                target.atomic_write(files[path], reject_target_races=True)
+                target.atomic_write(payload[path], reject_target_races=True)
             finally:
                 target.close()
-        marker_file = workspace.file("cache/shared-state.json")
-        try:
-            marker_file.atomic_write(marker, reject_target_races=True)
-        finally:
-            marker_file.close()
     finally:
         workspace.close()
-        project.close()
 
 
-def _validate_staged_state(
-    stage: Path,
+def _validation_snapshot(files: Mapping[str, bytes]) -> dict[str, bytes | None]:
+    return {
+        "config": files["config.yaml"],
+        "graph": files["graph.yaml"],
+        "history": files["history/changesets.jsonl"],
+        "cases": files["reconciliation/cases.jsonl"],
+        "evidence": files["evidence/evidence.jsonl"],
+        "receipts": files["approvals/receipts.jsonl"],
+        "checkpoints": files.get("cache/checkpoints.yaml"),
+    }
+
+
+def _validate_authenticated_state(
+    files: Mapping[str, bytes],
     manifest: SharedStateManifest,
     trust: SharedStateTrust,
 ) -> None:
-    report = validate_project(stage)
+    report = validate_canonical_snapshot(_validation_snapshot(files))
     if not report.valid or report.graph_version != manifest.graph_version:
         raise ValueError("restored shared state is invalid")
-    raw_config = (stage / ".intent/config.yaml").read_bytes()
+    raw_config = files["config.yaml"]
     loaded = yaml.safe_load(raw_config.decode("utf-8"))
     config = ProjectConfig.model_validate(loaded)
-    if config.project_id != trust.project_id or config.project_id != manifest.project_id:
+    if (
+        config.project_id != trust.project_id
+        or config.project_id != manifest.project_id
+        or str(configured_graph_relative(config.graph_path)) != "graph.yaml"
+    ):
         raise ValueError("restored project identity mismatch")
-    plans = JsonlWritePlanStore(stage / ".intent/approvals/plans.jsonl")
-    approvals = JsonlApprovalStore(stage / ".intent/approvals/approvals.jsonl")
-    try:
-        plans.list()
-        approvals.list()
-    finally:
-        approvals.close()
-        plans.close()
-    policy = (stage / ".intent/approvals/policy.yaml").read_bytes()
+    parse_immutable_records(files["approvals/plans.jsonl"], WritePlan)
+    parse_immutable_records(files["approvals/approvals.jsonl"], ApprovalRecord)
+    policy = files["approvals/policy.yaml"]
     if policy:
         MutationPolicy.model_validate(load_strict_yaml_mapping_bytes(policy))
 
 
 def _replace_existing_state(
-    root: Path,
+    project: SecureDirectory,
+    workspace: SecureDirectory,
     files: Mapping[str, bytes],
+    baseline_files: Mapping[str, bytes],
     marker: bytes,
     fault_hook: Callable[[str], None],
 ) -> None:
-    project = SecureDirectory.open(root)
-    workspace = project.subdirectory(".intent")
     path_to_name = {
         "approvals/approvals.jsonl": "approvals",
         "approvals/plans.jsonl": "plans",
@@ -1044,49 +1278,105 @@ def _replace_existing_state(
     try:
         for target in targets.values():
             target.read_optional_nonblocking(max_bytes=MAX_STATE_BYTES)
-        with coordinator.transaction(rollback_base_exceptions=True) as transaction:
-            for path in CANONICAL_STATE_PATHS:
-                transaction.write(path_to_name[path], files[path])
-                fault_hook(f"target:{path}")
-            transaction.write(path_to_name["cache/checkpoints.yaml"], b"")
-            transaction.write(path_to_name["cache/shared-state.json"], marker)
-            fault_hook("existing_precommit")
+        with coordinator.coordinated():
+            _assert_named_directory(project, ".intent", workspace)
+            current = {
+                path: targets[name].read_optional_nonblocking(max_bytes=MAX_FILE_BYTES) or b""
+                for path, name in path_to_name.items()
+            }
+            if not _same_semantic_baseline(current, baseline_files) and not _same_semantic_baseline(
+                current, files
+            ):
+                raise _Diverged("unpublished local state requires reconciliation")
+            evidence_path = "evidence/evidence.jsonl"
+            if current[evidence_path] != baseline_files[evidence_path]:
+                if current[evidence_path] != files[evidence_path] and (
+                    files[evidence_path] != baseline_files[evidence_path]
+                    or not current[evidence_path].startswith(baseline_files[evidence_path])
+                ):
+                    raise _Diverged("local evidence requires reconciliation")
+                local_state = _PinnedState(
+                    workspace, {path: current[path] for path in CANONICAL_STATE_PATHS}
+                )
+                if not validate_canonical_snapshot(_validation_snapshot(current)).valid:
+                    raise ValueError("invalid local evidence")
+                local_state.verify()
+                files = {**files, evidence_path: current[evidence_path]}
+            if (
+                all(current[path] == files[path] for path in files)
+                and current["cache/shared-state.json"] == marker
+            ):
+                pinned = _PinnedState(workspace, {**files, "cache/shared-state.json": marker})
+                report = validate_canonical_snapshot(_validation_snapshot(current))
+                if not report.valid:
+                    raise ValueError("invalid local shared state")
+                pinned.verify()
+                _assert_named_directory(project, ".intent", workspace)
+                _assert_project_binding(project)
+                return
+            with coordinator.transaction(rollback_base_exceptions=True) as transaction:
+                installed: dict[str, bytes] = {}
+                identities: dict[str, tuple[tuple[int, int], ...]] = {}
+                for path in CANONICAL_STATE_PATHS:
+                    transaction.write(path_to_name[path], files[path])
+                    installed[path] = files[path]
+                    identities[path] = workspace.read_relative(
+                        path, nonblocking=True, max_bytes=MAX_FILE_BYTES
+                    ).identities
+                    fault_hook(f"target:{path}")
+                for path, content in (
+                    ("cache/checkpoints.yaml", b""),
+                    ("cache/shared-state.json", marker),
+                ):
+                    transaction.write(path_to_name[path], content)
+                    installed[path] = content
+                    identities[path] = workspace.read_relative(
+                        path, nonblocking=True, max_bytes=MAX_FILE_BYTES
+                    ).identities
+                fault_hook("existing_precommit")
+                _assert_project_binding(project)
+                _assert_named_directory(project, ".intent", workspace)
+                for path, content in installed.items():
+                    observed = workspace.read_relative(
+                        path,
+                        expected_identities=identities[path],
+                        nonblocking=True,
+                        max_bytes=MAX_FILE_BYTES,
+                    )
+                    if observed.content != content:
+                        raise UnsafePathError()
     finally:
         coordinator.close()
         for target in targets.values():
             target.close()
-        workspace.close()
-        project.close()
 
 
-def _install_fresh_state(root: Path, stage: Path, fault_hook: Callable[[str], None]) -> None:
-    root_directory = SecureDirectory.open(root)
-    stage_directory = SecureDirectory.open(stage)
+def _install_fresh_state(
+    root_directory: SecureDirectory,
+    stage_directory: SecureDirectory,
+    state: _PinnedState,
+    fault_hook: Callable[[str], None],
+) -> None:
     installed = False
     try:
         fault_hook("fresh_preinstall")
-        os.rename(
-            ".intent",
-            ".intent",
-            src_dir_fd=stage_directory.descriptor,
-            dst_dir_fd=root_directory.descriptor,
-        )
+        _assert_project_binding(root_directory)
+        _assert_named_directory(root_directory, stage_directory.path.name, stage_directory)
+        _assert_named_directory(stage_directory, ".intent", state.workspace)
+        state.verify()
+        _rename_directory_exclusive(stage_directory, root_directory)
         installed = True
         fault_hook("fresh_installed")
+        _assert_project_binding(root_directory)
+        _assert_named_directory(root_directory, ".intent", state.workspace)
+        state.verify()
         os.fsync(root_directory.descriptor)
     except BaseException:
         if installed:
-            os.rename(
-                ".intent",
-                ".intent",
-                src_dir_fd=root_directory.descriptor,
-                dst_dir_fd=stage_directory.descriptor,
-            )
+            _assert_named_directory(root_directory, ".intent", state.workspace)
+            _rename_directory_exclusive(root_directory, stage_directory)
             os.fsync(root_directory.descriptor)
         raise
-    finally:
-        stage_directory.close()
-        root_directory.close()
 
 
 class GitSharedStateRestorer:
@@ -1104,14 +1394,14 @@ class GitSharedStateRestorer:
         self._fault_hook = fault_hook or (lambda _stage: None)
 
     def verify_and_restore_approved_baseline(self, root: Path) -> SharedStateRestoreResult:
-        stage: Path | None = None
+        project: SecureDirectory | None = None
+        workspace: SecureDirectory | None = None
+        stage: SecureDirectory | None = None
+        staged_workspace: SecureDirectory | None = None
+        state: _PinnedState | None = None
         trust: SharedStateTrust | None = None
-        private: X25519PrivateKey | None = None
-        shared = b""
-        wrapping_key = b""
-        content_key = b""
-        plaintext = b""
         files: dict[str, bytes] = {}
+        baseline_files: dict[str, bytes] = {}
         try:
             trust = self._trust_provider.load()
             if trust is None:
@@ -1119,6 +1409,13 @@ class GitSharedStateRestorer:
             if type(trust) is not SharedStateTrust:
                 raise ValueError("invalid shared-state trust")
             root = Path(os.path.abspath(root))
+            project = SecureDirectory.open(root)
+            try:
+                os.stat(".intent", dir_fd=project.descriptor, follow_symlinks=False)
+            except FileNotFoundError:
+                pass
+            else:
+                workspace = project.subdirectory(".intent")
             if _origin_repository(root) != trust.repository_id:
                 raise ValueError("repository identity mismatch")
             reader = _GitRefReader(root)
@@ -1126,70 +1423,38 @@ class GitSharedStateRestorer:
             now = self._clock()
             if now.tzinfo is None or now.utcoffset() != timedelta(0):
                 raise ValueError("invalid shared-state time")
-            marker = _read_local_marker(root)
-            tip = _verify_release_lineage(reader, commit, trust, now, marker)
-            manifest = tip.manifest
-            name = _release_name(manifest)
-            bundle = reader.blob(commit, f"bundles/{name}.intent", MAX_BUNDLE_BYTES)
-            if len(bundle) != manifest.bundle_size or _digest(bundle) != manifest.bundle_digest:
-                raise ValueError("shared-state bundle mismatch")
-            bundle_model = _parse_canonical_model(
-                bundle,
-                EncryptedStateBundle,
-                MAX_BUNDLE_BYTES,
+            marker = _read_local_marker(workspace)
+            lineage = _verify_release_lineage(reader, commit, trust, now, marker)
+            manifest = lineage.tip.manifest
+            files = _decrypt_release_payload(reader, lineage.tip, trust)
+            _validate_authenticated_state(files, manifest, trust)
+            baseline_files = (
+                _decrypt_release_payload(reader, lineage.baseline, trust)
+                if lineage.baseline is not None and lineage.baseline.commit != commit
+                else files
             )
-            assert isinstance(bundle_model, EncryptedStateBundle)
-            wrapped = {item.recipient_key_id: item for item in bundle_model.wrapped_keys}
-            if (
-                tuple(sorted(wrapped)) != manifest.recipient_key_ids
-                or trust.recipient_key_id not in wrapped
-            ):
-                raise ValueError("shared-state recipient mismatch")
-            aad = _manifest_aad(
-                project_id=manifest.project_id,
-                repository_id=manifest.repository_id,
-                graph_version=manifest.graph_version,
-                parent_bundle_digest=manifest.parent_bundle_digest,
-                created_at=manifest.created_at,
-                recipient_key_ids=manifest.recipient_key_ids,
-                required_signature_ids=manifest.required_signature_ids,
-            )
-            private = X25519PrivateKey.from_private_bytes(trust.recipient_private_key)
-            shared = private.exchange(
-                X25519PublicKey.from_public_bytes(
-                    _b64decode(bundle_model.ephemeral_public_key, expected_size=32)
-                )
-            )
-            selected = wrapped[trust.recipient_key_id]
-            wrapping_key = _derive_wrapping_key(shared, aad, trust.recipient_key_id)
-            content_key = AESGCM(wrapping_key).decrypt(
-                _b64decode(selected.nonce, expected_size=12),
-                _b64decode(selected.ciphertext),
-                aad + b"\0" + trust.recipient_key_id.encode(),
-            )
-            plaintext = AESGCM(content_key).decrypt(
-                _b64decode(bundle_model.nonce, expected_size=12),
-                _b64decode(bundle_model.ciphertext),
-                aad,
-            )
-            files = _parse_payload(plaintext)
             marker_bytes = _marker_bytes(manifest, commit)
-            if (
-                marker is not None
-                and marker["bundle_digest"] == manifest.bundle_digest
-                and _local_state_matches(root, files)
-            ):
-                report = validate_project(root)
-                if report.valid and report.graph_version == manifest.graph_version:
-                    return SharedStateRestoreResult(status=SharedStateRestoreStatus.VERIFIED)
-            stage = Path(tempfile.mkdtemp(prefix=".intent-restore-", dir=root))
+            if workspace is not None:
+                self._fault_hook("validated")
+                _assert_project_binding(project)
+                _replace_existing_state(
+                    project, workspace, files, baseline_files, marker_bytes, self._fault_hook
+                )
+                return SharedStateRestoreResult(status=SharedStateRestoreStatus.VERIFIED)
+            stage_path = Path(tempfile.mkdtemp(prefix=".intent-restore-", dir=root))
+            stage = project.subdirectory(stage_path.name)
             _write_staged_state(stage, files, marker_bytes)
-            _validate_staged_state(stage, manifest, trust)
+            staged_workspace = stage.subdirectory(".intent")
+            state = _PinnedState(
+                staged_workspace, {**files, "cache/shared-state.json": marker_bytes}
+            )
+            state.seal_inventory()
             self._fault_hook("validated")
-            if (root / ".intent").exists():
-                _replace_existing_state(root, files, marker_bytes, self._fault_hook)
-            else:
-                _install_fresh_state(root, stage, self._fault_hook)
+            _assert_project_binding(project)
+            _assert_named_directory(project, stage.path.name, stage)
+            _assert_named_directory(stage, ".intent", staged_workspace)
+            state.verify()
+            _install_fresh_state(project, stage, state, self._fault_hook)
             return SharedStateRestoreResult(status=SharedStateRestoreStatus.VERIFIED)
         except _Unavailable:
             return SharedStateRestoreResult(status=SharedStateRestoreStatus.UNAVAILABLE)
@@ -1197,6 +1462,8 @@ class GitSharedStateRestorer:
             return SharedStateRestoreResult(status=SharedStateRestoreStatus.UPGRADE_REQUIRED)
         except _Stale:
             return SharedStateRestoreResult(status=SharedStateRestoreStatus.STALE)
+        except _Diverged:
+            return SharedStateRestoreResult(status=SharedStateRestoreStatus.DIVERGED)
         except (
             InvalidSignature,
             InvalidTag,
@@ -1212,17 +1479,26 @@ class GitSharedStateRestorer:
             # Cancellation remains observable, but neither decrypted bytes nor the
             # injected private-key provider may survive in its traceback frames.
             trust = None
-            private = None
-            shared = b""
-            wrapping_key = b""
-            content_key = b""
-            plaintext = b""
             files.clear()
+            baseline_files.clear()
+            if state is not None:
+                state.files.clear()
             del self
             raise cancellation.with_traceback(None) from None
         finally:
-            if stage is not None:
-                shutil.rmtree(stage, ignore_errors=True)
+            if staged_workspace is not None:
+                staged_workspace.close()
+            if stage is not None and project is not None:
+                try:
+                    _discard_stage(project, stage)
+                except (OSError, UnsafePathError):
+                    pass
+                finally:
+                    stage.close()
+            if workspace is not None:
+                workspace.close()
+            if project is not None:
+                project.close()
 
 
 __all__ = [

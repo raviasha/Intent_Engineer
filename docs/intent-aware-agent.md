@@ -134,6 +134,23 @@ commands pass, and validates its repository, commit, timestamp and ACL before wr
 intent check --ci --require-review --test-results .intent-ci/test-results.json
 ```
 
+Restore preserves unpublished local graph decisions, ChangeSet history, proposals and reviewed
+configuration. A semantic extension or divergence returns `diverged`; the check reports
+`human_attention_required` and exits 4 before capture. Reconcile that state explicitly. Repeating
+the same approved release is a no-op and preserves valid evidence appended locally. An approved
+remote advance is automatic only when local decisions still match the authenticated baseline
+or the new approved release.
+
+CI restoration uses the workflow's fresh, disposable checkout. For a separate CI baseline when
+a developer workspace has unpublished decisions, run the workflow in a new checkout with its own
+`.intent` directory; do not reuse or clear the developer's state. There is no force-replacement
+switch. Existing self-hosted jobs must likewise use an isolated checkout per job.
+
+Every restore verifies the complete signed release chain, up to 64 commits including the tip.
+The unsigned local marker cannot shorten that traversal. Missing Git parent objects, merges,
+forks, invalid signatures, malformed genesis links and history beyond the bound fail closed.
+Use the full fetched history; shallow-boundary metadata cannot establish a signed genesis.
+
 Reviewed execution requires a clean commit snapshot before and after every command and both
 result writes. The helper hashes actual tracked bytes against HEAD, checks executable modes and
 the staged index, and binds staged evidence to file and ancestor-directory identities and

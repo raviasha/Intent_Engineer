@@ -30,6 +30,7 @@ from intent_engineering.storage.jsonl.history_store import serialize_changeset
 from intent_engineering.storage.secure import SecureDirectory
 from intent_engineering.storage.transaction import LocalTransactionCoordinator
 from intent_engineering.storage.yaml.graph_store import serialize_graph
+from intent_engineering.validation import service as validation_service
 from intent_engineering.validation import validate_project
 
 NOW = datetime(2026, 8, 25, 12, tzinfo=UTC)
@@ -133,6 +134,64 @@ def test_valid_workspace_reports_a_versioned_empty_diagnostic_set(tmp_path: Path
     assert report.graph_id == f"graph:{seeded.root.name}"
     assert report.graph_version == 1
     assert report.diagnostics == ()
+
+
+def _canonical_snapshot(root: Path) -> dict[str, bytes | None]:
+    names = {
+        "config": "config.yaml",
+        "graph": "graph.yaml",
+        "history": "history/changesets.jsonl",
+        "cases": "reconciliation/cases.jsonl",
+        "evidence": "evidence/evidence.jsonl",
+        "receipts": "approvals/receipts.jsonl",
+        "checkpoints": "cache/checkpoints.yaml",
+    }
+    return {
+        name: (
+            (root / ".intent" / path).read_bytes() if (root / ".intent" / path).exists() else None
+        )
+        for name, path in names.items()
+    }
+
+
+def test_canonical_snapshot_validation_uses_the_supplied_bytes_without_reopening_local_state(
+    tmp_path: Path,
+) -> None:
+    seeded = _seed(tmp_path)
+    snapshot = _canonical_snapshot(seeded.root)
+    (seeded.root / ".intent/graph.yaml").write_bytes(b"invalid local graph")
+
+    report = validation_service.validate_canonical_snapshot(snapshot)
+
+    assert report.valid
+    assert report.graph_version == 1
+    snapshot["history"] = b"invalid history"
+    invalid = validation_service.validate_canonical_snapshot(snapshot)
+    assert not invalid.valid
+    assert "history.invalid" in {item.code for item in invalid.diagnostics}
+
+
+@pytest.mark.parametrize("invalid", ["missing", "type", "file_size", "total_size"])
+def test_canonical_snapshot_validation_rejects_unbounded_or_malformed_inputs(
+    tmp_path: Path,
+    invalid: str,
+) -> None:
+    seeded = _seed(tmp_path)
+    snapshot = _canonical_snapshot(seeded.root)
+    if invalid == "missing":
+        del snapshot["config"]
+    elif invalid == "type":
+        snapshot["graph"] = "not immutable bytes"  # type: ignore[assignment]
+    elif invalid == "file_size":
+        snapshot["graph"] = b"X" * (8 * 1024 * 1024 + 1)
+    else:
+        snapshot["evidence"] = b"X" * (8 * 1024 * 1024)
+        snapshot["history"] = b"Y" * (8 * 1024 * 1024)
+
+    report = validation_service.validate_canonical_snapshot(snapshot)
+
+    assert not report.valid
+    assert tuple(item.code for item in report.diagnostics) == ("workspace.snapshot_invalid",)
 
 
 def test_graph_and_case_references_are_resolved_against_the_same_snapshot(

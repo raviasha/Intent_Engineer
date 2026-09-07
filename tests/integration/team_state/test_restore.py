@@ -5,13 +5,19 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import os
+import shutil
 from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
+from intent_engineering.capture.base import RawSourceObject, normalize_raw_source
+from intent_engineering.cli.runtime import load_runtime
+from intent_engineering.core.models import ChangeSet
+from intent_engineering.core.models.changeset import NodeUpdate
 from intent_engineering.intent_workflow.check import SharedStateRestoreStatus
-from intent_engineering.storage.secure import SecureDirectory
+from intent_engineering.storage.secure import SecureDirectory, SecureFile
 from intent_engineering.storage.transaction import LocalTransactionCoordinator
 from intent_engineering.team_state.restore import (
     GitSharedStateRestorer,
@@ -19,6 +25,7 @@ from intent_engineering.team_state.restore import (
 )
 from intent_engineering.validation import validate_project
 from tests.helpers.shared_state import (
+    NOW,
     artifacts,
     canonical_files,
     git,
@@ -343,12 +350,14 @@ def test_equal_verified_state_is_a_byte_noop_but_local_tampering_is_restored(
         is SharedStateRestoreStatus.VERIFIED
     )
     before = _state_snapshot(target)
+    root_modified = target.stat().st_mtime_ns
 
     assert (
         restorer.verify_and_restore_approved_baseline(target).status
         is SharedStateRestoreStatus.VERIFIED
     )
     assert _state_snapshot(target) == before
+    assert target.stat().st_mtime_ns == root_modified
 
     graph = target / ".intent/graph.yaml"
     graph.write_bytes(graph.read_bytes().replace(b"version: 1", b"version: 01"))
@@ -623,7 +632,10 @@ def test_divergent_signed_fork_and_rollback_to_an_older_tip_remain_stale(tmp_pat
     assert _state_snapshot(target) == before
 
 
-def test_fresh_restore_rejects_signed_history_beyond_the_fixed_bound(tmp_path: Path) -> None:
+@pytest.mark.parametrize("matching_marker", [False, True])
+def test_fresh_restore_rejects_signed_history_beyond_the_fixed_bound(
+    tmp_path: Path, matching_marker: bool
+) -> None:
     """Catches unbounded ancestry walks over attacker-amplified Git history."""
     source = _approved_source(tmp_path)
     target = init_repository(tmp_path / "target" / "project")
@@ -641,9 +653,573 @@ def test_fresh_restore_rejects_signed_history_beyond_the_fixed_bound(tmp_path: P
         parent_commit = install_state_ref(target, release, parent=parent_commit)
         parent_digest = json.loads(release.manifest)["bundle_digest"]
 
+    if matching_marker:
+        ready_project(target)
+        (target / ".intent/cache/shared-state.json").write_bytes(
+            _canonical(
+                {
+                    "schema_version": 1,
+                    "bundle_digest": parent_digest,
+                    "graph_version": 1,
+                    "ref_commit": parent_commit,
+                }
+            )
+        )
+        before = _state_snapshot(target)
+
     result = GitSharedStateRestorer(
         StaticTrustProvider(trust)
     ).verify_and_restore_approved_baseline(target)
 
     assert result.status is SharedStateRestoreStatus.STALE
+    if matching_marker:
+        assert _state_snapshot(target) == before
+    else:
+        assert not (target / ".intent").exists()
+
+
+@pytest.mark.parametrize("boundary", ["validated", "fresh_preinstall", "fresh_installed"])
+@pytest.mark.parametrize("attack", ["content", "file", "directory", "marker"])
+def test_promotion_rejects_changed_authenticated_stage(
+    tmp_path: Path, boundary: str, attack: str
+) -> None:
+    """Catches promotion trusting staging bytes or identities after validation."""
+    source = _approved_source(tmp_path)
+    target = init_repository(tmp_path / "target" / "project")
+    recipient, signer, trust = keys()
+    install_state_ref(target, artifacts(canonical_files(source), recipient, signer))
+
+    def substitute(stage: str) -> None:
+        if stage != boundary:
+            return
+        workspace = (
+            target / ".intent"
+            if boundary == "fresh_installed"
+            else next(target.glob(".intent-restore-*")) / ".intent"
+        )
+        graph = workspace / "graph.yaml"
+        if attack == "content":
+            with graph.open("r+b") as writable:
+                original = writable.read()
+                writable.seek(0)
+                writable.write(original.replace(b"Restore the approved", b"Destroy the approved"))
+                writable.truncate()
+        elif attack == "file":
+            original = graph.read_bytes()
+            graph.unlink()
+            graph.write_bytes(original)
+        elif attack == "directory":
+            original_directory = workspace / "history"
+            moved = workspace.parent / "displaced-history"
+            original_directory.rename(moved)
+            shutil.copytree(moved, original_directory)
+        else:
+            (workspace / "cache/shared-state.json").write_bytes(b"{}")
+
+    result = GitSharedStateRestorer(
+        StaticTrustProvider(trust), fault_hook=substitute
+    ).verify_and_restore_approved_baseline(target)
+
+    assert result.status is SharedStateRestoreStatus.INVALID
     assert not (target / ".intent").exists()
+    assert not list(target.glob(".intent-restore-*"))
+
+
+def test_promotion_rejects_replaced_stage_root_without_deleting_foreign_files(
+    tmp_path: Path,
+) -> None:
+    """Catches reopening a substituted staging root and unowned recursive cleanup."""
+    source = _approved_source(tmp_path)
+    target = init_repository(tmp_path / "target" / "project")
+    recipient, signer, trust = keys()
+    install_state_ref(target, artifacts(canonical_files(source), recipient, signer))
+    replacement: Path | None = None
+
+    def substitute(stage: str) -> None:
+        nonlocal replacement
+        if stage == "validated":
+            replacement = next(target.glob(".intent-restore-*"))
+            replacement.rename(tmp_path / "displaced-stage")
+            shutil.copytree(tmp_path / "displaced-stage", replacement)
+            (replacement / "foreign.txt").write_bytes(b"do not remove")
+
+    result = GitSharedStateRestorer(
+        StaticTrustProvider(trust), fault_hook=substitute
+    ).verify_and_restore_approved_baseline(target)
+
+    assert result.status is SharedStateRestoreStatus.INVALID
+    assert not (target / ".intent").exists()
+    assert replacement is not None
+    assert (replacement / "foreign.txt").read_bytes() == b"do not remove"
+
+
+def _extend_local_graph(root: Path, *, label: str = "Keep unpublished local decision") -> None:
+    """Apply a real validated semantic decision, preserving its baseline evidence."""
+    runtime = load_runtime(root)
+    try:
+        graph = runtime.graph_store.load()
+        requirement = next(node for node in graph.nodes if node.id == "requirement:approved")
+        runtime.graph_store.apply(
+            ChangeSet(
+                id="changeset:unpublished",
+                actor="local:owner",
+                timestamp=NOW,
+                baseline_graph_version=graph.version,
+                evidence_refs=requirement.evidence_refs,
+                nodes_added=(),
+                nodes_updated=(
+                    NodeUpdate(
+                        node_id=requirement.id,
+                        replacement=requirement.model_copy(update={"label": label}),
+                    ),
+                ),
+                nodes_superseded=(),
+                edges_added=(),
+                edges_updated=(),
+                edges_superseded=(),
+                confidence_changes=(),
+                implementation_status_changes=(),
+                reconciliation_cases_created=(),
+                reconciliation_cases_resolved=(),
+                validation_status="validated",
+            )
+        )
+    finally:
+        runtime.close()
+
+
+@pytest.mark.parametrize("advance_remote", [False, True])
+def test_restore_preserves_unpublished_semantic_extension_for_reconciliation(
+    tmp_path: Path, advance_remote: bool
+) -> None:
+    """Catches repeated restore deleting valid graph decisions and ChangeSet history."""
+    source = _approved_source(tmp_path)
+    target = init_repository(tmp_path / "target" / "project")
+    recipient, signer, trust = keys()
+    release = artifacts(canonical_files(source), recipient, signer)
+    commit = install_state_ref(target, release)
+    restorer = GitSharedStateRestorer(StaticTrustProvider(trust))
+    assert restorer.verify_and_restore_approved_baseline(target).status.value == "verified"
+    _extend_local_graph(target)
+    assert validate_project(target).valid
+    if advance_remote:
+        install_state_ref(
+            target,
+            artifacts(
+                canonical_files(source),
+                recipient,
+                signer,
+                parent_bundle_digest=json.loads(release.manifest)["bundle_digest"],
+            ),
+            parent=commit,
+        )
+    before = _state_snapshot(target)
+
+    result = restorer.verify_and_restore_approved_baseline(target)
+
+    assert result.status.value == "diverged"
+    assert _state_snapshot(target) == before
+    assert validate_project(target).graph_version == 2
+
+
+@pytest.mark.parametrize("case", ["missing_digest", "false_genesis", "merge", "shallow"])
+def test_marker_cannot_bypass_invalid_topology_behind_its_authenticated_parent(
+    tmp_path: Path, case: str
+) -> None:
+    """Catches an unsigned marker truncating complete signed ancestry validation."""
+    source = _approved_source(tmp_path)
+    target = init_repository(tmp_path / "target" / "project")
+    ready_project(target)
+    recipient, signer, trust = keys()
+    files = canonical_files(source)
+    genesis = artifacts(files, recipient, signer)
+    genesis_commit = install_state_ref(target, genesis)
+    bad = artifacts(
+        files,
+        recipient,
+        signer,
+        parent_bundle_digest=(
+            None
+            if case in {"missing_digest", "shallow"}
+            else json.loads(genesis.manifest)["bundle_digest"]
+        ),
+    )
+    bad_commit = install_state_ref(
+        target, bad, parent=None if case == "false_genesis" else genesis_commit
+    )
+    if case == "merge":
+        tree = git(target, "rev-parse", f"{bad_commit}^{{tree}}").decode().strip()
+        code_commit = git(target, "rev-parse", "HEAD").decode().strip()
+        bad_commit = (
+            git(
+                target,
+                "commit-tree",
+                tree,
+                "-p",
+                genesis_commit,
+                "-p",
+                code_commit,
+                input_bytes=b"merge hidden behind marker\n",
+            )
+            .decode()
+            .strip()
+        )
+    if case == "shallow":
+        (target / ".git/shallow").write_text(bad_commit + "\n")
+    parent = artifacts(
+        files,
+        recipient,
+        signer,
+        parent_bundle_digest=json.loads(bad.manifest)["bundle_digest"],
+    )
+    parent_commit = install_state_ref(target, parent, parent=bad_commit)
+    tip = artifacts(
+        files,
+        recipient,
+        signer,
+        parent_bundle_digest=json.loads(parent.manifest)["bundle_digest"],
+    )
+    tip_commit = install_state_ref(target, tip, parent=parent_commit)
+    (target / ".intent/cache/shared-state.json").write_bytes(
+        _canonical(
+            {
+                "schema_version": 1,
+                "bundle_digest": json.loads(tip.manifest)["bundle_digest"],
+                "graph_version": 1,
+                "ref_commit": tip_commit,
+            }
+        )
+    )
+    before = _state_snapshot(target)
+
+    result = GitSharedStateRestorer(
+        StaticTrustProvider(trust)
+    ).verify_and_restore_approved_baseline(target)
+
+    assert result.status in {SharedStateRestoreStatus.STALE, SharedStateRestoreStatus.INVALID}
+    assert _state_snapshot(target) == before
+
+
+def test_restore_advances_semantic_remote_when_local_still_matches_its_signed_baseline(
+    tmp_path: Path,
+) -> None:
+    """Catches a preservation guard rejecting an ordinary approved remote advance."""
+    source = _approved_source(tmp_path)
+    target = init_repository(tmp_path / "target" / "project")
+    recipient, signer, trust = keys()
+    release = artifacts(canonical_files(source), recipient, signer)
+    commit = install_state_ref(target, release)
+    restorer = GitSharedStateRestorer(StaticTrustProvider(trust))
+    assert restorer.verify_and_restore_approved_baseline(target).status.value == "verified"
+    _extend_local_graph(source, label="New approved remote decision")
+    install_state_ref(
+        target,
+        artifacts(
+            canonical_files(source),
+            recipient,
+            signer,
+            graph_version=2,
+            parent_bundle_digest=json.loads(release.manifest)["bundle_digest"],
+        ),
+        parent=commit,
+    )
+
+    result = restorer.verify_and_restore_approved_baseline(target)
+
+    assert result.status is SharedStateRestoreStatus.VERIFIED
+    assert canonical_files(target) == canonical_files(source)
+    assert validate_project(target).graph_version == 2
+
+
+def test_held_writable_descriptor_cannot_mutate_promoted_graph_after_install(
+    tmp_path: Path,
+) -> None:
+    """Catches trusting inode identity while a retained descriptor alters its bytes."""
+    source = _approved_source(tmp_path)
+    target = init_repository(tmp_path / "target" / "project")
+    recipient, signer, trust = keys()
+    install_state_ref(target, artifacts(canonical_files(source), recipient, signer))
+    descriptor: int | None = None
+
+    def mutate(stage: str) -> None:
+        nonlocal descriptor
+        if stage == "validated":
+            workspace = next(target.glob(".intent-restore-*")) / ".intent"
+            descriptor = os.open(workspace / "graph.yaml", os.O_RDWR)
+        elif stage == "fresh_installed":
+            assert descriptor is not None
+            os.write(descriptor, b"invalid: []\n")
+            os.ftruncate(descriptor, 12)
+
+    try:
+        result = GitSharedStateRestorer(
+            StaticTrustProvider(trust), fault_hook=mutate
+        ).verify_and_restore_approved_baseline(target)
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+    assert result.status is SharedStateRestoreStatus.INVALID
+    assert not (target / ".intent").exists()
+
+
+@pytest.mark.parametrize("attack", ["content", "file"])
+def test_existing_restore_revalidates_installed_bytes_and_identities_before_commit(
+    tmp_path: Path, attack: str
+) -> None:
+    """Catches corruption after a transaction writes an authenticated canonical file."""
+    source = _approved_source(tmp_path)
+    target = init_repository(tmp_path / "target" / "project")
+    ready_project(target)
+    before = _state_snapshot(target)
+    recipient, signer, trust = keys()
+    install_state_ref(target, artifacts(canonical_files(source), recipient, signer))
+
+    def mutate(stage: str) -> None:
+        if stage == "existing_precommit":
+            graph = target / ".intent/graph.yaml"
+            if attack == "content":
+                graph.write_bytes(b"unverified: []")
+            else:
+                original = graph.read_bytes()
+                graph.unlink()
+                graph.write_bytes(original)
+
+    result = GitSharedStateRestorer(
+        StaticTrustProvider(trust), fault_hook=mutate
+    ).verify_and_restore_approved_baseline(target)
+
+    assert result.status is SharedStateRestoreStatus.INVALID
+    assert _state_snapshot(target) == before
+
+
+def test_restore_does_not_overwrite_a_workspace_created_at_the_fresh_install_boundary(
+    tmp_path: Path,
+) -> None:
+    """Catches a nonexclusive fresh rename replacing newly created local state."""
+    source = _approved_source(tmp_path)
+    target = init_repository(tmp_path / "target" / "project")
+    recipient, signer, trust = keys()
+    install_state_ref(target, artifacts(canonical_files(source), recipient, signer))
+    created_identity: int | None = None
+
+    def create_workspace(stage: str) -> None:
+        nonlocal created_identity
+        if stage == "fresh_preinstall":
+            workspace = target / ".intent"
+            workspace.mkdir()
+            created_identity = workspace.stat().st_ino
+
+    result = GitSharedStateRestorer(
+        StaticTrustProvider(trust), fault_hook=create_workspace
+    ).verify_and_restore_approved_baseline(target)
+
+    assert result.status is SharedStateRestoreStatus.INVALID
+    assert (target / ".intent").stat().st_ino == created_identity
+    assert list((target / ".intent").iterdir()) == []
+
+
+@pytest.mark.parametrize("boundary", ["validated", "fresh_installed"])
+@pytest.mark.parametrize("path", ["approvals/webauthn-credentials.jsonl", "unexpected.json"])
+def test_restore_does_not_promote_unsigned_files_added_to_validated_stage(
+    tmp_path: Path, boundary: str, path: str
+) -> None:
+    """Catches promoting unsigned local authority or auxiliary files with a signed graph."""
+    source = _approved_source(tmp_path)
+    target = init_repository(tmp_path / "target" / "project")
+    recipient, signer, trust = keys()
+    install_state_ref(target, artifacts(canonical_files(source), recipient, signer))
+
+    def mutate(stage: str) -> None:
+        if stage == boundary:
+            workspace = (
+                target / ".intent"
+                if boundary == "fresh_installed"
+                else next(target.glob(".intent-restore-*")) / ".intent"
+            )
+            (workspace / path).write_bytes(b"unsigned authority")
+
+    result = GitSharedStateRestorer(
+        StaticTrustProvider(trust), fault_hook=mutate
+    ).verify_and_restore_approved_baseline(target)
+
+    assert result.status is SharedStateRestoreStatus.INVALID
+    assert not (target / ".intent").exists()
+
+
+def test_restore_cannot_return_verified_for_a_substituted_repository_root(tmp_path: Path) -> None:
+    """Catches descriptor-held promotion detached from the repository selected by the caller."""
+    source = _approved_source(tmp_path)
+    target = init_repository(tmp_path / "target" / "project")
+    recipient, signer, trust = keys()
+    install_state_ref(target, artifacts(canonical_files(source), recipient, signer))
+
+    def mutate(stage: str) -> None:
+        if stage == "validated":
+            target.rename(tmp_path / "displaced-project")
+            target.mkdir()
+            (target / "foreign.txt").write_bytes(b"preserve new owner")
+
+    result = GitSharedStateRestorer(
+        StaticTrustProvider(trust), fault_hook=mutate
+    ).verify_and_restore_approved_baseline(target)
+
+    assert result.status is SharedStateRestoreStatus.INVALID
+    assert (target / "foreign.txt").read_bytes() == b"preserve new owner"
+    assert not (tmp_path / "displaced-project/.intent").exists()
+
+
+def test_repeated_restore_preserves_valid_local_evidence_appended_to_the_approved_baseline(
+    tmp_path: Path,
+) -> None:
+    """Catches an unchanged baseline restore discarding normal post-check evidence."""
+    source = _approved_source(tmp_path)
+    target = init_repository(tmp_path / "target" / "project")
+    recipient, signer, trust = keys()
+    install_state_ref(target, artifacts(canonical_files(source), recipient, signer))
+    restorer = GitSharedStateRestorer(StaticTrustProvider(trust))
+    assert restorer.verify_and_restore_approved_baseline(target).status.value == "verified"
+    content = "New locally captured evidence"
+    digest = "sha256:" + hashlib.sha256(content.encode()).hexdigest()
+    evidence = normalize_raw_source(
+        RawSourceObject(
+            connector_type="markdown",
+            external_object_id="path:local-evidence.md",
+            external_version=digest,
+            author="local:owner",
+            observed_at=NOW,
+            source_locator="local-evidence.md",
+            content_hash=digest,
+            payload={"content": content},
+        )
+    )
+    runtime = load_runtime(target)
+    try:
+        runtime.evidence_store.associate("markdown", evidence)
+    finally:
+        runtime.close()
+    before = _state_snapshot(target)
+    assert validate_project(target).valid
+
+    result = restorer.verify_and_restore_approved_baseline(target)
+
+    assert result.status is SharedStateRestoreStatus.VERIFIED
+    assert _state_snapshot(target) == before
+
+
+def test_missing_git_ancestor_is_not_hidden_by_a_matching_unsigned_marker(tmp_path: Path) -> None:
+    """Catches a marker bypassing the existence of earlier signed release commits."""
+    source = _approved_source(tmp_path)
+    target = init_repository(tmp_path / "target" / "project")
+    ready_project(target)
+    recipient, signer, trust = keys()
+    files = canonical_files(source)
+    genesis = artifacts(files, recipient, signer)
+    genesis_commit = install_state_ref(target, genesis)
+    parent = artifacts(
+        files, recipient, signer, parent_bundle_digest=json.loads(genesis.manifest)["bundle_digest"]
+    )
+    parent_commit = install_state_ref(target, parent, parent=genesis_commit)
+    tip = artifacts(
+        files, recipient, signer, parent_bundle_digest=json.loads(parent.manifest)["bundle_digest"]
+    )
+    tip_commit = install_state_ref(target, tip, parent=parent_commit)
+    (target / ".intent/cache/shared-state.json").write_bytes(
+        _canonical(
+            {
+                "schema_version": 1,
+                "bundle_digest": json.loads(tip.manifest)["bundle_digest"],
+                "graph_version": 1,
+                "ref_commit": tip_commit,
+            }
+        )
+    )
+    (target / ".git/objects" / genesis_commit[:2] / genesis_commit[2:]).unlink()
+    before = _state_snapshot(target)
+
+    result = GitSharedStateRestorer(
+        StaticTrustProvider(trust)
+    ).verify_and_restore_approved_baseline(target)
+
+    assert result.status is SharedStateRestoreStatus.INVALID
+    assert _state_snapshot(target) == before
+
+
+def test_semantic_validation_cannot_read_substitute_bytes_then_promote_the_original_payload(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Catches validating mutable filesystem bytes instead of the authenticated snapshot."""
+    source = _approved_source(tmp_path)
+    target = init_repository(tmp_path / "target" / "project")
+    recipient, signer, trust = keys()
+    files = canonical_files(source)
+    valid_graph = files["graph.yaml"]
+    files["graph.yaml"] = valid_graph.replace(b"Restore the approved", b"Destroy the approved")
+    install_state_ref(target, artifacts(files, recipient, signer))
+    original_read = SecureFile.read_optional_nonblocking
+
+    def substitute_during_read(file: SecureFile, *, max_bytes: int | None = None) -> bytes | None:
+        if file.path.name != "graph.yaml" or not any(
+            part.startswith(".intent-restore-") for part in file.path.parts
+        ):
+            return original_read(file, max_bytes=max_bytes)
+        with file.path.open("r+b") as writable:
+            unvalidated = writable.read()
+            writable.seek(0)
+            writable.write(valid_graph)
+            writable.truncate()
+            try:
+                return original_read(file, max_bytes=max_bytes)
+            finally:
+                writable.seek(0)
+                writable.write(unvalidated)
+                writable.truncate()
+
+    monkeypatch.setattr(SecureFile, "read_optional_nonblocking", substitute_during_read)
+    result = GitSharedStateRestorer(
+        StaticTrustProvider(trust)
+    ).verify_and_restore_approved_baseline(target)
+
+    assert result.status is SharedStateRestoreStatus.INVALID
+    assert not (target / ".intent").exists()
+
+
+@pytest.mark.parametrize("cached", [False, True])
+def test_signed_descendant_cannot_replay_an_older_graph_version(
+    tmp_path: Path, cached: bool
+) -> None:
+    """Catches parent-linked signatures allowing a semantic graph-version rollback."""
+    source = _approved_source(tmp_path)
+    target = init_repository(tmp_path / "target" / "project")
+    recipient, signer, trust = keys()
+    original_files = canonical_files(source)
+    genesis = artifacts(original_files, recipient, signer)
+    genesis_commit = install_state_ref(target, genesis)
+    _extend_local_graph(source)
+    advanced = artifacts(
+        canonical_files(source),
+        recipient,
+        signer,
+        graph_version=2,
+        parent_bundle_digest=json.loads(genesis.manifest)["bundle_digest"],
+    )
+    advanced_commit = install_state_ref(target, advanced, parent=genesis_commit)
+    restorer = GitSharedStateRestorer(StaticTrustProvider(trust))
+    if cached:
+        assert restorer.verify_and_restore_approved_baseline(target).status.value == "verified"
+        before = _state_snapshot(target)
+    replay = artifacts(
+        original_files,
+        recipient,
+        signer,
+        parent_bundle_digest=json.loads(advanced.manifest)["bundle_digest"],
+    )
+    install_state_ref(target, replay, parent=advanced_commit)
+
+    result = restorer.verify_and_restore_approved_baseline(target)
+
+    assert result.status is SharedStateRestoreStatus.STALE
+    if cached:
+        assert _state_snapshot(target) == before
+    else:
+        assert not (target / ".intent").exists()

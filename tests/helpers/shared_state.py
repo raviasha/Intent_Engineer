@@ -217,6 +217,7 @@ def artifacts(
     project_id: str = "project",
     repository_id: str = REPOSITORY_ID,
     schema_version: int = 1,
+    graph_version: int = 1,
     parent_bundle_digest: str | None = None,
     payload: bytes | None = None,
 ) -> SharedStateArtifacts:
@@ -225,7 +226,7 @@ def artifacts(
         plaintext,
         project_id=project_id,
         repository_id=repository_id,
-        graph_version=1,
+        graph_version=graph_version,
         parent_bundle_digest=parent_bundle_digest,
         created_at=NOW,
         recipient_public_keys={RECIPIENT_ID: recipient.public_key().public_bytes_raw()},

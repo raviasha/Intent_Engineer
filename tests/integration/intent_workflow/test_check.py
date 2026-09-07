@@ -433,6 +433,25 @@ async def test_shared_state_restore_cancellation_propagates_before_readiness() -
 
 
 @pytest.mark.anyio
+async def test_unpublished_shared_state_requires_review_before_any_ci_capture() -> None:
+    """Catches preserved local decisions being treated as an operational failure or CI success."""
+    runtime = _Runtime(
+        restore_result=SharedStateRestoreResult(
+            status=SharedStateRestoreStatus.DIVERGED,
+        )
+    )
+
+    result = await CheckService(runtime, clock=lambda: NOW).run(CheckRequest(ci=True))
+
+    assert (result.status, result.exit_code, result.readiness_status) == (
+        CheckStatus.REVIEW_REQUIRED,
+        4,
+        EnsureStatus.HUMAN_ATTENTION_REQUIRED,
+    )
+    assert runtime.events == ["restore:shared"]
+
+
+@pytest.mark.anyio
 async def test_malformed_restore_result_is_a_fixed_readiness_failure() -> None:
     """Catches a broken restore adapter escaping the strict check result boundary."""
     runtime = _Runtime()
