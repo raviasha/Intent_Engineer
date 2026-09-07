@@ -34,11 +34,13 @@ jobs:
         run: python -m intent_engineering.integrations.github_action restore
         env:
           INTENT_CI_SHARED_STATE_TRUST: ${{ secrets.INTENT_CI_SHARED_STATE_TRUST }}
-      - name: Capture and check configured source versions
-        run: intent check --require-review --sources markdown,git,github
+      - name: Capture configured source versions
+        run: intent sync --project . --sources markdown,git,github
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_REPOSITORY: ${{ github.repository }}
+      - name: Validate captured canonical state
+        run: intent validate --project .
       - name: Render drift and assurance report
         run: intent drift --project . --format markdown --output intent-drift.md
       - uses: actions/upload-artifact@v4
@@ -47,3 +49,5 @@ jobs:
           path: intent-drift.md
           retention-days: 7
           if-no-files-found: error
+      - name: Require resolution of pending review
+        run: intent check --require-review

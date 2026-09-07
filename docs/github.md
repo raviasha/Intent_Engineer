@@ -88,7 +88,8 @@ cron `17 2 * * *`. Its exact read-only permissions are `contents: read`,
 ```bash
 python -m pip install .
 python -m intent_engineering.integrations.github_action restore
-intent check --require-review --sources markdown,git,github
+intent sync --project . --sources markdown,git,github
+intent validate --project .
 intent drift --project . --format markdown --output intent-drift.md
 ```
 
@@ -97,8 +98,9 @@ protected `intent-state` ref using `INTENT_CI_SHARED_STATE_TRUST` in the protect
 environment. Missing keys, invalid signatures or incompatible state fail closed. The workflow
 never runs `intent init` and cannot report an empty graph version 0 as clean. See
 [CI setup and trust prerequisites](intent-aware-agent.md#required-github-check-setup).
-The consolidated check preserves the granular `intent validate --project .` and
-`intent sync --project . --sources markdown,git,github` interfaces for manual diagnostics.
+After uploading the report, the final step runs `intent check --require-review`. Pending review
+therefore fails the workflow with exit 4 only after the artifact is available. Restore, capture,
+validation and rendering failures still stop the workflow; no failing command is masked.
 
 The sync step supplies `GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}` and
 `GITHUB_REPOSITORY: ${{ github.repository }}`. The workflow uploads the exact

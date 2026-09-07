@@ -134,6 +134,21 @@ commands pass, and validates its repository, commit, timestamp and ACL before wr
 intent check --ci --require-review --test-results .intent-ci/test-results.json
 ```
 
+Reviewed execution requires a clean commit snapshot before and after every command and both
+result writes. The helper hashes actual tracked bytes against HEAD, checks executable modes and
+the staged index, and binds staged evidence to file identities and modification/change times.
+Index shortcuts, arbitrary ignore rules and Git replacement objects cannot authorize dirty code.
+Any mismatch removes staged and final passing evidence. The internal staged snapshot is local to
+this checkout; the final canonical result schema is unchanged.
+
+Only untracked `.intent/`, `.intent-ci/`, `.venv/`, `.pytest_cache/`, `.mypy_cache/`, `.ruff_cache/`,
+`__pycache__/` directories and exact reviewed `test_result_paths` are permitted as generated
+outputs. Tracked files are never exempt. Other outputs must be explicitly reviewed, not merely
+added to `.gitignore`. Snapshot inspection is bounded to 4,096 tracked files, 16 MiB per file,
+128 MiB total, 1 MiB of Git listing output and five seconds; it fails closed beyond these limits.
+Tracked symlinks, submodules, hardlinks and checkout filters that change committed bytes are not
+supported by this CI execution contract.
+
 Configure these prerequisites before expecting the check to pass:
 
 1. Review and activate the project baseline. Include a nonempty `test_commands` list in the
@@ -179,8 +194,11 @@ Only the canonical passing test-result file is uploaded by the PR job, with seve
 It contains commit/project/test identifiers and ACL metadata, not decrypted canonical state or
 test stdout. Do not broaden its artifact path to `.intent`, the whole checkout or raw test logs.
 The nightly/manual workflow has separate concurrency and read-only source permissions. It uses
-the same protected environment to restore state, then captures and checks sources; it does not
-claim fresh repository test execution. Its generated drift report also has seven-day retention.
+the same protected environment to restore state, captures sources, validates canonical state,
+then renders and uploads the drift report before the final `intent check --require-review`.
+Pending review still fails the run, but its report remains available. Restore, capture, validation
+and rendering failures are not masked. It does not claim fresh repository test execution. Its
+generated drift report also has seven-day retention.
 
 For an onboarded local checkout, the first ordinary prompt checks readiness automatically; the
 developer does not need to type an Intent command per task. Current prompt readiness examines the

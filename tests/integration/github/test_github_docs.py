@@ -93,14 +93,16 @@ def test_github_guide_keeps_release_boundaries_and_action_contract_visible() -> 
     assert [step["run"] for step in steps if "run" in step] == [
         "python -m pip install .",
         "python -m intent_engineering.integrations.github_action restore",
-        "intent check --require-review --sources markdown,git,github",
+        "intent sync --project . --sources markdown,git,github",
+        "intent validate --project .",
         "intent drift --project . --format markdown --output intent-drift.md",
+        "intent check --require-review",
     ]
     assert steps[4]["env"] == {
         "GH_TOKEN": "${{ secrets.GITHUB_TOKEN }}",
         "GITHUB_REPOSITORY": "${{ github.repository }}",
     }
-    assert steps[6]["with"] == {
+    assert steps[7]["with"] == {
         "name": "intent-drift",
         "path": "intent-drift.md",
         "retention-days": "7",

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib
 import json
+import shlex
 from pathlib import Path
 from unittest.mock import patch
 
@@ -63,6 +64,7 @@ def _clone(
     case_type: str | None = None,
     failing: bool = False,
     commands: list[list[str]] | None = None,
+    result_paths: list[str] | None = None,
 ):
     source = init_repository(tmp_path / "source" / "project")
     ready_project(source)
@@ -80,7 +82,7 @@ def _clone(
     config_path = source / ".intent/config.yaml"
     config = yaml.safe_load(config_path.read_bytes())
     config["test_commands"] = [["tools/test-runner"]] if commands is None else commands
-    config["test_result_paths"] = []
+    config["test_result_paths"] = result_paths or []
     config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
     if case_type is not None:
         runtime = load_runtime(source)
@@ -331,7 +333,219 @@ def test_failed_rerun_invalidates_earlier_passing_artifacts(
         "#!/usr/bin/python3\nraise SystemExit(1)\n",
         encoding="utf-8",
     )
-    with pytest.raises(ValueError, match="reviewed tests failed"):
+    with pytest.raises(ValueError, match="clean commit snapshot unavailable"):
         anyio.run(action.run_tests, repo, NOW)
     assert not (repo / ".intent-ci/reviewed-tests.json").exists()
     assert not (repo / ".intent-ci/test-results.json").exists()
+
+
+@pytest.mark.parametrize(
+    "kind", ["unstaged", "staged", "assume-unchanged", "ignored-untracked", "replace-object"]
+)
+def test_reviewed_tests_reject_code_that_does_not_match_head(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    kind: str,
+) -> None:
+    action = _action()
+    repo, trust = _clone(tmp_path)
+    monkeypatch.setenv("INTENT_CI_SHARED_STATE_TRUST", trust_environment(trust))
+    action.restore(repo)
+    if kind == "ignored-untracked":
+        (repo / ".gitignore").write_text("*.py\n.intent/\n.intent-ci/\n", encoding="utf-8")
+        git(repo, "add", ".gitignore")
+        git(repo, "commit", "-qm", "ignore generated Python")
+        (repo / "unreviewed.py").write_text("value = True\n", encoding="utf-8")
+    else:
+        (repo / "feature.py").write_text("def enabled():\n    return False\n", encoding="utf-8")
+        git(repo, "add", "feature.py")
+        git(repo, "commit", "-qm", "failing committed behavior")
+        original_head = git(repo, "rev-parse", "HEAD").decode().strip()
+        if kind == "assume-unchanged":
+            git(repo, "update-index", "--assume-unchanged", "feature.py")
+        (repo / "feature.py").write_text("def enabled():\n    return True\n", encoding="utf-8")
+        if kind == "staged":
+            git(repo, "add", "feature.py")
+        if kind == "replace-object":
+            git(repo, "add", "feature.py")
+            git(repo, "commit", "-qm", "replacement passing behavior")
+            replacement = git(repo, "rev-parse", "HEAD").decode().strip()
+            git(repo, "update-ref", "HEAD", original_head)
+            git(repo, "replace", original_head, replacement)
+    with pytest.raises(ValueError):
+        anyio.run(action.run_tests, repo, NOW)
+    assert not (repo / ".intent-ci/reviewed-tests.json").exists()
+
+
+@pytest.mark.parametrize("restore_original", [False, True])
+def test_reviewed_test_cannot_change_code_during_execution(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    restore_original: bool,
+) -> None:
+    action = _action()
+    repo, trust = _clone(tmp_path)
+    monkeypatch.setenv("INTENT_CI_SHARED_STATE_TRUST", trust_environment(trust))
+    action.restore(repo)
+    runner = repo / "tools/test-runner"
+    runner.write_text(
+        "#!/usr/bin/python3\nfrom pathlib import Path\np = Path('feature.py')\n"
+        "original = p.read_text()\np.write_text('def enabled():\\n    return False\\n')\n"
+        + ("p.write_text(original)\n" if restore_original else ""),
+        encoding="utf-8",
+    )
+    git(repo, "add", "tools/test-runner")
+    git(repo, "commit", "-qm", "runner mutates code")
+    with pytest.raises(ValueError):
+        anyio.run(action.run_tests, repo, NOW)
+    assert not (repo / ".intent-ci/reviewed-tests.json").exists()
+
+
+@pytest.mark.parametrize("stage", ["after-tests", "staged-write", "final-write"])
+def test_code_changes_at_result_boundaries_cannot_publish_passing_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    stage: str,
+) -> None:
+    action = _action()
+    repo, trust = _clone(tmp_path)
+    monkeypatch.setenv("INTENT_CI_SHARED_STATE_TRUST", trust_environment(trust))
+    action.restore(repo)
+    original_write = action._write
+
+    def change_code(root, path, content):
+        original_write(root, path, content)
+        (repo / "feature.py").write_text("def enabled():\n    return False\n", encoding="utf-8")
+
+    if stage == "staged-write":
+        monkeypatch.setattr(action, "_write", change_code)
+        with pytest.raises(ValueError):
+            anyio.run(action.run_tests, repo, NOW)
+        assert not (repo / ".intent-ci/reviewed-tests.json").exists()
+    else:
+        anyio.run(action.run_tests, repo, NOW)
+        if stage == "after-tests":
+            (repo / "feature.py").write_text("def enabled():\n    return False\n", encoding="utf-8")
+        else:
+            monkeypatch.setattr(action, "_write", change_code)
+        with pytest.raises(ValueError):
+            action.write_results(repo, NOW)
+    assert not (repo / ".intent-ci/test-results.json").exists()
+
+
+def test_scheduled_capture_uploads_a_report_before_failing_for_pending_review(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo, trust = _clone(tmp_path, case_type="CONFLICTING_SOURCES")
+    monkeypatch.setenv("INTENT_CI_SHARED_STATE_TRUST", trust_environment(trust))
+    action = _action()
+    action.restore(repo)
+    monkeypatch.chdir(repo)
+    (repo / "new-source.md").write_text("A newly captured source version\n", encoding="utf-8")
+    workflow = yaml.safe_load(
+        (Path(__file__).parents[2] / ".github/workflows/intent-sync.yml").read_text()
+    )
+    uploaded = False
+    for step in workflow["jobs"]["drift"]["steps"][4:]:
+        if "uses" in step:
+            assert "upload-artifact" in step["uses"]
+            report = (repo / step["with"]["path"]).read_text()
+            assert "CONFLICTING" in report
+            uploaded = True
+            continue
+        arguments = shlex.split(step["run"])[1:]
+        if "--sources" in arguments:
+            # GitHub connector behavior is separately covered by its offline API fixtures.
+            arguments[arguments.index("--sources") + 1] = "markdown,git"
+        result = CliRunner().invoke(app, arguments)
+        assert result.exit_code == (4 if uploaded else 0), result.stdout
+    assert uploaded
+    runtime = load_runtime(repo)
+    try:
+        assert any(record.source_locator == "new-source.md" for record in runtime.evidence())
+    finally:
+        runtime.close()
+
+
+def test_clean_commit_boundary_allows_only_declared_untracked_outputs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    action = _action()
+    repo, trust = _clone(tmp_path, result_paths=["reports/reviewed.json"])
+    monkeypatch.setenv("INTENT_CI_SHARED_STATE_TRUST", trust_environment(trust))
+    action.restore(repo)
+    (repo / ".venv").mkdir()
+    (repo / ".venv/dependency").write_text("installed dependency", encoding="utf-8")
+    anyio.run(action.run_tests, repo, NOW)
+    action.write_results(repo, NOW)
+    assert (repo / "reports/reviewed.json").is_file()
+    assert (repo / ".intent-ci/test-results.json").is_file()
+
+
+def test_approved_output_path_cannot_exempt_tracked_code_from_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    action = _action()
+    repo, trust = _clone(tmp_path, result_paths=["feature.py"])
+    monkeypatch.setenv("INTENT_CI_SHARED_STATE_TRUST", trust_environment(trust))
+    action.restore(repo)
+    with pytest.raises(ValueError, match="clean commit snapshot"):
+        anyio.run(action.run_tests, repo, NOW)
+    assert not (repo / ".intent-ci/reviewed-tests.json").exists()
+
+
+@pytest.mark.parametrize("attack", ["symlink", "byte-bound"])
+def test_commit_snapshot_rejects_unsafe_or_oversized_tracked_inputs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    attack: str,
+) -> None:
+    action = _action()
+    repo, trust = _clone(tmp_path)
+    monkeypatch.setenv("INTENT_CI_SHARED_STATE_TRUST", trust_environment(trust))
+    action.restore(repo)
+    if attack == "symlink":
+        outside = tmp_path / "outside.py"
+        outside.write_bytes((repo / "feature.py").read_bytes())
+        (repo / "feature.py").unlink()
+        (repo / "feature.py").symlink_to(outside)
+    else:
+        monkeypatch.setattr(
+            "intent_engineering.intent_workflow.dev_observer.MAX_COMMIT_SNAPSHOT_BYTES", 1
+        )
+    with pytest.raises((ValueError, OSError)):
+        anyio.run(action.run_tests, repo, NOW)
+    assert not (repo / ".intent-ci/reviewed-tests.json").exists()
+
+
+@pytest.mark.parametrize("failure", ["capture", "render"])
+def test_scheduled_pipeline_does_not_mask_operational_failures(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+) -> None:
+    repo, trust = _clone(tmp_path, case_type="CONFLICTING_SOURCES")
+    monkeypatch.setenv("INTENT_CI_SHARED_STATE_TRUST", trust_environment(trust))
+    _action().restore(repo)
+    monkeypatch.chdir(repo)
+    if failure == "capture":
+        (repo / ".git").rename(repo / "git-metadata")
+    else:
+        (repo / "intent-drift.md").symlink_to(tmp_path / "outside.md")
+    workflow = yaml.safe_load(
+        (Path(__file__).parents[2] / ".github/workflows/intent-sync.yml").read_text()
+    )
+    for step in workflow["jobs"]["drift"]["steps"][4:]:
+        assert "uses" not in step, "an operational failure must stop before upload"
+        arguments = shlex.split(step["run"])[1:]
+        if "--sources" in arguments:
+            arguments[arguments.index("--sources") + 1] = "markdown,git"
+        result = CliRunner().invoke(app, arguments)
+        if result.exit_code:
+            assert result.exit_code == (3 if failure == "capture" else 1)
+            break
+    else:
+        pytest.fail("the operational failure was masked")

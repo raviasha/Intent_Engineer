@@ -39,6 +39,7 @@ MAX_REVIEWED_SOURCE_BYTES = 24 * 1024
 MAX_CHANGED_PATHS = 4096
 MAX_CHANGED_PATH_BYTES = 4096
 MAX_CHANGED_PATH_OUTPUT_BYTES = 1024 * 1024
+MAX_COMMIT_SNAPSHOT_BYTES = 128 * 1024 * 1024
 GIT_TIMEOUT_SECONDS = 5
 _REVISION = re.compile(r"^[0-9a-f]{40}(?:[0-9a-f]{24})?$")
 _GIT_EXECUTABLE = Path("/usr/bin/git")
@@ -52,6 +53,7 @@ _GIT_ENVIRONMENT: Mapping[str, str] = {
     "GIT_CONFIG_GLOBAL": "/dev/null",
     "GIT_CONFIG_NOSYSTEM": "1",
     "GIT_TERMINAL_PROMPT": "0",
+    "GIT_NO_REPLACE_OBJECTS": "1",
 }
 _VETTED_INTERPRETERS = frozenset({"/bin/sh", "/usr/bin/python3"})
 # The capability probe must launch through exactly the same interpreter wrapper.
@@ -555,6 +557,105 @@ class DevObserver:
         ):
             raise ValueError("Git path observation is oversized")
         return paths
+
+    def clean_commit_snapshot(self) -> str:
+        """Verify actual tracked bytes against HEAD and fingerprint their held identities.
+
+        This optional CI boundary does not trust index stat caches or arbitrary ignore rules.
+        Only known generated directories and exact reviewed result paths may be untracked.
+        Tracked files never receive an output-path exemption.
+        """
+        if self._directory is None:
+            raise ValueError("clean commit snapshot unavailable")
+        deadline = time.monotonic() + GIT_TIMEOUT_SECONDS
+        self._require_repository_root(self._root)
+        revision = self._current_revision()
+        tree = self._git(
+            ("ls-tree", "-rz", "--full-tree", revision), max_bytes=MAX_CHANGED_PATH_OUTPUT_BYTES
+        )
+        entries = tree.removesuffix("\0").split("\0") if tree else []
+        if not entries or len(entries) > MAX_CHANGED_PATHS:
+            raise ValueError("clean commit snapshot unavailable")
+        fingerprint = hashlib.sha256(revision.encode("ascii"))
+        total_bytes = 0
+        for entry in entries:
+            header, path = entry.split("\t", 1)
+            mode, kind, expected_hash = header.split(" ")
+            if (
+                mode not in {"100644", "100755"}
+                or kind != "blob"
+                or len(path.encode("utf-8")) > MAX_CHANGED_PATH_BYTES
+            ):
+                raise ValueError("clean commit snapshot unavailable")
+            source = self._directory.read_relative(
+                path, nonblocking=True, max_bytes=MAX_EXECUTABLE_BYTES
+            )
+            total_bytes += len(source.content)
+            if total_bytes > MAX_COMMIT_SNAPSHOT_BYTES or time.monotonic() > deadline:
+                raise ValueError("clean commit snapshot unavailable")
+            material = b"blob " + str(len(source.content)).encode("ascii") + b"\0" + source.content
+            digest = (
+                hashlib.sha1(material, usedforsecurity=False).hexdigest()
+                if len(revision) == 40
+                else hashlib.sha256(material).hexdigest()
+            )
+            target = self._directory.file(path)
+            try:
+                metadata = os.stat(target.name, dir_fd=target.parent_fd, follow_symlinks=False)
+            finally:
+                target.close()
+            if (
+                digest != expected_hash
+                or (metadata.st_dev, metadata.st_ino) != source.identities[-1]
+                or metadata.st_mtime_ns != source.modified_ns
+                or not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_nlink != 1
+                or bool(metadata.st_mode & 0o111) != (mode == "100755")
+            ):
+                raise ValueError("clean commit snapshot unavailable")
+            fingerprint.update(
+                _canonical_bytes(
+                    (path, source.identities, metadata.st_mtime_ns, metadata.st_ctime_ns, mode)
+                )
+            )
+        staged = self._git(
+            (
+                "diff",
+                "--cached",
+                "--name-only",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--ignore-submodules=none",
+                revision,
+                "--",
+            ),
+            max_bytes=MAX_CHANGED_PATH_OUTPUT_BYTES,
+        )
+        untracked = self._git(
+            (
+                "ls-files",
+                "--others",
+                "-z",
+                "--exclude=/.intent/",
+                "--exclude=/.intent-ci/",
+                "--exclude=/.venv/",
+                "--exclude=/.pytest_cache/",
+                "--exclude=/.mypy_cache/",
+                "--exclude=/.ruff_cache/",
+                "--exclude=__pycache__/",
+            ),
+            max_bytes=MAX_CHANGED_PATH_OUTPUT_BYTES,
+        )
+        paths = tuple(path for path in untracked.split("\0") if path)
+        if (
+            staged
+            or len(paths) > MAX_CHANGED_PATHS
+            or any(path not in self._config.test_result_paths for path in paths)
+            or revision != self._current_revision()
+            or time.monotonic() > deadline
+        ):
+            raise ValueError("clean commit snapshot unavailable")
+        return "sha256:" + fingerprint.hexdigest()
 
     def _pin_executable(self, relative: str) -> _ExecutablePin:
         if self._directory is None:

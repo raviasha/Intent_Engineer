@@ -122,8 +122,9 @@ intent check --ci --require-review --test-results .intent-ci/test-results.json
 
 Passing tests are evidence, not human approval. Missing trust or baseline, failing tests, invalid
 evidence, and unresolved review work fail the job. Disabling the local plugin does not disable
-this GitHub backstop. The nightly/manual `intent-sync.yml` remains separate and captures configured
-Markdown, Git, and GitHub sources through `intent check`.
+this GitHub backstop. The nightly/manual `intent-sync.yml` remains separate: it captures configured
+Markdown, Git, and GitHub sources, validates state, renders and uploads the drift report, then
+runs the review-required check. Pending review fails the run after producing its report.
 
 This workflow requires operator setup; committing it does not enable branch protection. Configure
 the protected `intent-ci` environment, supply the CI recipient key and pinned signing-key trust,

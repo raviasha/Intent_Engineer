@@ -98,3 +98,60 @@ fixture pass. Passing CI is bounded deterministic assurance, not a universal sem
 or human-approval claim.
 
 Commit message: `feat: automate intent readiness and checks`.
+
+## Review round 1: exact test tree and scheduled review reports
+
+Both Important review findings were reproduced before changing implementation. The initial
+review regressions produced **11 failures**: dirty committed/working/index state could acquire
+passing evidence, test/result-boundary mutations went undetected, and an open review case halted
+scheduled capture before artifact production. A further Git replacement-object regression also
+failed RED before disabling replacement objects in the bounded Git environment.
+
+The fix adds an optional CI-only clean-commit snapshot to the existing observer. It compares
+descriptor-read tracked file bytes and executable modes with the actual HEAD tree, checks the
+staged index and untracked paths without trusting arbitrary ignore rules, and binds evidence to
+file identities plus modification/change times. The adapter checks this snapshot before and
+after every reviewed command and both staged/canonical writes; any failure invalidates both
+passing-result paths. The internal staged envelope carries the fingerprint; the public canonical
+result schema and signed shared-state verification remain unchanged.
+
+Inspection retains the existing pinned Git executable, sanitized environment, disabled hooks and
+filesystem monitor, streaming output caps and process deadlines. It additionally disables replace
+objects and text-conversion helpers. Snapshot bounds are 4,096 tracked files, 16 MiB per file,
+128 MiB total and a five-second acceptance deadline. Only explicit generated directories and exact
+reviewed output paths may be untracked; tracked files never receive an exemption. Unsupported
+links, submodules and transformed checkout bytes fail closed. Documentation lists these limits.
+
+The scheduled workflow now restores, captures, validates, renders and uploads before the final
+review-required check. A real signed conflicting-state fixture walks the workflow's CLI steps,
+proves a new source is captured and the conflict report exists at upload, then observes exit 4.
+Separate capture and render failure fixtures prove operational errors stop the pipeline rather
+than being masked. The required PR workflow and its exact status/command are unchanged.
+
+Review regression coverage includes unstaged/staged/assume-unchanged/ignored-untracked and replaced
+HEAD attacks; mutation during tests, including restoring original bytes; all result boundaries;
+declared output allowance without exempting tracked code; unsafe and oversized inputs; and
+scheduled report/failure ordering. No GitHub mutation or push was performed.
+
+Review fix verification:
+
+- Focused observer, CI evidence, workflow, scheduled-pipeline and compatibility gates:
+  **63 passed**, 44.42 seconds.
+- Broad affected-feature gate (workflow/readiness/check, signed restore, GitHub, agent-host,
+  MCP, release proof and public-alpha contracts): **917 passed, 1 deselected, 19 existing
+  warnings**, 102.08 seconds. Only the previously documented installed-Codex version assertion
+  was deselected.
+- Full mypy: **140 source files**, no issues.
+- Ruff excluding the previously documented unrelated `dogfood 2.py`: passed.
+- Ruff formatting on all six changed Python files: passed.
+- Plugin validator, `intent check --help`, `intent ensure --help`, and diff checks: passed.
+- Complete offline suite (same installed-Codex-only exclusion as above): **2,172 passed,
+  1 failed, 1 skipped, 1 deselected, 31 warnings**, 323.98 seconds. The sole failure was the
+  unchanged `test_store_instances_dedupe_the_same_evidence_id_concurrently`: one fork child
+  received `FileNotFoundError` while creating `.evidence.jsonl.lock`, leaving its peer waiting
+  at the test barrier. The post-summary atexit wait was interrupted. All **8 evidence-store
+  contract tests passed** immediately in isolation (0.11 seconds). Neither storage implementation
+  nor storage tests changed; this intermittent failure is reported, not suppressed or claimed
+  green.
+
+Fix commit message: `fix: bind CI evidence and preserve scheduled reports`.

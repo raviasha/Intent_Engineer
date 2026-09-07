@@ -343,13 +343,14 @@ def test_scheduled_workflow_is_read_only_and_orders_capture_before_assurance() -
         "uses": "actions/setup-python@v5",
         "with": {"python-version": "3.12"},
     }
-    assert [step["name"] for step in steps[2:6]] == [
+    assert [step["name"] for step in steps[2:7]] == [
         "Install Intent Engineering",
         "Restore verified approved intent state",
-        "Capture and check configured source versions",
+        "Capture configured source versions",
+        "Validate captured canonical state",
         "Render drift and assurance report",
     ]
-    assert steps[6] == {
+    assert steps[7] == {
         "uses": "actions/upload-artifact@v4",
         "with": {
             "name": "intent-drift",
@@ -361,8 +362,10 @@ def test_scheduled_workflow_is_read_only_and_orders_capture_before_assurance() -
     commands = [step.get("run", "") for step in steps]
     assert commands[2] == "python -m pip install ."
     assert commands[3] == "python -m intent_engineering.integrations.github_action restore"
-    assert commands[4] == "intent check --require-review --sources markdown,git,github"
-    assert commands[5] == ("intent drift --project . --format markdown --output intent-drift.md")
+    assert commands[4] == "intent sync --project . --sources markdown,git,github"
+    assert commands[5] == "intent validate --project ."
+    assert commands[6] == ("intent drift --project . --format markdown --output intent-drift.md")
+    assert commands[8] == "intent check --require-review"
     assert steps[4]["env"] == {
         "GH_TOKEN": "${{ secrets.GITHUB_TOKEN }}",
         "GITHUB_REPOSITORY": "${{ github.repository }}",
@@ -430,10 +433,11 @@ def test_guided_adoption_docs_and_plugin_independent_assurance_are_ordered() -> 
         "uses": "actions/setup-python@v5",
         "with": {"python-version": "3.12"},
     }
-    assert [step.get("run") for step in steps[2:6]] == [
+    assert [step.get("run") for step in steps[2:7]] == [
         "python -m pip install .",
         "python -m intent_engineering.integrations.github_action restore",
-        "intent check --require-review --sources markdown,git,github",
+        "intent sync --project . --sources markdown,git,github",
+        "intent validate --project .",
         "intent drift --project . --format markdown --output intent-drift.md",
     ]
     assert "intent-advisor" not in raw

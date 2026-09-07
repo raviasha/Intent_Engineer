@@ -43,15 +43,16 @@ def test_intent_sync_workflow_is_nightly_manual_read_only_and_ordered() -> None:
     }
     assert steps[2]["run"] == "python -m pip install ."
     assert steps[3]["run"] == "python -m intent_engineering.integrations.github_action restore"
-    assert steps[4]["run"] == "intent check --require-review --sources markdown,git,github"
+    assert steps[4]["run"] == "intent sync --project . --sources markdown,git,github"
     assert steps[4]["env"] == {
         "GH_TOKEN": "${{ secrets.GITHUB_TOKEN }}",
         "GITHUB_REPOSITORY": "${{ github.repository }}",
     }
-    assert steps[5]["run"] == (
+    assert steps[5]["run"] == "intent validate --project ."
+    assert steps[6]["run"] == (
         "intent drift --project . --format markdown --output intent-drift.md"
     )
-    assert steps[6] == {
+    assert steps[7] == {
         "uses": "actions/upload-artifact@v4",
         "with": {
             "name": "intent-drift",
@@ -60,6 +61,7 @@ def test_intent_sync_workflow_is_nightly_manual_read_only_and_ordered() -> None:
             "if-no-files-found": "error",
         },
     }
+    assert steps[8]["run"] == "intent check --require-review"
     assert "continue-on-error" not in text
     assert "permissions: write" not in text
     assert "|| true" not in text
