@@ -302,6 +302,152 @@ def test_existing_cache_is_byte_identical_after_failure_or_cancellation(
     assert _state_snapshot(target) == before
 
 
+def test_ordinary_restore_rollback_preserves_open_runtime_and_unrelated_local_files(
+    tmp_path: Path,
+) -> None:
+    """Catches routine rollback replacing the live directory and stranding held stores."""
+    source = _approved_source(tmp_path)
+    target = init_repository(tmp_path / "target" / "project")
+    ready_project(target)
+    profile = target / ".intent/connectors/local-profile.yaml"
+    profile.write_bytes(b"local connector settings: preserve\n")
+    recipient, signer, trust = keys()
+    install_state_ref(target, artifacts(canonical_files(source), recipient, signer))
+    runtime = load_runtime(target)
+    try:
+        graph_path = target / ".intent/graph.yaml"
+        graph_path.chmod(0o640)
+        os.utime(graph_path, ns=(1_700_000_000_000_000_000, 1_700_000_000_000_000_000))
+        before = _state_snapshot(target)
+        metadata = {
+            path: (target / ".intent" / path).stat()
+            for path, content in before.items()
+            if content is not None
+        }
+        directories = {
+            path: path.stat().st_ino
+            for path in (target / ".intent", *(target / ".intent").iterdir())
+            if path.is_dir()
+        }
+        locks = {path: path.stat().st_ino for path in (target / ".intent").rglob("*.lock")}
+        profile_inode = profile.stat().st_ino
+
+        def fail(stage: str) -> None:
+            if stage == "target:graph.yaml":
+                raise OSError("ordinary disk fault")
+
+        result = GitSharedStateRestorer(
+            StaticTrustProvider(trust), fault_hook=fail
+        ).verify_and_restore_approved_baseline(target)
+
+        assert result.status is SharedStateRestoreStatus.INVALID
+        assert _state_snapshot(target) == before
+        assert {path: path.stat().st_ino for path in directories} == directories
+        assert {path: path.stat().st_ino for path in locks} == locks
+        assert profile.read_bytes() == b"local connector settings: preserve\n"
+        assert profile.stat().st_ino == profile_inode
+        for path, expected in metadata.items():
+            observed = (target / ".intent" / path).stat()
+            assert (observed.st_mode, observed.st_mtime_ns) == (
+                expected.st_mode,
+                expected.st_mtime_ns,
+            )
+
+        graph = runtime.graph_store.load()
+        requirement = next(node for node in graph.nodes if node.id == "requirement:approved")
+        runtime.graph_store.apply(
+            ChangeSet(
+                id="changeset:after-restore-rollback",
+                actor="local:owner",
+                timestamp=NOW,
+                baseline_graph_version=graph.version,
+                evidence_refs=requirement.evidence_refs,
+                nodes_added=(),
+                nodes_updated=(
+                    NodeUpdate(
+                        node_id=requirement.id,
+                        replacement=requirement.model_copy(
+                            update={"label": "Written through the already-open runtime"}
+                        ),
+                    ),
+                ),
+                nodes_superseded=(),
+                edges_added=(),
+                edges_updated=(),
+                edges_superseded=(),
+                confidence_changes=(),
+                implementation_status_changes=(),
+                reconciliation_cases_created=(),
+                reconciliation_cases_resolved=(),
+                validation_status="validated",
+            )
+        )
+        reopened = load_runtime(target)
+        try:
+            visible = reopened.graph_store.load()
+            assert visible.version == graph.version + 1
+            assert next(node for node in visible.nodes if node.id == requirement.id).label == (
+                "Written through the already-open runtime"
+            )
+            assert reopened.graph_store.history(requirement.id)[-1].id == (
+                "changeset:after-restore-rollback"
+            )
+        finally:
+            reopened.close()
+    finally:
+        runtime.close()
+
+
+def test_cancelled_stage_cleanup_preserves_a_post_validation_directory_substitution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Catches recursive cleanup deleting a replacement introduced after authentication."""
+    source = _approved_source(tmp_path)
+    target = init_repository(tmp_path / "target" / "project")
+    recipient, signer, trust = keys()
+    install_state_ref(target, artifacts(canonical_files(source), recipient, signer))
+    cancelled = _Cancelled()
+    cleaning = False
+    substituted = False
+    original_verify = restore_module._PinnedState.verify
+
+    def fail(stage: str) -> None:
+        nonlocal cleaning
+        if stage == "validated":
+            cleaning = True
+            raise cancelled
+
+    def substitute_after_verify(
+        state: restore_module._PinnedState, parent: SecureDirectory | None = None
+    ) -> None:
+        nonlocal substituted
+        original_verify(state, parent)
+        if cleaning and not substituted and parent is not None:
+            substituted = True
+            workspace = parent.path / ".intent"
+            workspace.rename(tmp_path / "displaced-authenticated-stage")
+            workspace.mkdir()
+            (workspace / "foreign.txt").write_bytes(b"unfamiliar bytes must survive cleanup")
+
+    monkeypatch.setattr(restore_module._PinnedState, "verify", substitute_after_verify)
+    with pytest.raises(_Cancelled) as raised:
+        GitSharedStateRestorer(
+            StaticTrustProvider(trust), fault_hook=fail
+        ).verify_and_restore_approved_baseline(target)
+
+    assert raised.value is cancelled
+    assert substituted
+    assert not (target / ".intent").exists()
+    assert [path.read_bytes() for path in target.rglob("foreign.txt")] == [
+        b"unfamiliar bytes must survive cleanup"
+    ]
+    assert all(
+        path.read_bytes() == b""
+        for path in (tmp_path / "displaced-authenticated-stage").rglob("*")
+        if path.is_file()
+    )
+
+
 @pytest.mark.parametrize("boundary", ["validated", "fresh_preinstall", "fresh_installed"])
 def test_fresh_cache_install_rolls_back_cancellation_and_removes_plaintext_stage(
     tmp_path: Path,

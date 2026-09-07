@@ -176,3 +176,63 @@ reconciliation, force replacement or remote mutation was added.
   three changed Python files pass the format check. Full mypy: **140 source files**, no issues.
 - `git diff --check` and direct `git check-ignore --no-index` checks for generated staging and
   recovery paths passed. No push, publication or GitHub mutation was performed.
+
+## Review round 2 — 2026-09-08
+
+### Reproductions and changes
+
+Both recovery findings were reproduced before changing production code, using real temporary
+Git repositories, the signed/encrypted release fixtures, and the public runtime stores:
+
+- An ordinary injected disk fault after the graph write restored canonical bytes but replaced
+  the entire workspace because rollback had changed file timestamps. The RED test found that
+  the unrelated local connector directory had disappeared from the live workspace. Recovery
+  now distinguishes directory device/inode substitution from file-content or metadata changes.
+  With the original directory bindings intact, it repairs only the bounded canonical/local
+  restore targets in place: exact bytes, absent entries, modes and modification timestamps.
+  Matching bytes are authenticated through held file descriptors before any metadata repair;
+  already-correct metadata is left alone. Unfamiliar target entries are moved into private
+  recovery before exclusive installation of the pinned preimage, never deleted.
+- Whole-directory reconstruction is now reserved for proven directory identity substitution.
+  The ordinary-fault regression verifies unchanged workspace, child-directory and existing
+  lock-file identities, the unrelated connector profile's bytes and inode, all canonical
+  bytes/absence, and file modes/mtimes. It then applies a real validated ChangeSet through a
+  runtime opened before the failed restore and confirms both the new graph version and
+  ChangeSet history through a newly opened runtime. Routine failure therefore does not split
+  the live stores or their lock domain.
+- Cancellation after validation allowed cleanup's recursive deletion to remove an unfamiliar
+  `.intent` replacement introduced immediately after the last successful verification. The
+  RED fixture lost its foreign file. Cleanup now atomically detaches the actual staging entry
+  into an owner-private recovery container, opens and authenticates the bounded inventory's
+  file descriptors, checks their stable change tokens, and scrubs only those held inodes.
+  It never recursively deletes or unlinks mutable inventory names. A substituted entry stays
+  quarantined for review; authenticated files stay as zero-byte tombstones instead of risking
+  deletion of a later replacement. The regression proves that cancellation propagates,
+  unfamiliar bytes survive, and the displaced authenticated inventory is scrubbed.
+
+The earlier coherent terminal-snapshot fences, fresh authenticated rematerialization, exact
+preimage reconstruction after real directory substitution, bounded full release-chain checks,
+Unicode Git headers, local divergence preservation and isolated disposable CI route remain
+covered. No encryption, signature, repository/project, semantic or ACL validation was weakened.
+Private recovery material is never an approved baseline and may retain unfamiliar plaintext;
+the existing ignore/documentation requirements continue to apply. Point-in-time snapshot and
+fail-closed recovery limits from round 1 are unchanged.
+
+### Round 2 verification
+
+- Initial targeted RED command: **2 failed, 90 deselected** in 1.73s. The failures were the
+  missing local connector directory after ordinary rollback and deleted foreign cleanup bytes.
+  Both targeted regressions then passed after implementation.
+- Focused restore, transaction, canonical-validation and check-service gate: **177 passed**
+  in 44.08s, including stronger final assertions for lock-file identity and authenticated
+  descriptor scrubbing. Command is the round 1 focused gate above.
+- Broader restore/workflow/storage/MCP/CI gate: **682 passed** in 83.78s, with 19 existing
+  warnings. Command is the round 1 broader gate above. This round's two localized recovery
+  changes use that proportional broad gate; the complete offline suite result above belongs
+  to round 1 and is not claimed as a new full-suite run.
+- Repository Ruff check passed with the existing unrelated `dogfood 2.py` exclusion; both
+  changed Python files pass formatting. Full mypy passed for **140 source files**.
+- After final descriptor-close and directory-metadata durability hardening, the ordinary
+  runtime rollback and all cancellation-boundary checks passed again: **5 passed,
+  87 deselected**. Ruff, formatting, mypy and diff checks were rerun with that final code.
+- `git diff --check` passed. No push, publication, or GitHub mutation was performed.

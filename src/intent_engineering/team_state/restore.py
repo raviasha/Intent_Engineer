@@ -17,7 +17,6 @@ import os
 import re
 import secrets
 import selectors
-import shutil
 import stat
 import subprocess
 import tempfile
@@ -1325,26 +1324,64 @@ def _remove_empty_directory(project: SecureDirectory, directory: SecureDirectory
 def _discard_stage(
     project: SecureDirectory, stage: SecureDirectory, state: _PinnedState | None
 ) -> None:
-    """Remove authenticated owned material; preserve any unfamiliar staging entry."""
+    """Detach staging; scrub only held authenticated inodes, never mutable names."""
     with os.scandir(stage.descriptor) as entries:
         names = [entry.name for _, entry in zip(range(2), entries, strict=False)]
     if names:
+        quarantine = _private_directory(project)
+        descriptors: dict[int, tuple[int, ...]] = {}
         try:
             if names != [".intent"] or state is None:
-                raise UnsafePathError()
-            _assert_named_directory(stage, ".intent", state.workspace)
-            state.verify(stage)
-        except (OSError, UnsafePathError):
-            # Do not delete a replacement entry, even when it copied approved bytes.
-            _assert_named_directory(project, stage.path.name, stage)
-            quarantine = _private_directory(project)
-            try:
+                _assert_named_directory(project, stage.path.name, stage)
                 _rename_entry_exclusive(project, stage.path.name, quarantine, "staging")
-            finally:
-                _remove_empty_directory(project, quarantine)
-                quarantine.close()
-            return
-        shutil.rmtree(".intent", dir_fd=stage.descriptor)
+                return
+            # Move the actual named entry before authenticating it. An unfamiliar
+            # replacement remains private and recoverable, even after a later swap.
+            _rename_directory_exclusive(stage, quarantine)
+            _assert_named_directory(quarantine, ".intent", state.workspace)
+            for path in state.files:
+                if path.endswith("/"):
+                    continue
+                target = state.workspace.file(path)
+                try:
+                    descriptor = os.open(
+                        target.name,
+                        os.O_WRONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
+                        dir_fd=target.parent_fd,
+                    )
+                    descriptors[descriptor] = ()
+                    metadata = os.fstat(descriptor)
+                    descriptors[descriptor] = _change_token(metadata)
+                    if (
+                        not stat.S_ISREG(metadata.st_mode)
+                        or metadata.st_nlink != 1
+                        or (metadata.st_dev, metadata.st_ino) != state.identities[path][-1]
+                    ):
+                        raise UnsafePathError()
+                finally:
+                    target.close()
+            state.verify(quarantine)
+            if any(
+                _change_token(os.fstat(descriptor)) != token
+                for descriptor, token in descriptors.items()
+            ):
+                raise UnsafePathError()
+            for descriptor, token in descriptors.items():
+                if _change_token(os.fstat(descriptor)) != token:
+                    raise UnsafePathError()
+                os.ftruncate(descriptor, 0)
+                os.fsync(descriptor)
+                if os.fstat(descriptor).st_size != 0:
+                    raise UnsafePathError()
+            # Keep private zero-byte tombstones. Unlink/rmtree would re-trust names
+            # that an uncooperative writer can replace after the authentication.
+        except (OSError, UnsafePathError):
+            pass
+        finally:
+            for descriptor in descriptors:
+                os.close(descriptor)
+            _remove_empty_directory(project, quarantine)
+            quarantine.close()
     _remove_empty_directory(project, stage)
 
 
@@ -1384,12 +1421,15 @@ class _RestorePreimage:
     ) -> None:
         self.project = project
         self.workspace = workspace
+        self.targets = {path: targets[name] for path, name in path_to_name.items()}
         self.directory_metadata = {"": os.fstat(workspace.descriptor)}
+        self.directory_descriptors = {"": workspace.descriptor}
         self.metadata: dict[str, os.stat_result | None] = {}
         for path, name in path_to_name.items():
             target = targets[name]
             prefix = str(Path(path).parent)
             prefix = "" if prefix == "." else prefix
+            self.directory_descriptors.setdefault(prefix, target.parent_fd)
             observed = os.fstat(target.parent_fd)
             previous = self.directory_metadata.setdefault(prefix, observed)
             if _change_token(previous) != _change_token(observed):
@@ -1556,43 +1596,95 @@ class _RestorePreimage:
         if not self._matches(self.project, ".intent", self.directory_metadata[""]):
             self._reconstruct(self.project, ".intent", "")
             return
-        changed = {
+        replaced_directories = {
             prefix
             for prefix, metadata in self.directory_metadata.items()
             if prefix and not self._matches(self.workspace, prefix, metadata)
         }
-        for path, expected in self.content.items():
+        for prefix in sorted(replaced_directories):
+            self._reconstruct(self.workspace, prefix, prefix)
+        for path in self.content:
             prefix = str(Path(path).parent)
             prefix = "" if prefix == "." else prefix
-            if prefix in changed:
+            if prefix in replaced_directories:
                 continue
+            self._repair_target(path)
+        # Routine transaction rollback replaces file inodes and changes mtimes.
+        # That is not a substituted directory: retain the live lock domain and all
+        # unrelated connector/runtime files, and repair only our pinned targets.
+        for prefix, metadata in self.directory_metadata.items():
+            if prefix not in replaced_directories:
+                descriptor = self.directory_descriptors[prefix]
+                current = os.fstat(descriptor)
+                if (stat.S_IMODE(current.st_mode), current.st_mtime_ns) != (
+                    stat.S_IMODE(metadata.st_mode),
+                    metadata.st_mtime_ns,
+                ):
+                    self._restore_metadata(descriptor, metadata)
+                    os.fsync(descriptor)
+
+    def _repair_target(self, path: str) -> None:
+        target = self.targets[path]
+        parent = SecureDirectory(os.dup(target.parent_fd), target.path.parent)
+        fence: _TreeFence | None = None
+        matches = False
+        try:
             try:
-                target = self.workspace.file(path)
-                try:
-                    observed = target.read_optional_nonblocking(max_bytes=MAX_FILE_BYTES)
-                    metadata = self.metadata[path]
-                    if observed != expected:
-                        changed.add(prefix)
-                    elif metadata is not None:
-                        current = os.stat(
-                            target.name, dir_fd=target.parent_fd, follow_symlinks=False
-                        )
-                        if (stat.S_IMODE(current.st_mode), current.st_mtime_ns) != (
-                            stat.S_IMODE(metadata.st_mode),
-                            metadata.st_mtime_ns,
-                        ):
-                            changed.add(prefix)
-                finally:
-                    target.close()
+                present = _TreeFence._named_token(target.parent_fd, target.name) is not None
+                fence = _TreeFence(parent, {target.name: b"" if present else None}, None)
+                observed = target.read_optional_nonblocking(max_bytes=MAX_FILE_BYTES)
+                fence.verify()
+                matches = observed == self.content[path]
             except (OSError, UnsafePathError):
-                changed.add(prefix)
-        if "" in changed:
-            self._reconstruct(self.project, ".intent", "")
-        else:
-            for prefix in sorted(changed):
-                self._reconstruct(self.workspace, prefix, prefix)
-            if changed:
-                self._restore_metadata(self.workspace.descriptor, self.directory_metadata[""])
+                matches = False
+            if matches:
+                metadata = self.metadata[path]
+                if metadata is not None:
+                    assert fence is not None
+                    descriptor = fence.file_descriptors[0]
+                    current = os.fstat(descriptor)
+                    if (stat.S_IMODE(current.st_mode), current.st_mtime_ns) != (
+                        stat.S_IMODE(metadata.st_mode),
+                        metadata.st_mtime_ns,
+                    ):
+                        self._restore_metadata(descriptor, metadata)
+                        os.fsync(descriptor)
+                return
+            self._reconstruct_target(parent, path)
+        finally:
+            if fence is not None:
+                fence.close()
+            parent.close()
+
+    def _reconstruct_target(self, parent: SecureDirectory, path: str) -> None:
+        """Repair one canonical name without deleting unfamiliar displaced bytes."""
+        recovery = _private_directory(self.project)
+        candidate = recovery.file("replacement")
+        try:
+            content = self.content[path]
+            if content is not None:
+                candidate.atomic_write(content, reject_target_races=True)
+                descriptor = os.open(
+                    candidate.name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=candidate.parent_fd
+                )
+                try:
+                    metadata = self.metadata[path]
+                    assert metadata is not None
+                    self._restore_metadata(descriptor, metadata)
+                    os.fsync(descriptor)
+                finally:
+                    os.close(descriptor)
+            try:
+                _rename_entry_exclusive(parent, Path(path).name, recovery, "unfamiliar")
+            except FileNotFoundError:
+                pass
+            if content is not None:
+                _rename_entry_exclusive(recovery, "replacement", parent, Path(path).name)
+            os.fsync(parent.descriptor)
+        finally:
+            candidate.close()
+            _remove_empty_directory(self.project, recovery)
+            recovery.close()
 
 
 def _validation_snapshot(files: Mapping[str, bytes]) -> dict[str, bytes | None]:
