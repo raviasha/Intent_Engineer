@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
 import subprocess
 from datetime import UTC, datetime
 from pathlib import Path
@@ -23,7 +24,19 @@ from intent_engineering.core.models import (
     SourceMode,
 )
 from intent_engineering.core.policy.project import initialize_project
+from intent_engineering.team_state.restore import TRUST_ENVIRONMENT_VARIABLE
 from tests.helpers.cli import init_git_repo
+from tests.helpers.shared_state import (
+    artifacts as shared_state_artifacts,
+)
+from tests.helpers.shared_state import (
+    canonical_files,
+    install_state_ref,
+    trust_environment,
+)
+from tests.helpers.shared_state import (
+    keys as shared_state_keys,
+)
 
 NOW = datetime(2026, 9, 7, 10, tzinfo=UTC)
 
@@ -231,6 +244,51 @@ def test_ci_check_rejects_a_local_only_manufactured_baseline(tmp_path: Path) -> 
         for path in sorted(workspace.rglob("*"))
         if path.is_file() and not path.is_symlink()
     } == before
+
+
+def test_ci_check_restores_the_signed_approved_ref_before_readiness_and_capture(
+    tmp_path: Path,
+) -> None:
+    """Catches the production CLI retaining no concrete shared-state restorer."""
+    repo = init_git_repo(tmp_path)
+    subprocess.run(
+        ["git", "remote", "add", "origin", "https://github.com/acme/project.git"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+    )
+    _ready(repo)
+    recipient, signer, trust = shared_state_keys(project_id=repo.name)
+    release = shared_state_artifacts(canonical_files(repo), recipient, signer, project_id=repo.name)
+    install_state_ref(repo, release)
+    result_path = repo / "test-results.json"
+    _write_result(repo, result_path)
+    shutil.rmtree(repo / ".intent")
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "check",
+            "--project",
+            str(repo),
+            "--ci",
+            "--test-results",
+            "test-results.json",
+            "--format",
+            "json",
+        ],
+        env={TRUST_ENVIRONMENT_VARIABLE: trust_environment(trust)},
+    )
+
+    assert result.exit_code == 0, (result.stdout, result.stderr, repr(result.exception))
+    assert json.loads(result.stdout) | {} == {
+        **json.loads(result.stdout),
+        "status": "passed",
+        "reason": "checks_passed",
+        "readiness_status": "ready",
+        "exit_code": 0,
+    }
+    assert (repo / ".intent/cache/shared-state.json").is_file()
 
 
 def test_check_rejects_an_unknown_source_with_one_fixed_json_failure(tmp_path: Path) -> None:

@@ -21,6 +21,7 @@ dependencies = [
   "starlette>=1.0,<2",
   "uvicorn>=0.31,<1",
   "webauthn>=3,<4",
+  "cryptography>=50,<51",
 ]
 
 [project.optional-dependencies]

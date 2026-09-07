@@ -97,6 +97,7 @@ from intent_engineering.render import GraphRenderer, render_drift_report
 from intent_engineering.storage.interfaces import GraphStore
 from intent_engineering.storage.secure import SecureDirectory
 from intent_engineering.sync.models import SyncRunResult, SyncRunStatus
+from intent_engineering.team_state.restore import EnvironmentTrustProvider, GitSharedStateRestorer
 from intent_engineering.validation import validate_project
 
 app = typer.Typer(
@@ -492,6 +493,7 @@ def check_command(
         project,
         principal_resolver=_authorized_principals,
         mcp_connector_resolver=lambda runtime: connector_catalog(runtime).read_connectors(),
+        shared_state_restorer=GitSharedStateRestorer(EnvironmentTrustProvider()),
     )
 
     async def run() -> CheckResult:
