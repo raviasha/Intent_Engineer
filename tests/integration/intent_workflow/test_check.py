@@ -23,6 +23,7 @@ from intent_engineering.intent_workflow.check import (
     SharedStateRestoreResult,
     SharedStateRestoreStatus,
     TestResultArtifact,
+    TestResultBinding,
 )
 from intent_engineering.intent_workflow.readiness import (
     EnsureResult,
@@ -73,9 +74,12 @@ def _validation(valid: bool = True) -> ValidationReport:
 
 def _artifact(**updates: object) -> bytes:
     value: dict[str, object] = {
-        "schema_version": 1,
+        "schema_version": 2,
         "repository_id": "demo",
         "commit_sha": REVISION,
+        "execution_snapshot": "sha256:" + "1" * 64,
+        "intent_baseline": "sha256:" + "2" * 64,
+        "reviewed_commands": "sha256:" + "3" * 64,
         "observed_at": NOW.isoformat().replace("+00:00", "Z"),
         "status": "passed",
         "test_ids": ["test:export"],
@@ -136,6 +140,15 @@ class _Runtime:
         self.events.append("revision")
         return self.revision
 
+    def test_result_binding(self) -> TestResultBinding:
+        self.events.append("test-binding")
+        return TestResultBinding(
+            execution_snapshot="sha256:" + "1" * 64,
+            intent_baseline="sha256:" + "2" * 64,
+            reviewed_commands="sha256:" + "3" * 64,
+            command_ids=("test:export",),
+        )
+
     async def capture(
         self,
         sources: tuple[str, ...],
@@ -178,11 +191,14 @@ async def test_check_runs_each_existing_boundary_in_order_and_returns_a_stable_p
         "readiness",
         "test-result-read",
         "revision",
+        "test-binding",
         "capture",
         "validation",
         "assurance",
         "cases",
         "render",
+        "revision",
+        "test-binding",
     ]
     assert result.status is CheckStatus.PASSED
     assert result.reason is CheckReason.CHECKS_PASSED
@@ -210,11 +226,14 @@ async def test_verified_ci_restore_precedes_readiness_capture_and_validation() -
         "readiness",
         "test-result-read",
         "revision",
+        "test-binding",
         "capture",
         "validation",
         "assurance",
         "cases",
         "render",
+        "revision",
+        "test-binding",
     ]
 
 
@@ -303,7 +322,7 @@ async def test_ci_requires_an_explicit_passing_test_result_artifact() -> None:
 @pytest.mark.parametrize(
     ("updates", "now"),
     [
-        ({"schema_version": 2}, NOW),
+        ({"schema_version": 1}, NOW),
         ({"repository_id": "other"}, NOW),
         ({"commit_sha": "b" * 40}, NOW),
         ({"observed_at": (NOW - timedelta(hours=24, microseconds=1)).isoformat()}, NOW),

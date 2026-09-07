@@ -11,7 +11,8 @@ import signal
 import stat
 import subprocess
 import time
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
@@ -23,14 +24,23 @@ from anyio import BrokenResourceError, ClosedResourceError, EndOfStream
 from pydantic import ConfigDict, Field
 
 from intent_engineering.capture.base import RawSourceObject, normalize_raw_source
+from intent_engineering.capture.mcp.profile_loader import load_strict_yaml_mapping_bytes
 from intent_engineering.core.models import EvidenceRecord, JsonValue, ProjectConfig
 from intent_engineering.core.models._base import StrictModel
 from intent_engineering.intent_workflow.check import (
     MAX_TEST_RESULT_BYTES,
     TestResultArtifact,
+    TestResultBinding,
+    evidence_repository_id,
     validate_test_result_artifact,
 )
-from intent_engineering.storage.secure import SecureDirectory, UnsafePathError
+from intent_engineering.storage.secure import (
+    SecureDirectory,
+    SecureFile,
+    UnsafePathError,
+    _read_descriptor,
+    configured_graph_relative,
+)
 
 MAX_TEST_OUTPUT_BYTES = 64 * 1024
 TEST_TIMEOUT_SECONDS = 300
@@ -436,6 +446,18 @@ def _command_id(argv: tuple[str, ...]) -> str:
     return f"test:sha256:{hashlib.sha256(_canonical_bytes(list(argv))).hexdigest()}"
 
 
+def _snapshot_token(metadata: os.stat_result) -> tuple[int, ...]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_nlink,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
 def _evidence(
     *,
     repository_id: str,
@@ -486,7 +508,7 @@ class DevObserver:
             if (
                 type(config) is not ProjectConfig
                 or type(repository_id) is not str
-                or not repository_id
+                or repository_id != evidence_repository_id(config)
                 or type(principals) is not frozenset
                 or not principals
                 or any(type(item) is not str or not item for item in principals)
@@ -522,6 +544,96 @@ class DevObserver:
         """Return stable content-derived identifiers for configured argv entries."""
         return tuple(self._commands)
 
+    def current_revision(self) -> str:
+        """Read HEAD through the same bounded, sanitized Git boundary as execution."""
+        self._require_repository_root(self._root)
+        return self._current_revision()
+
+    @contextmanager
+    def _intent_baseline(self) -> Iterator[str]:
+        """Hash configured intent and its semantic history under one bounded file fence."""
+        if self._directory is None:
+            raise ValueError("test intent baseline unavailable")
+        paths = (
+            ".intent/config.yaml",
+            ".intent/" + configured_graph_relative(self._config.graph_path).as_posix(),
+            ".intent/history/changesets.jsonl",
+        )
+        digest = hashlib.sha256(b"intent.test-baseline.v2\0")
+        held: list[tuple[SecureFile, int, tuple[int, ...]]] = []
+        ancestors: dict[str, tuple[int, int, int, int]] = {}
+        with ExitStack() as resources:
+            for relative in paths:
+                for parent in Path(relative).parents:
+                    name = str(parent)
+                    current = self._ancestor_metadata(name)
+                    if ancestors.setdefault(name, current) != current:
+                        raise ValueError("test intent baseline changed")
+                target = self._directory.file(relative)
+                resources.callback(target.close)
+                descriptor = os.open(
+                    target.name,
+                    os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
+                    dir_fd=target.parent_fd,
+                )
+                resources.callback(os.close, descriptor)
+                metadata = os.fstat(descriptor)
+                if (
+                    not stat.S_ISREG(metadata.st_mode)
+                    or metadata.st_nlink != 1
+                    or metadata.st_size > 8 * 1024 * 1024
+                ):
+                    raise ValueError("test intent baseline unavailable")
+                held.append((target, descriptor, _snapshot_token(metadata)))
+                content = _read_descriptor(descriptor, max_bytes=metadata.st_size)
+                if len(content) != metadata.st_size:
+                    raise ValueError("test intent baseline changed")
+                if (
+                    relative == paths[0]
+                    and ProjectConfig.model_validate(load_strict_yaml_mapping_bytes(content))
+                    != self._config
+                ):
+                    raise ValueError("reviewed test configuration changed")
+                digest.update(
+                    _canonical_bytes(
+                        (relative, hashlib.sha256(content).hexdigest(), _snapshot_token(metadata))
+                    )
+                )
+            # Keep intent descriptors open while code is read. Only metadata checks
+            # follow the complete content capture, so no later read can hide drift.
+            yield "sha256:" + digest.hexdigest()
+            for name, expected in ancestors.items():
+                if self._ancestor_metadata(name) != expected:
+                    raise ValueError("test intent baseline changed")
+            for target, descriptor, expected_token in held:
+                if (
+                    _snapshot_token(os.fstat(descriptor)) != expected_token
+                    or _snapshot_token(
+                        os.stat(target.name, dir_fd=target.parent_fd, follow_symlinks=False)
+                    )
+                    != expected_token
+                ):
+                    raise ValueError("test intent baseline changed")
+
+    def test_result_binding(self) -> TestResultBinding:
+        """Independently capture live code, intent baseline and reviewed test configuration."""
+        with self._intent_baseline() as baseline:
+            return TestResultBinding(
+                execution_snapshot=self.clean_commit_snapshot(),
+                intent_baseline=baseline,
+                reviewed_commands="sha256:"
+                + hashlib.sha256(
+                    _canonical_bytes(
+                        {
+                            "schema": "intent.reviewed-tests.v2",
+                            "commands": self._config.test_commands,
+                            "result_paths": self._config.test_result_paths,
+                        }
+                    )
+                ).hexdigest(),
+                command_ids=self.command_ids,
+            )
+
     def _git(self, args: tuple[str, ...], *, max_bytes: int) -> str:
         if not _git_pin_matches(self._git_pin):
             raise ValueError("Git executable changed")
@@ -534,6 +646,12 @@ class DevObserver:
         top = self._git(("rev-parse", "--show-toplevel"), max_bytes=8192).strip()
         if Path(top).resolve(strict=True) != root.resolve(strict=True):
             raise ValueError("foreign Git repository")
+        observed = SecureDirectory.open(root)
+        try:
+            if self._directory is None or observed.identity != self._directory.identity:
+                raise ValueError("repository root changed")
+        finally:
+            observed.close()
 
     def _current_revision(self) -> str:
         revision = self._git(("rev-parse", "--verify", "--quiet", "HEAD"), max_bytes=256).strip()
@@ -661,6 +779,7 @@ class DevObserver:
             raise ValueError("clean commit snapshot unavailable")
         fingerprint = hashlib.sha256(revision.encode("ascii"))
         ancestors: dict[str, tuple[int, int, int, int]] = {}
+        tracked_metadata: dict[str, tuple[int, ...]] = {}
         total_bytes = 0
         for entry in entries:
             header, path = entry.split("\t", 1)
@@ -713,6 +832,7 @@ class DevObserver:
                     (path, source.identities, metadata.st_mtime_ns, metadata.st_ctime_ns, mode)
                 )
             )
+            tracked_metadata[path] = _snapshot_token(metadata)
         staged = self._git(
             (
                 "diff",
@@ -750,6 +870,16 @@ class DevObserver:
             or time.monotonic() > deadline
         ):
             raise ValueError("clean commit snapshot unavailable")
+        # Fence earlier files after the last content read and Git subprocess. A later
+        # read may otherwise hide a modification to an already-hashed file.
+        for path, expected_token in tracked_metadata.items():
+            target = self._directory.file(path)
+            try:
+                metadata = os.stat(target.name, dir_fd=target.parent_fd, follow_symlinks=False)
+                if _snapshot_token(metadata) != expected_token:
+                    raise ValueError("clean commit snapshot changed")
+            finally:
+                target.close()
         for parent, expected_metadata in sorted(ancestors.items()):
             if self._ancestor_metadata(parent) != expected_metadata:
                 raise ValueError("clean commit snapshot changed")
@@ -872,6 +1002,7 @@ class DevObserver:
                     commit_sha=revision,
                     at=at,
                     principals=self._principals,
+                    binding=self.test_result_binding(),
                 )
                 candidates.append(artifact.evidence())
             self._last_revision = revision
@@ -1153,12 +1284,20 @@ class DevObserver:
                 return TestRunResult(command_id=command_id, status=TestRunStatus.REJECTED)
             self._require_repository_root(self._root)
             before = self._current_revision()
+            self.prepare_clean_commit_execution()
+            try:
+                binding = self.test_result_binding()
+            except (OSError, ValueError):
+                # Dirty local runs may report their process outcome, but cannot certify HEAD.
+                binding = None
             status, exit_code, stdout, stderr = await self._execute(argv, pin)
             after = self._current_revision()
             if before != after or not self._executable_matches(pin):
                 return TestRunResult(command_id=command_id, status=TestRunStatus.REJECTED)
             artifact = None
-            if status is TestRunStatus.PASSED:
+            if status is TestRunStatus.PASSED and binding is not None:
+                if self.test_result_binding() != binding:
+                    return TestRunResult(command_id=command_id, status=TestRunStatus.REJECTED)
                 artifact = TestResultArtifact(
                     repository_id=self._repository_id,
                     commit_sha=after,
@@ -1167,8 +1306,13 @@ class DevObserver:
                     test_ids=(command_id,),
                     author=self._config.local_actor,
                     acl=self._acl,
+                    execution_snapshot=binding.execution_snapshot,
+                    intent_baseline=binding.intent_baseline,
+                    reviewed_commands=binding.reviewed_commands,
                 )
                 self._write_artifact(artifact)
+                if self.test_result_binding() != binding:
+                    raise ValueError("test result binding changed")
             return TestRunResult(
                 command_id=command_id,
                 status=status,

@@ -94,7 +94,8 @@ async def run_tests(root: Path, at: datetime) -> None:
             raise ValueError("reviewed tests failed")
         observer.prepare_clean_commit_execution()
         revision = adapter.current_revision()
-        snapshot = observer.clean_commit_snapshot()
+        binding = observer.test_result_binding()
+        snapshot = binding.execution_snapshot
         completed: list[str] = []
         author = ""
         for identifier in observer.command_ids:
@@ -117,7 +118,12 @@ async def run_tests(root: Path, at: datetime) -> None:
             test_ids=tuple(completed),
             author=author,
             acl=tuple(sorted(adapter.principals)),
+            execution_snapshot=binding.execution_snapshot,
+            intent_baseline=binding.intent_baseline,
+            reviewed_commands=binding.reviewed_commands,
         )
+        if observer.test_result_binding() != binding:
+            raise ValueError("reviewed test binding changed")
         _require_snapshot(observer, snapshot)
         staged = _StagedResult(snapshot=snapshot, result=artifact)
         _write(root, _STAGED_RESULT, staged.model_dump_json().encode("utf-8"))
@@ -147,6 +153,8 @@ def write_results(root: Path, at: datetime) -> None:
             commit_sha=adapter.current_revision(),
             at=at,
             principals=adapter.principals,
+            binding=adapter.test_result_binding(),
+            require_all_commands=True,
         )
         observer = _observer(root, adapter)
         _require_snapshot(observer, staged.snapshot)

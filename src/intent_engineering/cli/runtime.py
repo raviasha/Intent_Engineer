@@ -6,7 +6,6 @@ import json
 import os
 import re
 import stat
-import subprocess
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
@@ -19,7 +18,7 @@ import yaml  # type: ignore[import-untyped]
 from pydantic import ValidationError
 
 from intent_engineering.capture.base import Connector
-from intent_engineering.capture.git.connector import GitConnector, run_git
+from intent_engineering.capture.git.connector import GitConnector
 from intent_engineering.capture.github.auth import (
     GitHubCredentials,
     GitHubTokenRunner,
@@ -53,6 +52,8 @@ from intent_engineering.intent_workflow.check import (
     SharedStateRestoreResult,
     SharedStateRestoreStatus,
     TestResultArtifact,
+    TestResultBinding,
+    evidence_repository_id,
 )
 from intent_engineering.intent_workflow.dev_observer import DevObserver, TestRunStatus
 from intent_engineering.intent_workflow.models import (
@@ -679,7 +680,7 @@ class CheckRuntimeAdapter:
 
     @property
     def repository_id(self) -> str:
-        return self._opened().config.project_id
+        return evidence_repository_id(self._opened().config)
 
     @property
     def principals(self) -> frozenset[str]:
@@ -731,25 +732,30 @@ class CheckRuntimeAdapter:
         )
 
     def current_revision(self) -> str:
+        observer = self._test_observer()
         try:
-            revision = run_git(
-                self._root,
-                ["rev-parse", "--verify", "--quiet", "HEAD"],
-            ).strip()
-        except (OSError, subprocess.SubprocessError, UnicodeError) as error:
-            raise ValueError("repository revision is unavailable") from error
-        if re.fullmatch(r"[0-9a-f]{40}(?:[0-9a-f]{24})?", revision) is None:
-            raise ValueError("repository revision is unavailable")
-        return revision
+            return observer.current_revision()
+        finally:
+            observer.close()
 
-    async def run_reviewed_tests(self, command_id: str, *, at: datetime) -> TestResultArtifact:
+    def _test_observer(self) -> DevObserver:
         runtime = self._opened()
-        observer = DevObserver(
+        return DevObserver(
             runtime.root,
             runtime.config,
             repository_id=self.repository_id,
             principals=self.principals,
         )
+
+    def test_result_binding(self) -> TestResultBinding:
+        observer = self._test_observer()
+        try:
+            return observer.test_result_binding()
+        finally:
+            observer.close()
+
+    async def run_reviewed_tests(self, command_id: str, *, at: datetime) -> TestResultArtifact:
+        observer = self._test_observer()
         try:
             result = await observer.run_reviewed_tests(command_id, at=at)
         finally:

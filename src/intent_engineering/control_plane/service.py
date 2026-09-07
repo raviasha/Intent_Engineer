@@ -44,6 +44,7 @@ from intent_engineering.core.models import (
 )
 from intent_engineering.core.policy.access import refs_allowed
 from intent_engineering.intent_workflow.bootstrap import BootstrapService
+from intent_engineering.intent_workflow.check import evidence_repository_id
 from intent_engineering.intent_workflow.clarification import (
     ClarificationCoordinator,
     ProposalConfirmationService,
@@ -264,7 +265,7 @@ class ControlPlaneService:
             self._dev_observer = DevObserver(
                 self._runtime.root,
                 self._runtime.config,
-                repository_id=self.repository_id,
+                repository_id=evidence_repository_id(self._runtime.config),
                 principals=frozenset({self._runtime.config.local_actor}),
             )
         return self._dev_observer

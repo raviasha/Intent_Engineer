@@ -14,7 +14,12 @@ from typing import Annotated, ClassVar, Literal, Protocol
 from pydantic import ConfigDict, Field, ValidationInfo, field_validator, model_validator
 
 from intent_engineering.capture.base import RawSourceObject, normalize_raw_source
-from intent_engineering.core.models import EvidenceRecord, JsonValue, ReconciliationCase
+from intent_engineering.core.models import (
+    EvidenceRecord,
+    JsonValue,
+    ProjectConfig,
+    ReconciliationCase,
+)
 from intent_engineering.core.models._base import StrictModel
 from intent_engineering.intent_workflow.readiness import EnsureResult, EnsureStatus
 from intent_engineering.storage.jsonl.strict import loads_strict_object
@@ -27,6 +32,7 @@ _MAX_TEST_IDS = 256
 _MAX_IDENTIFIER_BYTES = 512
 _MAX_DRIFT_REPORT_BYTES = 1024 * 1024
 _REVISION = re.compile(r"^[0-9a-f]{40}(?:[0-9a-f]{24})?$")
+_DIGEST = r"^sha256:[0-9a-f]{64}$"
 
 
 class CheckStatus(StrEnum):
@@ -103,14 +109,33 @@ def _exact_tuple(value: object, info: ValidationInfo) -> object:
     return value
 
 
+def evidence_repository_id(config: ProjectConfig) -> str:
+    """Stable project evidence identity; never the checkout's WebAuthn/service identity."""
+    return _identifier(config.project_id)
+
+
+class TestResultBinding(_CheckModel):
+    """Independently observed inputs required to accept a test execution artifact."""
+
+    __test__: ClassVar[bool] = False
+
+    execution_snapshot: Annotated[str, Field(pattern=_DIGEST)]
+    intent_baseline: Annotated[str, Field(pattern=_DIGEST)]
+    reviewed_commands: Annotated[str, Field(pattern=_DIGEST)]
+    command_ids: tuple[str, ...]
+
+
 class TestResultArtifact(_CheckModel):
     """Canonical passing-test result accepted as evidence, never as a command."""
 
     __test__: ClassVar[bool] = False
 
-    schema_version: Literal[1] = 1
+    schema_version: Literal[2] = 2
     repository_id: str
     commit_sha: Annotated[str, Field(pattern=_REVISION.pattern)]
+    execution_snapshot: Annotated[str, Field(pattern=_DIGEST)]
+    intent_baseline: Annotated[str, Field(pattern=_DIGEST)]
+    reviewed_commands: Annotated[str, Field(pattern=_DIGEST)]
     observed_at: datetime
     status: Literal["passed", "failed", "cancelled"]
     test_ids: Annotated[tuple[str, ...], Field(min_length=1, max_length=_MAX_TEST_IDS)]
@@ -174,6 +199,9 @@ class TestResultArtifact(_CheckModel):
             "schema_version": self.schema_version,
             "repository_id": self.repository_id,
             "commit_sha": self.commit_sha,
+            "execution_snapshot": self.execution_snapshot,
+            "intent_baseline": self.intent_baseline,
+            "reviewed_commands": self.reviewed_commands,
             "outcome": self.status,
             "test_refs": list(self.test_ids),
         }
@@ -287,6 +315,8 @@ class CheckRuntime(Protocol):
 
     def current_revision(self) -> str: ...
 
+    def test_result_binding(self) -> TestResultBinding: ...
+
     async def run_reviewed_tests(self, command_id: str, *, at: datetime) -> TestResultArtifact: ...
 
     async def capture(
@@ -311,11 +341,15 @@ def validate_test_result_artifact(
     commit_sha: str,
     at: datetime,
     principals: frozenset[str],
+    binding: TestResultBinding,
+    require_all_commands: bool = False,
 ) -> TestResultArtifact:
     """Parse and bind one artifact using the canonical check ingestion contract."""
     if type(raw) is not bytes or not raw or len(raw) > MAX_TEST_RESULT_BYTES:
         raise ValueError("invalid test result artifact")
-    loads_strict_object(raw.decode("utf-8"))
+    decoded = loads_strict_object(raw.decode("utf-8"))
+    if decoded.get("schema_version") != 2:
+        raise ValueError("invalid test result artifact")
     artifact = TestResultArtifact.model_validate_json(raw)
     if (
         type(repository_id) is not str
@@ -335,6 +369,16 @@ def validate_test_result_artifact(
         or artifact.observed_at > now
         or now - artifact.observed_at > MAX_TEST_RESULT_AGE
         or frozenset(artifact.acl).isdisjoint(principals)
+        or type(binding) is not TestResultBinding
+        or artifact.execution_snapshot != binding.execution_snapshot
+        or artifact.intent_baseline != binding.intent_baseline
+        or artifact.reviewed_commands != binding.reviewed_commands
+        or (binding.command_ids and not set(artifact.test_ids).issubset(binding.command_ids))
+        or (
+            require_all_commands
+            and binding.command_ids
+            and set(artifact.test_ids) != set(binding.command_ids)
+        )
     ):
         raise ValueError("invalid test result binding")
     return artifact
@@ -377,7 +421,7 @@ class CheckService:
             drift_report=report,
         )
 
-    def _parse_test_result(self, path: Path) -> TestResultArtifact:
+    def _parse_test_result(self, path: Path, *, ci: bool) -> TestResultArtifact:
         raw = self._runtime.read_test_results(path)
         now = self._clock()
         return validate_test_result_artifact(
@@ -386,6 +430,8 @@ class CheckService:
             commit_sha=self._runtime.current_revision(),
             at=now,
             principals=self._runtime.principals,
+            binding=self._runtime.test_result_binding(),
+            require_all_commands=ci,
         )
 
     async def run(self, request: CheckRequest) -> CheckResult:
@@ -452,6 +498,7 @@ class CheckService:
                     commit_sha=self._runtime.current_revision(),
                     at=now,
                     principals=self._runtime.principals,
+                    binding=self._runtime.test_result_binding(),
                 )
                 evidence_id = artifact.evidence().id
             except Exception:  # noqa: BLE001 - fixed explicit-test failure boundary
@@ -463,7 +510,7 @@ class CheckService:
                 )
         elif request.test_results is not None:
             try:
-                artifact = self._parse_test_result(request.test_results)
+                artifact = self._parse_test_result(request.test_results, ci=request.ci)
                 evidence_id = artifact.evidence().id
             except Exception:  # noqa: BLE001 - fixed secret-free artifact failure
                 return self._result(
@@ -554,6 +601,26 @@ class CheckService:
                 cases=len(cases),
                 report=report,
             )
+        if artifact is not None:
+            try:
+                validate_test_result_artifact(
+                    artifact.canonical_bytes(),
+                    repository_id=self._runtime.repository_id,
+                    commit_sha=self._runtime.current_revision(),
+                    at=self._clock(),
+                    principals=self._runtime.principals,
+                    binding=self._runtime.test_result_binding(),
+                    require_all_commands=request.ci,
+                )
+            except Exception:  # noqa: BLE001 - recheck the live boundary before success
+                return self._result(
+                    CheckStatus.FAILED,
+                    CheckReason.TEST_RESULTS_INVALID,
+                    1,
+                    readiness=readiness.status,
+                    capture=capture.status,
+                    validation=True,
+                )
         return self._result(
             CheckStatus.PASSED,
             CheckReason.CHECKS_PASSED,
@@ -580,5 +647,7 @@ __all__ = [
     "SharedStateRestoreStatus",
     "SharedStateRestorer",
     "TestResultArtifact",
+    "TestResultBinding",
+    "evidence_repository_id",
     "validate_test_result_artifact",
 ]

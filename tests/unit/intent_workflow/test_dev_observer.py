@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
 import signal
 import subprocess
 import tempfile
@@ -24,9 +25,10 @@ from intent_engineering.intent_workflow.dev_observer import (
     DevObserverError,
     TestRunStatus,
 )
+from tests.helpers.shared_state import ready_project
 
 NOW = datetime(2026, 8, 30, 12, 0, tzinfo=UTC)
-REPOSITORY_ID = "repo:sha256:" + "1" * 64
+REPOSITORY_ID = "demo"
 
 
 def _git(repo: Path, *args: str) -> str:
@@ -74,6 +76,29 @@ def _observer(repo: Path, **updates: object) -> DevObserver:
     )
 
 
+def _clean_observer(repo: Path, **updates: object) -> DevObserver:
+    """Create the configured intent baseline and committed code required by v2 results."""
+    ready_project(repo)
+    config = ProjectConfig.model_validate(
+        {
+            "project_id": "demo",
+            "local_actor": "local:asha",
+            "test_commands": (("tools/test-runner",),),
+            "test_result_paths": (".intent/cache/test-results.json",),
+            **updates,
+        }
+    )
+    (repo / ".intent/config.yaml").write_text(yaml.safe_dump(config.model_dump(mode="json")))
+    if (repo / "tools/test-runner").exists():
+        _git(repo, "add", "tools/test-runner")
+        _git(repo, "commit", "-qm", "reviewed test command")
+    observer = DevObserver(
+        repo, config, repository_id=REPOSITORY_ID, principals=frozenset({"local:asha"})
+    )
+    observer.prepare_clean_commit_execution()
+    return observer
+
+
 def test_observer_rejects_a_git_worktree_owned_by_a_parent_repository(tmp_path: Path) -> None:
     parent, _revision = _repo(tmp_path)
     nested = parent / "nested"
@@ -102,6 +127,20 @@ def test_git_observation_ignores_hostile_ambient_repository_environment(
     result = _observer(repo).poll(at=NOW)
 
     assert result.current_revision == revision
+
+
+def test_execution_binding_rejects_replacement_of_the_held_repository_root(tmp_path: Path) -> None:
+    """Git and execution cwd cannot move to a clone while evidence reads the old inode."""
+    repo, _revision = _repo(tmp_path)
+    observer = _clean_observer(repo)
+    moved = tmp_path / "original-repository"
+    repo.rename(moved)
+    shutil.copytree(moved, repo)
+    try:
+        with pytest.raises(ValueError):
+            observer.test_result_binding()
+    finally:
+        observer.close()
 
 
 def test_git_path_observation_fails_at_the_fixed_path_count_bound(tmp_path: Path) -> None:
@@ -157,7 +196,8 @@ def test_poll_emits_only_evidence_candidates_for_git_changes_and_is_idempotent(
 
 def test_poll_ingests_only_fresh_bound_passing_canonical_result_artifacts(tmp_path: Path) -> None:
     repo, revision = _repo(tmp_path)
-    observer = _observer(repo)
+    observer = _clean_observer(repo)
+    binding = observer.test_result_binding()
     artifact = TestResultArtifact(
         repository_id=REPOSITORY_ID,
         commit_sha=revision,
@@ -166,8 +206,11 @@ def test_poll_ingests_only_fresh_bound_passing_canonical_result_artifacts(tmp_pa
         test_ids=(observer.command_ids[0],),
         author="local:asha",
         acl=("local:asha",),
+        execution_snapshot=binding.execution_snapshot,
+        intent_baseline=binding.intent_baseline,
+        reviewed_commands=binding.reviewed_commands,
     )
-    (repo / "test-results.json").write_bytes(artifact.canonical_bytes())
+    (repo / ".intent/cache/test-results.json").write_bytes(artifact.canonical_bytes())
 
     result = observer.poll(at=NOW)
     replay = observer.poll(at=NOW)
@@ -178,8 +221,9 @@ def test_poll_ingests_only_fresh_bound_passing_canonical_result_artifacts(tmp_pa
 
 def test_poll_rejects_an_oversized_or_wrongly_bound_result_artifact(tmp_path: Path) -> None:
     repo, revision = _repo(tmp_path)
-    observer = _observer(repo)
-    (repo / "test-results.json").write_bytes(b"x" * (64 * 1024 + 1))
+    observer = _clean_observer(repo)
+    binding = observer.test_result_binding()
+    (repo / ".intent/cache/test-results.json").write_bytes(b"x" * (64 * 1024 + 1))
     with pytest.raises(DevObserverError, match="development observation unavailable"):
         observer.poll(at=NOW)
 
@@ -191,8 +235,11 @@ def test_poll_rejects_an_oversized_or_wrongly_bound_result_artifact(tmp_path: Pa
         test_ids=(observer.command_ids[0],),
         author="local:asha",
         acl=("local:asha",),
+        execution_snapshot=binding.execution_snapshot,
+        intent_baseline=binding.intent_baseline,
+        reviewed_commands=binding.reviewed_commands,
     )
-    (repo / "test-results.json").write_bytes(artifact.canonical_bytes())
+    (repo / ".intent/cache/test-results.json").write_bytes(artifact.canonical_bytes())
     with pytest.raises(DevObserverError, match="development observation unavailable"):
         observer.poll(at=NOW)
 
@@ -209,9 +256,10 @@ async def test_explicit_reviewed_command_runs_without_shell_and_captures_canonic
         "assert os.environ['LC_ALL'] == 'C.UTF-8'\n"
         "assert os.environ['PATH'] == '/usr/bin:/bin'\n"
         "assert 'HOME' not in os.environ\n"
-        "pathlib.Path('literal-$HOME;*').write_text('argv-only')\n",
+        "pathlib.Path('.intent/cache/literal-$HOME;*').write_text('argv-only')\n",
     )
-    observer = _observer(repo)
+    observer = _clean_observer(repo)
+    revision = _git(repo, "rev-parse", "HEAD")
 
     result = await observer.run_reviewed_tests(observer.command_ids[0], at=NOW)
 
@@ -220,7 +268,7 @@ async def test_explicit_reviewed_command_runs_without_shell_and_captures_canonic
     assert result.artifact.repository_id == REPOSITORY_ID
     assert result.artifact.commit_sha == revision
     assert result.artifact.test_ids == (observer.command_ids[0],)
-    assert json.loads((repo / "test-results.json").read_bytes()) == json.loads(
+    assert json.loads((repo / ".intent/cache/test-results.json").read_bytes()) == json.loads(
         result.artifact.canonical_bytes()
     )
 
@@ -279,16 +327,9 @@ async def test_reviewed_python_main_namespace_preserves_script_metadata_and_exit
         "    'stdin': sys.stdin.read(),\n"
         "}))\n" + ending,
     )
-    observer = DevObserver(
+    observer = _clean_observer(
         repo,
-        ProjectConfig(
-            project_id="demo",
-            local_actor="local:asha",
-            test_commands=(("tools/test-runner", "literal argument", "--reviewed-option"),),
-            test_result_paths=("test-results.json",),
-        ),
-        repository_id=REPOSITORY_ID,
-        principals=frozenset({"local:asha"}),
+        test_commands=(("tools/test-runner", "literal argument", "--reviewed-option"),),
     )
     expected_file = (
         "intent-reviewed-test:"
@@ -310,7 +351,7 @@ async def test_reviewed_python_main_namespace_preserves_script_metadata_and_exit
     assert result.status is status
     assert result.exit_code == exit_code
     assert (result.artifact is not None) is (status is TestRunStatus.PASSED)
-    assert (repo / "test-results.json").exists() is (status is TestRunStatus.PASSED)
+    assert (repo / ".intent/cache/test-results.json").exists() is (status is TestRunStatus.PASSED)
     if "RuntimeError" in ending:
         assert expected_file in result.stderr
         assert "RuntimeError: reviewed failure" in result.stderr

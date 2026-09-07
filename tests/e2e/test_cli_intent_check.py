@@ -28,6 +28,8 @@ from intent_engineering.core.models import (
     SourceMode,
 )
 from intent_engineering.core.policy.project import initialize_project
+from intent_engineering.intent_workflow.check import TestResultArtifact
+from intent_engineering.intent_workflow.dev_observer import DevObserver
 from intent_engineering.team_state.restore import TRUST_ENVIRONMENT_VARIABLE
 from tests.helpers.cli import init_git_repo
 from tests.helpers.shared_state import (
@@ -38,6 +40,7 @@ from tests.helpers.shared_state import (
     install_state_ref,
     trust_environment,
 )
+from tests.helpers.shared_state import git as fixture_git
 from tests.helpers.shared_state import (
     keys as shared_state_keys,
 )
@@ -54,7 +57,7 @@ def _configure_reviewed_test(repo: Path) -> str:
     runner = repo / "tools/test-runner"
     runner.parent.mkdir(exist_ok=True)
     runner.write_text(
-        "#!/usr/bin/python3\nfrom pathlib import Path\nPath('reviewed-ran').write_text('yes')\n",
+        "#!/usr/bin/python3\nfrom pathlib import Path\nPath('.intent/cache/reviewed-ran').write_text('yes')\n",
         encoding="utf-8",
     )
     runner.chmod(0o755)
@@ -63,6 +66,8 @@ def _configure_reviewed_test(repo: Path) -> str:
     config["test_commands"] = [["tools/test-runner"]]
     config["test_result_paths"] = [".intent/cache/reviewed-test.json"]
     config_path.write_text(yaml.safe_dump(config, sort_keys=True), encoding="utf-8")
+    fixture_git(repo, "add", "tools/test-runner")
+    fixture_git(repo, "commit", "-qm", "reviewed test command")
     return _reviewed_command_id(["tools/test-runner"])
 
 
@@ -159,36 +164,34 @@ def _head(repo: Path) -> str:
 
 
 def _write_result(repo: Path, path: Path) -> None:
-    config = json.loads(
-        subprocess.run(
-            [
-                str(Path(os.sys.executable)),
-                "-c",
-                "import json,yaml; print(json.dumps(yaml.safe_load(open('.intent/config.yaml'))))",
-            ],
-            cwd=repo,
-            check=True,
-            capture_output=True,
-            text=True,
-        ).stdout
+    runtime = load_runtime(repo)
+    observer = DevObserver(
+        repo,
+        runtime.config,
+        repository_id=runtime.config.project_id,
+        principals=frozenset({runtime.config.local_actor}),
     )
-    path.write_text(
-        json.dumps(
-            {
-                "schema_version": 1,
-                "repository_id": config["project_id"],
-                "commit_sha": _head(repo),
-                "observed_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
-                "status": "passed",
-                "test_ids": ["test:repository"],
-                "author": "ci:test-runner",
-                "acl": [config["local_actor"]],
-            },
-            separators=(",", ":"),
-            sort_keys=True,
-        ),
-        encoding="utf-8",
-    )
+    try:
+        observer.prepare_clean_commit_execution()
+        path.parent.mkdir(exist_ok=True)
+        path.touch()
+        binding = observer.test_result_binding()
+        artifact = TestResultArtifact(
+            repository_id=runtime.config.project_id,
+            commit_sha=_head(repo),
+            observed_at=datetime.now(UTC),
+            status="passed",
+            test_ids=("test:repository",),
+            author="ci:test-runner",
+            acl=(runtime.config.local_actor,),
+            execution_snapshot=binding.execution_snapshot,
+            intent_baseline=binding.intent_baseline,
+            reviewed_commands=binding.reviewed_commands,
+        )
+        path.write_bytes(artifact.canonical_bytes())
+    finally:
+        observer.close()
+        runtime.close()
 
 
 def test_check_emits_one_strict_versioned_json_result_for_an_aligned_project(
@@ -281,7 +284,7 @@ def test_ci_check_rejects_a_local_only_manufactured_baseline(tmp_path: Path) -> 
     """Catches local state satisfying CI without a verified approved shared baseline."""
     repo = init_git_repo(tmp_path)
     _ready(repo)
-    result_path = repo / "test-results.json"
+    result_path = repo / ".intent-ci/test-results.json"
     _write_result(repo, result_path)
     workspace = repo / ".intent"
     before = {
@@ -298,7 +301,7 @@ def test_ci_check_rejects_a_local_only_manufactured_baseline(tmp_path: Path) -> 
             str(repo),
             "--ci",
             "--test-results",
-            "test-results.json",
+            ".intent-ci/test-results.json",
             "--format",
             "json",
         ],
@@ -334,9 +337,17 @@ def test_ci_check_restores_the_signed_approved_ref_before_readiness_and_capture(
     recipient, signer, trust = shared_state_keys(project_id=repo.name)
     release = shared_state_artifacts(canonical_files(repo), recipient, signer, project_id=repo.name)
     install_state_ref(repo, release)
-    result_path = repo / "test-results.json"
-    _write_result(repo, result_path)
     shutil.rmtree(repo / ".intent")
+
+    # Execution evidence is produced only after the approved baseline has been restored.
+    restored = CliRunner().invoke(
+        app,
+        ["check", "--project", str(repo), "--ci"],
+        env={TRUST_ENVIRONMENT_VARIABLE: trust_environment(trust)},
+    )
+    assert json.loads(restored.stdout)["reason"] == "test_results_required"
+    result_path = repo / ".intent-ci/test-results.json"
+    _write_result(repo, result_path)
 
     result = CliRunner().invoke(
         app,
@@ -346,7 +357,7 @@ def test_ci_check_restores_the_signed_approved_ref_before_readiness_and_capture(
             str(repo),
             "--ci",
             "--test-results",
-            "test-results.json",
+            ".intent-ci/test-results.json",
             "--format",
             "json",
         ],
@@ -391,7 +402,7 @@ def test_check_ingests_a_bound_test_result_once_and_replay_is_a_byte_noop(
     """Catches canonical test-result replay appending duplicate evidence or checkpoints."""
     repo = init_git_repo(tmp_path)
     _ready(repo)
-    result_path = repo / "test-results.json"
+    result_path = repo / ".intent-ci/test-results.json"
     _write_result(repo, result_path)
     arguments = [
         "check",
@@ -400,7 +411,7 @@ def test_check_ingests_a_bound_test_result_once_and_replay_is_a_byte_noop(
         "--sources",
         "markdown,git",
         "--test-results",
-        "test-results.json",
+        ".intent-ci/test-results.json",
         "--format",
         "json",
     ]
@@ -501,7 +512,7 @@ def test_check_explicitly_runs_one_reviewed_command_and_ingests_its_artifact(
     payload = json.loads(result.stdout)
     assert payload["reason"] == "checks_passed"
     assert payload["test_evidence_id"].startswith("evidence:sha256:")
-    assert (repo / "reviewed-ran").read_text(encoding="utf-8") == "yes"
+    assert (repo / ".intent/cache/reviewed-ran").read_text(encoding="utf-8") == "yes"
     artifact = json.loads((repo / ".intent/cache/reviewed-test.json").read_bytes())
     assert artifact["test_ids"] == [command_id]
     stored = load_runtime(repo)
@@ -524,11 +535,11 @@ def test_check_rejects_unreviewed_or_ambiguous_test_execution_without_running(
     )
 
     for options in invalid_invocations:
-        (repo / "reviewed-ran").unlink(missing_ok=True)
+        (repo / ".intent/cache/reviewed-ran").unlink(missing_ok=True)
         result = CliRunner().invoke(
             app,
             ["check", "--project", str(repo), *options, "--format", "json"],
         )
         assert result.exit_code == 1
         assert json.loads(result.stdout)["reason"] in {"operation_failed", "test_run_failed"}
-        assert not (repo / "reviewed-ran").exists()
+        assert not (repo / ".intent/cache/reviewed-ran").exists()
