@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import signal
@@ -222,6 +223,99 @@ async def test_explicit_reviewed_command_runs_without_shell_and_captures_canonic
     assert json.loads((repo / "test-results.json").read_bytes()) == json.loads(
         result.artifact.canonical_bytes()
     )
+
+
+@pytest.mark.anyio
+async def test_reviewed_python_unittest_failure_does_not_produce_passing_evidence(
+    tmp_path: Path,
+) -> None:
+    repo, _revision = _repo(tmp_path)
+    _runner(
+        repo,
+        "import unittest\n"
+        "class ReviewedTests(unittest.TestCase):\n"
+        "    def test_reviewed_failure(self):\n"
+        "        self.fail('reviewed test failed')\n"
+        "if __name__ == '__main__':\n"
+        "    unittest.main()\n",
+    )
+    observer = _observer(repo)
+
+    result = await observer.run_reviewed_tests(observer.command_ids[0], at=NOW)
+
+    assert result.status is TestRunStatus.FAILED, result
+    assert result.exit_code == 1
+    assert "Ran 1 test" in result.stderr
+    assert "reviewed test failed" in result.stderr
+    assert "FAILED (failures=1)" in result.stderr
+    assert result.artifact is None
+    assert not (repo / "test-results.json").exists()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("ending", "status", "exit_code"),
+    [
+        ("", TestRunStatus.PASSED, 0),
+        ("raise SystemExit(37)\n", TestRunStatus.FAILED, 37),
+        ("raise RuntimeError('reviewed failure')\n", TestRunStatus.FAILED, 1),
+    ],
+)
+async def test_reviewed_python_main_namespace_preserves_script_metadata_and_exit_semantics(
+    tmp_path: Path, ending: str, status: TestRunStatus, exit_code: int
+) -> None:
+    repo, _revision = _repo(tmp_path)
+    _runner(
+        repo,
+        "import __main__, json, sys\n"
+        "print(json.dumps({\n"
+        "    'same_namespace': globals() is vars(__main__),\n"
+        "    'name': __name__,\n"
+        "    'file': __file__,\n"
+        "    'module_file': getattr(__main__, '__file__', None),\n"
+        "    'package': __package__,\n"
+        "    'cached': __cached__,\n"
+        "    'argv': sys.argv,\n"
+        "    'stdin': sys.stdin.read(),\n"
+        "}))\n" + ending,
+    )
+    observer = DevObserver(
+        repo,
+        ProjectConfig(
+            project_id="demo",
+            local_actor="local:asha",
+            test_commands=(("tools/test-runner", "literal argument", "--reviewed-option"),),
+            test_result_paths=("test-results.json",),
+        ),
+        repository_id=REPOSITORY_ID,
+        principals=frozenset({"local:asha"}),
+    )
+    expected_file = (
+        "intent-reviewed-test:"
+        + hashlib.sha256((repo / "tools/test-runner").read_bytes()).hexdigest()
+    )
+
+    result = await observer.run_reviewed_tests(observer.command_ids[0], at=NOW)
+
+    assert json.loads(result.stdout) == {
+        "same_namespace": True,
+        "name": "__main__",
+        "file": expected_file,
+        "module_file": expected_file,
+        "package": None,
+        "cached": None,
+        "argv": [expected_file, "literal argument", "--reviewed-option"],
+        "stdin": "",
+    }
+    assert result.status is status
+    assert result.exit_code == exit_code
+    assert (result.artifact is not None) is (status is TestRunStatus.PASSED)
+    assert (repo / "test-results.json").exists() is (status is TestRunStatus.PASSED)
+    if "RuntimeError" in ending:
+        assert expected_file in result.stderr
+        assert "RuntimeError: reviewed failure" in result.stderr
+    else:
+        assert "Traceback" not in result.stderr
 
 
 @pytest.mark.anyio

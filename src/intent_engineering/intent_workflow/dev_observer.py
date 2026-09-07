@@ -54,7 +54,28 @@ _GIT_ENVIRONMENT: Mapping[str, str] = {
     "GIT_TERMINAL_PROMPT": "0",
 }
 _VETTED_INTERPRETERS = frozenset({"/bin/sh", "/usr/bin/python3"})
-_DESCRIPTOR_PROBE = """\
+# The capability probe must launch through exactly the same interpreter wrapper.
+_REVIEWED_ARGV = """\
+synthetic_path = 'intent-reviewed-test:' + expected_digest
+if interpreter == '/usr/bin/python3':
+    wrapper = (
+        'import sys\\n'
+        + '_source = ' + repr(source_text) + '\\n'
+        + '_path = ' + repr(synthetic_path) + '\\n'
+        + 'sys.argv[0] = _path\\n'
+        + '_scope = vars(sys.modules["__main__"])\\n'
+        + '_scope.update({"__name__": "__main__", "__file__": _path, '
+        + '"__package__": None, "__cached__": None})\\n'
+        + 'exec(compile(_source, _path, "exec"), _scope, _scope)\\n'
+    )
+    reviewed_argv = [interpreter, '-c', wrapper, *reviewed_args]
+elif interpreter == '/bin/sh':
+    reviewed_argv = [interpreter, '-c', source_text, synthetic_path, *reviewed_args]
+else:
+    raise SystemExit(125)
+"""
+_DESCRIPTOR_PROBE = (
+    """\
 import hashlib
 import os
 import subprocess
@@ -77,24 +98,25 @@ try:
     source_text = bytes(source).decode('utf-8')
 except UnicodeError:
     raise SystemExit(125)
-if interpreter == '/usr/bin/python3':
-    command = [interpreter, '-c', source_text]
-    expected = 37
-elif interpreter == '/bin/sh':
-    command = [interpreter, '-c', source_text, 'intent-reviewed-probe']
-    expected = 37
-else:
+if '\\x00' in source_text:
     raise SystemExit(125)
+source.clear()
+reviewed_args = ['intent-reviewed-probe']
+"""
+    + _REVIEWED_ARGV
+    + """\
 completed = subprocess.run(
-    command,
+    reviewed_argv,
     stdin=subprocess.DEVNULL,
     stdout=subprocess.DEVNULL,
     stderr=subprocess.DEVNULL,
     check=False,
 )
-raise SystemExit(0 if completed.returncode == expected else 125)
+raise SystemExit(0 if completed.returncode == 37 else 125)
 """
-_PROCESS_SUPERVISOR = """\
+)
+_PROCESS_SUPERVISOR = (
+    """\
 import hashlib
 import os
 import signal
@@ -165,22 +187,9 @@ except UnicodeError:
 if '\\x00' in source_text:
     raise SystemExit(125)
 source_buffer.clear()
-synthetic_path = 'intent-reviewed-test:' + expected_digest
-if interpreter == '/usr/bin/python3':
-    wrapper = (
-        'import sys\\n'
-        + '_source = ' + repr(source_text) + '\\n'
-        + '_path = ' + repr(synthetic_path) + '\\n'
-        + 'sys.argv[0] = _path\\n'
-        + '_scope = {"__name__": "__main__", "__file__": _path, '
-        + '"__package__": None, "__cached__": None}\\n'
-        + 'exec(compile(_source, _path, "exec"), _scope, _scope)\\n'
-    )
-    reviewed_argv = [interpreter, '-c', wrapper, *reviewed_args]
-elif interpreter == '/bin/sh':
-    reviewed_argv = [interpreter, '-c', source_text, synthetic_path, *reviewed_args]
-else:
-    raise SystemExit(125)
+"""
+    + _REVIEWED_ARGV
+    + """\
 # source-verified-boundary
 spawned = None
 try:
@@ -202,6 +211,7 @@ time.sleep(0.05)
 stop_tree(signal.SIGKILL)
 raise SystemExit(code if code >= 0 else 128 - code)
 """
+)
 
 
 class DevObserverError(ValueError):
@@ -851,7 +861,18 @@ class DevObserver:
         """Prove isolated pipe-to-memory source transport before reviewed use."""
         if interpreter not in _VETTED_INTERPRETERS:
             return False
-        source = b"raise SystemExit(37)\n" if interpreter == "/usr/bin/python3" else b"exit 37\n"
+        source = (
+            b"import __main__, sys\n"
+            b"assert globals() is vars(__main__)\n"
+            b"assert __name__ == '__main__'\n"
+            b"assert __file__ == __main__.__file__ == sys.argv[0]\n"
+            b"assert __file__.startswith('intent-reviewed-test:')\n"
+            b"assert sys.argv[1:] == ['intent-reviewed-probe']\n"
+            b"assert sys.stdin.read() == ''\n"
+            b"raise SystemExit(37)\n"
+            if interpreter == "/usr/bin/python3"
+            else b"exit 37\n"
+        )
         read_descriptor, write_descriptor = _open_source_pipe()
         process: anyio.abc.Process | None = None
         try:
