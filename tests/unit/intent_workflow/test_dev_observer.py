@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import json
+import os
+import signal
 import subprocess
+import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -261,6 +264,102 @@ async def test_executable_swap_during_launch_cannot_execute_unreviewed_bytes(
 
 
 @pytest.mark.anyio
+async def test_staged_executable_path_replacement_cannot_change_launched_bytes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo, _revision = _repo(tmp_path)
+    _runner(repo, "from pathlib import Path\nPath('reviewed').write_text('yes')\n")
+    observer = _observer(repo)
+    real_open_process = anyio.open_process
+    real_unlink = os.unlink
+    staged_paths: list[Path] = []
+    attacked: list[Path] = []
+
+    def record_staged_unlink(path: str | bytes | os.PathLike[str] | os.PathLike[bytes]) -> None:
+        candidate = Path(path)
+        if candidate.name == "executable" and candidate.parent.name.startswith(
+            "intent-reviewed-test-"
+        ):
+            staged_paths.append(candidate)
+        real_unlink(path)
+
+    async def replace_staged_path(*args: object, **kwargs: object) -> anyio.abc.Process:
+        visible = list(Path(tempfile.gettempdir()).glob("intent-reviewed-test-*/executable"))
+        for staged in (*visible, *staged_paths):
+            if staged in attacked:
+                continue
+            staged.parent.mkdir(mode=0o700, exist_ok=True)
+            if staged.exists():
+                staged.parent.chmod(0o700)
+                staged.chmod(0o700)
+            attacked.append(staged)
+            staged.write_text(
+                "#!/usr/bin/python3\nfrom pathlib import Path\n"
+                "Path('unreviewed').write_text('bad')\n",
+                encoding="utf-8",
+            )
+        return await real_open_process(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(observer_module.os, "unlink", record_staged_unlink)
+    monkeypatch.setattr(observer_module.anyio, "open_process", replace_staged_path)
+
+    try:
+        result = await observer.run_reviewed_tests(observer.command_ids[0], at=NOW)
+    finally:
+        for staged in attacked:
+            staged.unlink(missing_ok=True)
+            staged.parent.rmdir()
+
+    assert result.status is TestRunStatus.PASSED, (result, attacked)
+    assert attacked
+    assert (repo / "reviewed").exists(), (result, attacked)
+    assert not (repo / "unreviewed").exists()
+
+
+@pytest.mark.anyio
+async def test_missing_descriptor_backed_launch_support_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo, _revision = _repo(tmp_path)
+    _runner(repo, "from pathlib import Path\nPath('reviewed').write_text('yes')\n")
+    observer = _observer(repo)
+    real_open_process = anyio.open_process
+
+    async def reject_passed_descriptors(*args: object, **kwargs: object) -> anyio.abc.Process:
+        if kwargs.get("pass_fds"):
+            raise OSError("descriptor passing unavailable")
+        return await real_open_process(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(observer_module.anyio, "open_process", reject_passed_descriptors)
+
+    result = await observer.run_reviewed_tests(observer.command_ids[0], at=NOW)
+
+    assert result.status is TestRunStatus.REJECTED
+    assert not (repo / "reviewed").exists()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("module_name", ["signal", "subprocess"])
+async def test_supervisor_imports_cannot_resolve_from_repository(
+    tmp_path: Path, module_name: str
+) -> None:
+    repo, _revision = _repo(tmp_path)
+    marker = repo / f"hostile-{module_name}-ran"
+    (repo / f"{module_name}.py").write_text(
+        f"open({str(marker)!r}, 'w').close()\nraise RuntimeError('hostile import')\n",
+        encoding="utf-8",
+    )
+    _runner(repo, "from pathlib import Path\nPath('reviewed').write_text('yes')\n")
+    observer = _observer(repo)
+
+    result = await observer.run_reviewed_tests(observer.command_ids[0], at=NOW)
+
+    assert result.status is TestRunStatus.PASSED
+    assert not marker.exists()
+    assert (repo / "reviewed").exists()
+
+
+@pytest.mark.anyio
 async def test_output_limit_and_cancellation_clean_up_the_child(tmp_path: Path) -> None:
     repo, _revision = _repo(tmp_path)
     _runner(repo, "print('x' * 70000)\n")
@@ -278,9 +377,16 @@ async def test_output_limit_and_cancellation_clean_up_the_child(tmp_path: Path) 
         "pathlib.Path('finished').write_text('bad')\n",
     )
     cancellable = _observer(repo)
-    with anyio.move_on_after(0.2) as scope:
+
+    async def run_cancellable() -> None:
         await cancellable.run_reviewed_tests(cancellable.command_ids[0], at=NOW)
-    assert scope.cancel_called
+
+    async with anyio.create_task_group() as tasks:
+        tasks.start_soon(run_cancellable)
+        with anyio.fail_after(2):
+            while not (repo / "started").exists():
+                await anyio.sleep(0.01)
+        tasks.cancel_scope.cancel()
     await anyio.sleep(0.1)
     assert (repo / "started").exists()
     assert not (repo / "finished").exists()
@@ -309,6 +415,72 @@ async def test_cancellation_kills_a_real_grandchild_process_tree(tmp_path: Path)
     assert (repo / "grandchild-started").exists()
     await anyio.sleep(1)
     assert not (repo / "grandchild-finished").exists()
+
+
+@pytest.mark.anyio
+async def test_cancellation_at_spawn_assignment_boundary_cannot_orphan_descendants(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo, _revision = _repo(tmp_path)
+    _runner(
+        repo,
+        "import os, pathlib, signal, subprocess, time\n"
+        "pathlib.Path('parent-pid').write_text(str(os.getpid()))\n"
+        "subprocess.Popen(['/usr/bin/python3', '-I', '-S', '-c', "
+        "'import os,pathlib,signal,time; "
+        'pathlib.Path("grandchild-pid").write_text(str(os.getpid())); '
+        'pathlib.Path("grandchild-started").touch(); '
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(0.8); "
+        'pathlib.Path("grandchild-orphaned").write_text("bad")\'])\n'
+        "time.sleep(30)\n",
+    )
+    observer = _observer(repo)
+    source = observer_module._PROCESS_SUPERVISOR
+    old_launch = "child = subprocess.Popen(sys.argv[1:], start_new_session=True)"
+    if old_launch in source:
+        source = source.replace(
+            old_launch,
+            "spawned = subprocess.Popen(sys.argv[1:], start_new_session=True)\n"
+            "time.sleep(0.5)\nchild = spawned",
+            1,
+        )
+    else:
+        source = source.replace(
+            "    child = spawned",
+            "    time.sleep(0.5)\n    child = spawned",
+            1,
+        )
+    monkeypatch.setattr(observer_module, "_PROCESS_SUPERVISOR", source)
+
+    completed = anyio.Event()
+    results: list[object] = []
+
+    async def run() -> None:
+        try:
+            results.append(await observer.run_reviewed_tests(observer.command_ids[0], at=NOW))
+        finally:
+            completed.set()
+
+    orphaned = False
+    try:
+        async with anyio.create_task_group() as tasks:
+            tasks.start_soon(run)
+            with anyio.fail_after(2):
+                while not (repo / "grandchild-started").exists() and not completed.is_set():
+                    await anyio.sleep(0.01)
+            assert not completed.is_set(), results
+            tasks.cancel_scope.cancel()
+        await anyio.sleep(0.9)
+        orphaned = (repo / "grandchild-orphaned").exists()
+    finally:
+        for name in ("parent-pid", "grandchild-pid"):
+            path = repo / name
+            if path.exists():
+                try:
+                    os.kill(int(path.read_text(encoding="utf-8")), signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+    assert not orphaned
 
 
 @pytest.mark.anyio

@@ -54,7 +54,32 @@ _GIT_ENVIRONMENT: Mapping[str, str] = {
     "GIT_TERMINAL_PROMPT": "0",
 }
 _VETTED_INTERPRETERS = frozenset({"/bin/sh", "/usr/bin/python3"})
+_DESCRIPTOR_PROBE = """\
+import subprocess
+import sys
+
+descriptor = int(sys.argv[1])
+interpreter = sys.argv[2]
+if interpreter == '/usr/bin/python3':
+    command = [interpreter, '-']
+    expected = 37
+elif interpreter == '/bin/sh':
+    command = [interpreter, '-s', '--']
+    expected = 37
+else:
+    raise SystemExit(125)
+completed = subprocess.run(
+    command,
+    stdin=descriptor,
+    stdout=subprocess.DEVNULL,
+    stderr=subprocess.DEVNULL,
+    pass_fds=(descriptor,),
+    check=False,
+)
+raise SystemExit(0 if completed.returncode == expected else 125)
+"""
 _PROCESS_SUPERVISOR = """\
+import hashlib
 import os
 import signal
 import subprocess
@@ -78,8 +103,10 @@ def interrupted(sig, _frame):
     raise SystemExit(128 + sig)
 
 signal.signal(signal.SIGTERM, interrupted)
+if not hasattr(signal, 'pthread_sigmask'):
+    raise SystemExit(125)
 probe = subprocess.Popen(
-    ['/usr/bin/python3', '-c', 'import time; time.sleep(30)'],
+    ['/usr/bin/python3', '-I', '-S', '-c', 'import time; time.sleep(30)'],
     stdin=subprocess.DEVNULL,
     stdout=subprocess.DEVNULL,
     stderr=subprocess.DEVNULL,
@@ -94,7 +121,39 @@ except BaseException:
     probe.kill()
     probe.wait()
     raise SystemExit(125)
-child = subprocess.Popen(sys.argv[1:], start_new_session=True)
+try:
+    previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})
+except BaseException:
+    raise SystemExit(125)
+reviewed_descriptor = int(sys.argv[1])
+expected_digest = sys.argv[2]
+expected_size = int(sys.argv[3])
+reviewed_argv = sys.argv[4:]
+digest = hashlib.sha256()
+observed_size = 0
+os.lseek(reviewed_descriptor, 0, os.SEEK_SET)
+while chunk := os.read(reviewed_descriptor, 65536):
+    observed_size += len(chunk)
+    if observed_size > expected_size:
+        raise SystemExit(125)
+    digest.update(chunk)
+if observed_size != expected_size or digest.hexdigest() != expected_digest:
+    raise SystemExit(125)
+os.lseek(reviewed_descriptor, 0, os.SEEK_SET)
+spawned = None
+try:
+    spawned = subprocess.Popen(
+        reviewed_argv,
+        stdin=reviewed_descriptor,
+        start_new_session=True,
+    )
+    if os.getpgid(spawned.pid) != spawned.pid:
+        spawned.kill()
+        spawned.wait()
+        raise SystemExit(125)
+    child = spawned
+finally:
+    signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
 code = child.wait()
 stop_tree(signal.SIGTERM)
 time.sleep(0.05)
@@ -198,6 +257,65 @@ def _git_pin_matches(pin: _GitPin) -> bool:
         return _pin_git_executable() == pin
     except (OSError, ValueError):
         return False
+
+
+def _descriptor_matches(descriptor: int, pin: _ExecutablePin) -> bool:
+    content = bytearray()
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_size != len(pin.content):
+            return False
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        while chunk := os.read(descriptor, 64 * 1024):
+            content.extend(chunk)
+            if len(content) > MAX_EXECUTABLE_BYTES:
+                return False
+        return hashlib.sha256(content).hexdigest() == pin.digest
+    except OSError:
+        return False
+    finally:
+        try:
+            os.lseek(descriptor, 0, os.SEEK_SET)
+        except OSError:
+            pass
+        content.clear()
+
+
+def _stage_executable_descriptor(pin: _ExecutablePin) -> int:
+    """Freeze reviewed bytes behind an unlinked, read-only descriptor."""
+    temporary = tempfile.TemporaryDirectory(prefix="intent-reviewed-test-")
+    staged = Path(temporary.name) / "executable"
+    writer: int | None = None
+    held: int | None = None
+    try:
+        writer = os.open(
+            staged,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0),
+            0o400,
+        )
+        written = 0
+        while written < len(pin.content):
+            written += os.write(writer, pin.content[written:])
+        os.fsync(writer)
+        os.close(writer)
+        writer = None
+        held = os.open(
+            staged,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0),
+        )
+        os.unlink(staged)
+        temporary.cleanup()
+        if not _descriptor_matches(held, pin):
+            raise ValueError("staged executable changed")
+        descriptor = held
+        held = None
+        return descriptor
+    finally:
+        if writer is not None:
+            os.close(writer)
+        if held is not None:
+            os.close(held)
+        temporary.cleanup()
 
 
 def _terminate_fixed_process(process: subprocess.Popen[bytes]) -> None:
@@ -568,34 +686,35 @@ class DevObserver:
     ) -> tuple[TestRunStatus, int | None, bytes, bytes]:
         if not await self._process_group_available():
             raise ValueError("test process containment is unavailable")
+        if not await self._descriptor_launch_available(pin.interpreter):
+            raise ValueError("descriptor-backed launch is unavailable")
         stdout = bytearray()
         stderr = bytearray()
         budget = [MAX_TEST_OUTPUT_BYTES]
         overflow = [False]
         timed_out = False
-        temporary = tempfile.TemporaryDirectory(prefix="intent-reviewed-test-")
-        copied = Path(temporary.name) / "executable"
-        descriptor = os.open(
-            copied,
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0),
-            0o500,
+        descriptor = _stage_executable_descriptor(pin)
+        if pin.interpreter == "/usr/bin/python3":
+            reviewed_argv = (pin.interpreter, "-", *argv[1:])
+        elif pin.interpreter == "/bin/sh":
+            reviewed_argv = (pin.interpreter, "-s", "--", *argv[1:])
+        else:
+            raise ValueError("descriptor-backed launch is unavailable")
+        execution_argv = (
+            "/usr/bin/python3",
+            "-I",
+            "-S",
+            "-c",
+            _PROCESS_SUPERVISOR,
+            str(descriptor),
+            pin.digest,
+            str(len(pin.content)),
+            *reviewed_argv,
         )
-        try:
-            written = 0
-            while written < len(pin.content):
-                written += os.write(descriptor, pin.content[written:])
-            os.fsync(descriptor)
-        finally:
-            os.close(descriptor)
-        os.chmod(temporary.name, 0o500)
-        reviewed_argv = (
-            (pin.interpreter, str(copied), *argv[1:])
-            if pin.interpreter is not None
-            else (str(copied), *argv[1:])
-        )
-        execution_argv = ("/usr/bin/python3", "-c", _PROCESS_SUPERVISOR, *reviewed_argv)
         process: anyio.abc.Process | None = None
         try:
+            if not _descriptor_matches(descriptor, pin):
+                raise ValueError("staged executable changed")
             process = await anyio.open_process(
                 execution_argv,
                 cwd=self._root,
@@ -604,6 +723,7 @@ class DevObserver:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 start_new_session=True,
+                pass_fds=(descriptor,),
             )
             assert process.stdout is not None
             assert process.stderr is not None
@@ -649,8 +769,7 @@ class DevObserver:
                         await process.wait()
             if process is not None:
                 await process.aclose()
-            os.chmod(temporary.name, 0o700)
-            temporary.cleanup()
+            os.close(descriptor)
             stdout.clear()
             stderr.clear()
             budget.clear()
@@ -705,6 +824,58 @@ class DevObserver:
                     await probe.wait()
             if probe is not None:
                 await probe.aclose()
+
+    @staticmethod
+    async def _descriptor_launch_available(interpreter: str | None) -> bool:
+        """Prove nested execution reads the held descriptor before use."""
+        if interpreter not in _VETTED_INTERPRETERS:
+            return False
+        with tempfile.TemporaryFile() as handle:
+            process: anyio.abc.Process | None = None
+            try:
+                source = (
+                    b"raise SystemExit(37)\n" if interpreter == "/usr/bin/python3" else b"exit 37\n"
+                )
+                handle.write(source)
+                handle.flush()
+                handle.seek(0)
+                descriptor = handle.fileno()
+                process = await anyio.open_process(
+                    [
+                        "/usr/bin/python3",
+                        "-I",
+                        "-S",
+                        "-c",
+                        _DESCRIPTOR_PROBE,
+                        str(descriptor),
+                        interpreter,
+                    ],
+                    cwd="/",
+                    env=dict(_FIXED_ENVIRONMENT),
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    start_new_session=True,
+                    pass_fds=(descriptor,),
+                )
+                with anyio.fail_after(1):
+                    await process.wait()
+                return process.returncode == 0
+            except (OSError, TimeoutError, ValueError):
+                return False
+            finally:
+                if process is not None and process.returncode is None:
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except (PermissionError, ProcessLookupError):
+                        try:
+                            process.kill()
+                        except ProcessLookupError:
+                            pass
+                    with anyio.CancelScope(shield=True):
+                        await process.wait()
+                if process is not None:
+                    await process.aclose()
 
     def _write_artifact(self, artifact: TestResultArtifact) -> None:
         if not self._config.test_result_paths or self._directory is None:
