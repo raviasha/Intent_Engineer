@@ -104,7 +104,7 @@ operate it as mandatory enforcement.
 
 Explicit opt-out is always available: decline the onboarding offer, or disable/uninstall the
 plugin. When disabled, ordinary coding behavior is unchanged and no prompt-time workflow call is
-made. The local CLI, MCP server, and scheduled assurance remain independent.
+made. The local CLI, MCP server, scheduled assurance, and required GitHub check remain independent.
 
 Operators can still inspect the bounded diagnostic views manually:
 
@@ -115,6 +115,81 @@ intent preflight --task "add CSV export" --project . --format json
 
 The CLI diagnostic does not classify the request and does not mint a capability; it reports
 `authorization_issued: false`.
+
+### Required GitHub check setup
+
+The code-PR workflow in `.github/workflows/intent-check.yml` names its job exactly
+`Intent Engineering / check`. It runs on every PR without path filters and cancels older runs for
+the same PR. Its only GitHub permission is `contents: read`; checkout does not persist Git
+credentials. It never installs or invokes the advisory plugin.
+
+The workflow restores the fetched `refs/remotes/origin/intent-state` without checking out that
+branch. Signature, repository/project identity, lineage, ciphertext, canonical ledgers and graph
+invariants must all validate before replacement. It then executes every reviewed argv in the
+restored project configuration using the bounded `DevObserver`, stages a result only when all
+commands pass, and validates its repository, commit, timestamp and ACL before writing
+`.intent-ci/test-results.json`. The final command independently restores and verifies state again:
+
+```bash
+intent check --ci --require-review --test-results .intent-ci/test-results.json
+```
+
+Configure these prerequisites before expecting the check to pass:
+
+1. Review and activate the project baseline. Include a nonempty `test_commands` list in the
+   approved shared configuration, for example `[["tools/test-runner"]]`. The first argv entry
+   must be a regular executable file relative to the repository; shell strings, PATH executable
+   lookup and arbitrary prompt commands are rejected. Script interpreters must satisfy the
+   existing observer's vetted-interpreter contract. The PR job uses `macos-14` because the
+   observer requires a root-owned regular `/bin/sh` or `/usr/bin/python3`; ordinary Ubuntu
+   symlinks at those paths are rejected. Installation creates `.venv` with the installed test
+   dependencies. A reviewed `#!/bin/sh` wrapper can run `exec .venv/bin/python -m pytest -q`.
+   The subprocess receives a minimal environment, so it must not rely on setup-python's PATH
+   or ambient credentials. Commands have the existing five-minute and output bounds.
+   `test_result_paths` may remain empty because this workflow writes its own combined artifact.
+   Review changes to the test runner, its imports, dependencies and workflow together with code.
+2. Provision a compatible signed, encrypted state release on a protected `intent-state` branch.
+   The checkout fetches full history, including that branch. Preserve the signed parent lineage;
+   do not merge the state branch into a code branch. Current restore supports the
+   `seal_state_payload` envelope and independently pinned Ed25519 signing keys. Automatic team
+   enrollment, publication PR creation and WebAuthn-bound publication are not provided by this
+   workflow. The offline tests' fixed keys are fixtures and must never be used for deployment.
+3. Create a GitHub environment named `intent-ci`, with required reviewers and deployment rules
+   for the intended branches. Store `INTENT_CI_SHARED_STATE_TRUST` as an environment secret.
+   Its strict JSON object has `schema_version: 1`, `project_id`,
+   `repository_id: "github.com/owner/repository"`, `recipient_key_id`,
+   `recipient_private_key_base64`, and `signing_keys`, an array of
+   `{ "signature_id": "...", "public_key_base64": "..." }` records sorted by signature ID.
+   Keys use unpadded URL-safe base64 for exactly 32 bytes; all configured signers must match the
+   release. Provision the recipient private key and trusted signing public keys through an
+   independent secure channel. Do not copy keys from a PR or commit them to Git.
+4. Treat approval of this environment as approval to execute the entire PR checkout with access
+   to decrypted state and the CI secret. Review the exact revision, workflow, package installation
+   hooks, test runner and dependencies before releasing it. Merely naming an environment does
+   not configure its protection. Fork PRs normally receive no secret and fail closed; review and
+   test approved contributions through a trusted branch workflow. Do not change this workflow to
+   `pull_request_target` to expose secrets to fork code.
+5. After observing a run, configure the code branch's ruleset or branch protection to require
+   **`Intent Engineering / check`**, select GitHub Actions as the expected source where available,
+   and require the tested revision to be current before merging. Protect workflow and runner
+   changes with review. Do not require this code check on the separate state-only branch. The
+   repository files do not create rulesets, configure reviewers, provision secrets or merge PRs.
+
+Only the canonical passing test-result file is uploaded by the PR job, with seven-day retention.
+It contains commit/project/test identifiers and ACL metadata, not decrypted canonical state or
+test stdout. Do not broaden its artifact path to `.intent`, the whole checkout or raw test logs.
+The nightly/manual workflow has separate concurrency and read-only source permissions. It uses
+the same protected environment to restore state, then captures and checks sources; it does not
+claim fresh repository test execution. Its generated drift report also has seven-day retention.
+
+For an onboarded local checkout, the first ordinary prompt checks readiness automatically; the
+developer does not need to type an Intent command per task. Current prompt readiness examines the
+local baseline. A fresh team checkout must first receive a verified baseline through the restore
+integration; the prompt hook itself does not fetch or enroll team state. The offline release proof
+covers a real fresh clone, signed baseline restore, the first prompt, an implementation/test commit,
+a passing CI check, and ambiguous/conflicting cases that still block CI when the plugin is absent.
+Passing that check means the configured deterministic checks passed; it does not declare all
+software semantically complete.
 
 ## 4. Clarification and review
 

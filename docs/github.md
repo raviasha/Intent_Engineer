@@ -87,20 +87,24 @@ cron `17 2 * * *`. Its exact read-only permissions are `contents: read`,
 
 ```bash
 python -m pip install .
-intent status --project . --format json --require-baseline
-intent validate --project .
-intent sync --project . --sources markdown,git,github
+python -m intent_engineering.integrations.github_action restore
+intent check --require-review --sources markdown,git,github
 intent drift --project . --format markdown --output intent-drift.md
 ```
 
-Because `.intent` is ignored and this template has no restore source, a clean checkout deliberately
-fails the first command with `onboarding_required`. Restore an approved baseline artifact before
-the guard, or run the job in a persistent/self-hosted workspace. The workflow never runs
-`intent init` and can never report an empty graph version 0 as clean.
+Because `.intent` is ignored, a clean checkout restores its approved baseline from the fetched
+protected `intent-state` ref using `INTENT_CI_SHARED_STATE_TRUST` in the protected `intent-ci`
+environment. Missing keys, invalid signatures or incompatible state fail closed. The workflow
+never runs `intent init` and cannot report an empty graph version 0 as clean. See
+[CI setup and trust prerequisites](intent-aware-agent.md#required-github-check-setup).
+The consolidated check preserves the granular `intent validate --project .` and
+`intent sync --project . --sources markdown,git,github` interfaces for manual diagnostics.
 
 The sync step supplies `GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}` and
 `GITHUB_REPOSITORY: ${{ github.repository }}`. The workflow uploads the exact
-`intent-drift.md` path as the `intent-drift` artifact. Its GitHub Actions
+`intent-drift.md` path as the `intent-drift` artifact with seven-day retention. The separate
+`.github/workflows/intent-check.yml` PR job runs reviewed repository tests and the required
+`Intent Engineering / check` status without any plugin dependency. Its GitHub Actions
 `GITHUB_TOKEN` is ephemeral and distinct from the local CLI credential sources
 above. It performs no external write.
 

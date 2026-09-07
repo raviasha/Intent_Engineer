@@ -109,6 +109,29 @@ offer or disable/uninstall `intent-advisor`. A decline leaves the repository unc
 task; disabling the plugin leaves ordinary coding behavior unchanged. The CLI and MCP services
 remain usable independently.
 
+### Required GitHub check
+
+The separate PR workflow, [intent-check.yml](.github/workflows/intent-check.yml), exposes the
+required status **`Intent Engineering / check`**. It installs the package, restores the signed and
+encrypted approved baseline, runs every reviewed `test_commands` argv from that baseline, writes
+canonical evidence for the checkout's exact Git commit, and runs:
+
+```bash
+intent check --ci --require-review --test-results .intent-ci/test-results.json
+```
+
+Passing tests are evidence, not human approval. Missing trust or baseline, failing tests, invalid
+evidence, and unresolved review work fail the job. Disabling the local plugin does not disable
+this GitHub backstop. The nightly/manual `intent-sync.yml` remains separate and captures configured
+Markdown, Git, and GitHub sources through `intent check`.
+
+This workflow requires operator setup; committing it does not enable branch protection. Configure
+the protected `intent-ci` environment, supply the CI recipient key and pinned signing-key trust,
+publish compatible approved encrypted state to protected `intent-state`, and require the exact
+status above on your code branches. A bare checkout or a locally manufactured `.intent` directory
+cannot satisfy CI. See [CI setup and trust prerequisites](docs/intent-aware-agent.md#required-github-check-setup)
+before enabling it. Automated key enrollment and publication setup remain future work.
+
 Clients other than Codex that launch and connect stdio themselves may run
 `intent mcp --project .`; that is a client-managed process, not an extra Codex setup step.
 

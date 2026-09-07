@@ -5,9 +5,17 @@ name: Intent sync
   schedule:
     - cron: "17 2 * * *"
 
+permissions: {}
+
+concurrency:
+  group: intent-sync-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   drift:
     runs-on: ubuntu-latest
+    environment: intent-ci
+    timeout-minutes: 20
     permissions:
       contents: read
       issues: read
@@ -16,17 +24,18 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          persist-credentials: false
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
       - name: Install Intent Engineering
         run: python -m pip install .
-      - name: Require restored approved intent baseline
-        run: intent status --project . --format json --require-baseline
-      - name: Validate local intent state
-        run: intent validate --project .
-      - name: Capture configured source versions
-        run: intent sync --project . --sources markdown,git,github
+      - name: Restore verified approved intent state
+        run: python -m intent_engineering.integrations.github_action restore
+        env:
+          INTENT_CI_SHARED_STATE_TRUST: ${{ secrets.INTENT_CI_SHARED_STATE_TRUST }}
+      - name: Capture and check configured source versions
+        run: intent check --require-review --sources markdown,git,github
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_REPOSITORY: ${{ github.repository }}
@@ -36,3 +45,5 @@ jobs:
         with:
           name: intent-drift
           path: intent-drift.md
+          retention-days: 7
+          if-no-files-found: error

@@ -3,6 +3,7 @@
 .DS_Store
 .venv/
 .intent/
+.intent-ci/
 __pycache__/
 .pytest_cache/
 .mypy_cache/

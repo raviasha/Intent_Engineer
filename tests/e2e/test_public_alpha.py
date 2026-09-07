@@ -335,29 +335,35 @@ def test_scheduled_workflow_is_read_only_and_orders_capture_before_assurance() -
         "pull-requests": "read",
     }
     steps = job["steps"]
-    assert steps[0] == {"uses": "actions/checkout@v4", "with": {"fetch-depth": 0}}
+    assert steps[0] == {
+        "uses": "actions/checkout@v4",
+        "with": {"fetch-depth": 0, "persist-credentials": False},
+    }
     assert steps[1] == {
         "uses": "actions/setup-python@v5",
         "with": {"python-version": "3.12"},
     }
-    assert [step["name"] for step in steps[2:7]] == [
+    assert [step["name"] for step in steps[2:6]] == [
         "Install Intent Engineering",
-        "Require restored approved intent baseline",
-        "Validate local intent state",
-        "Capture configured source versions",
+        "Restore verified approved intent state",
+        "Capture and check configured source versions",
         "Render drift and assurance report",
     ]
-    assert steps[7] == {
+    assert steps[6] == {
         "uses": "actions/upload-artifact@v4",
-        "with": {"name": "intent-drift", "path": "intent-drift.md"},
+        "with": {
+            "name": "intent-drift",
+            "path": "intent-drift.md",
+            "retention-days": 7,
+            "if-no-files-found": "error",
+        },
     }
     commands = [step.get("run", "") for step in steps]
     assert commands[2] == "python -m pip install ."
-    assert commands[3] == "intent status --project . --format json --require-baseline"
-    assert commands[4] == "intent validate --project ."
-    assert commands[5] == "intent sync --project . --sources markdown,git,github"
-    assert commands[6] == ("intent drift --project . --format markdown --output intent-drift.md")
-    assert steps[5]["env"] == {
+    assert commands[3] == "python -m intent_engineering.integrations.github_action restore"
+    assert commands[4] == "intent check --require-review --sources markdown,git,github"
+    assert commands[5] == ("intent drift --project . --format markdown --output intent-drift.md")
+    assert steps[4]["env"] == {
         "GH_TOKEN": "${{ secrets.GITHUB_TOKEN }}",
         "GITHUB_REPOSITORY": "${{ github.repository }}",
     }
@@ -416,16 +422,18 @@ def test_guided_adoption_docs_and_plugin_independent_assurance_are_ordered() -> 
     workflow = yaml.safe_load(raw)
     assert set(workflow["on"]) == {"schedule", "workflow_dispatch"}
     steps = workflow["jobs"]["drift"]["steps"]
-    assert steps[0] == {"uses": "actions/checkout@v4", "with": {"fetch-depth": 0}}
+    assert steps[0] == {
+        "uses": "actions/checkout@v4",
+        "with": {"fetch-depth": 0, "persist-credentials": False},
+    }
     assert steps[1] == {
         "uses": "actions/setup-python@v5",
         "with": {"python-version": "3.12"},
     }
-    assert [step.get("run") for step in steps[2:7]] == [
+    assert [step.get("run") for step in steps[2:6]] == [
         "python -m pip install .",
-        "intent status --project . --format json --require-baseline",
-        "intent validate --project .",
-        "intent sync --project . --sources markdown,git,github",
+        "python -m intent_engineering.integrations.github_action restore",
+        "intent check --require-review --sources markdown,git,github",
         "intent drift --project . --format markdown --output intent-drift.md",
     ]
     assert "intent-advisor" not in raw

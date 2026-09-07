@@ -1,0 +1,50 @@
+name: Intent Engineering
+
+"on":
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: intent-check-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: Intent Engineering / check
+    runs-on: macos-14
+    environment: intent-ci
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install Intent Engineering and test dependencies
+        run: |
+          python -m pip install '.[dev]'
+          python -m venv --system-site-packages .venv
+      - name: Restore verified approved intent state
+        run: python -m intent_engineering.integrations.github_action restore
+        env:
+          INTENT_CI_SHARED_STATE_TRUST: ${{ secrets.INTENT_CI_SHARED_STATE_TRUST }}
+      - name: Run reviewed repository tests
+        run: python -m intent_engineering.integrations.github_action test
+      - name: Write canonical test-result evidence
+        run: python -m intent_engineering.integrations.github_action results
+      - name: Intent Engineering check
+        run: intent check --ci --require-review --test-results .intent-ci/test-results.json
+        env:
+          INTENT_CI_SHARED_STATE_TRUST: ${{ secrets.INTENT_CI_SHARED_STATE_TRUST }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: intent-test-results
+          path: .intent-ci/test-results.json
+          retention-days: 7
+          if-no-files-found: error
+          include-hidden-files: true
