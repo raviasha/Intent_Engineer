@@ -1,6 +1,8 @@
 """Shared local workspace validation application service."""
 
 from intent_engineering.validation.service import (
+    MAX_CANONICAL_FILE_BYTES,
+    MAX_CANONICAL_SNAPSHOT_BYTES,
     DiagnosticSeverity,
     ValidationDiagnostic,
     ValidationReport,
@@ -11,6 +13,8 @@ from intent_engineering.validation.service import (
 )
 
 __all__ = [
+    "MAX_CANONICAL_FILE_BYTES",
+    "MAX_CANONICAL_SNAPSHOT_BYTES",
     "DiagnosticSeverity",
     "ValidationDiagnostic",
     "ValidationReport",

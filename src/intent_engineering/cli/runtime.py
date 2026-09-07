@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import stat
 import subprocess
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -66,6 +67,7 @@ from intent_engineering.intent_workflow.proposal_store import (
 from intent_engineering.intent_workflow.readiness import (
     EnsureRequest,
     EnsureResult,
+    ReadinessError,
     ReadinessService,
 )
 from intent_engineering.reconcile import LocalResolutionService
@@ -76,6 +78,7 @@ from intent_engineering.storage.jsonl.evidence_store import JsonlEvidenceStore
 from intent_engineering.storage.secure import (
     SecureDirectory,
     UnsafePathError,
+    _read_descriptor,
     configured_graph_relative,
 )
 from intent_engineering.storage.transaction import LocalTransactionCoordinator
@@ -83,7 +86,13 @@ from intent_engineering.storage.yaml.checkpoint_store import YamlCheckpointStore
 from intent_engineering.storage.yaml.graph_store import YamlGraphStore, parse_graph
 from intent_engineering.sync import SyncOrchestrator
 from intent_engineering.sync.models import ConnectorRunResult, SyncRunResult, SyncRunStatus
-from intent_engineering.validation import ValidationReport, validate_project_directory
+from intent_engineering.validation import (
+    MAX_CANONICAL_FILE_BYTES,
+    MAX_CANONICAL_SNAPSHOT_BYTES,
+    ValidationReport,
+    validate_canonical_snapshot,
+    validate_project_directory,
+)
 
 if TYPE_CHECKING:
     from intent_engineering.assessment import AssessmentSnapshot
@@ -254,11 +263,123 @@ class Runtime:
 class _ReadinessSnapshot:
     """One raw, no-write read of every readiness input."""
 
-    config: bytes
-    graph: bytes
-    cases: bytes | None
+    canonical: Mapping[str, bytes | None]
     intent_proposals: bytes | None
-    journal: bytes | None
+
+
+def _readiness_change_token(metadata: os.stat_result) -> tuple[int, ...]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_nlink,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
+class _ReadinessCapture:
+    """Hold every canonical inode and ancestor until the complete snapshot is validated."""
+
+    def __init__(self, project: SecureDirectory, workspace: SecureDirectory) -> None:
+        self.project = project
+        self.directories = {"": workspace.duplicate()}
+        self.files: dict[str, int | None] = {}
+        self.tokens: dict[int, tuple[int, ...]] = {
+            project.descriptor: _readiness_change_token(os.fstat(project.descriptor)),
+            workspace.descriptor: _readiness_change_token(os.fstat(workspace.descriptor)),
+        }
+        self.names: list[tuple[int, str, tuple[int, ...] | None]] = [
+            (project.descriptor, ".intent", self.tokens[workspace.descriptor])
+        ]
+        self.total_bytes = 0
+
+    def pin(self, path: str, *, optional: bool = False) -> None:
+        parts = Path(path).parts
+        if path in self.files or len(parts) > 32 or len(path.encode("utf-8")) > 4096:
+            raise UnsafePathError()
+        prefix = ""
+        for part in parts[:-1]:
+            next_prefix = f"{prefix}/{part}" if prefix else part
+            if next_prefix not in self.directories:
+                ancestor = self.directories[prefix]
+                directory = ancestor.subdirectory(part)
+                self.directories[next_prefix] = directory
+                token = _readiness_change_token(os.fstat(directory.descriptor))
+                self.tokens[directory.descriptor] = token
+                self.names.append((ancestor.descriptor, part, token))
+            prefix = next_prefix
+        parent = self.directories[prefix]
+        try:
+            descriptor = os.open(
+                parts[-1],
+                os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
+                dir_fd=parent.descriptor,
+            )
+        except FileNotFoundError:
+            if not optional:
+                raise
+            self.files[path] = None
+            self.names.append((parent.descriptor, parts[-1], None))
+            return
+        self.files[path] = descriptor
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_nlink != 1
+            or metadata.st_size > MAX_CANONICAL_FILE_BYTES
+        ):
+            raise UnsafePathError()
+        self.total_bytes += metadata.st_size
+        if self.total_bytes > MAX_CANONICAL_SNAPSHOT_BYTES:
+            raise UnsafePathError()
+        token = _readiness_change_token(metadata)
+        self.tokens[descriptor] = token
+        self.names.append((parent.descriptor, parts[-1], token))
+
+    def read(self, path: str) -> bytes | None:
+        descriptor = self.files[path]
+        if descriptor is None:
+            return None
+        # Bound reads to the authenticated size as well as the aggregate reservation;
+        # growth or truncation during the read is an invalid snapshot.
+        expected_size = self.tokens[descriptor][4]
+        content = _read_descriptor(descriptor, max_bytes=expected_size)
+        if len(content) != expected_size:
+            raise UnsafePathError()
+        return content
+
+    def verify(self) -> None:
+        observed = SecureDirectory.open(self.project.path)
+        try:
+            if observed.identity != self.project.identity:
+                raise UnsafePathError()
+        finally:
+            observed.close()
+        # No content reads or callbacks follow this whole-snapshot metadata barrier.
+        # ctime also detects a writer restoring the original bytes and mtime.
+        for parent, name, expected in self.names:
+            try:
+                token = _readiness_change_token(os.stat(name, dir_fd=parent, follow_symlinks=False))
+            except FileNotFoundError:
+                token = None
+            if token != expected:
+                raise UnsafePathError()
+        if any(
+            _readiness_change_token(os.fstat(descriptor)) != expected
+            for descriptor, expected in self.tokens.items()
+        ):
+            raise UnsafePathError()
+
+    def close(self) -> None:
+        for descriptor in self.files.values():
+            if descriptor is not None:
+                os.close(descriptor)
+        self.files.clear()
+        for directory in self.directories.values():
+            directory.close()
+        self.directories.clear()
 
 
 @dataclass(frozen=True)
@@ -304,24 +425,12 @@ class ReadinessRuntime:
         """Match the ordinary runtime lifecycle; detached snapshots own no descriptors."""
 
 
-def _read_readiness_file(
-    workspace_directory: SecureDirectory,
-    relative_path: str,
-    *,
-    optional: bool = False,
-) -> bytes | None:
-    secure_file = workspace_directory.file(relative_path)
-    try:
-        return secure_file.read_optional() if optional else secure_file.read_bytes()
-    finally:
-        secure_file.close()
-
-
 def _capture_readiness_snapshot(
-    workspace_directory: SecureDirectory,
+    capture: _ReadinessCapture,
 ) -> _ReadinessSnapshot:
     """Read all readiness inputs once without recovery, locking, or local writes."""
-    config = _read_readiness_file(workspace_directory, "config.yaml")
+    capture.pin("config.yaml")
+    config = capture.read("config.yaml")
     if config is None:  # pragma: no cover - required file invariant
         raise ValueError("project configuration is unavailable")
     loaded = yaml.safe_load(config.decode("utf-8"))
@@ -331,33 +440,53 @@ def _capture_readiness_snapshot(
         json.dumps(cast(dict[str, Any], loaded), ensure_ascii=False, separators=(",", ":"))
     )
     graph_relative = configured_graph_relative(project_config.graph_path).as_posix()
-    graph = _read_readiness_file(workspace_directory, graph_relative)
-    if graph is None:  # pragma: no cover - required file invariant
-        raise ValueError("graph is unavailable")
+    paths = {
+        "graph": graph_relative,
+        "history": "history/changesets.jsonl",
+        "cases": "reconciliation/cases.jsonl",
+        "evidence": "evidence/evidence.jsonl",
+        "receipts": "approvals/receipts.jsonl",
+        "checkpoints": "cache/checkpoints.yaml",
+    }
+    proposal_path = "history/intent-proposals.jsonl"
+    journal_path = "history/.local-transaction.json"
+    for name, path in paths.items():
+        capture.pin(path, optional=name != "graph")
+    capture.pin(proposal_path, optional=True)
+    capture.pin(journal_path, optional=True)
+    if capture.files[journal_path] is not None:
+        raise ValueError("unrecovered local transaction")
     return _ReadinessSnapshot(
-        config=config,
-        graph=graph,
-        cases=_read_readiness_file(
-            workspace_directory, "reconciliation/cases.jsonl", optional=True
+        canonical=MappingProxyType(
+            {"config": config, **{name: capture.read(path) for name, path in paths.items()}}
         ),
-        intent_proposals=_read_readiness_file(
-            workspace_directory,
-            "history/intent-proposals.jsonl",
-            optional=True,
-        ),
-        journal=_read_readiness_file(
-            workspace_directory,
-            "history/.local-transaction.json",
-            optional=True,
-        ),
+        intent_proposals=capture.read(proposal_path),
     )
 
 
 def load_readiness_runtime(root: Path) -> ReadinessRuntime:
     """Return a stable no-write snapshot or fail closed when local state changes."""
+    signal: BaseException | None = None
+    try:
+        return _load_readiness_runtime(root)
+    except ProjectNotInitialized:
+        signal = ProjectNotInitialized("local project is not initialized")
+    except Exception:  # noqa: BLE001 - discard parser contents and unsafe filesystem details
+        signal = ReadinessError()
+    except BaseException as caught:  # noqa: BLE001 - preserve exact cancellation without plaintext
+        caught.__traceback__ = None
+        caught.__cause__ = None
+        caught.__context__ = None
+        signal = caught
+    if signal is not None:
+        raise signal from None
+    raise ReadinessError() from None
+
+
+def _load_readiness_runtime(root: Path) -> ReadinessRuntime:
     project_directory: SecureDirectory | None = None
     workspace_directory: SecureDirectory | None = None
-    snapshot: _ReadinessSnapshot | None = None
+    capture: _ReadinessCapture | None = None
     try:
         root = Path(os.path.abspath(root))
         try:
@@ -365,22 +494,18 @@ def load_readiness_runtime(root: Path) -> ReadinessRuntime:
             workspace_directory = project_directory.subdirectory(".intent")
         except UnsafePathError as error:
             raise ProjectNotInitialized("local project is not initialized") from error
-        for _ in range(2):
-            first = _capture_readiness_snapshot(workspace_directory)
-            second = _capture_readiness_snapshot(workspace_directory)
-            if first.journal is not None or second.journal is not None:
-                raise ValueError("unrecovered local transaction")
-            if first == second:
-                snapshot = second
-                break
-        if snapshot is None:
-            raise ValueError("unstable readiness snapshot")
-        graph = parse_graph(snapshot.graph)
-        latest_cases = {case.id: case for case in parse_case_versions(snapshot.cases)}
+        capture = _ReadinessCapture(project_directory, workspace_directory)
+        snapshot = _capture_readiness_snapshot(capture)
+        if not validate_canonical_snapshot(snapshot.canonical).valid:
+            raise ValueError("canonical state is invalid")
+        graph_bytes = snapshot.canonical["graph"]
+        assert graph_bytes is not None
+        graph = parse_graph(graph_bytes)
+        latest_cases = {case.id: case for case in parse_case_versions(snapshot.canonical["cases"])}
         ledger = parse_intent_ledger(snapshot.intent_proposals or b"")
         if ledger is None:
             raise ValueError("intent proposal ledger is invalid")
-        return ReadinessRuntime(
+        result = ReadinessRuntime(
             graph_store=_ReadinessGraphStore(graph),
             intent_proposals=_ReadinessProposalStore(
                 proposals=tuple(ledger.proposals.values()),
@@ -389,7 +514,11 @@ def load_readiness_runtime(root: Path) -> ReadinessRuntime:
             ),
             case_items=tuple(sorted(latest_cases.values(), key=lambda case: case.id)),
         )
+        capture.verify()
+        return result
     finally:
+        if capture is not None:
+            capture.close()
         if workspace_directory is not None:
             workspace_directory.close()
         if project_directory is not None:

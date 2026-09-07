@@ -122,6 +122,9 @@ class ReadinessService:
             raise ReadinessError()
         failed = False
         try:
+            proposals = self._runtime.intent_proposals.list()
+            if type(proposals) is not tuple or len(proposals) > _MAX_ATTENTION_IDS:
+                raise ReadinessError()
             onboarding = inspect_onboarding(self._runtime)
             if onboarding.state is OnboardingState.REQUIRED:
                 return EnsureResult(
@@ -149,6 +152,14 @@ class ReadinessService:
                     graph_version=onboarding.graph_version,
                     pending_proposal_ids=onboarding.pending_proposal_ids,
                     open_case_ids=open_case_ids,
+                )
+            if onboarding.pending_proposal_ids:
+                return EnsureResult(
+                    status=EnsureStatus.HUMAN_ATTENTION_REQUIRED,
+                    attention_route=ReadinessTarget.PROPOSAL,
+                    graph_version=onboarding.graph_version,
+                    pending_proposal_ids=onboarding.pending_proposal_ids,
+                    open_case_ids=(),
                 )
             return EnsureResult(
                 status=EnsureStatus.READY,

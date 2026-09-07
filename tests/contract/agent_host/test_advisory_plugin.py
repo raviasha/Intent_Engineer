@@ -30,6 +30,8 @@ from intent_engineering.intent_workflow.readiness import (
     EnsureStatus,
     ReadinessTarget,
 )
+from tests.helpers.readiness import apply_baseline, put_pending_proposal
+from tests.helpers.shared_state import ready_project
 
 REPO_ROOT = Path(__file__).parents[3]
 PLUGIN_ROOT = REPO_ROOT / "plugins" / "intent-advisor"
@@ -154,7 +156,8 @@ def _durable_bytes(project: Path) -> dict[str, bytes]:
 def _ready_project(project: Path) -> None:
     initialize_project(project)
     runtime = load_runtime(project)
-    runtime.graph_store.initialize(
+    apply_baseline(
+        runtime,
         Graph(
             id="graph:plugin-test",
             version=1,
@@ -172,8 +175,9 @@ def _ready_project(project: Path) -> None:
                 ),
             ),
             edges=(),
-        )
+        ),
     )
+    runtime.close()
 
 
 def _fake_intent(directory: Path, source: str) -> Path:
@@ -294,16 +298,68 @@ def test_real_hook_routes_ready_prompt_to_preflight_without_secret_or_echo(
     assert "capability" not in lowered
     assert "token" not in lowered
     after = _durable_bytes(project)
-    assert after.keys() - before.keys() == {".config.yaml.lock", "evidence/evidence.jsonl"}
-    assert "evidence/evidence.jsonl" not in before
-    assert after["evidence/evidence.jsonl"]
+    assert after.keys() - before.keys() == {".config.yaml.lock"}
+    assert after["evidence/evidence.jsonl"].startswith(before["evidence/evidence.jsonl"])
     for path in before:
-        assert after[path] == before[path]
+        if path != "evidence/evidence.jsonl":
+            assert after[path] == before[path]
     captured = load_runtime(project).evidence_store.ledger("conversation:codex")
     assert len(captured) == 1
     assert captured[0].evidence.external_object_id == expected_ref
     assert captured[0].evidence.author == "agent:codex"
     assert captured[0].evidence.payload == {"role": "agent", "content": marker}
+
+
+def test_real_hook_blocks_capture_for_a_pending_proposal_on_an_approved_graph(
+    tmp_path: Path,
+) -> None:
+    """Catches real first-prompt readiness bypassing a durable undecided proposal."""
+    project = tmp_path / "project"
+    project.mkdir()
+    ready_project(project)
+    runtime = load_runtime(project)
+    try:
+        put_pending_proposal(runtime)
+    finally:
+        runtime.close()
+    before = _durable_bytes(project)
+    marker = "PRIVATE-PENDING-PROMPT-8197"
+
+    first = _run_official_hook(project, prompt=marker)
+    replay = _run_official_hook(project, prompt=marker)
+
+    assert _additional_context(first) == (
+        "action=human_attention_required. Intent Engineering requires human review in the "
+        "local Proposal review view before implementation. Do not implement or resolve the "
+        "intent work automatically."
+    )
+    assert first.stdout == replay.stdout
+    assert marker.encode() not in first.stdout + first.stderr
+    assert b"PRIVATE-PENDING-PROPOSAL-8197" not in first.stdout + first.stderr
+    assert _durable_bytes(project) == before
+
+
+@pytest.mark.parametrize(
+    "path", ("evidence/evidence.jsonl", "history/changesets.jsonl", "cache/checkpoints.yaml")
+)
+def test_real_hook_blocks_capture_for_corrupt_canonical_state(tmp_path: Path, path: str) -> None:
+    """Catches the actual prompt hook classifying while canonical validation has failed."""
+    project = tmp_path / "project"
+    project.mkdir()
+    ready_project(project)
+    marker = "PRIVATE-CORRUPT-CANONICAL-8197"
+    (project / ".intent" / path).write_text(f"{marker}: [", encoding="utf-8")
+    before = _durable_bytes(project)
+
+    completed = _run_official_hook(project, prompt=marker)
+
+    assert _additional_context(completed) == (
+        "action=human_attention_required. Intent Engineering cannot verify local readiness. "
+        "Open the local Team state view before governed implementation; do not implement or "
+        "resolve intent work automatically."
+    )
+    assert marker.encode() not in completed.stdout + completed.stderr
+    assert _durable_bytes(project) == before
 
 
 def test_real_hook_uses_retry_stable_turn_specific_ref_without_host_id_leakage(
@@ -535,13 +591,9 @@ def test_special_project_files_fail_promptly_without_replacement(
     completed = _run_official_hook(project, timeout=3)
 
     expected = (
-        FALLBACK
-        if attack == "fifo"
-        else (
-            "action=human_attention_required. Intent Engineering cannot verify local readiness. "
-            "Open the local Team state view before governed implementation; do not implement or "
-            "resolve intent work automatically."
-        )
+        "action=human_attention_required. Intent Engineering cannot verify local readiness. "
+        "Open the local Team state view before governed implementation; do not implement or "
+        "resolve intent work automatically."
     )
     assert _additional_context(completed) == expected
     after = os.lstat(config)

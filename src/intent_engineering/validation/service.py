@@ -60,6 +60,8 @@ _GITHUB_CONNECTOR_PREFIX = "github:"
 _GITHUB_SHA = re.compile(r"^[0-9a-f]{40}$")
 _MCP_CONNECTOR_IDENTITY = re.compile(r"^[0-9a-f]{64}$")
 _MCP_WRITE_EVIDENCE = re.compile(r"^evidence:mcp-write:[0-9a-f]{64}$")
+MAX_CANONICAL_FILE_BYTES = 8 * 1024 * 1024
+MAX_CANONICAL_SNAPSHOT_BYTES = 16 * 1024 * 1024
 
 
 class DiagnosticSeverity(StrEnum):
@@ -1116,7 +1118,10 @@ def validate_canonical_snapshot(content: Mapping[str, bytes | None]) -> Validati
         if any(value is not None and type(value) is not bytes for value in snapshot.values()):
             raise ValueError("invalid canonical snapshot")
         sizes = [len(value) for value in snapshot.values() if value is not None]
-        if any(size > 8 * 1024 * 1024 for size in sizes) or sum(sizes) > 16 * 1024 * 1024:
+        if (
+            any(size > MAX_CANONICAL_FILE_BYTES for size in sizes)
+            or sum(sizes) > MAX_CANONICAL_SNAPSHOT_BYTES
+        ):
             raise ValueError("oversized canonical snapshot")
     except (TypeError, ValueError):
         return _report((_diagnostic("workspace.snapshot_invalid", "workspace"),))

@@ -912,7 +912,7 @@ def ensure_command(
 ) -> None:
     """Return a bounded readiness result without initializing or approving state."""
     root = Path(os.path.abspath(project))
-    if not (root / ".intent").exists():
+    if not os.path.lexists(root / ".intent"):
         emit(
             EnsureResult(
                 status=EnsureStatus.ONBOARDING_REQUIRED,

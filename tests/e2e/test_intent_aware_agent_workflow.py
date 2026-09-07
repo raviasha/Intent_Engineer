@@ -679,8 +679,11 @@ def test_guided_onboarding_plugin_and_assurance_share_one_project(
             review_hook_stderr,
         )
     )
-    assert "action=review_clarification_proposal" in review_route
-    assert "intent_clarification_show" in review_route
+    assert review_route == (
+        "action=human_attention_required. Intent Engineering requires human review in the "
+        "local Proposal review view before implementation. Do not implement or resolve the "
+        "intent work automatically."
+    )
     clarification_shown = call_tool(
         "intent_clarification_show",
         {"proposal_id": clarification_proposed["proposal_id"]},

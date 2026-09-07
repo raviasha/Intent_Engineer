@@ -15,6 +15,7 @@ from intent_engineering.cli.runtime import load_runtime
 from intent_engineering.core.models import Graph, Node, NodeType
 from intent_engineering.core.policy.project import initialize_project
 from intent_engineering.storage.transaction import LocalTransactionCoordinator
+from tests.helpers.readiness import apply_baseline
 
 NOW = datetime(2026, 9, 7, tzinfo=UTC)
 
@@ -23,7 +24,8 @@ def _ready_project(project: Path) -> None:
     initialize_project(project)
     runtime = load_runtime(project)
     try:
-        runtime.graph_store.initialize(
+        apply_baseline(
+            runtime,
             Graph(
                 id="graph:ensure-cli",
                 version=1,
@@ -40,7 +42,7 @@ def _ready_project(project: Path) -> None:
                     ),
                 ),
                 edges=(),
-            )
+            ),
         )
     finally:
         runtime.close()
@@ -218,7 +220,7 @@ def test_ensure_rejects_pending_transaction_without_recovery_writes(tmp_path: Pa
     } == before
 
 
-def test_ensure_retries_when_the_readiness_snapshot_changes_mid_read(
+def test_ensure_rejects_when_the_readiness_snapshot_changes_before_validation_completes(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -245,7 +247,7 @@ def test_ensure_retries_when_the_readiness_snapshot_changes_mid_read(
         ["ensure", "--project", str(project), "--preset", "developer", "--format", "json"],
     )
 
-    assert calls == 4
+    assert calls == 1
     assert result.exit_code == 0
     assert json.loads(result.stdout)["status"] == "shared_state_invalid"
     assert marker not in result.stdout + result.stderr

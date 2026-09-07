@@ -19,6 +19,7 @@ from mcp.client.stdio import StdioServerParameters, stdio_client
 from intent_engineering.cli.runtime import load_runtime
 from intent_engineering.core.models import Graph, Node, NodeType
 from intent_engineering.core.policy.project import initialize_project
+from tests.helpers.readiness import apply_baseline
 
 pytestmark = pytest.mark.anyio
 
@@ -59,7 +60,8 @@ async def test_intent_mcp_stdio_is_protocol_clean_and_read_only(tmp_path: Path) 
     )
     runtime = load_runtime(project)
     now = datetime(2026, 8, 29, 12, 0, tzinfo=UTC)
-    runtime.graph_store.initialize(
+    apply_baseline(
+        runtime,
         Graph(
             id="graph:mcp-stdio",
             version=1,
@@ -77,7 +79,7 @@ async def test_intent_mcp_stdio_is_protocol_clean_and_read_only(tmp_path: Path) 
                 ),
             ),
             edges=(),
-        )
+        ),
     )
     executable = Path(sys.executable).with_name("intent")
     prompt = "Format README\nwithout changing semantics"

@@ -34,6 +34,7 @@ from intent_engineering.intent_workflow.readiness import (
     EnsureStatus,
     ReadinessTarget,
 )
+from tests.helpers.readiness import apply_baseline
 
 NOW = datetime(2026, 8, 28, 12, 0, tzinfo=UTC)
 OFFER = (
@@ -76,7 +77,8 @@ def _durable_bytes(project: Path) -> dict[str, bytes]:
 def _ready_runtime(project: Path):
     initialize_project(project)
     runtime = load_runtime(project)
-    runtime.graph_store.initialize(
+    apply_baseline(
+        runtime,
         Graph(
             id=f"graph:{project.name}",
             version=1,
@@ -94,7 +96,7 @@ def _ready_runtime(project: Path):
                 ),
             ),
             edges=(),
-        )
+        ),
     )
     return runtime
 

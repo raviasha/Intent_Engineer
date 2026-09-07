@@ -160,7 +160,7 @@ def _prompt_readiness_route(project: Path, preset: EnsurePreset) -> PromptRoute 
     try:
         runtime = load_readiness_runtime(project)
     except ProjectNotInitialized:
-        if (project / ".intent").exists():
+        if os.path.lexists(project / ".intent"):
             return readiness_unavailable_prompt_route()
         return _onboarding_prompt_route()
     except Exception:  # noqa: BLE001 - readiness errors must block implementation

@@ -137,6 +137,45 @@ def test_pending_baseline_proposal_requires_human_review() -> None:
     )
 
 
+def test_pending_proposal_blocks_a_populated_baseline_at_proposal_review() -> None:
+    """Catches readiness ignoring an undecided proposal after baseline approval."""
+
+    @dataclass(frozen=True)
+    class Proposal:
+        id: str
+
+    runtime = _ready_runtime()
+    runtime.intent_proposals.proposals = (Proposal("proposal:pending"),)
+
+    result = ReadinessService(runtime).ensure(EnsureRequest())
+
+    assert result == EnsureResult(
+        status=EnsureStatus.HUMAN_ATTENTION_REQUIRED,
+        attention_route=ReadinessTarget.PROPOSAL,
+        graph_version=1,
+        pending_proposal_ids=("proposal:pending",),
+        open_case_ids=(),
+    )
+
+
+def test_proposal_overflow_cannot_hide_an_undecided_proposal_after_decided_prefix() -> None:
+    """Catches the onboarding projection's truncation turning unseen proposals into ready."""
+
+    @dataclass(frozen=True)
+    class Proposal:
+        id: str
+
+    class Store(_ProposalStore):
+        def decision_for(self, proposal_id: str) -> object | None:
+            return None if proposal_id == "proposal:256" else object()
+
+    runtime = _ready_runtime()
+    runtime.intent_proposals = Store(tuple(Proposal(f"proposal:{index}") for index in range(257)))
+
+    with pytest.raises(ReadinessError, match="^intent readiness unavailable$"):
+        ReadinessService(runtime).ensure(EnsureRequest())
+
+
 def test_open_reconciliation_case_requires_human_review() -> None:
     """Catches an unresolved divergence being hidden behind a ready status."""
 
