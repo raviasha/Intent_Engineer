@@ -195,3 +195,36 @@ Round-2 verification:
   changed-file formatting, plugin validation, CLI check/ensure help and diff gates passed.
 
 Fix commit message: `fix: reject stale bytecode and bind tracked ancestors`.
+
+## Review round 3: empty repository cache directories
+
+The new complete-path regression reproduced temporary passing bytecode written into a pre-existing
+empty `__pycache__`, imported, and deleted during reviewed execution. The tracked failing source
+and ancestor metadata remained unchanged, so the old file-only check emitted canonical passing
+results and the real required CI command returned exit 0. Root/nested and ordinary/case-variant
+cache names each reproduced that false green. An empty cache under wholly untracked nested
+directories also escaped rejection. Initial RED: **5 failed, 1 passed**; a separate directory-entry
+budget regression failed RED before implementation.
+
+Every clean snapshot now includes a bounded descriptor-based directory scan, independent of Git's
+file listing. It rejects cache directory names case-insensitively, even when empty, and traverses
+nested untracked/ignored directories without following links. Root Git metadata and the existing
+explicit generated/dependency scopes are excluded; external directories are never traversed.
+Inspection streams entries and fails closed beyond 16,384 entries, 1 MiB of cumulative path names,
+the existing per-path bound or snapshot deadline. It neither deletes nor mutates rejected caches.
+No workflow, trust, canonical-result or reviewed-command contract was weakened.
+
+The new regression group passed **7 tests**: four complete false-green attacks are rejected,
+wholly untracked nested empty caches remain untouched, explicitly generated/dependency/external
+caches remain preserved while CI passes, and the entry budget fails closed. Existing ordinary
+clean-import and scheduled-reporting regressions remain in the focused/broad gates.
+
+Final round-3 gates:
+
+- Focused observer/workflow/release/public-alpha/GitHub compatibility: **77 passed**, 44.31 seconds.
+- Broad affected-feature gate: **931 passed, 1 deselected, 19 existing warnings**, 96.27 seconds.
+  The only deselection remains the documented installed-Codex version assertion.
+- Full mypy: **140 source files**, no issues. Ruff (same known unrelated duplicate exclusion),
+  changed-file formatting, plugin validation, CLI check/ensure help and workflow/diff gates passed.
+
+Fix commit message: `fix: inspect empty repository cache directories`.

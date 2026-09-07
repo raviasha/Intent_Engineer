@@ -674,3 +674,120 @@ def test_clean_python_imports_pass_ci_without_creating_repository_bytecode(
     assert not (repo / "__pycache__").exists()
     result = _check(repo, trust)
     assert result.exit_code == 0, (result.stdout, repr(result.exception))
+
+
+@pytest.mark.parametrize("package", [".", "package/nested"])
+@pytest.mark.parametrize("cache_name", ["__pycache__", "__PYCACHE__"])
+def test_empty_cache_directory_cannot_hide_temporary_passing_bytecode_from_ci(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    package: str,
+    cache_name: str,
+) -> None:
+    action = _action()
+    repo, trust = _clone(tmp_path)
+    monkeypatch.setenv("INTENT_CI_SHARED_STATE_TRUST", trust_environment(trust))
+    action.restore(repo)
+    parent = repo / package
+    parent.mkdir(parents=True, exist_ok=True)
+    module = parent / "feature.py"
+    module.write_text("def enabled():\n    return False\n", encoding="utf-8")
+    (repo / "tools/test-runner").write_text(
+        "#!/usr/bin/python3\nimport importlib.util, importlib._bootstrap_external as b\n"
+        "from pathlib import Path\n"
+        f"p=Path({str(module.relative_to(repo))!r})\n"
+        "s=p.stat()\n"
+        "code=compile('def enabled():\\n    return True\\n', str(p), 'exec')\n"
+        "out=Path(importlib.util.cache_from_source(str(p)))\n"
+        "out.write_bytes(b._code_to_timestamp_pyc(code, int(s.st_mtime), s.st_size))\n"
+        "try:\n"
+        "    spec=importlib.util.spec_from_file_location('observed_feature', str(p))\n"
+        "    observed=importlib.util.module_from_spec(spec)\n"
+        "    spec.loader.exec_module(observed)\n"
+        "    assert observed.enabled()\n"
+        "finally:\n"
+        "    out.unlink()\n",
+        encoding="utf-8",
+    )
+    git(repo, "add", str(module.relative_to(repo)), "tools/test-runner")
+    git(repo, "commit", "-qm", "test transient bytecode inside an existing empty cache")
+    cache = parent / cache_name
+    cache.mkdir()
+    before = module.stat()
+    try:
+        anyio.run(action.run_tests, repo, NOW)
+        action.write_results(repo, NOW)
+    except ValueError:
+        pass
+    after = module.stat()
+    assert (after.st_ino, after.st_mtime_ns, after.st_ctime_ns) == (
+        before.st_ino,
+        before.st_mtime_ns,
+        before.st_ctime_ns,
+    )
+    assert cache.is_dir() and not tuple(cache.iterdir())
+    result = _check(repo, trust)
+    assert result.exit_code != 0, "transient bytecode received complete CI acceptance"
+    assert not (repo / ".intent-ci/test-results.json").exists()
+
+
+def test_empty_cache_under_untracked_nested_directories_is_rejected_without_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    action = _action()
+    repo, trust = _clone(tmp_path)
+    monkeypatch.setenv("INTENT_CI_SHARED_STATE_TRUST", trust_environment(trust))
+    action.restore(repo)
+    cache = repo / "untracked/empty/nested/__PYCACHE__"
+    cache.mkdir(parents=True)
+    before = cache.stat()
+    with pytest.raises(ValueError):
+        anyio.run(action.run_tests, repo, NOW)
+    after = cache.stat()
+    assert (after.st_ino, after.st_mtime_ns, after.st_ctime_ns) == (
+        before.st_ino,
+        before.st_mtime_ns,
+        before.st_ctime_ns,
+    )
+    assert not tuple(cache.iterdir())
+
+
+def test_cache_directories_in_explicit_generated_dependency_and_external_scopes_are_preserved(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    action = _action()
+    repo, trust = _clone(tmp_path)
+    monkeypatch.setenv("INTENT_CI_SHARED_STATE_TRUST", trust_environment(trust))
+    action.restore(repo)
+    caches = (
+        repo / ".venv/lib/package/__pycache__",
+        repo / ".intent-ci/generated/__pycache__",
+        tmp_path / "external/__pycache__",
+    )
+    for cache in caches:
+        cache.mkdir(parents=True)
+        (cache / "owned.pyc").write_bytes(b"preserved scope")
+    anyio.run(action.run_tests, repo, NOW)
+    action.write_results(repo, NOW)
+    assert _check(repo, trust).exit_code == 0
+    assert all((cache / "owned.pyc").read_bytes() == b"preserved scope" for cache in caches)
+
+
+def test_cache_directory_inspection_fails_closed_at_entry_budget(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    action = _action()
+    repo, trust = _clone(tmp_path)
+    monkeypatch.setenv("INTENT_CI_SHARED_STATE_TRUST", trust_environment(trust))
+    action.restore(repo)
+    monkeypatch.setattr(
+        "intent_engineering.intent_workflow.dev_observer.MAX_SNAPSHOT_TREE_ENTRIES",
+        1,
+        raising=False,
+    )
+    with pytest.raises(ValueError):
+        anyio.run(action.run_tests, repo, NOW)
+    assert not (repo / ".intent-ci/test-results.json").exists()

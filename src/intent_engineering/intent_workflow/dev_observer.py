@@ -40,6 +40,7 @@ MAX_CHANGED_PATHS = 4096
 MAX_CHANGED_PATH_BYTES = 4096
 MAX_CHANGED_PATH_OUTPUT_BYTES = 1024 * 1024
 MAX_COMMIT_SNAPSHOT_BYTES = 128 * 1024 * 1024
+MAX_SNAPSHOT_TREE_ENTRIES = 16_384
 GIT_TIMEOUT_SECONDS = 5
 _REVISION = re.compile(r"^[0-9a-f]{40}(?:[0-9a-f]{24})?$")
 _GIT_EXECUTABLE = Path("/usr/bin/git")
@@ -594,6 +595,51 @@ class DevObserver:
         finally:
             directory.close()
 
+    def _reject_repository_cache_directories(self, *, deadline: float) -> None:
+        """Inspect directory names too: Git does not report pre-existing empty caches."""
+        if self._directory is None:
+            raise ValueError("clean commit snapshot unavailable")
+        pending = ["."]
+        count = 0
+        path_bytes = 0
+        while pending:
+            relative = pending.pop()
+            directory = (
+                self._directory.duplicate()
+                if relative == "."
+                else self._directory.subdirectory(relative)
+            )
+            try:
+                with os.scandir(directory.descriptor) as entries:
+                    for entry in entries:
+                        path = entry.name if relative == "." else f"{relative}/{entry.name}"
+                        encoded_size = len(path.encode("utf-8"))
+                        count += 1
+                        path_bytes += encoded_size
+                        if (
+                            count > MAX_SNAPSHOT_TREE_ENTRIES
+                            or encoded_size > MAX_CHANGED_PATH_BYTES
+                            or path_bytes > MAX_CHANGED_PATH_OUTPUT_BYTES
+                            or time.monotonic() > deadline
+                        ):
+                            raise ValueError("clean commit snapshot unavailable")
+                        if relative == "." and entry.name in {
+                            ".git",
+                            ".intent",
+                            ".intent-ci",
+                            ".venv",
+                            ".pytest_cache",
+                            ".mypy_cache",
+                            ".ruff_cache",
+                        }:
+                            continue
+                        if entry.name.casefold() == "__pycache__":
+                            raise ValueError("clean commit snapshot unavailable")
+                        if entry.is_dir(follow_symlinks=False):
+                            pending.append(path)
+            finally:
+                directory.close()
+
     def clean_commit_snapshot(self) -> str:
         """Verify actual tracked bytes against HEAD and fingerprint their held identities.
 
@@ -604,6 +650,7 @@ class DevObserver:
         if self._directory is None:
             raise ValueError("clean commit snapshot unavailable")
         deadline = time.monotonic() + GIT_TIMEOUT_SECONDS
+        self._reject_repository_cache_directories(deadline=deadline)
         self._require_repository_root(self._root)
         revision = self._current_revision()
         tree = self._git(

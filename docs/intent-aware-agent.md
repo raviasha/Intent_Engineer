@@ -151,8 +151,12 @@ along tracked ancestors (including loose outputs at the repository root) invalid
 Tracked files are never exempt. Other outputs must be explicitly reviewed, not merely added to
 `.gitignore`.
 
-Repository `__pycache__` content and `.pyc`/`.pyo` files are rejected, including committed bytecode;
-rejected caches are left untouched for the operator to handle. They cannot shadow failing committed
+Repository `__pycache__` directories (even empty or case-variant names) and `.pyc`/`.pyo` files
+are rejected, including committed bytecode. A descriptor-based directory scan covers nested,
+untracked and ignored directories that Git's file listing cannot see; it does not follow links.
+It skips only root Git metadata and the explicit generated/dependency directories listed above.
+The scan is capped at 16,384 entries, 1 MiB of path names and the existing snapshot deadline.
+Rejected caches are left untouched for the operator to handle. They cannot shadow failing committed
 Python source. Reviewed CI subprocesses inherit `PYTHONDONTWRITEBYTECODE=1` to prevent ordinary
 imports from creating new repository caches. This flag prevents writes, not reads: rejection of
 existing repository bytecode provides the read-side boundary. Installed dependencies inside the
