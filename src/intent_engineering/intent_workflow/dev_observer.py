@@ -10,7 +10,6 @@ import selectors
 import signal
 import stat
 import subprocess
-import tempfile
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -36,6 +35,7 @@ from intent_engineering.storage.secure import SecureDirectory, UnsafePathError
 MAX_TEST_OUTPUT_BYTES = 64 * 1024
 TEST_TIMEOUT_SECONDS = 300
 MAX_EXECUTABLE_BYTES = 16 * 1024 * 1024
+MAX_REVIEWED_SOURCE_BYTES = 24 * 1024
 MAX_CHANGED_PATHS = 4096
 MAX_CHANGED_PATH_BYTES = 4096
 MAX_CHANGED_PATH_OUTPUT_BYTES = 1024 * 1024
@@ -55,25 +55,41 @@ _GIT_ENVIRONMENT: Mapping[str, str] = {
 }
 _VETTED_INTERPRETERS = frozenset({"/bin/sh", "/usr/bin/python3"})
 _DESCRIPTOR_PROBE = """\
+import hashlib
+import os
 import subprocess
 import sys
 
 descriptor = int(sys.argv[1])
 interpreter = sys.argv[2]
+expected_digest = sys.argv[3]
+expected_size = int(sys.argv[4])
+source = bytearray()
+while len(source) < expected_size:
+    chunk = os.read(descriptor, min(65536, expected_size - len(source)))
+    if not chunk:
+        raise SystemExit(125)
+    source.extend(chunk)
+os.close(descriptor)
+if len(source) != expected_size or hashlib.sha256(source).hexdigest() != expected_digest:
+    raise SystemExit(125)
+try:
+    source_text = bytes(source).decode('utf-8')
+except UnicodeError:
+    raise SystemExit(125)
 if interpreter == '/usr/bin/python3':
-    command = [interpreter, '-']
+    command = [interpreter, '-c', source_text]
     expected = 37
 elif interpreter == '/bin/sh':
-    command = [interpreter, '-s', '--']
+    command = [interpreter, '-c', source_text, 'intent-reviewed-probe']
     expected = 37
 else:
     raise SystemExit(125)
 completed = subprocess.run(
     command,
-    stdin=descriptor,
+    stdin=subprocess.DEVNULL,
     stdout=subprocess.DEVNULL,
     stderr=subprocess.DEVNULL,
-    pass_fds=(descriptor,),
     check=False,
 )
 raise SystemExit(0 if completed.returncode == expected else 125)
@@ -125,26 +141,52 @@ try:
     previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})
 except BaseException:
     raise SystemExit(125)
-reviewed_descriptor = int(sys.argv[1])
+source_descriptor = int(sys.argv[1])
 expected_digest = sys.argv[2]
 expected_size = int(sys.argv[3])
-reviewed_argv = sys.argv[4:]
-digest = hashlib.sha256()
-observed_size = 0
-os.lseek(reviewed_descriptor, 0, os.SEEK_SET)
-while chunk := os.read(reviewed_descriptor, 65536):
-    observed_size += len(chunk)
-    if observed_size > expected_size:
+interpreter = sys.argv[4]
+reviewed_args = sys.argv[5:]
+source_buffer = bytearray()
+while len(source_buffer) < expected_size:
+    chunk = os.read(source_descriptor, min(65536, expected_size - len(source_buffer)))
+    if not chunk:
         raise SystemExit(125)
-    digest.update(chunk)
-if observed_size != expected_size or digest.hexdigest() != expected_digest:
+    source_buffer.extend(chunk)
+os.close(source_descriptor)
+if (
+    len(source_buffer) != expected_size
+    or hashlib.sha256(source_buffer).hexdigest() != expected_digest
+):
     raise SystemExit(125)
-os.lseek(reviewed_descriptor, 0, os.SEEK_SET)
+try:
+    source_text = bytes(source_buffer).decode('utf-8')
+except UnicodeError:
+    raise SystemExit(125)
+if '\\x00' in source_text:
+    raise SystemExit(125)
+source_buffer.clear()
+synthetic_path = 'intent-reviewed-test:' + expected_digest
+if interpreter == '/usr/bin/python3':
+    wrapper = (
+        'import sys\\n'
+        + '_source = ' + repr(source_text) + '\\n'
+        + '_path = ' + repr(synthetic_path) + '\\n'
+        + 'sys.argv[0] = _path\\n'
+        + '_scope = {"__name__": "__main__", "__file__": _path, '
+        + '"__package__": None, "__cached__": None}\\n'
+        + 'exec(compile(_source, _path, "exec"), _scope, _scope)\\n'
+    )
+    reviewed_argv = [interpreter, '-c', wrapper, *reviewed_args]
+elif interpreter == '/bin/sh':
+    reviewed_argv = [interpreter, '-c', source_text, synthetic_path, *reviewed_args]
+else:
+    raise SystemExit(125)
+# source-verified-boundary
 spawned = None
 try:
     spawned = subprocess.Popen(
         reviewed_argv,
-        stdin=reviewed_descriptor,
+        stdin=subprocess.DEVNULL,
         start_new_session=True,
     )
     if os.getpgid(spawned.pid) != spawned.pid:
@@ -259,63 +301,37 @@ def _git_pin_matches(pin: _GitPin) -> bool:
         return False
 
 
-def _descriptor_matches(descriptor: int, pin: _ExecutablePin) -> bool:
-    content = bytearray()
+def _reviewed_source(pin: _ExecutablePin) -> bytes:
+    content = pin.content
+    if (
+        pin.interpreter not in _VETTED_INTERPRETERS
+        or not content
+        or len(content) > MAX_REVIEWED_SOURCE_BYTES
+        or b"\x00" in content
+    ):
+        raise ValueError("reviewed source is unsupported")
     try:
-        metadata = os.fstat(descriptor)
-        if not stat.S_ISREG(metadata.st_mode) or metadata.st_size != len(pin.content):
-            return False
-        os.lseek(descriptor, 0, os.SEEK_SET)
-        while chunk := os.read(descriptor, 64 * 1024):
-            content.extend(chunk)
-            if len(content) > MAX_EXECUTABLE_BYTES:
-                return False
-        return hashlib.sha256(content).hexdigest() == pin.digest
-    except OSError:
-        return False
-    finally:
-        try:
-            os.lseek(descriptor, 0, os.SEEK_SET)
-        except OSError:
-            pass
-        content.clear()
+        content.decode("utf-8")
+    except UnicodeError as error:
+        raise ValueError("reviewed source is unsupported") from error
+    return content
 
 
-def _stage_executable_descriptor(pin: _ExecutablePin) -> int:
-    """Freeze reviewed bytes behind an unlinked, read-only descriptor."""
-    temporary = tempfile.TemporaryDirectory(prefix="intent-reviewed-test-")
-    staged = Path(temporary.name) / "executable"
-    writer: int | None = None
-    held: int | None = None
+def _open_source_pipe() -> tuple[int, int]:
+    return os.pipe()
+
+
+async def _write_source_pipe(descriptor: int, source: bytes) -> None:
+    os.set_blocking(descriptor, False)
+    offset = 0
     try:
-        writer = os.open(
-            staged,
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0),
-            0o400,
-        )
-        written = 0
-        while written < len(pin.content):
-            written += os.write(writer, pin.content[written:])
-        os.fsync(writer)
-        os.close(writer)
-        writer = None
-        held = os.open(
-            staged,
-            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0),
-        )
-        os.unlink(staged)
-        temporary.cleanup()
-        if not _descriptor_matches(held, pin):
-            raise ValueError("staged executable changed")
-        descriptor = held
-        held = None
-        return descriptor
+        while offset < len(source):
+            try:
+                offset += os.write(descriptor, source[offset:])
+            except BlockingIOError:
+                await anyio.wait_writable(descriptor)
     finally:
-        if writer is not None:
-            os.close(writer)
-        if held is not None:
-            os.close(held)
-        temporary.cleanup()
+        os.close(descriptor)
 
 
 def _terminate_fixed_process(process: subprocess.Popen[bytes]) -> None:
@@ -684,37 +700,34 @@ class DevObserver:
     async def _execute(
         self, argv: tuple[str, ...], pin: _ExecutablePin
     ) -> tuple[TestRunStatus, int | None, bytes, bytes]:
+        source = _reviewed_source(pin)
+        interpreter = pin.interpreter
+        if interpreter is None:
+            raise ValueError("reviewed source is unsupported")
         if not await self._process_group_available():
             raise ValueError("test process containment is unavailable")
-        if not await self._descriptor_launch_available(pin.interpreter):
-            raise ValueError("descriptor-backed launch is unavailable")
+        if not await self._descriptor_launch_available(interpreter):
+            raise ValueError("private source transport is unavailable")
         stdout = bytearray()
         stderr = bytearray()
         budget = [MAX_TEST_OUTPUT_BYTES]
         overflow = [False]
         timed_out = False
-        descriptor = _stage_executable_descriptor(pin)
-        if pin.interpreter == "/usr/bin/python3":
-            reviewed_argv = (pin.interpreter, "-", *argv[1:])
-        elif pin.interpreter == "/bin/sh":
-            reviewed_argv = (pin.interpreter, "-s", "--", *argv[1:])
-        else:
-            raise ValueError("descriptor-backed launch is unavailable")
+        read_descriptor, write_descriptor = _open_source_pipe()
         execution_argv = (
             "/usr/bin/python3",
             "-I",
             "-S",
             "-c",
             _PROCESS_SUPERVISOR,
-            str(descriptor),
+            str(read_descriptor),
             pin.digest,
-            str(len(pin.content)),
-            *reviewed_argv,
+            str(len(source)),
+            interpreter,
+            *argv[1:],
         )
         process: anyio.abc.Process | None = None
         try:
-            if not _descriptor_matches(descriptor, pin):
-                raise ValueError("staged executable changed")
             process = await anyio.open_process(
                 execution_argv,
                 cwd=self._root,
@@ -723,8 +736,13 @@ class DevObserver:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 start_new_session=True,
-                pass_fds=(descriptor,),
+                pass_fds=(read_descriptor,),
             )
+            os.close(read_descriptor)
+            read_descriptor = -1
+            owned_writer = write_descriptor
+            write_descriptor = -1
+            await _write_source_pipe(owned_writer, source)
             assert process.stdout is not None
             assert process.stderr is not None
             try:
@@ -769,7 +787,10 @@ class DevObserver:
                         await process.wait()
             if process is not None:
                 await process.aclose()
-            os.close(descriptor)
+            if read_descriptor >= 0:
+                os.close(read_descriptor)
+            if write_descriptor >= 0:
+                os.close(write_descriptor)
             stdout.clear()
             stderr.clear()
             budget.clear()
@@ -827,55 +848,60 @@ class DevObserver:
 
     @staticmethod
     async def _descriptor_launch_available(interpreter: str | None) -> bool:
-        """Prove nested execution reads the held descriptor before use."""
+        """Prove isolated pipe-to-memory source transport before reviewed use."""
         if interpreter not in _VETTED_INTERPRETERS:
             return False
-        with tempfile.TemporaryFile() as handle:
-            process: anyio.abc.Process | None = None
-            try:
-                source = (
-                    b"raise SystemExit(37)\n" if interpreter == "/usr/bin/python3" else b"exit 37\n"
-                )
-                handle.write(source)
-                handle.flush()
-                handle.seek(0)
-                descriptor = handle.fileno()
-                process = await anyio.open_process(
-                    [
-                        "/usr/bin/python3",
-                        "-I",
-                        "-S",
-                        "-c",
-                        _DESCRIPTOR_PROBE,
-                        str(descriptor),
-                        interpreter,
-                    ],
-                    cwd="/",
-                    env=dict(_FIXED_ENVIRONMENT),
-                    stdin=subprocess.DEVNULL,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    start_new_session=True,
-                    pass_fds=(descriptor,),
-                )
-                with anyio.fail_after(1):
-                    await process.wait()
-                return process.returncode == 0
-            except (OSError, TimeoutError, ValueError):
-                return False
-            finally:
-                if process is not None and process.returncode is None:
+        source = b"raise SystemExit(37)\n" if interpreter == "/usr/bin/python3" else b"exit 37\n"
+        read_descriptor, write_descriptor = _open_source_pipe()
+        process: anyio.abc.Process | None = None
+        try:
+            process = await anyio.open_process(
+                [
+                    "/usr/bin/python3",
+                    "-I",
+                    "-S",
+                    "-c",
+                    _DESCRIPTOR_PROBE,
+                    str(read_descriptor),
+                    interpreter,
+                    hashlib.sha256(source).hexdigest(),
+                    str(len(source)),
+                ],
+                cwd="/",
+                env=dict(_FIXED_ENVIRONMENT),
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+                pass_fds=(read_descriptor,),
+            )
+            os.close(read_descriptor)
+            read_descriptor = -1
+            owned_writer = write_descriptor
+            write_descriptor = -1
+            await _write_source_pipe(owned_writer, source)
+            with anyio.fail_after(1):
+                await process.wait()
+            return process.returncode == 0
+        except (OSError, TimeoutError, ValueError):
+            return False
+        finally:
+            if process is not None and process.returncode is None:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except (PermissionError, ProcessLookupError):
                     try:
-                        os.killpg(process.pid, signal.SIGKILL)
-                    except (PermissionError, ProcessLookupError):
-                        try:
-                            process.kill()
-                        except ProcessLookupError:
-                            pass
-                    with anyio.CancelScope(shield=True):
-                        await process.wait()
-                if process is not None:
-                    await process.aclose()
+                        process.kill()
+                    except ProcessLookupError:
+                        pass
+                with anyio.CancelScope(shield=True):
+                    await process.wait()
+            if process is not None:
+                await process.aclose()
+            if read_descriptor >= 0:
+                os.close(read_descriptor)
+            if write_descriptor >= 0:
+                os.close(write_descriptor)
 
     def _write_artifact(self, artifact: TestResultArtifact) -> None:
         if not self._config.test_result_paths or self._directory is None:

@@ -311,7 +311,8 @@ async def test_staged_executable_path_replacement_cannot_change_launched_bytes(
             staged.parent.rmdir()
 
     assert result.status is TestRunStatus.PASSED, (result, attacked)
-    assert attacked
+    assert not staged_paths
+    assert not attacked
     assert (repo / "reviewed").exists(), (result, attacked)
     assert not (repo / "unreviewed").exists()
 
@@ -336,6 +337,116 @@ async def test_missing_descriptor_backed_launch_support_fails_closed(
 
     assert result.status is TestRunStatus.REJECTED
     assert not (repo / "reviewed").exists()
+
+
+@pytest.mark.anyio
+async def test_retained_writer_cannot_change_source_after_supervisor_verification(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo, _revision = _repo(tmp_path)
+    _runner(
+        repo,
+        "from pathlib import Path\nPath('reviewed').write_text('yes')\n" + "# pad\n" * 256,
+    )
+    observer = _observer(repo)
+    executable = repo / "tools/test-runner"
+    reviewed_source = executable.read_bytes()
+    malicious_prefix = (
+        b"#!/usr/bin/python3\nfrom pathlib import Path\nPath('unreviewed').write_text('bad')\n"
+    )
+    malicious_source = malicious_prefix + b"#" * (len(reviewed_source) - len(malicious_prefix))
+    retained_writers: list[int] = []
+    real_open = os.open
+    real_source_pipe = os.pipe
+
+    def retain_staged_writer(
+        path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        descriptor = real_open(path, flags, mode, dir_fd=dir_fd)
+        if Path(path).name == "executable" and flags & os.O_ACCMODE == os.O_WRONLY:
+            retained_writers.append(os.dup(descriptor))
+        return descriptor
+
+    def retain_source_pipe_writer() -> tuple[int, int]:
+        reader, writer = real_source_pipe()
+        retained_writers.append(os.dup(writer))
+        return reader, writer
+
+    monkeypatch.setattr(observer_module.os, "open", retain_staged_writer)
+    monkeypatch.setattr(
+        observer_module,
+        "_open_source_pipe",
+        retain_source_pipe_writer,
+        raising=False,
+    )
+    boundary = repo / "source-verified-boundary"
+    source = observer_module._PROCESS_SUPERVISOR
+    old_boundary = "os.lseek(reviewed_descriptor, 0, os.SEEK_SET)\nspawned = None"
+    new_boundary = "# source-verified-boundary\nspawned = None"
+    selected_boundary = old_boundary if old_boundary in source else new_boundary
+    source = source.replace(
+        selected_boundary,
+        selected_boundary.split("\n", 1)[0]
+        + f"\nopen({str(boundary)!r}, 'w').close()\ntime.sleep(0.5)\nspawned = None",
+        1,
+    )
+    assert source != observer_module._PROCESS_SUPERVISOR
+    monkeypatch.setattr(observer_module, "_PROCESS_SUPERVISOR", source)
+    completed = anyio.Event()
+    results: list[object] = []
+
+    async def run() -> None:
+        try:
+            results.append(await observer.run_reviewed_tests(observer.command_ids[0], at=NOW))
+        finally:
+            completed.set()
+
+    try:
+        async with anyio.create_task_group() as tasks:
+            tasks.start_soon(run)
+            with anyio.fail_after(2):
+                while not boundary.exists() and not completed.is_set():
+                    await anyio.sleep(0.01)
+            assert boundary.exists(), results
+            assert retained_writers
+            for descriptor in retained_writers:
+                try:
+                    os.lseek(descriptor, 0, os.SEEK_SET)
+                except OSError:
+                    try:
+                        os.write(descriptor, malicious_source)
+                    except OSError:
+                        pass
+                else:
+                    os.write(descriptor, malicious_source)
+        result = results[0]
+    finally:
+        for descriptor in retained_writers:
+            os.close(descriptor)
+
+    assert result.status is TestRunStatus.PASSED
+    assert (repo / "reviewed").exists()
+    assert not (repo / "unreviewed").exists()
+
+
+@pytest.mark.anyio
+async def test_shell_source_cannot_consume_failing_lines_as_command_stdin(tmp_path: Path) -> None:
+    repo, _revision = _repo(tmp_path)
+    runner = repo / "tools/test-runner"
+    runner.parent.mkdir(exist_ok=True)
+    runner.write_text("#!/bin/sh\nread swallowed\nexit 1\n", encoding="utf-8")
+    runner.chmod(0o755)
+    observer = _observer(repo)
+
+    result = await observer.run_reviewed_tests(observer.command_ids[0], at=NOW)
+
+    assert result.status is TestRunStatus.FAILED
+    assert result.artifact is None
+    assert not (repo / "test-results.json").exists()
 
 
 @pytest.mark.anyio
