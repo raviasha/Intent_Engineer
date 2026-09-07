@@ -15,6 +15,7 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import selectors
 import shutil
 import stat
@@ -25,7 +26,8 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Annotated, Final, Literal, Protocol
+from types import TracebackType
+from typing import Annotated, Final, Literal, Protocol, Self
 from urllib.parse import urlparse
 
 import yaml  # type: ignore[import-untyped]
@@ -56,6 +58,7 @@ from intent_engineering.storage.jsonl.approval_store import parse_immutable_reco
 from intent_engineering.storage.jsonl.strict import loads_strict_object
 from intent_engineering.storage.secure import (
     SecureDirectory,
+    SecureFile,
     UnsafePathError,
     configured_graph_relative,
 )
@@ -718,8 +721,8 @@ class _GitRefReader:
         # Read the immutable object itself: rev-list hides parents at shallow
         # boundaries and may apply local history grafts.
         raw = _run_git(self._root, ("cat-file", "commit", commit), maximum=MAX_MANIFEST_BYTES)
-        header = raw.split(b"\n\n", 1)[0].decode("ascii").splitlines()
-        parents = tuple(line[7:] for line in header if line.startswith("parent "))
+        header = raw.split(b"\n\n", 1)[0].split(b"\n")
+        parents = tuple(line[7:].decode("ascii") for line in header if line.startswith(b"parent "))
         if not header or any(_GIT_COMMIT.fullmatch(item) is None for item in parents):
             raise ValueError("invalid shared-state lineage")
         if len(parents) > 1:
@@ -1032,14 +1035,134 @@ def _assert_project_binding(project: SecureDirectory) -> None:
         observed.close()
 
 
+def _change_token(metadata: os.stat_result) -> tuple[int, ...]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_nlink,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
+class _TreeFence:
+    """Hold every scanned inode and reject any change across the complete byte scan."""
+
+    def __init__(
+        self,
+        workspace: SecureDirectory,
+        paths: Mapping[str, bytes | None],
+        parent: SecureDirectory | None,
+    ) -> None:
+        self.directories: dict[str, SecureDirectory] = {"": workspace.duplicate()}
+        self.file_descriptors: list[int] = []
+        self.tokens: dict[int, tuple[int, ...]] = {}
+        self.names: list[tuple[int, str, tuple[int, ...] | None]] = []
+        self.parent = parent.duplicate() if parent is not None else None
+        try:
+            self._pin_directory(self.directories[""])
+            if self.parent is not None:
+                self._pin_directory(self.parent)
+                self.names.append(
+                    (
+                        self.parent.descriptor,
+                        ".intent",
+                        self.tokens[self.directories[""].descriptor],
+                    )
+                )
+            for path in sorted(paths):
+                parts = Path(path).parts
+                directory_parts = parts if path.endswith("/") else parts[:-1]
+                prefix = ""
+                for part in directory_parts:
+                    next_prefix = f"{prefix}/{part}" if prefix else part
+                    if next_prefix not in self.directories:
+                        ancestor = self.directories[prefix]
+                        opened = ancestor.subdirectory(part)
+                        self.directories[next_prefix] = opened
+                        self._pin_directory(opened)
+                        self.names.append(
+                            (ancestor.descriptor, part, self.tokens[opened.descriptor])
+                        )
+                    prefix = next_prefix
+                if path.endswith("/"):
+                    continue
+                ancestor = self.directories[prefix]
+                if paths[path] is None:
+                    self.names.append((ancestor.descriptor, parts[-1], None))
+                    continue
+                descriptor = os.open(
+                    parts[-1],
+                    os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
+                    dir_fd=ancestor.descriptor,
+                )
+                self.file_descriptors.append(descriptor)
+                metadata = os.fstat(descriptor)
+                if (
+                    not stat.S_ISREG(metadata.st_mode)
+                    or metadata.st_nlink != 1
+                    or metadata.st_size > MAX_FILE_BYTES
+                ):
+                    raise UnsafePathError()
+                token = _change_token(metadata)
+                self.tokens[descriptor] = token
+                self.names.append((ancestor.descriptor, parts[-1], token))
+            self.verify()
+        except BaseException:
+            self.close()
+            raise
+
+    def _pin_directory(self, directory: SecureDirectory) -> None:
+        self.tokens[directory.descriptor] = _change_token(os.fstat(directory.descriptor))
+
+    def verify(self) -> None:
+        # No content reads, callbacks or path reopening follow this terminal token
+        # barrier. ctime prevents a writer from hiding a change by restoring mtime.
+        if any(
+            self._named_token(parent, name) != expected for parent, name, expected in self.names
+        ) or any(
+            _change_token(os.fstat(descriptor)) != expected
+            for descriptor, expected in self.tokens.items()
+        ):
+            raise UnsafePathError()
+
+    @staticmethod
+    def _named_token(parent: int, name: str) -> tuple[int, ...] | None:
+        try:
+            return _change_token(os.stat(name, dir_fd=parent, follow_symlinks=False))
+        except FileNotFoundError:
+            return None
+
+    def close(self) -> None:
+        for descriptor in self.file_descriptors:
+            os.close(descriptor)
+        self.file_descriptors.clear()
+        for directory in self.directories.values():
+            directory.close()
+        if self.parent is not None:
+            self.parent.close()
+
+
 class _PinnedState:
     """Bind immutable authenticated bytes to the directory and file identities used."""
 
-    def __init__(self, workspace: SecureDirectory, files: Mapping[str, bytes]) -> None:
+    def __init__(
+        self,
+        workspace: SecureDirectory,
+        files: Mapping[str, bytes],
+        identities: Mapping[str, tuple[tuple[int, int], ...]] | None = None,
+    ) -> None:
         self.workspace = workspace
         self.files = dict(files)
         self.identities: dict[str, tuple[tuple[int, int], ...]] = {}
         self.inventory_sealed = False
+        if identities is not None:
+            if set(identities) != set(files):
+                raise UnsafePathError()
+            self.identities = dict(identities)
+            return
         for path, content in self.files.items():
             observed = workspace.read_relative(path, nonblocking=True, max_bytes=MAX_FILE_BYTES)
             if observed.content != content:
@@ -1111,7 +1234,15 @@ class _PinnedState:
         self.inventory_sealed = True
         self.verify()
 
-    def verify(self) -> None:
+    def verify(self, parent: SecureDirectory | None = None) -> None:
+        fence = _TreeFence(self.workspace, self.files, parent)
+        try:
+            self._verify_content()
+            fence.verify()
+        finally:
+            fence.close()
+
+    def _verify_content(self) -> None:
         if self.inventory_sealed:
             inventory = self._inventory()
             if {path for path, _, _ in inventory} != set(self.files):
@@ -1131,8 +1262,10 @@ class _PinnedState:
                 raise UnsafePathError()
 
 
-def _rename_directory_exclusive(source: SecureDirectory, destination: SecureDirectory) -> None:
-    """Promote only into an absent name, using the already held parent descriptors."""
+def _rename_entry_exclusive(
+    source: SecureDirectory, source_name: str, destination: SecureDirectory, destination_name: str
+) -> None:
+    """Move only into an absent name, using the already held parent descriptors."""
     library = ctypes.CDLL(None, use_errno=True)
     try:
         function = library.renameat2
@@ -1151,27 +1284,73 @@ def _rename_directory_exclusive(source: SecureDirectory, destination: SecureDire
         ctypes.c_uint,
     )
     function.restype = ctypes.c_int
-    if function(source.descriptor, b".intent", destination.descriptor, b".intent", flag) != 0:
+    if (
+        function(
+            source.descriptor,
+            os.fsencode(source_name),
+            destination.descriptor,
+            os.fsencode(destination_name),
+            flag,
+        )
+        != 0
+    ):
         number = ctypes.get_errno()
         raise OSError(number, os.strerror(number))
 
 
-def _discard_stage(project: SecureDirectory, stage: SecureDirectory) -> None:
-    """Clean through the owned descriptor, never through a substituted staging root."""
-    for name in os.listdir(stage.descriptor):
-        metadata = os.stat(name, dir_fd=stage.descriptor, follow_symlinks=False)
-        if stat.S_ISDIR(metadata.st_mode):
-            shutil.rmtree(name, dir_fd=stage.descriptor)
-        else:
-            os.unlink(name, dir_fd=stage.descriptor)
+def _rename_directory_exclusive(source: SecureDirectory, destination: SecureDirectory) -> None:
+    _rename_entry_exclusive(source, ".intent", destination, ".intent")
+
+
+def _private_directory(project: SecureDirectory) -> SecureDirectory:
+    """Reserve a collision-safe recovery container through the held repository root."""
+    for _attempt in range(32):
+        name = f".intent-quarantine-{secrets.token_hex(16)}"
+        try:
+            os.mkdir(name, 0o700, dir_fd=project.descriptor)
+        except FileExistsError:
+            continue
+        return project.subdirectory(name)
+    raise UnsafePathError()
+
+
+def _remove_empty_directory(project: SecureDirectory, directory: SecureDirectory) -> None:
     try:
-        _assert_named_directory(project, stage.path.name, stage)
+        _assert_named_directory(project, directory.path.name, directory)
+        os.rmdir(directory.path.name, dir_fd=project.descriptor)
     except (OSError, UnsafePathError):
         return
-    os.rmdir(stage.path.name, dir_fd=project.descriptor)
 
 
-def _write_staged_state(stage: SecureDirectory, files: Mapping[str, bytes], marker: bytes) -> None:
+def _discard_stage(
+    project: SecureDirectory, stage: SecureDirectory, state: _PinnedState | None
+) -> None:
+    """Remove authenticated owned material; preserve any unfamiliar staging entry."""
+    with os.scandir(stage.descriptor) as entries:
+        names = [entry.name for _, entry in zip(range(2), entries, strict=False)]
+    if names:
+        try:
+            if names != [".intent"] or state is None:
+                raise UnsafePathError()
+            _assert_named_directory(stage, ".intent", state.workspace)
+            state.verify(stage)
+        except (OSError, UnsafePathError):
+            # Do not delete a replacement entry, even when it copied approved bytes.
+            _assert_named_directory(project, stage.path.name, stage)
+            quarantine = _private_directory(project)
+            try:
+                _rename_entry_exclusive(project, stage.path.name, quarantine, "staging")
+            finally:
+                _remove_empty_directory(project, quarantine)
+                quarantine.close()
+            return
+        shutil.rmtree(".intent", dir_fd=stage.descriptor)
+    _remove_empty_directory(project, stage)
+
+
+def _write_staged_state(
+    stage: SecureDirectory, files: Mapping[str, bytes], marker: bytes, *, fresh: bool = True
+) -> None:
     workspace = stage.subdirectory(".intent", create=True)
     try:
         for name in ("approvals", "cache", "connectors", "evidence", "history", "reconciliation"):
@@ -1186,11 +1365,234 @@ def _write_staged_state(stage: SecureDirectory, files: Mapping[str, bytes], mark
         for path in sorted(payload):
             target = workspace.file(path)
             try:
-                target.atomic_write(payload[path], reject_target_races=True)
+                target.atomic_write(payload[path], reject_target_races=fresh)
             finally:
                 target.close()
     finally:
         workspace.close()
+
+
+class _RestorePreimage:
+    """Bounded preimage material, captured under the restore transaction's complete locks."""
+
+    def __init__(
+        self,
+        project: SecureDirectory,
+        workspace: SecureDirectory,
+        targets: Mapping[str, SecureFile],
+        path_to_name: Mapping[str, str],
+    ) -> None:
+        self.project = project
+        self.workspace = workspace
+        self.directory_metadata = {"": os.fstat(workspace.descriptor)}
+        self.metadata: dict[str, os.stat_result | None] = {}
+        for path, name in path_to_name.items():
+            target = targets[name]
+            prefix = str(Path(path).parent)
+            prefix = "" if prefix == "." else prefix
+            observed = os.fstat(target.parent_fd)
+            previous = self.directory_metadata.setdefault(prefix, observed)
+            if _change_token(previous) != _change_token(observed):
+                raise UnsafePathError()
+            try:
+                self.metadata[path] = os.stat(
+                    target.name, dir_fd=target.parent_fd, follow_symlinks=False
+                )
+            except FileNotFoundError:
+                self.metadata[path] = None
+        fence = _TreeFence(
+            workspace,
+            {path: None if metadata is None else b"" for path, metadata in self.metadata.items()},
+            project,
+        )
+        try:
+            self.content = {
+                path: targets[name].read_optional_nonblocking(max_bytes=MAX_FILE_BYTES)
+                for path, name in path_to_name.items()
+            }
+            if (
+                sum(len(value) for value in self.content.values() if value is not None)
+                > MAX_STATE_BYTES
+            ):
+                raise UnsafePathError()
+            for path, name in path_to_name.items():
+                expected = self.metadata[path]
+                target = targets[name]
+                if _TreeFence._named_token(target.parent_fd, target.name) != (
+                    None if expected is None else _change_token(expected)
+                ):
+                    raise UnsafePathError()
+            for prefix, metadata in self.directory_metadata.items():
+                if _change_token(os.fstat(fence.directories[prefix].descriptor)) != _change_token(
+                    metadata
+                ):
+                    raise UnsafePathError()
+            fence.verify()
+        finally:
+            fence.close()
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(
+        self,
+        error_type: type[BaseException] | None,
+        _error: BaseException | None,
+        _traceback: TracebackType | None,
+    ) -> None:
+        if error_type is not None:
+            self._restore_directory_bindings()
+            restored = self.project.subdirectory(".intent")
+            try:
+                self._verify_reconstruction(restored, "")
+            finally:
+                restored.close()
+
+    @staticmethod
+    def _matches(parent: SecureDirectory, name: str, expected: os.stat_result) -> bool:
+        try:
+            observed = os.stat(name, dir_fd=parent.descriptor, follow_symlinks=False)
+        except FileNotFoundError:
+            return False
+        return (observed.st_dev, observed.st_ino) == (expected.st_dev, expected.st_ino)
+
+    @staticmethod
+    def _restore_metadata(descriptor: int, metadata: os.stat_result) -> None:
+        os.fchmod(descriptor, stat.S_IMODE(metadata.st_mode))
+        os.utime(descriptor, ns=(metadata.st_atime_ns, metadata.st_mtime_ns))
+
+    def _verify_reconstruction(self, candidate: SecureDirectory, prefix: str) -> None:
+        members = {
+            path.removeprefix(prefix + "/") if prefix else path: content
+            for path, content in self.content.items()
+            if not prefix or path.startswith(prefix + "/")
+        }
+        fence = _TreeFence(candidate, members, None)
+        try:
+            for path, expected in members.items():
+                target = candidate.file(path)
+                try:
+                    if target.read_optional_nonblocking(max_bytes=MAX_FILE_BYTES) != expected:
+                        raise UnsafePathError()
+                    metadata = self.metadata[f"{prefix}/{path}" if prefix else path]
+                    if metadata is not None:
+                        current = os.stat(
+                            target.name, dir_fd=target.parent_fd, follow_symlinks=False
+                        )
+                        if (stat.S_IMODE(current.st_mode), current.st_mtime_ns) != (
+                            stat.S_IMODE(metadata.st_mode),
+                            metadata.st_mtime_ns,
+                        ):
+                            raise UnsafePathError()
+                finally:
+                    target.close()
+            for relative, metadata in self.directory_metadata.items():
+                if prefix and relative != prefix:
+                    continue
+                local = "" if prefix else relative
+                directory = fence.directories[local]
+                current = os.fstat(directory.descriptor)
+                if (stat.S_IMODE(current.st_mode), current.st_mtime_ns) != (
+                    stat.S_IMODE(metadata.st_mode),
+                    metadata.st_mtime_ns,
+                ):
+                    raise UnsafePathError()
+            fence.verify()
+        finally:
+            fence.close()
+
+    def _reconstruct(self, live_parent: SecureDirectory, name: str, prefix: str) -> None:
+        recovery = _private_directory(self.project)
+        candidate = recovery.subdirectory("replacement", create=True)
+        try:
+            if not prefix:
+                for relative in self.directory_metadata:
+                    if relative:
+                        directory = candidate.subdirectory(relative, create=True)
+                        directory.close()
+            for path, content in self.content.items():
+                if content is None or (prefix and not path.startswith(prefix + "/")):
+                    continue
+                relative = path.removeprefix(prefix + "/") if prefix else path
+                target = candidate.file(relative)
+                try:
+                    target.atomic_write(content, reject_target_races=True)
+                    metadata = self.metadata[path]
+                    assert metadata is not None
+                    descriptor = os.open(
+                        target.name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=target.parent_fd
+                    )
+                    try:
+                        self._restore_metadata(descriptor, metadata)
+                    finally:
+                        os.close(descriptor)
+                finally:
+                    target.close()
+            if not prefix:
+                for relative, metadata in self.directory_metadata.items():
+                    if relative:
+                        directory = candidate.subdirectory(relative)
+                        try:
+                            self._restore_metadata(directory.descriptor, metadata)
+                        finally:
+                            directory.close()
+            self._restore_metadata(candidate.descriptor, self.directory_metadata[prefix])
+            self._verify_reconstruction(candidate, prefix)
+            try:
+                _rename_entry_exclusive(live_parent, name, recovery, "unfamiliar")
+            except FileNotFoundError:
+                pass
+            _rename_entry_exclusive(recovery, "replacement", live_parent, name)
+            _assert_named_directory(live_parent, name, candidate)
+            self._verify_reconstruction(candidate, prefix)
+            os.fsync(live_parent.descriptor)
+        finally:
+            candidate.close()
+            _remove_empty_directory(self.project, recovery)
+            recovery.close()
+
+    def _restore_directory_bindings(self) -> None:
+        _assert_project_binding(self.project)
+        if not self._matches(self.project, ".intent", self.directory_metadata[""]):
+            self._reconstruct(self.project, ".intent", "")
+            return
+        changed = {
+            prefix
+            for prefix, metadata in self.directory_metadata.items()
+            if prefix and not self._matches(self.workspace, prefix, metadata)
+        }
+        for path, expected in self.content.items():
+            prefix = str(Path(path).parent)
+            prefix = "" if prefix == "." else prefix
+            if prefix in changed:
+                continue
+            try:
+                target = self.workspace.file(path)
+                try:
+                    observed = target.read_optional_nonblocking(max_bytes=MAX_FILE_BYTES)
+                    metadata = self.metadata[path]
+                    if observed != expected:
+                        changed.add(prefix)
+                    elif metadata is not None:
+                        current = os.stat(
+                            target.name, dir_fd=target.parent_fd, follow_symlinks=False
+                        )
+                        if (stat.S_IMODE(current.st_mode), current.st_mtime_ns) != (
+                            stat.S_IMODE(metadata.st_mode),
+                            metadata.st_mtime_ns,
+                        ):
+                            changed.add(prefix)
+                finally:
+                    target.close()
+            except (OSError, UnsafePathError):
+                changed.add(prefix)
+        if "" in changed:
+            self._reconstruct(self.project, ".intent", "")
+        else:
+            for prefix in sorted(changed):
+                self._reconstruct(self.workspace, prefix, prefix)
+            if changed:
+                self._restore_metadata(self.workspace.descriptor, self.directory_metadata[""])
 
 
 def _validation_snapshot(files: Mapping[str, bytes]) -> dict[str, bytes | None]:
@@ -1254,9 +1656,17 @@ def _replace_existing_state(
         "cache/shared-state.json": "shared_state",
     }
     targets = {name: workspace.file(path) for path, name in path_to_name.items()}
+    terminal_state: _PinnedState | None = None
+
+    def verify_committed(stage: str) -> None:
+        if stage == "journal_cleaned" and terminal_state is not None:
+            _assert_project_binding(project)
+            terminal_state.verify(project)
+
     coordinator = LocalTransactionCoordinator(
         workspace.file("history/.local-transaction.json"),
         targets,
+        fault_hook=verify_committed,
         legacy_target_sets=(
             frozenset({"graph", "history", "cases"}),
             frozenset({"graph", "history", "cases", "evidence", "receipts"}),
@@ -1278,12 +1688,12 @@ def _replace_existing_state(
     try:
         for target in targets.values():
             target.read_optional_nonblocking(max_bytes=MAX_STATE_BYTES)
-        with coordinator.coordinated():
+        with (
+            coordinator.coordinated(),
+            _RestorePreimage(project, workspace, targets, path_to_name) as preimage,
+        ):
             _assert_named_directory(project, ".intent", workspace)
-            current = {
-                path: targets[name].read_optional_nonblocking(max_bytes=MAX_FILE_BYTES) or b""
-                for path, name in path_to_name.items()
-            }
+            current = {path: content or b"" for path, content in preimage.content.items()}
             if not _same_semantic_baseline(current, baseline_files) and not _same_semantic_baseline(
                 current, files
             ):
@@ -1300,7 +1710,7 @@ def _replace_existing_state(
                 )
                 if not validate_canonical_snapshot(_validation_snapshot(current)).valid:
                     raise ValueError("invalid local evidence")
-                local_state.verify()
+                local_state.verify(project)
                 files = {**files, evidence_path: current[evidence_path]}
             if (
                 all(current[path] == files[path] for path in files)
@@ -1310,7 +1720,7 @@ def _replace_existing_state(
                 report = validate_canonical_snapshot(_validation_snapshot(current))
                 if not report.valid:
                     raise ValueError("invalid local shared state")
-                pinned.verify()
+                pinned.verify(project)
                 _assert_named_directory(project, ".intent", workspace)
                 _assert_project_binding(project)
                 return
@@ -1336,15 +1746,8 @@ def _replace_existing_state(
                 fault_hook("existing_precommit")
                 _assert_project_binding(project)
                 _assert_named_directory(project, ".intent", workspace)
-                for path, content in installed.items():
-                    observed = workspace.read_relative(
-                        path,
-                        expected_identities=identities[path],
-                        nonblocking=True,
-                        max_bytes=MAX_FILE_BYTES,
-                    )
-                    if observed.content != content:
-                        raise UnsafePathError()
+                terminal_state = _PinnedState(workspace, installed, identities)
+                terminal_state.verify(project)
     finally:
         coordinator.close()
         for target in targets.values():
@@ -1358,25 +1761,56 @@ def _install_fresh_state(
     fault_hook: Callable[[str], None],
 ) -> None:
     installed = False
+    recovery = _private_directory(root_directory)
     try:
         fault_hook("fresh_preinstall")
         _assert_project_binding(root_directory)
         _assert_named_directory(root_directory, stage_directory.path.name, stage_directory)
         _assert_named_directory(stage_directory, ".intent", state.workspace)
-        state.verify()
+        state.verify(stage_directory)
+        # Previously writable staged inodes never become the installed authority.
+        # Materialize the authenticated immutable bytes into new regular files.
+        _write_staged_state(
+            stage_directory,
+            {path: state.files[path] for path in CANONICAL_STATE_PATHS},
+            state.files["cache/shared-state.json"],
+            fresh=False,
+        )
+        refreshed = _PinnedState(
+            state.workspace,
+            {path: content for path, content in state.files.items() if not path.endswith("/")},
+        )
+        refreshed.seal_inventory()
+        state.files = refreshed.files
+        state.identities = refreshed.identities
+        state.inventory_sealed = True
+        state.verify(stage_directory)
         _rename_directory_exclusive(stage_directory, root_directory)
         installed = True
         fault_hook("fresh_installed")
         _assert_project_binding(root_directory)
         _assert_named_directory(root_directory, ".intent", state.workspace)
-        state.verify()
         os.fsync(root_directory.descriptor)
+        state.verify(root_directory)
     except BaseException:
         if installed:
-            _assert_named_directory(root_directory, ".intent", state.workspace)
-            _rename_directory_exclusive(root_directory, stage_directory)
+            # Move the actual named entry, not the inode we hoped was promoted.
+            # An occupied recovery name cannot strand it in the live workspace.
+            for _attempt in range(32):
+                try:
+                    _rename_directory_exclusive(root_directory, recovery)
+                    break
+                except FileExistsError:
+                    recovery.close()
+                    recovery = _private_directory(root_directory)
+            else:
+                raise UnsafePathError()
             os.fsync(root_directory.descriptor)
+            _discard_stage(root_directory, recovery, state)
         raise
+    finally:
+        _remove_empty_directory(root_directory, recovery)
+        recovery.close()
 
 
 class GitSharedStateRestorer:
@@ -1481,20 +1915,20 @@ class GitSharedStateRestorer:
             trust = None
             files.clear()
             baseline_files.clear()
-            if state is not None:
-                state.files.clear()
             del self
             raise cancellation.with_traceback(None) from None
         finally:
-            if staged_workspace is not None:
-                staged_workspace.close()
             if stage is not None and project is not None:
                 try:
-                    _discard_stage(project, stage)
+                    _discard_stage(project, stage, state)
                 except (OSError, UnsafePathError):
                     pass
                 finally:
                     stage.close()
+            if staged_workspace is not None:
+                staged_workspace.close()
+            if state is not None:
+                state.files.clear()
             if workspace is not None:
                 workspace.close()
             if project is not None:

@@ -635,6 +635,7 @@ class LocalTransactionCoordinator:
                 self._write_journal(committed)
                 self._fault("journal_committed")
                 self._journal.unlink()
+                self._fault("journal_cleaned")
             except Exception:
                 try:
                     self._restore(preimages)

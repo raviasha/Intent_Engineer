@@ -4,6 +4,8 @@
 .venv/
 .intent/
 .intent-ci/
+.intent-restore-*/
+.intent-quarantine-*/
 __pycache__/
 .pytest_cache/
 .mypy_cache/

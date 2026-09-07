@@ -19,6 +19,7 @@ from intent_engineering.core.models.changeset import NodeUpdate
 from intent_engineering.intent_workflow.check import SharedStateRestoreStatus
 from intent_engineering.storage.secure import SecureDirectory, SecureFile
 from intent_engineering.storage.transaction import LocalTransactionCoordinator
+from intent_engineering.team_state import restore as restore_module
 from intent_engineering.team_state.restore import (
     GitSharedStateRestorer,
     StaticTrustProvider,
@@ -301,8 +302,10 @@ def test_existing_cache_is_byte_identical_after_failure_or_cancellation(
     assert _state_snapshot(target) == before
 
 
+@pytest.mark.parametrize("boundary", ["validated", "fresh_preinstall", "fresh_installed"])
 def test_fresh_cache_install_rolls_back_cancellation_and_removes_plaintext_stage(
     tmp_path: Path,
+    boundary: str,
 ) -> None:
     """Catches cancellation leaving a new cache or decrypted staging directory behind."""
     source = _approved_source(tmp_path)
@@ -313,7 +316,7 @@ def test_fresh_cache_install_rolls_back_cancellation_and_removes_plaintext_stage
     cancelled = _Cancelled()
 
     def fail(stage: str) -> None:
-        if stage == "fresh_installed":
+        if stage == boundary:
             raise cancelled
 
     with pytest.raises(_Cancelled) as raised:
@@ -324,6 +327,12 @@ def test_fresh_cache_install_rolls_back_cancellation_and_removes_plaintext_stage
     assert raised.value is cancelled
     assert not (target / ".intent").exists()
     assert list(target.glob(".intent-restore-*")) == []
+    assert not any(
+        b"Approved shared-state baseline" in path.read_bytes()
+        for directory in target.glob(".intent-quarantine-*")
+        for path in directory.rglob("*")
+        if path.is_file()
+    )
     traceback_values: list[str] = []
     cursor = raised.value.__traceback__
     while cursor is not None:
@@ -940,12 +949,14 @@ def test_held_writable_descriptor_cannot_mutate_promoted_graph_after_install(
     recipient, signer, trust = keys()
     install_state_ref(target, artifacts(canonical_files(source), recipient, signer))
     descriptor: int | None = None
+    staged_identity: int | None = None
 
     def mutate(stage: str) -> None:
-        nonlocal descriptor
+        nonlocal descriptor, staged_identity
         if stage == "validated":
             workspace = next(target.glob(".intent-restore-*")) / ".intent"
             descriptor = os.open(workspace / "graph.yaml", os.O_RDWR)
+            staged_identity = os.fstat(descriptor).st_ino
         elif stage == "fresh_installed":
             assert descriptor is not None
             os.write(descriptor, b"invalid: []\n")
@@ -959,8 +970,9 @@ def test_held_writable_descriptor_cannot_mutate_promoted_graph_after_install(
         if descriptor is not None:
             os.close(descriptor)
 
-    assert result.status is SharedStateRestoreStatus.INVALID
-    assert not (target / ".intent").exists()
+    assert result.status is SharedStateRestoreStatus.VERIFIED
+    assert canonical_files(target) == canonical_files(source)
+    assert (target / ".intent/graph.yaml").stat().st_ino != staged_identity
 
 
 @pytest.mark.parametrize("attack", ["content", "file"])
@@ -1223,3 +1235,306 @@ def test_signed_descendant_cannot_replay_an_older_graph_version(
         assert _state_snapshot(target) == before
     else:
         assert not (target / ".intent").exists()
+
+
+@pytest.mark.parametrize("restore_path", ["fresh", "replacement", "noop"])
+@pytest.mark.parametrize("attack", ["content", "directory"])
+def test_terminal_scan_rejects_an_earlier_file_changed_while_later_files_are_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, restore_path: str, attack: str
+) -> None:
+    """Catches a final multi-file scan returning an internally inconsistent snapshot."""
+    source = _approved_source(tmp_path)
+    target = init_repository(tmp_path / "target" / "project")
+    recipient, signer, trust = keys()
+    install_state_ref(target, artifacts(canonical_files(source), recipient, signer))
+    if restore_path == "replacement":
+        ready_project(target)
+    elif restore_path == "noop":
+        assert (
+            GitSharedStateRestorer(StaticTrustProvider(trust))
+            .verify_and_restore_approved_baseline(target)
+            .status
+            is SharedStateRestoreStatus.VERIFIED
+        )
+    before = _state_snapshot(target) if restore_path != "fresh" else None
+    original_read = SecureDirectory.read_relative
+    armed = False
+    earlier_reads = 0
+    fresh_earlier: str | None = None
+    attacked = False
+
+    def arm(boundary: str) -> None:
+        nonlocal armed
+        armed = (
+            boundary
+            == {
+                "fresh": "fresh_installed",
+                "replacement": "existing_precommit",
+                "noop": "validated",
+            }[restore_path]
+            or armed
+        )
+
+    def mutate_during_scan(directory: SecureDirectory, relative: str | Path, **options: object):  # type: ignore[no-untyped-def]
+        nonlocal earlier_reads, attacked, fresh_earlier
+        observed = original_read(directory, relative, **options)  # type: ignore[arg-type]
+        if not armed or attacked:
+            return observed
+        if restore_path == "fresh" and fresh_earlier is None:
+            if str(relative) in canonical_files(source):
+                fresh_earlier = str(relative)
+            return observed
+        if str(relative) == "approvals/approvals.jsonl":
+            earlier_reads += 1
+        if restore_path == "fresh" or (
+            str(relative) == "graph.yaml" and earlier_reads == (2 if restore_path == "noop" else 1)
+        ):
+            workspace = target / ".intent"
+            if attack == "content":
+                changed = fresh_earlier if restore_path == "fresh" else "approvals/approvals.jsonl"
+                assert changed is not None
+                (workspace / changed).write_bytes(b"unverified decision\n")
+            else:
+                approvals = workspace if restore_path == "fresh" else workspace / "approvals"
+                approvals.rename(tmp_path / "displaced-approvals")
+                shutil.copytree(tmp_path / "displaced-approvals", approvals)
+            attacked = True
+        return observed
+
+    monkeypatch.setattr(SecureDirectory, "read_relative", mutate_during_scan)
+    result = GitSharedStateRestorer(
+        StaticTrustProvider(trust), fault_hook=arm
+    ).verify_and_restore_approved_baseline(target)
+
+    assert attacked
+    assert result.status is SharedStateRestoreStatus.INVALID
+    if restore_path == "fresh":
+        assert not (target / ".intent").exists()
+    else:
+        assert _state_snapshot(target) == before
+
+
+@pytest.mark.parametrize("collision", [False, True])
+def test_staging_substitution_at_rename_is_quarantined_and_restores_absent_preimage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, collision: bool
+) -> None:
+    """Catches rollback abandoning a foreign promoted inode or deleting unfamiliar bytes."""
+    source = _approved_source(tmp_path)
+    target = init_repository(tmp_path / "target" / "project")
+    recipient, signer, trust = keys()
+    install_state_ref(target, artifacts(canonical_files(source), recipient, signer))
+    original_rename = restore_module._rename_directory_exclusive
+    attacked = False
+
+    def substitute(source_directory: SecureDirectory, destination: SecureDirectory) -> None:
+        nonlocal attacked
+        if destination.path == target and not attacked:
+            staged = source_directory.path / ".intent"
+            staged.rename(tmp_path / "displaced-authenticated-stage")
+            staged.mkdir()
+            (staged / "foreign.txt").write_bytes(b"preserve unfamiliar promoted bytes")
+            attacked = True
+            original_rename(source_directory, destination)
+            if collision:
+                staged.mkdir()
+                (staged / "collision.txt").write_bytes(b"preserve rollback-name occupant")
+            return
+        original_rename(source_directory, destination)
+
+    monkeypatch.setattr(restore_module, "_rename_directory_exclusive", substitute)
+    result = GitSharedStateRestorer(
+        StaticTrustProvider(trust)
+    ).verify_and_restore_approved_baseline(target)
+
+    assert attacked
+    assert result.status is SharedStateRestoreStatus.INVALID
+    assert not (target / ".intent").exists()
+    preserved = [path.read_bytes() for path in target.rglob("foreign.txt")]
+    assert preserved == [b"preserve unfamiliar promoted bytes"]
+    if collision:
+        assert [path.read_bytes() for path in target.rglob("collision.txt")] == [
+            b"preserve rollback-name occupant"
+        ]
+
+
+def test_complete_lineage_accepts_unicode_author_and_committer_headers(tmp_path: Path) -> None:
+    """Catches parsing unrelated Git commit headers as ASCII while authenticating parents."""
+    source = _approved_source(tmp_path)
+    target = init_repository(tmp_path / "target" / "project")
+    recipient, signer, trust = keys()
+    genesis = artifacts(canonical_files(source), recipient, signer)
+    original_commit = install_state_ref(target, genesis)
+    commit_bytes = (
+        git(target, "cat-file", "commit", original_commit)
+        .replace(b"author Shared State Fixture", "author Zoë 李".encode())
+        .replace(b"committer Shared State Fixture", "committer Renée राम".encode())
+    )
+    unicode_commit = (
+        git(target, "hash-object", "-t", "commit", "-w", "--stdin", input_bytes=commit_bytes)
+        .decode()
+        .strip()
+    )
+    child = artifacts(
+        canonical_files(source),
+        recipient,
+        signer,
+        parent_bundle_digest=json.loads(genesis.manifest)["bundle_digest"],
+    )
+    install_state_ref(target, child, parent=unicode_commit)
+
+    result = GitSharedStateRestorer(
+        StaticTrustProvider(trust)
+    ).verify_and_restore_approved_baseline(target)
+
+    assert result.status is SharedStateRestoreStatus.VERIFIED
+    assert canonical_files(target) == canonical_files(source)
+
+
+def test_existing_restore_checks_canonical_state_after_the_commit_journal_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Catches canonical mutation in journal finalization after the precommit byte scan."""
+    source = _approved_source(tmp_path)
+    target = init_repository(tmp_path / "target" / "project")
+    ready_project(target)
+    before = _state_snapshot(target)
+    recipient, signer, trust = keys()
+    install_state_ref(target, artifacts(canonical_files(source), recipient, signer))
+    original_write = SecureFile.atomic_write
+    attacked = False
+
+    def mutate_during_commit(file: SecureFile, content: bytes, **options: object) -> None:
+        nonlocal attacked
+        original_write(file, content, **options)  # type: ignore[arg-type]
+        if file.name == ".local-transaction.json" and b'"state":"committed"' in content:
+            (target / ".intent/approvals/approvals.jsonl").write_bytes(b"unverified decision\n")
+            attacked = True
+
+    monkeypatch.setattr(SecureFile, "atomic_write", mutate_during_commit)
+    result = GitSharedStateRestorer(
+        StaticTrustProvider(trust)
+    ).verify_and_restore_approved_baseline(target)
+
+    assert attacked
+    assert result.status is SharedStateRestoreStatus.INVALID
+    assert _state_snapshot(target) == before
+
+
+@pytest.mark.parametrize("restore_path", ["replacement", "noop"])
+def test_existing_workspace_substitution_reconstructs_the_pinned_preimage_and_metadata(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, restore_path: str
+) -> None:
+    """Catches rollback leaving a swapped workspace named or losing its pinned preimage."""
+    source = _approved_source(tmp_path)
+    target = init_repository(tmp_path / "target" / "project")
+    recipient, signer, trust = keys()
+    install_state_ref(target, artifacts(canonical_files(source), recipient, signer))
+    if restore_path == "noop":
+        assert (
+            GitSharedStateRestorer(StaticTrustProvider(trust))
+            .verify_and_restore_approved_baseline(target)
+            .status
+            is SharedStateRestoreStatus.VERIFIED
+        )
+    else:
+        ready_project(target)
+    (target / ".intent/approvals").chmod(0o750)
+    graph = target / ".intent/graph.yaml"
+    graph.chmod(0o640)
+    os.utime(graph, ns=(1_700_000_000_000_000_000, 1_700_000_000_000_000_000))
+    before = _state_snapshot(target)
+    original_read = SecureDirectory.read_relative
+    armed = False
+    graph_reads = 0
+    attacked = False
+
+    def arm(boundary: str) -> None:
+        nonlocal armed
+        if boundary == ("validated" if restore_path == "noop" else "existing_precommit"):
+            armed = True
+
+    def substitute(directory: SecureDirectory, relative: str | Path, **options: object):  # type: ignore[no-untyped-def]
+        nonlocal attacked, graph_reads
+        value = original_read(directory, relative, **options)  # type: ignore[arg-type]
+        if armed and str(relative) == "graph.yaml":
+            graph_reads += 1
+            if graph_reads == (2 if restore_path == "noop" else 1) and not attacked:
+                workspace = target / ".intent"
+                workspace.rename(tmp_path / "displaced-workspace")
+                shutil.copytree(tmp_path / "displaced-workspace", workspace)
+                (workspace / "foreign.txt").write_bytes(b"preserve substituted workspace")
+                attacked = True
+        return value
+
+    monkeypatch.setattr(SecureDirectory, "read_relative", substitute)
+    result = GitSharedStateRestorer(
+        StaticTrustProvider(trust), fault_hook=arm
+    ).verify_and_restore_approved_baseline(target)
+
+    assert attacked
+    assert result.status is SharedStateRestoreStatus.INVALID
+    assert _state_snapshot(target) == before
+    assert graph.stat().st_mode & 0o777 == 0o640
+    assert graph.stat().st_mtime_ns == 1_700_000_000_000_000_000
+    assert (target / ".intent/approvals").stat().st_mode & 0o777 == 0o750
+    assert [path.read_bytes() for path in target.rglob("foreign.txt")] == [
+        b"preserve substituted workspace"
+    ]
+
+
+def test_existing_restore_checks_canonical_state_after_journal_cleanup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Catches corruption during the last transaction side effect after its earlier scan."""
+    source = _approved_source(tmp_path)
+    target = init_repository(tmp_path / "target" / "project")
+    ready_project(target)
+    before = _state_snapshot(target)
+    recipient, signer, trust = keys()
+    install_state_ref(target, artifacts(canonical_files(source), recipient, signer))
+    original_unlink = SecureFile.unlink
+    attacked = False
+
+    def mutate_during_cleanup(file: SecureFile, *, missing_ok: bool = False) -> None:
+        nonlocal attacked
+        original_unlink(file, missing_ok=missing_ok)
+        if file.name == ".local-transaction.json" and not missing_ok:
+            (target / ".intent/approvals/approvals.jsonl").write_bytes(b"unverified decision\n")
+            attacked = True
+
+    monkeypatch.setattr(SecureFile, "unlink", mutate_during_cleanup)
+    result = GitSharedStateRestorer(
+        StaticTrustProvider(trust)
+    ).verify_and_restore_approved_baseline(target)
+
+    assert attacked
+    assert result.status is SharedStateRestoreStatus.INVALID
+    assert _state_snapshot(target) == before
+
+
+def test_fresh_rollback_reserves_another_container_when_its_recovery_name_is_occupied(
+    tmp_path: Path,
+) -> None:
+    """Catches a recovery-name collision stranding a failed promotion or deleting its occupant."""
+    source = _approved_source(tmp_path)
+    target = init_repository(tmp_path / "target" / "project")
+    recipient, signer, trust = keys()
+    install_state_ref(target, artifacts(canonical_files(source), recipient, signer))
+
+    def occupy_recovery(boundary: str) -> None:
+        if boundary == "fresh_installed":
+            recovery = next(target.glob(".intent-quarantine-*")) / ".intent"
+            recovery.mkdir()
+            (recovery / "foreign.txt").write_bytes(b"preserve occupied recovery name")
+            (target / ".intent/graph.yaml").write_bytes(b"unverified decision\n")
+
+    result = GitSharedStateRestorer(
+        StaticTrustProvider(trust), fault_hook=occupy_recovery
+    ).verify_and_restore_approved_baseline(target)
+
+    assert result.status is SharedStateRestoreStatus.INVALID
+    assert not (target / ".intent").exists()
+    assert [path.read_bytes() for path in target.rglob("foreign.txt")] == [
+        b"preserve occupied recovery name"
+    ]
+    assert any(path.read_bytes() == b"unverified decision\n" for path in target.rglob("graph.yaml"))

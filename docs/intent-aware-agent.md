@@ -151,6 +151,12 @@ The unsigned local marker cannot shorten that traversal. Missing Git parent obje
 forks, invalid signatures, malformed genesis links and history beyond the bound fail closed.
 Use the full fetched history; shallow-boundary metadata cannot establish a signed genesis.
 
+Failed restoration preserves unfamiliar substituted state in owner-private
+`.intent-quarantine-*` directories for explicit review. These can contain plaintext local state
+and are never approved baselines. Keep `.intent-restore-*/` and `.intent-quarantine-*/` ignored
+alongside `.intent/` in each consuming repository; do not commit or publish recovery contents.
+Restore does not silently modify a consumer repository's Git configuration or ignore rules.
+
 Reviewed execution requires a clean commit snapshot before and after every command and both
 result writes. The helper hashes actual tracked bytes against HEAD, checks executable modes and
 the staged index, and binds staged evidence to file and ancestor-directory identities and
