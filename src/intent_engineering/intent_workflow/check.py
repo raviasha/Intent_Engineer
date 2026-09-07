@@ -1,0 +1,465 @@
+"""One bounded orchestration boundary for local and CI intent assurance checks."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import re
+from collections.abc import Callable
+from datetime import UTC, datetime, timedelta
+from enum import StrEnum
+from pathlib import Path
+from typing import Annotated, ClassVar, Literal, Protocol
+
+from pydantic import ConfigDict, Field, ValidationInfo, field_validator, model_validator
+
+from intent_engineering.capture.base import RawSourceObject, normalize_raw_source
+from intent_engineering.core.models import EvidenceRecord, JsonValue, ReconciliationCase
+from intent_engineering.core.models._base import StrictModel
+from intent_engineering.intent_workflow.readiness import EnsureResult, EnsureStatus
+from intent_engineering.storage.jsonl.strict import loads_strict_object
+from intent_engineering.sync.models import SyncRunResult, SyncRunStatus
+from intent_engineering.validation.service import ValidationReport
+
+MAX_TEST_RESULT_BYTES = 64 * 1024
+MAX_TEST_RESULT_AGE = timedelta(hours=24)
+_MAX_TEST_IDS = 256
+_MAX_IDENTIFIER_BYTES = 512
+_MAX_DRIFT_REPORT_BYTES = 1024 * 1024
+_REVISION = re.compile(r"^[0-9a-f]{40}(?:[0-9a-f]{24})?$")
+
+
+class CheckStatus(StrEnum):
+    """Stable aggregate states for the consolidated command."""
+
+    PASSED = "passed"
+    PARTIAL = "partial"
+    REVIEW_REQUIRED = "review_required"
+    FAILED = "failed"
+
+
+class CheckReason(StrEnum):
+    """Fixed, non-sensitive reasons suitable for local and CI policy."""
+
+    CHECKS_PASSED = "checks_passed"
+    READINESS_REQUIRED = "readiness_required"
+    TEST_RESULTS_REQUIRED = "test_results_required"
+    TEST_RESULTS_INVALID = "test_results_invalid"
+    CAPTURE_PARTIAL = "capture_partial"
+    CAPTURE_FAILED = "capture_failed"
+    VALIDATION_FAILED = "validation_failed"
+    ASSURANCE_FAILED = "assurance_failed"
+    REVIEW_REQUIRED = "review_required"
+    OPERATION_FAILED = "operation_failed"
+
+
+class _CheckModel(StrictModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+
+def _identifier(value: str) -> str:
+    if (
+        type(value) is not str
+        or not value
+        or value != value.strip()
+        or len(value.encode("utf-8")) > _MAX_IDENTIFIER_BYTES
+        or any(character in value for character in ("\x00", "\r", "\n"))
+    ):
+        raise ValueError("invalid check identifier")
+    return value
+
+
+def _exact_tuple(value: object, info: ValidationInfo) -> object:
+    if info.mode == "json" and type(value) is list:
+        return tuple(value)
+    if info.mode == "python" and type(value) is not tuple:
+        raise ValueError("invalid check collection")
+    return value
+
+
+class TestResultArtifact(_CheckModel):
+    """Canonical passing-test result accepted as evidence, never as a command."""
+
+    __test__: ClassVar[bool] = False
+
+    schema_version: Literal[1] = 1
+    repository_id: str
+    commit_sha: Annotated[str, Field(pattern=_REVISION.pattern)]
+    observed_at: datetime
+    status: Literal["passed", "failed", "cancelled"]
+    test_ids: Annotated[tuple[str, ...], Field(min_length=1, max_length=_MAX_TEST_IDS)]
+    author: str
+    acl: Annotated[tuple[str, ...], Field(min_length=1, max_length=_MAX_TEST_IDS)]
+
+    @field_validator("schema_version", mode="before")
+    @classmethod
+    def require_integer_schema_version(cls, value: object) -> object:
+        if type(value) is not int:
+            raise ValueError("invalid test result schema version")
+        return value
+
+    @field_validator("test_ids", "acl", mode="before")
+    @classmethod
+    def require_exact_lists(cls, value: object, info: ValidationInfo) -> object:
+        return _exact_tuple(value, info)
+
+    @field_validator("repository_id", "author")
+    @classmethod
+    def require_identifiers(cls, value: str) -> str:
+        return _identifier(value)
+
+    @field_validator("test_ids", "acl")
+    @classmethod
+    def require_unique_identifiers(cls, values: tuple[str, ...]) -> tuple[str, ...]:
+        if len(values) != len(set(values)):
+            raise ValueError("duplicate test result identifier")
+        for value in values:
+            _identifier(value)
+        return values
+
+    @field_validator("observed_at")
+    @classmethod
+    def require_utc_timestamp(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() != timedelta(0):
+            raise ValueError("test result timestamp must be UTC")
+        return value.astimezone(UTC)
+
+    @model_validator(mode="after")
+    def require_lowercase_revision(self) -> TestResultArtifact:
+        if self.commit_sha != self.commit_sha.lower():
+            raise ValueError("test result revision must be lowercase")
+        return self
+
+    def canonical_bytes(self) -> bytes:
+        """Return the stable semantic spelling used for immutable evidence identity."""
+        return json.dumps(
+            self.model_dump(mode="json"),
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+
+    def evidence(self) -> EvidenceRecord:
+        """Project the artifact into the existing immutable evidence contract."""
+        canonical = self.canonical_bytes()
+        digest = hashlib.sha256(canonical).hexdigest()
+        payload: dict[str, JsonValue] = {
+            "schema_version": self.schema_version,
+            "repository_id": self.repository_id,
+            "commit_sha": self.commit_sha,
+            "outcome": self.status,
+            "test_refs": list(self.test_ids),
+        }
+        encoded_payload = json.dumps(
+            payload,
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        return normalize_raw_source(
+            RawSourceObject(
+                connector_type="test_result",
+                external_object_id=f"test-run:{self.commit_sha}",
+                external_version=f"sha256:{digest}",
+                author=self.author,
+                observed_at=self.observed_at,
+                source_locator=f"test:run:{self.commit_sha}",
+                content_hash=f"sha256:{hashlib.sha256(encoded_payload).hexdigest()}",
+                payload=payload,
+                acl=self.acl,
+            )
+        )
+
+
+class CheckRequest(_CheckModel):
+    """One bounded consolidated check request with no command-execution input."""
+
+    schema_version: Literal[1] = 1
+    ci: bool = False
+    require_review: bool = False
+    sources: tuple[str, ...] = ("markdown", "git")
+    test_results: Path | None = None
+
+    @field_validator("schema_version", mode="before")
+    @classmethod
+    def require_integer_schema_version(cls, value: object) -> object:
+        if type(value) is not int:
+            raise ValueError("invalid check schema version")
+        return value
+
+    @field_validator("sources")
+    @classmethod
+    def require_sources(cls, values: tuple[str, ...]) -> tuple[str, ...]:
+        allowed = frozenset({"markdown", "git", "github", "mcp"})
+        if (
+            not values
+            or len(values) != len(set(values))
+            or any(value not in allowed for value in values)
+        ):
+            raise ValueError("invalid check sources")
+        for value in values:
+            _identifier(value)
+        return values
+
+    @field_validator("test_results")
+    @classmethod
+    def require_relative_result_path(cls, value: Path | None) -> Path | None:
+        if value is None:
+            return None
+        if not isinstance(value, Path) or value.is_absolute() or not value.parts:
+            raise ValueError("invalid test result path")
+        if any(part in {"", ".", ".."} for part in value.parts):
+            raise ValueError("invalid test result path")
+        return value
+
+
+class CheckResult(_CheckModel):
+    """Bounded aggregate result with one stable exit-code selection."""
+
+    schema_version: Literal[1] = 1
+    status: CheckStatus
+    reason: CheckReason
+    exit_code: Literal[0, 1, 3, 4]
+    readiness_status: EnsureStatus | None = None
+    capture_status: SyncRunStatus | None = None
+    validation_valid: bool | None = None
+    test_evidence_id: str | None = None
+    review_case_count: Annotated[int, Field(ge=0)] = 0
+    drift_report: str = ""
+
+
+class CheckRuntime(Protocol):
+    """Narrow composition surface over existing readiness and assurance services."""
+
+    @property
+    def repository_id(self) -> str: ...
+
+    @property
+    def principals(self) -> frozenset[str]: ...
+
+    def ensure(self) -> EnsureResult: ...
+
+    def read_test_results(self, path: Path) -> bytes: ...
+
+    def current_revision(self) -> str: ...
+
+    async def capture(
+        self,
+        sources: tuple[str, ...],
+        test_result: TestResultArtifact | None,
+    ) -> SyncRunResult: ...
+
+    def validate(self) -> ValidationReport: ...
+
+    async def assure(self) -> SyncRunResult: ...
+
+    def authorized_cases(self) -> tuple[ReconciliationCase, ...]: ...
+
+    def render_drift(self, cases: tuple[ReconciliationCase, ...]) -> str: ...
+
+
+class CheckService:
+    """Compose existing deterministic services without acquiring human authority."""
+
+    def __init__(
+        self,
+        runtime: CheckRuntime,
+        *,
+        clock: Callable[[], datetime] | None = None,
+    ) -> None:
+        self._runtime = runtime
+        self._clock = clock or (lambda: datetime.now(UTC))
+
+    @staticmethod
+    def _result(
+        status: CheckStatus,
+        reason: CheckReason,
+        exit_code: Literal[0, 1, 3, 4],
+        *,
+        readiness: EnsureStatus | None = None,
+        capture: SyncRunStatus | None = None,
+        validation: bool | None = None,
+        evidence_id: str | None = None,
+        cases: int = 0,
+        report: str = "",
+    ) -> CheckResult:
+        return CheckResult(
+            status=status,
+            reason=reason,
+            exit_code=exit_code,
+            readiness_status=readiness,
+            capture_status=capture,
+            validation_valid=validation,
+            test_evidence_id=evidence_id,
+            review_case_count=cases,
+            drift_report=report,
+        )
+
+    def _parse_test_result(self, path: Path) -> TestResultArtifact:
+        raw = self._runtime.read_test_results(path)
+        if type(raw) is not bytes or not raw or len(raw) > MAX_TEST_RESULT_BYTES:
+            raise ValueError("invalid test result artifact")
+        loads_strict_object(raw.decode("utf-8"))
+        artifact = TestResultArtifact.model_validate_json(raw)
+        now = self._clock()
+        if now.tzinfo is None or now.utcoffset() != timedelta(0):
+            raise ValueError("invalid check clock")
+        if (
+            artifact.repository_id != self._runtime.repository_id
+            or artifact.commit_sha != self._runtime.current_revision()
+            or artifact.status != "passed"
+            or artifact.observed_at > now
+            or now - artifact.observed_at > MAX_TEST_RESULT_AGE
+            or frozenset(artifact.acl).isdisjoint(self._runtime.principals)
+        ):
+            raise ValueError("invalid test result binding")
+        return artifact
+
+    async def run(self, request: CheckRequest) -> CheckResult:
+        """Run ordered bounded checks and return one fixed machine result."""
+        if type(request) is not CheckRequest:
+            return self._result(CheckStatus.FAILED, CheckReason.OPERATION_FAILED, 1)
+        readiness: EnsureResult | None = None
+        artifact: TestResultArtifact | None = None
+        evidence_id: str | None = None
+        try:
+            readiness = self._runtime.ensure()
+        except Exception:  # noqa: BLE001 - fixed readiness failure boundary
+            return self._result(CheckStatus.FAILED, CheckReason.READINESS_REQUIRED, 1)
+        if readiness.status is not EnsureStatus.READY:
+            exit_code: Literal[1, 4] = (
+                4 if readiness.status is EnsureStatus.HUMAN_ATTENTION_REQUIRED else 1
+            )
+            status = CheckStatus.REVIEW_REQUIRED if exit_code == 4 else CheckStatus.FAILED
+            return self._result(
+                status,
+                CheckReason.READINESS_REQUIRED,
+                exit_code,
+                readiness=readiness.status,
+            )
+        if request.ci and request.test_results is None:
+            return self._result(
+                CheckStatus.FAILED,
+                CheckReason.TEST_RESULTS_REQUIRED,
+                1,
+                readiness=readiness.status,
+            )
+        if request.test_results is not None:
+            try:
+                artifact = self._parse_test_result(request.test_results)
+                evidence_id = artifact.evidence().id
+            except Exception:  # noqa: BLE001 - fixed secret-free artifact failure
+                return self._result(
+                    CheckStatus.FAILED,
+                    CheckReason.TEST_RESULTS_INVALID,
+                    1,
+                    readiness=readiness.status,
+                )
+        try:
+            capture = await self._runtime.capture(request.sources, artifact)
+        except Exception:  # noqa: BLE001 - cancellation remains a BaseException
+            return self._result(
+                CheckStatus.FAILED,
+                CheckReason.CAPTURE_FAILED,
+                1,
+                readiness=readiness.status,
+                evidence_id=evidence_id,
+            )
+        if capture.status is SyncRunStatus.FAILED:
+            return self._result(
+                CheckStatus.FAILED,
+                CheckReason.CAPTURE_FAILED,
+                1,
+                readiness=readiness.status,
+                capture=capture.status,
+                evidence_id=evidence_id,
+            )
+        try:
+            validation = self._runtime.validate()
+        except Exception:  # noqa: BLE001 - fixed validation failure boundary
+            return self._result(
+                CheckStatus.FAILED,
+                CheckReason.VALIDATION_FAILED,
+                1,
+                readiness=readiness.status,
+                capture=capture.status,
+                evidence_id=evidence_id,
+            )
+        if not validation.valid:
+            return self._result(
+                CheckStatus.FAILED,
+                CheckReason.VALIDATION_FAILED,
+                1,
+                readiness=readiness.status,
+                capture=capture.status,
+                validation=False,
+                evidence_id=evidence_id,
+            )
+        try:
+            assurance = await self._runtime.assure()
+            if assurance.status is not SyncRunStatus.SUCCESS:
+                raise ValueError("assurance failed")
+            cases = self._runtime.authorized_cases()
+            report = self._runtime.render_drift(cases)
+            if len(report.encode("utf-8")) > _MAX_DRIFT_REPORT_BYTES:
+                raise ValueError("drift report is oversized")
+        except Exception:  # noqa: BLE001 - fixed assurance failure boundary
+            return self._result(
+                CheckStatus.FAILED,
+                CheckReason.ASSURANCE_FAILED,
+                1,
+                readiness=readiness.status,
+                capture=capture.status,
+                validation=True,
+                evidence_id=evidence_id,
+            )
+        if capture.status is SyncRunStatus.PARTIAL:
+            return self._result(
+                CheckStatus.PARTIAL,
+                CheckReason.CAPTURE_PARTIAL,
+                3,
+                readiness=readiness.status,
+                capture=capture.status,
+                validation=True,
+                evidence_id=evidence_id,
+                cases=len(cases),
+                report=report,
+            )
+        if request.require_review and cases:
+            return self._result(
+                CheckStatus.REVIEW_REQUIRED,
+                CheckReason.REVIEW_REQUIRED,
+                4,
+                readiness=readiness.status,
+                capture=capture.status,
+                validation=True,
+                evidence_id=evidence_id,
+                cases=len(cases),
+                report=report,
+            )
+        return self._result(
+            CheckStatus.PASSED,
+            CheckReason.CHECKS_PASSED,
+            0,
+            readiness=readiness.status,
+            capture=capture.status,
+            validation=True,
+            evidence_id=evidence_id,
+            cases=len(cases),
+            report=report,
+        )
+
+
+__all__ = [
+    "MAX_TEST_RESULT_AGE",
+    "MAX_TEST_RESULT_BYTES",
+    "CheckReason",
+    "CheckRequest",
+    "CheckResult",
+    "CheckRuntime",
+    "CheckService",
+    "CheckStatus",
+    "TestResultArtifact",
+]

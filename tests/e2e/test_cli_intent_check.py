@@ -1,0 +1,305 @@
+"""End-to-end contracts for the consolidated ``intent check`` command."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import subprocess
+from datetime import UTC, datetime
+from pathlib import Path
+
+from typer.testing import CliRunner
+
+from intent_engineering.capture.base import RawSourceObject, normalize_raw_source
+from intent_engineering.cli.app import app
+from intent_engineering.cli.runtime import load_runtime
+from intent_engineering.core.models import (
+    ChangeSet,
+    Edge,
+    Node,
+    NodeType,
+    RelationType,
+    SourceMode,
+)
+from intent_engineering.core.policy.project import initialize_project
+from tests.helpers.cli import init_git_repo
+
+NOW = datetime(2026, 9, 7, 10, tzinfo=UTC)
+
+
+def _ready(repo: Path) -> None:
+    initialize_project(repo)
+    runtime = load_runtime(repo)
+    try:
+        content = "Consolidated checks preserve reviewed intent"
+        evidence = normalize_raw_source(
+            RawSourceObject(
+                connector_type="markdown",
+                external_object_id="path:approved-intent.md",
+                external_version="sha256:" + hashlib.sha256(content.encode()).hexdigest(),
+                author="local:owner",
+                observed_at=NOW,
+                source_locator="approved-intent.md",
+                content_hash="sha256:" + hashlib.sha256(content.encode()).hexdigest(),
+                payload={"content": content},
+            )
+        )
+        runtime.evidence_store.associate("markdown", evidence)
+        node = Node(
+            id="intent:check",
+            type=NodeType.PRODUCT_INTENT,
+            label=content,
+            status="active",
+            created_by="local:owner",
+            created_at=NOW,
+            last_modified_by="local:owner",
+            last_modified_at=NOW,
+            source_mode=SourceMode.EXPLICIT,
+            intent_fidelity_confidence=1.0,
+            confidence_basis="approved test fixture",
+            evidence_refs=(evidence.id,),
+        )
+        requirement = Node(
+            id="requirement:check",
+            type=NodeType.REQUIREMENT,
+            label="Run the consolidated check",
+            status="active",
+            created_by="local:owner",
+            created_at=NOW,
+            last_modified_by="local:owner",
+            last_modified_at=NOW,
+            source_mode=SourceMode.EXPLICIT,
+            intent_fidelity_confidence=1.0,
+            confidence_basis="approved test fixture",
+            evidence_refs=(evidence.id,),
+        )
+        edge = Edge(
+            id="edge:check-requirement",
+            from_id=node.id,
+            relation=RelationType.REFINES,
+            to_id=requirement.id,
+            status="active",
+            created_by="local:owner",
+            created_at=NOW,
+            last_modified_by="local:owner",
+            last_modified_at=NOW,
+        )
+        runtime.graph_store.apply(
+            ChangeSet(
+                id="changeset:approved-check-baseline",
+                actor="local:owner",
+                timestamp=NOW,
+                baseline_graph_version=0,
+                evidence_refs=(evidence.id,),
+                nodes_added=(node, requirement),
+                nodes_updated=(),
+                nodes_superseded=(),
+                edges_added=(edge,),
+                edges_updated=(),
+                edges_superseded=(),
+                confidence_changes=(),
+                implementation_status_changes=(),
+                reconciliation_cases_created=(),
+                reconciliation_cases_resolved=(),
+                validation_status="validated",
+            )
+        )
+    finally:
+        runtime.close()
+
+
+def _head(repo: Path) -> str:
+    return subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+    ).stdout.strip()
+
+
+def _write_result(repo: Path, path: Path) -> None:
+    config = json.loads(
+        subprocess.run(
+            [
+                str(Path(os.sys.executable)),
+                "-c",
+                "import json,yaml; print(json.dumps(yaml.safe_load(open('.intent/config.yaml'))))",
+            ],
+            cwd=repo,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+    )
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "repository_id": config["project_id"],
+                "commit_sha": _head(repo),
+                "observed_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+                "status": "passed",
+                "test_ids": ["test:repository"],
+                "author": "ci:test-runner",
+                "acl": [config["local_actor"]],
+            },
+            separators=(",", ":"),
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+
+
+def test_check_emits_one_strict_versioned_json_result_for_an_aligned_project(
+    tmp_path: Path,
+) -> None:
+    """Catches the consolidated command leaking stage logs or omitting a stable result."""
+    repo = init_git_repo(tmp_path)
+    _ready(repo)
+
+    result = CliRunner().invoke(
+        app,
+        ["check", "--project", str(repo), "--sources", "markdown,git", "--format", "json"],
+    )
+
+    assert result.exit_code == 0, repr(result.exception)
+    assert json.loads(result.stdout) | {} == {
+        **json.loads(result.stdout),
+        "version": "1",
+        "schema_version": 1,
+        "status": "passed",
+        "reason": "checks_passed",
+        "exit_code": 0,
+    }
+    assert "Consolidated checks preserve" not in result.stdout + result.stderr
+
+
+def test_ci_check_never_initializes_an_unonboarded_repository(tmp_path: Path) -> None:
+    """Catches the required check manufacturing or approving an empty baseline."""
+    repo = init_git_repo(tmp_path)
+
+    result = CliRunner().invoke(
+        app,
+        ["check", "--project", str(repo), "--ci", "--require-review", "--format", "json"],
+    )
+
+    assert result.exit_code == 1
+    assert json.loads(result.stdout)["reason"] == "readiness_required"
+    assert not (repo / ".intent").exists()
+
+
+def test_check_rejects_an_unknown_source_with_one_fixed_json_failure(tmp_path: Path) -> None:
+    """Catches connector selection errors escaping the strict check result boundary."""
+    repo = init_git_repo(tmp_path)
+
+    result = CliRunner().invoke(
+        app,
+        ["check", "--project", str(repo), "--sources", "prompt-command", "--format", "json"],
+    )
+
+    assert result.exit_code == 1
+    assert json.loads(result.stdout) | {} == {
+        **json.loads(result.stdout),
+        "version": "1",
+        "schema_version": 1,
+        "status": "failed",
+        "reason": "operation_failed",
+        "exit_code": 1,
+    }
+    assert not (repo / ".intent").exists()
+
+
+def test_check_ingests_a_bound_test_result_once_and_replay_is_a_byte_noop(
+    tmp_path: Path,
+) -> None:
+    """Catches canonical test-result replay appending duplicate evidence or checkpoints."""
+    repo = init_git_repo(tmp_path)
+    _ready(repo)
+    result_path = repo / "test-results.json"
+    _write_result(repo, result_path)
+    arguments = [
+        "check",
+        "--project",
+        str(repo),
+        "--ci",
+        "--sources",
+        "markdown,git",
+        "--test-results",
+        "test-results.json",
+        "--format",
+        "json",
+    ]
+
+    first = CliRunner().invoke(app, arguments)
+    assert first.exit_code == 0, repr(first.exception)
+    evidence = (repo / ".intent" / "evidence" / "evidence.jsonl").read_bytes()
+    checkpoints = (repo / ".intent" / "cache" / "checkpoints.yaml").read_bytes()
+    second = CliRunner().invoke(app, arguments)
+
+    assert second.exit_code == 0, repr(second.exception)
+    assert (repo / ".intent" / "evidence" / "evidence.jsonl").read_bytes() == evidence
+    assert (repo / ".intent" / "cache" / "checkpoints.yaml").read_bytes() == checkpoints
+    stored = load_runtime(repo)
+    try:
+        records = tuple(
+            record for record in stored.evidence() if record.connector_type == "test_result"
+        )
+    finally:
+        stored.close()
+    assert len(records) == 1
+    assert records[0].payload["commit_sha"] == _head(repo)
+
+
+def test_partial_connector_failure_returns_three_after_validating_surviving_state(
+    tmp_path: Path,
+) -> None:
+    """Catches one failed connector corrupting or collapsing the consolidated result."""
+    repo = tmp_path / "plain-project"
+    repo.mkdir()
+    _ready(repo)
+
+    result = CliRunner().invoke(
+        app,
+        ["check", "--project", str(repo), "--sources", "markdown,git", "--format", "json"],
+    )
+
+    assert result.exit_code == 3
+    payload = json.loads(result.stdout)
+    assert (payload["status"], payload["reason"], payload["validation_valid"]) == (
+        "partial",
+        "capture_partial",
+        True,
+    )
+
+
+def test_test_result_path_is_descriptor_safe_and_fails_without_evidence_mutation(
+    tmp_path: Path,
+) -> None:
+    """Catches symlinked result input escaping the project descriptor boundary."""
+    repo = init_git_repo(tmp_path)
+    _ready(repo)
+    outside = tmp_path / "outside.json"
+    outside.write_text("{}", encoding="utf-8")
+    (repo / "test-results.json").symlink_to(outside)
+    evidence_path = repo / ".intent" / "evidence" / "evidence.jsonl"
+    before = evidence_path.read_bytes() if evidence_path.exists() else None
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "check",
+            "--project",
+            str(repo),
+            "--test-results",
+            "test-results.json",
+            "--format",
+            "json",
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert json.loads(result.stdout)["reason"] == "test_results_invalid"
+    assert (evidence_path.read_bytes() if evidence_path.exists() else None) == before

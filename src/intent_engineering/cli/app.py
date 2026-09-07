@@ -31,6 +31,7 @@ from intent_engineering.cli.intent_workflow import (
 )
 from intent_engineering.cli.output import OutputFormat, emit
 from intent_engineering.cli.runtime import (
+    CheckRuntimeAdapter,
     GitHubConfigurationError,
     Runtime,
     github_repository_scope,
@@ -72,6 +73,13 @@ from intent_engineering.integrations.agent_host.advisory import (
     readiness_unavailable_prompt_route,
     repository_matches,
     unavailable_prompt_route,
+)
+from intent_engineering.intent_workflow.check import (
+    CheckReason,
+    CheckRequest,
+    CheckResult,
+    CheckService,
+    CheckStatus,
 )
 from intent_engineering.intent_workflow.onboarding import (
     OnboardingRuntime,
@@ -468,6 +476,49 @@ def sync_command(
     _validate_sources(sources)
     _validate_github_scope(sources)
     _sync_command(_runtime(project), sources, output_format)
+
+
+@app.command("check")
+def check_command(
+    project: Path = typer.Option(Path("."), "--project"),
+    ci: bool = typer.Option(False, "--ci"),
+    require_review: bool = typer.Option(False, "--require-review"),
+    sources: str = typer.Option("markdown,git", "--sources"),
+    test_results: Path | None = typer.Option(None, "--test-results"),
+    output_format: OutputFormat = typer.Option(OutputFormat.JSON, "--format"),
+) -> None:
+    """Run readiness, capture, validation, assurance, and bounded drift reporting."""
+    adapter = CheckRuntimeAdapter(
+        project,
+        principal_resolver=_authorized_principals,
+        mcp_connector_resolver=lambda runtime: connector_catalog(runtime).read_connectors(),
+    )
+
+    async def run() -> CheckResult:
+        return await CheckService(adapter).run(
+            CheckRequest(
+                ci=ci,
+                require_review=require_review,
+                sources=parse_sources(sources),
+                test_results=test_results,
+            )
+        )
+
+    try:
+        _validate_sources(sources)
+        _validate_github_scope(sources)
+        result = anyio.run(run)
+    except (TypeError, ValueError, typer.BadParameter):
+        result = CheckResult(
+            status=CheckStatus.FAILED,
+            reason=CheckReason.OPERATION_FAILED,
+            exit_code=1,
+        )
+    finally:
+        adapter.close()
+    emit(result, output_format)
+    if result.exit_code:
+        raise typer.Exit(result.exit_code)
 
 
 @app.command("mcp")

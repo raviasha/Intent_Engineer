@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import subprocess
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -16,7 +17,7 @@ import yaml  # type: ignore[import-untyped]
 from pydantic import ValidationError
 
 from intent_engineering.capture.base import Connector
-from intent_engineering.capture.git.connector import GitConnector
+from intent_engineering.capture.git.connector import GitConnector, run_git
 from intent_engineering.capture.github.auth import (
     GitHubCredentials,
     GitHubTokenRunner,
@@ -38,11 +39,13 @@ from intent_engineering.core.models import (
     Graph,
     ProjectConfig,
     ReconciliationCase,
+    is_nonterminal_case_status,
 )
 from intent_engineering.core.policy.access import refs_allowed
 from intent_engineering.core.policy.project import ProjectNotInitialized, workspace_path
 from intent_engineering.extract.deterministic import DeterministicReasoner
 from intent_engineering.intent_workflow.assurance import AssuranceService
+from intent_engineering.intent_workflow.check import MAX_TEST_RESULT_BYTES, TestResultArtifact
 from intent_engineering.intent_workflow.models import (
     ClarificationEvent,
     IntentProposal,
@@ -51,6 +54,11 @@ from intent_engineering.intent_workflow.models import (
 from intent_engineering.intent_workflow.proposal_store import (
     IntentProposalStore,
     parse_intent_ledger,
+)
+from intent_engineering.intent_workflow.readiness import (
+    EnsureRequest,
+    EnsureResult,
+    ReadinessService,
 )
 from intent_engineering.reconcile import LocalResolutionService
 from intent_engineering.reconcile.evidence_detection import detect_evidence_drift
@@ -66,7 +74,8 @@ from intent_engineering.storage.transaction import LocalTransactionCoordinator
 from intent_engineering.storage.yaml.checkpoint_store import YamlCheckpointStore
 from intent_engineering.storage.yaml.graph_store import YamlGraphStore, parse_graph
 from intent_engineering.sync import SyncOrchestrator
-from intent_engineering.sync.models import SyncRunResult
+from intent_engineering.sync.models import ConnectorRunResult, SyncRunResult, SyncRunStatus
+from intent_engineering.validation import ValidationReport, validate_project_directory
 
 if TYPE_CHECKING:
     from intent_engineering.assessment import AssessmentSnapshot
@@ -75,6 +84,8 @@ _GITHUB_OWNER = re.compile(r"(?!-)(?!.*--)[A-Za-z0-9-]{1,39}(?<!-)\Z")
 _GITHUB_REPOSITORY = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}\Z")
 
 type GitHubClientFactory = Callable[[GitHubCredentials], GitHubClient]
+type PrincipalResolver = Callable[[Runtime], frozenset[str]]
+type McpConnectorResolver = Callable[[Runtime], Sequence[Connector]]
 
 
 class GitHubConfigurationError(ValueError):
@@ -503,6 +514,155 @@ def load_runtime(root: Path) -> Runtime:
         workspace_directory=workspace_directory,
         transactions=transactions,
     )
+
+
+class CheckRuntimeAdapter:
+    """Lazy production adapter for the consolidated non-authoritative check service."""
+
+    def __init__(
+        self,
+        root: Path,
+        *,
+        principal_resolver: PrincipalResolver | None = None,
+        mcp_connector_resolver: McpConnectorResolver | None = None,
+    ) -> None:
+        self._root = Path(os.path.abspath(root))
+        self._runtime: Runtime | None = None
+        self._principal_resolver = principal_resolver
+        self._mcp_connector_resolver = mcp_connector_resolver
+
+    def _opened(self) -> Runtime:
+        if self._runtime is None:
+            self._runtime = load_runtime(self._root)
+        return self._runtime
+
+    @property
+    def repository_id(self) -> str:
+        return self._opened().config.project_id
+
+    @property
+    def principals(self) -> frozenset[str]:
+        runtime = self._opened()
+        if self._principal_resolver is None:
+            return frozenset({runtime.config.local_actor})
+        resolved = self._principal_resolver(runtime)
+        if type(resolved) is not frozenset or any(
+            type(value) is not str or not value for value in resolved
+        ):
+            raise ValueError("check principals are unavailable")
+        return resolved
+
+    def ensure(self) -> EnsureResult:
+        readiness = load_readiness_runtime(self._root)
+        try:
+            return ReadinessService(readiness).ensure(EnsureRequest())
+        finally:
+            readiness.close()
+
+    def read_test_results(self, path: Path) -> bytes:
+        return (
+            self._opened()
+            .project_directory.read_relative(
+                path,
+                nonblocking=True,
+                max_bytes=MAX_TEST_RESULT_BYTES,
+            )
+            .content
+        )
+
+    def current_revision(self) -> str:
+        try:
+            revision = run_git(
+                self._root,
+                ["rev-parse", "--verify", "--quiet", "HEAD"],
+            ).strip()
+        except (OSError, subprocess.SubprocessError, UnicodeError) as error:
+            raise ValueError("repository revision is unavailable") from error
+        if re.fullmatch(r"[0-9a-f]{40}(?:[0-9a-f]{24})?", revision) is None:
+            raise ValueError("repository revision is unavailable")
+        return revision
+
+    async def capture(
+        self,
+        sources: tuple[str, ...],
+        test_result: TestResultArtifact | None,
+    ) -> SyncRunResult:
+        runtime = self._opened()
+        mcp_connectors: Sequence[Connector] = ()
+        if "mcp" in sources:
+            if self._mcp_connector_resolver is None:
+                raise ValueError("MCP connector selection is unavailable")
+            mcp_connectors = self._mcp_connector_resolver(runtime)
+        captured = await run_selected_sync(
+            runtime,
+            ",".join(sources),
+            new_run_id(),
+            mcp_connectors=mcp_connectors,
+        )
+        if test_result is None:
+            return captured
+        test_result_new = runtime.evidence_store.associate(
+            "test-results",
+            test_result.evidence(),
+        )
+        connector_results = {
+            **captured.connectors,
+            "test-results": ConnectorRunResult.succeeded(
+                evidence_added=int(test_result_new),
+                changes_applied=0,
+                cases_created=0,
+                checkpoint_advanced=False,
+            ),
+        }
+        return SyncRunResult.from_connector_results(
+            captured.run_id,
+            connector_results,
+            captured.duration_ms,
+        )
+
+    def validate(self) -> ValidationReport:
+        return validate_project_directory(self._opened().project_directory)
+
+    async def assure(self) -> SyncRunResult:
+        runtime = self._opened()
+        observations = AssuranceService(actor=runtime.config.local_actor).detect(
+            graph=runtime.graph_store.load(),
+            records=runtime.evidence(),
+            ingestions=runtime.evidence_store.ingestions(),
+            existing_cases=runtime.cases(),
+        )
+        status = SyncRunStatus.SUCCESS if not observations else SyncRunStatus.FAILED
+        return SyncRunResult(
+            run_id=new_run_id(),
+            status=status,
+            connectors={},
+            evidence_added=0,
+            changes_applied=0,
+            cases_created=0,
+            duration_ms=0,
+        )
+
+    def authorized_cases(self) -> tuple[ReconciliationCase, ...]:
+        runtime = self._opened()
+        records = runtime.evidence()
+        principals = self.principals
+        return tuple(
+            case
+            for case in runtime.cases()
+            if is_nonterminal_case_status(case.status)
+            and refs_allowed(case.all_evidence_refs, records, principals)
+        )
+
+    @staticmethod
+    def render_drift(cases: tuple[ReconciliationCase, ...]) -> str:
+        from intent_engineering.render import render_drift_report
+
+        return render_drift_report(cases)
+
+    def close(self) -> None:
+        if self._runtime is not None:
+            self._runtime.close()
+            self._runtime = None
 
 
 def resolve_connectors(
