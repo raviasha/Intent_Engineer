@@ -545,28 +545,17 @@ def test_guided_onboarding_plugin_and_assurance_share_one_project(
             for item in pending.questions
             if item.id not in {record.question_id for record in pending.answers}
         )
+        evidence_before_answer_hook = tuple(runtime.evidence())
         answer_route, answer_hook_stdout, answer_hook_stderr = _plugin_prompt(
             project,
             answer,
             turn_id=turn_id,
         )
         transcript.extend((f"hook-submitted: {answer}", answer_hook_stdout, answer_hook_stderr))
-        assert "action=human_confirmation_required" in answer_route
+        assert "action=human_attention_required" in answer_route
+        assert "local Inbox" in answer_route
         assert "intent_clarification_answer" not in answer_route
-        answer_conversation_ref = codex_conversation_ref(
-            "codex:guided-release-proof",
-            turn_id,
-            answer,
-        )
-        hook_answer = next(
-            record
-            for record in runtime.evidence()
-            if record.external_object_id == answer_conversation_ref
-            and record.payload.get("content") == answer
-        )
-        assert hook_answer.payload.get("role") == "agent"
-        assert hook_answer.author == "agent:codex"
-        answer_evidence_ref = hook_answer.id
+        assert tuple(runtime.evidence()) == evidence_before_answer_hook
         graph_before_answer = (project / ".intent/graph.yaml").read_bytes()
         session_before_answer = (project / ".intent/history/intent-proposals.jsonl").read_bytes()
         rejected_answer = call_tool(
@@ -574,7 +563,7 @@ def test_guided_onboarding_plugin_and_assurance_share_one_project(
             {
                 "session_id": session_id,
                 "question_id": question.id,
-                "answer_evidence_ref": answer_evidence_ref,
+                "answer_evidence_ref": pending.classification_evidence_ref,
             },
         )
         assert rejected_answer == {

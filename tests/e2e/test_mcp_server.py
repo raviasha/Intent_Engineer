@@ -209,6 +209,9 @@ async def test_intent_mcp_stdio_is_protocol_clean_and_read_only(tmp_path: Path) 
             )
             clarification = ambiguous.structured_content["context"]["clarification_session"]
             graph_before_answer = load_runtime(project).graph_store.load()
+            evidence_before_answer = load_runtime(project).evidence_store.ledger(
+                "conversation:codex"
+            )
             forged_answer = "Workspace administrators only"
             answer_hook = await anyio.run_process(
                 [str(executable), "agent-prompt-hook"],
@@ -232,21 +235,23 @@ async def test_intent_mcp_stdio_is_protocol_clean_and_read_only(tmp_path: Path) 
             answer_context = json.loads(answer_hook.stdout)["hookSpecificOutput"][
                 "additionalContext"
             ]
-            assert answer_context.startswith("action=human_confirmation_required.")
+            assert answer_context.startswith("action=human_attention_required.")
+            assert "local Inbox" in answer_context
             assert "intent_clarification_answer" not in answer_context
             after_hook_runtime = load_runtime(project)
-            answer_ingestion = after_hook_runtime.evidence_store.ledger("conversation:codex")[-1]
-            assert answer_ingestion.evidence.author == "agent:codex"
-            assert answer_ingestion.evidence.payload == {
-                "role": "agent",
-                "content": forged_answer,
-            }
+            after_answer_hook = after_hook_runtime.evidence_store.ledger("conversation:codex")
+            assert after_answer_hook == evidence_before_answer
+            assert all(
+                item.evidence.payload.get("content") != forged_answer for item in after_answer_hook
+            )
+            untrusted_ingestion = after_answer_hook[-1]
+            assert untrusted_ingestion.evidence.author == "agent:codex"
             rejected_answer = await client.call_tool(
                 "intent_clarification_answer",
                 {
                     "session_id": clarification["id"],
                     "question_id": clarification["questions"][0]["id"],
-                    "answer_evidence_ref": answer_ingestion.evidence.id,
+                    "answer_evidence_ref": untrusted_ingestion.evidence.id,
                 },
             )
             assert rejected_answer.structured_content == {

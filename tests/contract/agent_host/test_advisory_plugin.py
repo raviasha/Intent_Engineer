@@ -255,8 +255,8 @@ def test_real_hook_blocks_implementation_when_local_readiness_is_invalid(tmp_pat
 
     assert _additional_context(completed) == (
         "action=human_attention_required. Intent Engineering cannot verify local readiness. "
-        "Do not implement or resolve governed intent work automatically. Review local Intent "
-        "state before continuing."
+        "Open the local Team state view before governed implementation; do not implement or "
+        "resolve intent work automatically."
     )
     assert marker.encode() not in completed.stdout + completed.stderr
     assert _durable_bytes(project) == before
@@ -417,6 +417,34 @@ def test_missing_cli_returns_fixed_fallback_with_strict_streams(tmp_path: Path) 
     assert _additional_context(completed) == FALLBACK
 
 
+def test_hook_runs_one_exact_developer_preset_process_without_mcp_recursion(
+    tmp_path: Path,
+) -> None:
+    """Catches readiness and advisory routing splitting into recursive plugin or MCP processes."""
+    project = tmp_path / "project"
+    fake_bin = tmp_path / "fake-bin"
+    calls = tmp_path / "calls.jsonl"
+    project.mkdir()
+    fake_bin.mkdir()
+    context = "action=classify. Fixed fake advisory guidance."
+    _fake_intent(
+        fake_bin,
+        "import json, pathlib, sys\n"
+        f"path = pathlib.Path({str(calls)!r})\n"
+        "with path.open('a', encoding='utf-8') as stream:\n"
+        "    stream.write(json.dumps(sys.argv[1:]) + '\\n')\n"
+        f"print(json.dumps({{'hookSpecificOutput': {{'hookEventName': "
+        f"'UserPromptSubmit', 'additionalContext': {context!r}}}}}, separators=(',', ':')))",
+    )
+
+    completed = _run_official_hook(project, path=f"{fake_bin}:/usr/bin:/bin")
+
+    assert _additional_context(completed) == context
+    assert [json.loads(line) for line in calls.read_text(encoding="utf-8").splitlines()] == [
+        ["agent-prompt-hook", "--preset", "developer"]
+    ]
+
+
 def test_unbounded_child_output_returns_bounded_fallback(tmp_path: Path) -> None:
     project = tmp_path / "project"
     fake_bin = tmp_path / "fake-bin"
@@ -502,8 +530,8 @@ def test_special_project_files_fail_promptly_without_replacement(
         if attack == "fifo"
         else (
             "action=human_attention_required. Intent Engineering cannot verify local readiness. "
-            "Do not implement or resolve governed intent work automatically. Review local Intent "
-            "state before continuing."
+            "Open the local Team state view before governed implementation; do not implement or "
+            "resolve intent work automatically."
         )
     )
     assert _additional_context(completed) == expected

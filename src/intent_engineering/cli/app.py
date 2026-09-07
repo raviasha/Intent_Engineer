@@ -87,6 +87,7 @@ from intent_engineering.intent_workflow.onboarding import (
     inspect_onboarding,
 )
 from intent_engineering.intent_workflow.readiness import (
+    EnsurePreset,
     EnsureRequest,
     EnsureStatus,
     ReadinessError,
@@ -153,7 +154,7 @@ def _onboarding_prompt_route() -> PromptRoute:
     )
 
 
-def _prompt_readiness_route(project: Path) -> PromptRoute | None:
+def _prompt_readiness_route(project: Path, preset: EnsurePreset) -> PromptRoute | None:
     """Return a fixed blocking route unless a no-recovery readiness snapshot is ready."""
     runtime = None
     try:
@@ -165,7 +166,7 @@ def _prompt_readiness_route(project: Path) -> PromptRoute | None:
     except Exception:  # noqa: BLE001 - readiness errors must block implementation
         return readiness_unavailable_prompt_route()
     try:
-        result = ReadinessService(runtime).ensure(EnsureRequest())
+        result = ReadinessService(runtime).ensure(EnsureRequest(preset=preset))
     except ReadinessError:
         return readiness_unavailable_prompt_route()
     finally:
@@ -177,7 +178,9 @@ def _prompt_readiness_route(project: Path) -> PromptRoute | None:
 
 
 @app.command("agent-prompt-hook", hidden=True)
-def agent_prompt_hook_command() -> None:
+def agent_prompt_hook_command(
+    preset: EnsurePreset = typer.Option(EnsurePreset.DEVELOPER, "--preset"),
+) -> None:
     """Route exactly one bounded advisory prompt event over stdin/stdout."""
     raw: bytes | None = None
     parsed: object = None
@@ -209,7 +212,7 @@ def agent_prompt_hook_command() -> None:
             codex_event = parse_codex_prompt_event(parsed)
             if not repository_matches(current, codex_event.cwd):
                 raise ValueError("advisory repository mismatch")
-            route = _prompt_readiness_route(Path.cwd())
+            route = _prompt_readiness_route(Path.cwd(), preset)
             if route is None:
                 try:
                     runtime = load_runtime(Path.cwd())
@@ -232,7 +235,7 @@ def agent_prompt_hook_command() -> None:
             event = parse_prompt_event(parsed)
             if not repository_matches(current, event.repository):
                 raise ValueError("advisory repository mismatch")
-            route = _prompt_readiness_route(Path.cwd())
+            route = _prompt_readiness_route(Path.cwd(), preset)
             if route is None:
                 try:
                     runtime = load_runtime(Path.cwd())

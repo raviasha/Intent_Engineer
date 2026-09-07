@@ -39,6 +39,7 @@ from intent_engineering.intent_workflow.onboarding import (
 from intent_engineering.intent_workflow.readiness import (
     EnsureResult,
     EnsureStatus,
+    ReadinessTarget,
 )
 from intent_engineering.storage.secure import SecureDirectory
 
@@ -64,8 +65,8 @@ _HUMAN_ATTENTION = (
     "Do not implement or resolve the intent work automatically."
 )
 _READINESS_UNAVAILABLE = (
-    "Intent Engineering cannot verify local readiness. Do not implement or resolve governed "
-    "intent work automatically. Review local Intent state before continuing."
+    "Intent Engineering cannot verify local readiness. Open the local Team state view before "
+    "governed implementation; do not implement or resolve intent work automatically."
 )
 
 
@@ -376,18 +377,46 @@ def readiness_prompt_route(result: EnsureResult) -> PromptRoute:
     if result.status is EnsureStatus.ONBOARDING_REQUIRED:
         return PromptRoute(
             action="offer_onboarding",
-            message=_OFFER,
+            message=readiness_context(result),
             mcp_tool=None,
             arguments={},
         )
-    if result.status is EnsureStatus.HUMAN_ATTENTION_REQUIRED:
+    if result.status is not EnsureStatus.READY:
         return PromptRoute(
             action="human_attention_required",
-            message=_HUMAN_ATTENTION,
+            message=readiness_context(result),
             mcp_tool=None,
             arguments={},
         )
     return readiness_unavailable_prompt_route()
+
+
+def readiness_context(result: EnsureResult) -> str:
+    """Render fixed prompt guidance for one strict readiness result."""
+    if type(result) is not EnsureResult:
+        raise ValueError("invalid readiness result")
+    if result.status is EnsureStatus.ONBOARDING_REQUIRED:
+        return _OFFER
+    if result.status is EnsureStatus.HUMAN_ATTENTION_REQUIRED:
+        if result.attention_route is ReadinessTarget.INBOX:
+            return _HUMAN_ATTENTION
+        view = {
+            ReadinessTarget.HOME: "Home",
+            ReadinessTarget.ONBOARDING: "Onboarding",
+            ReadinessTarget.PROPOSAL: "Proposal review",
+            ReadinessTarget.TEAM_STATE: "Team state",
+        }[result.attention_route]
+        return (
+            f"Intent Engineering requires human review in the local {view} view before "
+            "implementation. Do not implement or resolve the intent work automatically."
+        )
+    if result.status is EnsureStatus.OFFLINE_STALE:
+        return (
+            "Intent Engineering is using a stale verified local baseline while shared state is "
+            "offline. Open the local Team state view before governed implementation; do not "
+            "publish or resolve intent state automatically."
+        )
+    return _READINESS_UNAVAILABLE
 
 
 def readiness_unavailable_prompt_route() -> PromptRoute:
@@ -774,6 +803,7 @@ __all__ = [
     "codex_prompt_output",
     "parse_codex_prompt_event",
     "parse_prompt_event",
+    "readiness_context",
     "readiness_prompt_route",
     "readiness_unavailable_prompt_route",
     "repository_matches",

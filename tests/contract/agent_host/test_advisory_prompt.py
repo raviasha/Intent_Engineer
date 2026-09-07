@@ -144,6 +144,25 @@ def test_readiness_attention_routes_to_a_fixed_human_review_instruction() -> Non
     assert "case:private" not in rendered
 
 
+def test_readiness_attention_names_the_exact_bounded_ui_route() -> None:
+    """Catches a proposal review result being misdirected to the generic Inbox view."""
+    result = EnsureResult(
+        status=EnsureStatus.HUMAN_ATTENTION_REQUIRED,
+        attention_route=ReadinessTarget.PROPOSAL,
+        graph_version=7,
+        pending_proposal_ids=("proposal:private",),
+        open_case_ids=(),
+    )
+
+    context = advisory_module.readiness_context(result)
+
+    assert context == (
+        "Intent Engineering requires human review in the local Proposal review view before "
+        "implementation. Do not implement or resolve the intent work automatically."
+    )
+    assert "proposal:private" not in context
+
+
 def test_readiness_onboarding_reuses_the_guided_onboarding_offer() -> None:
     """Catches the first-prompt readiness gate giving a different onboarding journey."""
     route = readiness_prompt_route(
@@ -179,9 +198,39 @@ def test_readiness_state_failure_blocks_implementation_in_official_hook_context(
     assert route.arguments == {}
     assert codex_prompt_context(route) == (
         "action=human_attention_required. Intent Engineering cannot verify local readiness. "
-        "Do not implement or resolve governed intent work automatically. Review local Intent "
-        "state before continuing."
+        "Open the local Team state view before governed implementation; do not implement or "
+        "resolve intent work automatically."
     )
+
+
+def test_offline_stale_readiness_routes_to_the_exact_team_state_view() -> None:
+    """Catches stale shared state being treated as ready or routed to an unrelated review view."""
+    result = EnsureResult(
+        status=EnsureStatus.OFFLINE_STALE,
+        attention_route=ReadinessTarget.TEAM_STATE,
+        graph_version=7,
+        pending_proposal_ids=("proposal:private",),
+        open_case_ids=("case:private",),
+    )
+
+    context = advisory_module.readiness_context(result)
+    route = readiness_prompt_route(result)
+
+    assert context == (
+        "Intent Engineering is using a stale verified local baseline while shared state is "
+        "offline. Open the local Team state view before governed implementation; do not publish "
+        "or resolve intent state automatically."
+    )
+    assert route == PromptRoute(
+        action="human_attention_required",
+        message=context,
+        mcp_tool=None,
+        arguments={},
+    )
+    rendered = route.model_dump_json()
+    assert "proposal:private" not in rendered
+    assert "case:private" not in rendered
+    assert "token" not in rendered.casefold()
 
 
 def test_initialized_repository_routes_once_to_public_preflight(tmp_path: Path) -> None:
