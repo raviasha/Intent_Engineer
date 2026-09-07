@@ -401,14 +401,24 @@ def test_restore_recovers_the_existing_runtime_journal_before_replacement(tmp_pa
     assert not (target / ".intent/history/.local-transaction.json").exists()
 
 
-def test_authentic_cache_advances_across_two_skipped_signed_releases(tmp_path: Path) -> None:
+@pytest.mark.parametrize("cached_genesis", [True, False], ids=["genesis", "non_genesis"])
+def test_authentic_cache_advances_across_two_skipped_signed_releases(
+    tmp_path: Path,
+    cached_genesis: bool,
+) -> None:
     """Catches ancestry validation accepting only the tip's immediate parent."""
     source = _approved_source(tmp_path)
     target = init_repository(tmp_path / "target" / "project")
     recipient, signer, trust = keys()
     files = canonical_files(source)
-    release_a = artifacts(files, recipient, signer)
-    commit_a = install_state_ref(target, release_a)
+    parent_commit: str | None = None
+    parent_digest: str | None = None
+    if not cached_genesis:
+        parent = artifacts(files, recipient, signer)
+        parent_commit = install_state_ref(target, parent)
+        parent_digest = json.loads(parent.manifest)["bundle_digest"]
+    release_a = artifacts(files, recipient, signer, parent_bundle_digest=parent_digest)
+    commit_a = install_state_ref(target, release_a, parent=parent_commit)
     restorer = GitSharedStateRestorer(StaticTrustProvider(trust))
     assert (
         restorer.verify_and_restore_approved_baseline(target).status
@@ -435,6 +445,99 @@ def test_authentic_cache_advances_across_two_skipped_signed_releases(tmp_path: P
     marker = json.loads((target / ".intent/cache/shared-state.json").read_bytes())
     assert marker["ref_commit"] == commit_c
     assert marker["bundle_digest"] == json.loads(release_c.manifest)["bundle_digest"]
+    before = _state_snapshot(target)
+
+    assert (
+        restorer.verify_and_restore_approved_baseline(target).status
+        is SharedStateRestoreStatus.VERIFIED
+    )
+    assert _state_snapshot(target) == before
+
+
+@pytest.mark.parametrize("matched_ancestor", [False, True], ids=["tip", "ancestor"])
+@pytest.mark.parametrize(
+    ("case", "expected"),
+    [
+        ("merge", SharedStateRestoreStatus.INVALID),
+        ("false_genesis", SharedStateRestoreStatus.STALE),
+        ("missing_parent_digest", SharedStateRestoreStatus.STALE),
+        ("mismatched_parent_digest", SharedStateRestoreStatus.STALE),
+        ("invalid_parent_signature", SharedStateRestoreStatus.INVALID),
+    ],
+)
+def test_matching_local_marker_cannot_bypass_endpoint_lineage_validation(
+    tmp_path: Path,
+    case: str,
+    expected: SharedStateRestoreStatus,
+    matched_ancestor: bool,
+) -> None:
+    """Catches unsigned cache metadata bypassing the matched signed release's lineage."""
+    source = _approved_source(tmp_path)
+    target = init_repository(tmp_path / "target" / "project")
+    ready_project(target)
+    recipient, signer, trust = keys()
+    files = canonical_files(source)
+    parent = artifacts(files, recipient, signer)
+    if case == "invalid_parent_signature":
+        signature = json.loads(parent.signatures)
+        signature["signatures"][0]["signature"] = (
+            base64.urlsafe_b64encode(b"\0" * 64).rstrip(b"=").decode()
+        )
+        parent = replace(parent, signatures=_canonical(signature))
+    parent_commit = install_state_ref(target, parent)
+    parent_digest = json.loads(parent.manifest)["bundle_digest"]
+    if case == "missing_parent_digest":
+        parent_digest = None
+    elif case == "mismatched_parent_digest":
+        parent_digest = "sha256:" + "0" * 64
+    endpoint = artifacts(files, recipient, signer, parent_bundle_digest=parent_digest)
+    endpoint_commit = install_state_ref(
+        target, endpoint, parent=None if case == "false_genesis" else parent_commit
+    )
+    if case == "merge":
+        tree = git(target, "rev-parse", f"{endpoint_commit}^{{tree}}").decode().strip()
+        code_commit = git(target, "rev-parse", "HEAD").decode().strip()
+        endpoint_commit = (
+            git(
+                target,
+                "commit-tree",
+                tree,
+                "-p",
+                parent_commit,
+                "-p",
+                code_commit,
+                input_bytes=b"unsupported shared-state merge\n",
+            )
+            .decode()
+            .strip()
+        )
+        git(target, "update-ref", "refs/remotes/origin/intent-state", endpoint_commit)
+    manifest = json.loads(endpoint.manifest)
+    if matched_ancestor:
+        successor = artifacts(
+            files, recipient, signer, parent_bundle_digest=manifest["bundle_digest"]
+        )
+        install_state_ref(target, successor, parent=endpoint_commit)
+    restorer = GitSharedStateRestorer(StaticTrustProvider(trust))
+    before = _state_snapshot(target)
+
+    assert restorer.verify_and_restore_approved_baseline(target).status is expected
+    assert _state_snapshot(target) == before
+
+    (target / ".intent/cache/shared-state.json").write_bytes(
+        _canonical(
+            {
+                "schema_version": 1,
+                "bundle_digest": manifest["bundle_digest"],
+                "graph_version": 1,
+                "ref_commit": endpoint_commit,
+            }
+        )
+    )
+    before = _state_snapshot(target)
+
+    assert restorer.verify_and_restore_approved_baseline(target).status is expected
+    assert _state_snapshot(target) == before
 
 
 def test_skipped_release_fails_closed_when_an_intermediate_signature_is_invalid(

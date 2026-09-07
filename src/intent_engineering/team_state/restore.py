@@ -856,21 +856,26 @@ def _verify_release_lineage(
             tip = release
         if expected_digest is not None and release.manifest.bundle_digest != expected_digest:
             raise _Stale("divergent shared-state lineage")
-        if (
+        marker_matches = (
             marker is not None
             and marker["bundle_digest"] == release.manifest.bundle_digest
             and marker["ref_commit"] == commit
-        ):
-            return tip
+        )
         parents = reader.parents(commit)
         if not parents:
             if release.manifest.parent_bundle_digest is not None:
                 raise _Stale("invalid shared-state genesis")
-            if marker is not None:
+            if marker is not None and not marker_matches:
                 raise _Stale("local shared-state lineage diverged")
             return tip
         if release.manifest.parent_bundle_digest is None:
             raise _Stale("invalid shared-state parent")
+        if marker_matches:
+            # The unsigned marker cannot vouch for the endpoint's signed parent link.
+            parent = _verify_release_manifest(reader, parents[0], trust, now)
+            if parent.manifest.bundle_digest != release.manifest.parent_bundle_digest:
+                raise _Stale("divergent shared-state lineage")
+            return tip
         expected_digest = release.manifest.parent_bundle_digest
         commit = parents[0]
     raise _Stale("shared-state history exceeds traversal bound")
