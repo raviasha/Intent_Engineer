@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib
 import json
 import shlex
+import subprocess
 from pathlib import Path
 from unittest.mock import patch
 
@@ -549,3 +550,127 @@ def test_scheduled_pipeline_does_not_mask_operational_failures(
             break
     else:
         pytest.fail("the operational failure was masked")
+
+
+@pytest.mark.parametrize("cache_kind", ["untracked", "tracked", "tracked-casefold"])
+def test_repository_bytecode_cannot_turn_failing_committed_source_into_green_ci(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    cache_kind: str,
+) -> None:
+    action = _action()
+    repo, trust = _clone(tmp_path)
+    monkeypatch.setenv("INTENT_CI_SHARED_STATE_TRUST", trust_environment(trust))
+    action.restore(repo)
+    (repo / "feature.py").write_text("def enabled():\n    return False\n", encoding="utf-8")
+    (repo / "tools/test-runner").write_text(
+        "#!/usr/bin/python3\nimport feature\nassert feature.enabled()\n", encoding="utf-8"
+    )
+    git(repo, "add", "feature.py", "tools/test-runner")
+    git(repo, "commit", "-qm", "test committed failing Python source")
+    # Construct valid interpreter-native bytecode with the source's current size and mtime.
+    # The code object deliberately disagrees with the committed source it will shadow.
+    subprocess.run(
+        [
+            "/usr/bin/python3",
+            "-c",
+            (
+                "import importlib.util, importlib._bootstrap_external as b; from pathlib import Path; "
+                "p=Path('feature.py'); s=p.stat(); "
+                "c=compile('def enabled():\\n    return True\\n', str(p), 'exec'); "
+                "out=Path(importlib.util.cache_from_source(str(p))); out.parent.mkdir(); "
+                "out.write_bytes(b._code_to_timestamp_pyc(c, int(s.st_mtime), s.st_size))"
+            ),
+        ],
+        cwd=repo,
+        env={"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8"},
+        check=True,
+    )
+    cache = next((repo / "__pycache__").glob("*.pyc"))
+    original_cache = cache.read_bytes()
+    if cache_kind == "tracked-casefold":
+        cache.rename(cache.with_suffix(".PYC"))
+        cache.parent.rename(repo / "__PYCACHE__")
+        cache = repo / "__PYCACHE__" / cache.with_suffix(".PYC").name
+    if cache_kind != "untracked":
+        git(repo, "add", "-f", str(cache.relative_to(repo)))
+        git(repo, "commit", "-qm", "commit stale bytecode beside source")
+    try:
+        anyio.run(action.run_tests, repo, NOW)
+        action.write_results(repo, NOW)
+    except ValueError:
+        pass
+    result = _check(repo, trust)
+    assert result.exit_code != 0, "cached passing code received complete CI acceptance"
+    assert not (repo / ".intent-ci/test-results.json").exists()
+    assert cache.read_bytes() == original_cache, "rejected user caches must remain untouched"
+
+
+@pytest.mark.parametrize("package", ["package", "package/nested"])
+def test_restored_parent_directory_cannot_turn_failing_committed_source_into_green_ci(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    package: str,
+) -> None:
+    action = _action()
+    repo, trust = _clone(tmp_path)
+    monkeypatch.setenv("INTENT_CI_SHARED_STATE_TRUST", trust_environment(trust))
+    action.restore(repo)
+    (repo / package).mkdir(parents=True)
+    module = repo / package / "feature.py"
+    module.write_text("def enabled():\n    return False\n", encoding="utf-8")
+    (repo / "tools/test-runner").write_text(
+        "#!/usr/bin/python3\nimport os,runpy,shutil\nfrom pathlib import Path\n"
+        f"package = {package!r}\n"
+        "os.rename(package, '.intent-ci/original-package')\n"
+        "try:\n"
+        "    Path(package).mkdir()\n"
+        "    (Path(package) / 'feature.py').write_text('def enabled():\\n    return True\\n')\n"
+        "    assert runpy.run_path(package + '/feature.py')['enabled']()\n"
+        "finally:\n"
+        "    shutil.rmtree(package)\n"
+        "    os.rename('.intent-ci/original-package', package)\n",
+        encoding="utf-8",
+    )
+    git(repo, "add", str(module.relative_to(repo)), "tools/test-runner")
+    git(repo, "commit", "-qm", "test restored parent directory substitution")
+    before = module.stat()
+    try:
+        anyio.run(action.run_tests, repo, NOW)
+        action.write_results(repo, NOW)
+    except ValueError:
+        pass
+    after = module.stat()
+    assert (after.st_ino, after.st_mtime_ns, after.st_ctime_ns) == (
+        before.st_ino,
+        before.st_mtime_ns,
+        before.st_ctime_ns,
+    )
+    result = _check(repo, trust)
+    assert result.exit_code != 0, "restored parent substitution received complete CI acceptance"
+    assert not (repo / ".intent-ci/test-results.json").exists()
+
+
+@pytest.mark.parametrize("interpreter", ["python", "shell"])
+def test_clean_python_imports_pass_ci_without_creating_repository_bytecode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    interpreter: str,
+) -> None:
+    action = _action()
+    repo, trust = _clone(tmp_path)
+    monkeypatch.setenv("INTENT_CI_SHARED_STATE_TRUST", trust_environment(trust))
+    action.restore(repo)
+    runner = (
+        "#!/usr/bin/python3\nimport feature\nassert feature.enabled()\n"
+        if interpreter == "python"
+        else "#!/bin/sh\nexec /usr/bin/python3 -c 'import feature; assert feature.enabled()'\n"
+    )
+    (repo / "tools/test-runner").write_text(runner, encoding="utf-8")
+    git(repo, "add", "tools/test-runner")
+    git(repo, "commit", "-qm", "verify ordinary clean Python imports")
+    anyio.run(action.run_tests, repo, NOW)
+    action.write_results(repo, NOW)
+    assert not (repo / "__pycache__").exists()
+    result = _check(repo, trust)
+    assert result.exit_code == 0, (result.stdout, repr(result.exception))

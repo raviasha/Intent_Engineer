@@ -136,15 +136,29 @@ intent check --ci --require-review --test-results .intent-ci/test-results.json
 
 Reviewed execution requires a clean commit snapshot before and after every command and both
 result writes. The helper hashes actual tracked bytes against HEAD, checks executable modes and
-the staged index, and binds staged evidence to file identities and modification/change times.
+the staged index, and binds staged evidence to file and ancestor-directory identities and
+modification/change times, including the repository root. Swapping a tracked parent directory
+and restoring it after execution cannot preserve a passing snapshot.
 Index shortcuts, arbitrary ignore rules and Git replacement objects cannot authorize dirty code.
 Any mismatch removes staged and final passing evidence. The internal staged snapshot is local to
 this checkout; the final canonical result schema is unchanged.
 
-Only untracked `.intent/`, `.intent-ci/`, `.venv/`, `.pytest_cache/`, `.mypy_cache/`, `.ruff_cache/`,
-`__pycache__/` directories and exact reviewed `test_result_paths` are permitted as generated
-outputs. Tracked files are never exempt. Other outputs must be explicitly reviewed, not merely
-added to `.gitignore`. Snapshot inspection is bounded to 4,096 tracked files, 16 MiB per file,
+Only untracked `.intent/`, `.intent-ci/`, `.venv/`, `.pytest_cache/`, `.mypy_cache/`, `.ruff_cache/`
+directories and exact reviewed `test_result_paths` are permitted as generated outputs. The helper
+creates these bounded output directories and reviewed result parents before the initial snapshot.
+Outputs must remain in those pre-existing, untracked directories: creating or replacing entries
+along tracked ancestors (including loose outputs at the repository root) invalidates the snapshot.
+Tracked files are never exempt. Other outputs must be explicitly reviewed, not merely added to
+`.gitignore`.
+
+Repository `__pycache__` content and `.pyc`/`.pyo` files are rejected, including committed bytecode;
+rejected caches are left untouched for the operator to handle. They cannot shadow failing committed
+Python source. Reviewed CI subprocesses inherit `PYTHONDONTWRITEBYTECODE=1` to prevent ordinary
+imports from creating new repository caches. This flag prevents writes, not reads: rejection of
+existing repository bytecode provides the read-side boundary. Installed dependencies inside the
+explicit `.venv` directory remain part of the separately reviewed dependency environment.
+
+Snapshot inspection is bounded to 4,096 tracked files, 16 MiB per file,
 128 MiB total, 1 MiB of Git listing output and five seconds; it fails closed beyond these limits.
 Tracked symlinks, submodules, hardlinks and checkout filters that change committed bytes are not
 supported by this CI execution contract.

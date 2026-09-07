@@ -155,3 +155,43 @@ Review fix verification:
   green.
 
 Fix commit message: `fix: bind CI evidence and preserve scheduled reports`.
+
+## Review round 2: repository bytecode and restored ancestors
+
+Real end-to-end regressions reproduced both Important false greens before implementation:
+valid interpreter-native stale bytecode shadowed committed failing Python source, and a tracked
+package directory was swapped for passing code then restored with unchanged leaf identity and
+timestamps. In each case reviewed execution, canonical result production and the actual
+`intent check --ci --require-review --test-results .intent-ci/test-results.json` path all completed
+successfully. The initial completed-path regressions produced **3 RED failures**, covering both
+untracked and committed caches plus the restored package. A further case-insensitive macOS
+cache-name regression (`__PYCACHE__` / `.PYC`) also failed RED before case-folded rejection.
+
+The CI snapshot no longer exempts repository bytecode. It rejects cache content and `.pyc`/`.pyo`
+files, including tracked bytecode and case-insensitive spellings, without deleting or rewriting
+the user's caches. Reviewed CI subprocesses inherit `PYTHONDONTWRITEBYTECODE=1`; this prevents new
+ordinary-import writes, while rejection of existing caches supplies the read-side boundary.
+The flag alone is not treated as protection from cached reads. Installed dependencies in `.venv`
+remain the explicit separately reviewed dependency scope. Normal Python imports and Python imports
+through the vetted shell runner both pass real CI without creating repository bytecode.
+
+Snapshots now record and revalidate identity, mtime and ctime for every tracked ancestor directory,
+including the repository root, in addition to tracked leaf bytes/metadata. Nested and root-level
+parent substitutions are covered. The fingerprint remains bound across every command and staged/
+canonical result boundary. The bounded generated directories and exact reviewed result parents
+are prepared before the initial snapshot, so ordinary `.intent-ci` writes remain supported.
+Changing entries along tracked ancestors after pinning fails closed; the documentation makes the
+result-output placement restriction explicit. Existing Git, process, descriptor and timing bounds,
+signed-state verification, exact required-check command and scheduled reporting remain unchanged.
+
+Round-2 verification:
+
+- Final focused observer/workflow/release/public-alpha/GitHub compatibility: **70 passed**,
+  41.03 seconds, including the additional case-insensitive regression.
+- Final attack and normal-import regressions, including case-insensitive caches: **7 passed**.
+- Final broad affected-feature gate: **924 passed, 1 deselected, 19 existing warnings**,
+  97.15 seconds. The sole deselection remains the documented installed-Codex version assertion.
+- Full mypy: **140 source files**, no issues. Ruff (same known unrelated duplicate exclusion),
+  changed-file formatting, plugin validation, CLI check/ensure help and diff gates passed.
+
+Fix commit message: `fix: reject stale bytecode and bind tracked ancestors`.

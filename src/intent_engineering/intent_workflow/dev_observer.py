@@ -498,6 +498,7 @@ class DevObserver:
             self._git_pin = _pin_git_executable()
             self._require_repository_root(root)
             self._config = config
+            self._execution_environment = dict(_FIXED_ENVIRONMENT)
             self._repository_id = repository_id
             self._principals = principals
             self._acl = tuple(sorted(principals))
@@ -558,6 +559,41 @@ class DevObserver:
             raise ValueError("Git path observation is oversized")
         return paths
 
+    def prepare_clean_commit_execution(self) -> None:
+        """Create bounded generated-output parents before pinning ancestor timestamps."""
+        if self._directory is None:
+            raise ValueError("clean commit snapshot unavailable")
+        for relative in (
+            ".intent",
+            ".intent-ci",
+            ".venv",
+            ".pytest_cache",
+            ".mypy_cache",
+            ".ruff_cache",
+        ):
+            directory = self._directory.subdirectory(relative, create=True)
+            directory.close()
+        for relative in self._config.test_result_paths:
+            target = self._directory.file(relative, create_parents=True)
+            target.close()
+        # This only prevents new writes. Snapshot rejection of existing repository bytecode
+        # is the read-side boundary; -B alone would still execute stale cached code.
+        self._execution_environment["PYTHONDONTWRITEBYTECODE"] = "1"
+
+    def _ancestor_metadata(self, relative: str) -> tuple[int, int, int, int]:
+        if self._directory is None:
+            raise ValueError("clean commit snapshot unavailable")
+        directory = (
+            self._directory.duplicate()
+            if relative == "."
+            else self._directory.subdirectory(relative)
+        )
+        try:
+            metadata = os.fstat(directory.descriptor)
+            return metadata.st_dev, metadata.st_ino, metadata.st_mtime_ns, metadata.st_ctime_ns
+        finally:
+            directory.close()
+
     def clean_commit_snapshot(self) -> str:
         """Verify actual tracked bytes against HEAD and fingerprint their held identities.
 
@@ -577,6 +613,7 @@ class DevObserver:
         if not entries or len(entries) > MAX_CHANGED_PATHS:
             raise ValueError("clean commit snapshot unavailable")
         fingerprint = hashlib.sha256(revision.encode("ascii"))
+        ancestors: dict[str, tuple[int, int, int, int]] = {}
         total_bytes = 0
         for entry in entries:
             header, path = entry.split("\t", 1)
@@ -585,11 +622,22 @@ class DevObserver:
                 mode not in {"100644", "100755"}
                 or kind != "blob"
                 or len(path.encode("utf-8")) > MAX_CHANGED_PATH_BYTES
+                or path.casefold().endswith((".pyc", ".pyo"))
+                or "__pycache__" in Path(path.casefold()).parts
             ):
                 raise ValueError("clean commit snapshot unavailable")
+            parents = (".", *(str(parent) for parent in reversed(Path(path).parents[:-1])))
+            parent_identities = []
+            for parent in parents:
+                metadata_before = self._ancestor_metadata(parent)
+                if ancestors.setdefault(parent, metadata_before) != metadata_before:
+                    raise ValueError("clean commit snapshot changed")
+                parent_identities.append(metadata_before[:2])
             source = self._directory.read_relative(
                 path, nonblocking=True, max_bytes=MAX_EXECUTABLE_BYTES
             )
+            if source.identities[:-1] != tuple(parent_identities):
+                raise ValueError("clean commit snapshot changed")
             total_bytes += len(source.content)
             if total_bytes > MAX_COMMIT_SNAPSHOT_BYTES or time.monotonic() > deadline:
                 raise ValueError("clean commit snapshot unavailable")
@@ -642,7 +690,6 @@ class DevObserver:
                 "--exclude=/.pytest_cache/",
                 "--exclude=/.mypy_cache/",
                 "--exclude=/.ruff_cache/",
-                "--exclude=__pycache__/",
             ),
             max_bytes=MAX_CHANGED_PATH_OUTPUT_BYTES,
         )
@@ -651,9 +698,16 @@ class DevObserver:
             staged
             or len(paths) > MAX_CHANGED_PATHS
             or any(path not in self._config.test_result_paths for path in paths)
+            or any(path.casefold().endswith((".pyc", ".pyo")) for path in paths)
             or revision != self._current_revision()
             or time.monotonic() > deadline
         ):
+            raise ValueError("clean commit snapshot unavailable")
+        for parent, expected_metadata in sorted(ancestors.items()):
+            if self._ancestor_metadata(parent) != expected_metadata:
+                raise ValueError("clean commit snapshot changed")
+            fingerprint.update(_canonical_bytes((parent, expected_metadata)))
+        if time.monotonic() > deadline:
             raise ValueError("clean commit snapshot unavailable")
         return "sha256:" + fingerprint.hexdigest()
 
@@ -842,7 +896,7 @@ class DevObserver:
             process = await anyio.open_process(
                 execution_argv,
                 cwd=self._root,
-                env=dict(_FIXED_ENVIRONMENT),
+                env=dict(self._execution_environment),
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,

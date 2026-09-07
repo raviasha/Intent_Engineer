@@ -92,6 +92,7 @@ async def run_tests(root: Path, at: datetime) -> None:
         observer = _observer(root, adapter)
         if not observer.command_ids:
             raise ValueError("reviewed tests failed")
+        observer.prepare_clean_commit_execution()
         revision = adapter.current_revision()
         snapshot = observer.clean_commit_snapshot()
         completed: list[str] = []
