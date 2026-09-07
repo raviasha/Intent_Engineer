@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import inspect
 import json
+import os
 from pathlib import Path
 from unittest.mock import patch
 
@@ -16,8 +18,8 @@ from intent_engineering.cli.app import app
 from intent_engineering.cli.runtime import CheckRuntimeAdapter, load_runtime
 from intent_engineering.control_plane.service import ControlPlaneService
 from intent_engineering.core.models import ChangeSet, NodeUpdate
-from intent_engineering.intent_workflow.check import CheckService
-from intent_engineering.intent_workflow.dev_observer import TestRunStatus
+from intent_engineering.intent_workflow.check import CheckService, TestResultArtifact
+from intent_engineering.intent_workflow.dev_observer import DevObserver, TestRunStatus
 from intent_engineering.storage.secure import SecureDirectory
 from tests.e2e.test_intent_dev_automation import _action, _check, _clone
 from tests.helpers.shared_state import NOW, git, trust_environment
@@ -71,12 +73,13 @@ def test_control_plane_run_is_consumed_by_cli_and_keeps_authentication_identity_
     finally:
         service.close()
         runtime.close()
-    first = _check(repo, trust)
+    first = _local_check(repo, "--test-results", ".intent-ci/test-results.json")
     assert first.exit_code == 0, (first.stdout, first.exception)
     evidence = (repo / ".intent/evidence/evidence.jsonl").read_bytes()
-    replay = _check(repo, trust)
+    replay = _local_check(repo, "--test-results", ".intent-ci/test-results.json")
     assert replay.exit_code == 0, (replay.stdout, replay.exception)
     assert (repo / ".intent/evidence/evidence.jsonl").read_bytes() == evidence
+    assert json.loads(_check(repo, trust).stdout)["reason"] == "test_environment_unsupported"
 
 
 def test_dirty_local_test_cannot_certify_the_failing_committed_tree(
@@ -177,11 +180,11 @@ def test_canonical_evidence_preserves_all_execution_bindings(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Canonical ingestion must not discard the producer's independently verified bindings."""
-    repo, trust = _restored(tmp_path, monkeypatch)
+    repo, _trust = _restored(tmp_path, monkeypatch)
     assert _run_local(repo).exit_code == 0
     artifact = json.loads((repo / ".intent-ci/test-results.json").read_bytes())
     assert artifact["schema_version"] == 2
-    assert _check(repo, trust).exit_code == 0
+    assert _local_check(repo, "--test-results", ".intent-ci/test-results.json").exit_code == 0
     runtime = load_runtime(repo)
     try:
         evidence = [
@@ -195,11 +198,11 @@ def test_canonical_evidence_preserves_all_execution_bindings(
         runtime.close()
 
 
-def test_final_ci_rechecks_binding_after_assurance(
+def test_final_local_check_rechecks_binding_after_assurance(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A code mutation during later check stages must prevent a final green result."""
-    repo, trust = _restored(tmp_path, monkeypatch)
+    repo, _trust = _restored(tmp_path, monkeypatch)
     action = _action()
     anyio.run(action.run_tests, repo, NOW)
     action.write_results(repo, NOW)
@@ -211,7 +214,7 @@ def test_final_ci_rechecks_binding_after_assurance(
         return report
 
     monkeypatch.setattr(CheckRuntimeAdapter, "render_drift", mutate_after_render)
-    result = _check(repo, trust)
+    result = _local_check(repo, "--test-results", ".intent-ci/test-results.json")
     assert result.exit_code == 1, result.stdout
     assert json.loads(result.stdout)["reason"] == "test_results_invalid"
 
@@ -246,7 +249,7 @@ def test_final_snapshot_rejects_an_earlier_file_changed_during_the_scan(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The final snapshot must fence all files after its last content read."""
-    repo, trust = _restored(tmp_path, monkeypatch)
+    repo, _trust = _restored(tmp_path, monkeypatch)
     action = _action()
     anyio.run(action.run_tests, repo, NOW)
     action.write_results(repo, NOW)
@@ -273,7 +276,7 @@ def test_final_snapshot_rejects_an_earlier_file_changed_during_the_scan(
 
     monkeypatch.setattr(CheckRuntimeAdapter, "render_drift", arm_final_scan)
     monkeypatch.setattr(SecureDirectory, "read_relative", mutate_earlier_file)
-    result = _check(repo, trust)
+    result = _local_check(repo, "--test-results", ".intent-ci/test-results.json")
     assert attacked
     assert result.exit_code == 1, result.stdout
     assert json.loads(result.stdout)["reason"] == "test_results_invalid"
@@ -314,3 +317,142 @@ def test_local_execution_cannot_temporarily_change_and_restore_intent(
     result = _run_local(repo)
     assert result.exit_code == 1, result.stdout
     assert not (repo / ".intent-ci/test-results.json").exists()
+
+
+def test_final_ci_rejects_earlier_source_changed_during_a_later_final_stat(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A sequential metadata sweep is not an atomic snapshot of the checkout."""
+    repo, trust = _restored(tmp_path, monkeypatch)
+    action = _action()
+    anyio.run(action.run_tests, repo, NOW)
+    action.write_results(repo, NOW)
+    final_scan = False
+    attacked = False
+    render = CheckRuntimeAdapter.render_drift
+    original_stat = os.stat
+
+    def arm_final_scan(self, cases):
+        nonlocal final_scan
+        final_scan = True
+        return render(cases)
+
+    def mutate_after_earlier_final_stat(path, **options):
+        nonlocal attacked
+        result = original_stat(path, **options)
+        caller = inspect.currentframe().f_back
+        if (
+            final_scan
+            and not attacked
+            and path == "test-runner"
+            and caller.f_code.co_name == "clean_commit_snapshot"
+            and "expected_token" in caller.f_locals
+        ):
+            attacked = True
+            (repo / "feature.py").write_text("def enabled():\n    return False\n")
+        return result
+
+    monkeypatch.setattr(CheckRuntimeAdapter, "render_drift", arm_final_scan)
+    monkeypatch.setattr(os, "stat", mutate_after_earlier_final_stat)
+    result = _check(repo, trust)
+    # CI rejects the mutable host before it can enter the vulnerable final sweep.
+    assert not attacked
+    assert result.exit_code == 1, result.stdout
+    assert json.loads(result.stdout)["reason"] == "test_environment_unsupported"
+
+
+def test_generated_directory_runner_cannot_produce_committed_test_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A signed argv is insufficient when its executable bytes are not in HEAD."""
+    repo, trust = _restored(tmp_path, monkeypatch, commands=[[".intent-ci/test-runner"]])
+    runner = repo / ".intent-ci/test-runner"
+    runner.write_text("#!/usr/bin/python3\nprint('passing untracked runner')\n")
+    runner.chmod(0o755)
+    result = _run_local(repo)
+    runner.write_text("#!/usr/bin/python3\nraise SystemExit(1)\n")
+    assert _check(repo, trust).exit_code == 1
+    assert result.exit_code == 1, result.stdout
+    assert not (repo / ".intent-ci/test-results.json").exists()
+
+
+def test_ci_rejects_an_arbitrary_test_id_for_a_signed_empty_command_set(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """CI must independently require a nonempty, exactly covered reviewed command set."""
+    repo, trust = _restored(tmp_path, monkeypatch, commands=[])
+    runtime = load_runtime(repo)
+    observer = DevObserver(
+        repo,
+        runtime.config,
+        repository_id=runtime.config.project_id,
+        principals=frozenset({runtime.config.local_actor}),
+    )
+    try:
+        observer.prepare_clean_commit_execution()
+        binding = observer.test_result_binding()
+        artifact = TestResultArtifact(
+            repository_id=runtime.config.project_id,
+            commit_sha=observer.current_revision(),
+            observed_at=NOW,
+            status="passed",
+            test_ids=("test:unreviewed",),
+            author=runtime.config.local_actor,
+            acl=(runtime.config.local_actor,),
+            execution_snapshot=binding.execution_snapshot,
+            intent_baseline=binding.intent_baseline,
+            reviewed_commands=binding.reviewed_commands,
+        )
+    finally:
+        observer.close()
+        runtime.close()
+    (repo / ".intent-ci/test-results.json").write_bytes(artifact.canonical_bytes())
+    result = _check(repo, trust)
+    assert result.exit_code == 1, result.stdout
+    assert json.loads(result.stdout)["reason"] == "test_results_invalid"
+
+
+def test_immutable_build_material_comes_from_authenticated_state_not_local_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from intent_engineering.team_state.restore import (
+        EnvironmentTrustProvider,
+        read_approved_baseline,
+    )
+
+    repo, _trust = _restored(tmp_path, monkeypatch)
+    approved = (repo / ".intent/graph.yaml").read_bytes()
+    (repo / ".intent/graph.yaml").write_bytes(b"not approved graph material\n")
+    files = read_approved_baseline(repo, EnvironmentTrustProvider(), at=NOW)
+    assert files["graph.yaml"] == approved
+    assert b"not approved graph material" not in b"".join(files.values())
+
+
+@pytest.mark.parametrize("change", ["dirty", "stale"])
+def test_passive_service_observation_keeps_git_evidence_when_test_results_are_invalid(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, change: str
+) -> None:
+    """Stale tests must not make the development observer blind to later code changes."""
+    repo, _trust = _restored(tmp_path, monkeypatch)
+    runtime = load_runtime(repo)
+    service = ControlPlaneService(runtime, origin="http://localhost:8765", clock=lambda: NOW)
+    try:
+        initial = service.observe_development()
+        executed = anyio.run(service.run_reviewed_tests, initial.command_ids[0])
+        assert executed.artifact is not None
+        service.observe_development()
+        (repo / "feature.py").write_text("def enabled():\n    return False\n")
+        if change == "stale":
+            git(repo, "add", "feature.py")
+            git(repo, "commit", "-qm", "invalidate old passing results")
+        observed = service.observe_development()
+        assert observed.current_revision == git(repo, "rev-parse", "HEAD").decode().strip()
+        assert observed.changed_paths == (("feature.py",) if change == "dirty" else ())
+        assert observed.evidence_candidates
+        assert {record.connector_type for record in observed.evidence_candidates} == {
+            "dev_observer"
+        }
+        assert service.observe_development().evidence_candidates == ()
+    finally:
+        service.close()
+        runtime.close()

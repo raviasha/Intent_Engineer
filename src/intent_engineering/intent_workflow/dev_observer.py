@@ -34,6 +34,7 @@ from intent_engineering.intent_workflow.check import (
     evidence_repository_id,
     validate_test_result_artifact,
 )
+from intent_engineering.intent_workflow.immutable_execution import ImmutableExecutionGuard
 from intent_engineering.storage.secure import (
     SecureDirectory,
     SecureFile,
@@ -65,6 +66,7 @@ _GIT_ENVIRONMENT: Mapping[str, str] = {
     "GIT_CONFIG_NOSYSTEM": "1",
     "GIT_TERMINAL_PROMPT": "0",
     "GIT_NO_REPLACE_OBJECTS": "1",
+    "GIT_OPTIONAL_LOCKS": "0",
 }
 _VETTED_INTERPRETERS = frozenset({"/bin/sh", "/usr/bin/python3"})
 # The capability probe must launch through exactly the same interpreter wrapper.
@@ -369,6 +371,10 @@ def _terminate_fixed_process(process: subprocess.Popen[bytes]) -> None:
 
 
 def _run_git_bounded(root: Path, args: tuple[str, ...], *, max_bytes: int) -> str:
+    return _run_git_bytes_bounded(root, args, max_bytes=max_bytes).decode("utf-8")
+
+
+def _run_git_bytes_bounded(root: Path, args: tuple[str, ...], *, max_bytes: int) -> bytes:
     """Run one fixed Git argv with sanitized state, deadline, and streaming cap."""
     if type(args) is not tuple or not args or type(max_bytes) is not int or max_bytes < 1:
         raise ValueError("invalid bounded Git invocation")
@@ -380,6 +386,8 @@ def _run_git_bounded(root: Path, args: tuple[str, ...], *, max_bytes: int) -> st
             "core.fsmonitor=false",
             "-c",
             "core.hooksPath=/dev/null",
+            "-c",
+            f"safe.directory={root}",
             *args,
         ],
         cwd=root,
@@ -424,7 +432,7 @@ def _run_git_bounded(root: Path, args: tuple[str, ...], *, max_bytes: int) -> st
         if remaining <= 0 or process.wait(timeout=remaining) != 0:
             raise ValueError("bounded Git invocation failed")
         succeeded = True
-        return stdout.decode("utf-8")
+        return bytes(stdout)
     finally:
         selector.close()
         if not succeeded and process.poll() is None:
@@ -502,6 +510,7 @@ class DevObserver:
         *,
         repository_id: str,
         principals: frozenset[str],
+        persist_artifacts: bool = True,
     ) -> None:
         self._directory: SecureDirectory | None = None
         try:
@@ -521,6 +530,8 @@ class DevObserver:
             self._git_pin = _pin_git_executable()
             self._require_repository_root(root)
             self._config = config
+            self._immutable_guard: ImmutableExecutionGuard | None = None
+            self._persist_artifacts = persist_artifacts
             self._execution_environment = dict(_FIXED_ENVIRONMENT)
             self._repository_id = repository_id
             self._principals = principals
@@ -548,6 +559,13 @@ class DevObserver:
         """Read HEAD through the same bounded, sanitized Git boundary as execution."""
         self._require_repository_root(self._root)
         return self._current_revision()
+
+    def require_immutable_execution(self) -> None:
+        """Fail closed unless all evidence inputs belong to an immutable image."""
+        if self._directory is None:
+            raise ValueError("closed development observer")
+        self._immutable_guard = ImmutableExecutionGuard(self._directory)
+        self.test_result_binding()
 
     @contextmanager
     def _intent_baseline(self) -> Iterator[str]:
@@ -578,6 +596,8 @@ class DevObserver:
                 )
                 resources.callback(os.close, descriptor)
                 metadata = os.fstat(descriptor)
+                if self._immutable_guard is not None:
+                    self._immutable_guard.require_descriptor(descriptor)
                 if (
                     not stat.S_ISREG(metadata.st_mode)
                     or metadata.st_nlink != 1
@@ -599,8 +619,8 @@ class DevObserver:
                         (relative, hashlib.sha256(content).hexdigest(), _snapshot_token(metadata))
                     )
                 )
-            # Keep intent descriptors open while code is read. Only metadata checks
-            # follow the complete content capture, so no later read can hide drift.
+            # Retained descriptors support local drift detection. Only the separate
+            # kernel-verified immutable image boundary can establish CI atomicity.
             yield "sha256:" + digest.hexdigest()
             for name, expected in ancestors.items():
                 if self._ancestor_metadata(name) != expected:
@@ -759,11 +779,12 @@ class DevObserver:
                 directory.close()
 
     def clean_commit_snapshot(self) -> str:
-        """Verify actual tracked bytes against HEAD and fingerprint their held identities.
+        """Verify tracked bytes against HEAD and produce a local drift fingerprint.
 
         This optional CI boundary does not trust index stat caches or arbitrary ignore rules.
         Only known generated directories and exact reviewed result paths may be untracked.
         Tracked files never receive an output-path exemption.
+        This sequential scan is not atomic; CI separately requires immutable image material.
         """
         if self._directory is None:
             raise ValueError("clean commit snapshot unavailable")
@@ -802,6 +823,8 @@ class DevObserver:
             source = self._directory.read_relative(
                 path, nonblocking=True, max_bytes=MAX_EXECUTABLE_BYTES
             )
+            if self._immutable_guard is not None:
+                self._immutable_guard.require_file(self._directory, path)
             if source.identities[:-1] != tuple(parent_identities):
                 raise ValueError("clean commit snapshot changed")
             total_bytes += len(source.content)
@@ -833,6 +856,11 @@ class DevObserver:
                 )
             )
             tracked_metadata[path] = _snapshot_token(metadata)
+        if any(
+            argv[0] not in tracked_metadata or not tracked_metadata[argv[0]][2] & 0o111
+            for argv in self._commands.values()
+        ):
+            raise ValueError("reviewed test executable is not committed")
         staged = self._git(
             (
                 "diff",
@@ -993,17 +1021,22 @@ class DevObserver:
                     )
                 )
             for relative in self._config.test_result_paths:
-                raw = self._read_result(relative)
-                if raw is None:
+                try:
+                    raw = self._read_result(relative)
+                    if raw is None:
+                        continue
+                    artifact = validate_test_result_artifact(
+                        raw,
+                        repository_id=self._repository_id,
+                        commit_sha=revision,
+                        at=at,
+                        principals=self._principals,
+                        binding=self.test_result_binding(),
+                    )
+                except (OSError, ValueError, UnsafePathError):
+                    # Test evidence has its own rejection boundary. A stale result
+                    # must not suppress independent Git/path observations.
                     continue
-                artifact = validate_test_result_artifact(
-                    raw,
-                    repository_id=self._repository_id,
-                    commit_sha=revision,
-                    at=at,
-                    principals=self._principals,
-                    binding=self.test_result_binding(),
-                )
                 candidates.append(artifact.evidence())
             self._last_revision = revision
             self._last_paths = paths
@@ -1258,7 +1291,11 @@ class DevObserver:
                 os.close(write_descriptor)
 
     def _write_artifact(self, artifact: TestResultArtifact) -> None:
-        if not self._config.test_result_paths or self._directory is None:
+        if (
+            not self._persist_artifacts
+            or not self._config.test_result_paths
+            or self._directory is None
+        ):
             return
         target = self._directory.file(self._config.test_result_paths[0], create_parents=True)
         try:

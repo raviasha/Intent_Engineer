@@ -1905,6 +1905,27 @@ def _install_fresh_state(
         recovery.close()
 
 
+def read_approved_baseline(
+    root: Path, trust_provider: TrustProvider, *, at: datetime
+) -> dict[str, bytes]:
+    """Return only authenticated immutable Git release bytes, without restoring paths.
+
+    This read-only export is the build-material boundary for immutable CI images;
+    local graph/config bytes never become Docker build inputs.
+    """
+    trust = trust_provider.load()
+    if type(trust) is not SharedStateTrust or _origin_repository(root) != trust.repository_id:
+        raise ValueError("approved baseline unavailable")
+    if at.tzinfo is None or at.utcoffset() != timedelta(0):
+        raise ValueError("approved baseline unavailable")
+    reader = _GitRefReader(root)
+    commit = reader.commit()
+    lineage = _verify_release_lineage(reader, commit, trust, at, None)
+    files = _decrypt_release_payload(reader, lineage.tip, trust)
+    _validate_authenticated_state(files, lineage.tip.manifest, trust)
+    return {**files, "cache/shared-state.json": _marker_bytes(lineage.tip.manifest, commit)}
+
+
 class GitSharedStateRestorer:
     """Verify a protected Git ref and atomically install its approved state."""
 
@@ -2040,5 +2061,6 @@ __all__ = [
     "StaticTrustProvider",
     "TrustedSigningKey",
     "build_state_payload",
+    "read_approved_baseline",
     "seal_state_payload",
 ]

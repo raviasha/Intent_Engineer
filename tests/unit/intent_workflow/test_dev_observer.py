@@ -89,9 +89,10 @@ def _clean_observer(repo: Path, **updates: object) -> DevObserver:
         }
     )
     (repo / ".intent/config.yaml").write_text(yaml.safe_dump(config.model_dump(mode="json")))
-    if (repo / "tools/test-runner").exists():
-        _git(repo, "add", "tools/test-runner")
-        _git(repo, "commit", "-qm", "reviewed test command")
+    if not (repo / "tools/test-runner").exists():
+        _runner(repo, "print('reviewed test')\n")
+    _git(repo, "add", "tools/test-runner")
+    _git(repo, "commit", "-qm", "reviewed test command")
     observer = DevObserver(
         repo, config, repository_id=REPOSITORY_ID, principals=frozenset({"local:asha"})
     )
@@ -195,8 +196,9 @@ def test_poll_emits_only_evidence_candidates_for_git_changes_and_is_idempotent(
 
 
 def test_poll_ingests_only_fresh_bound_passing_canonical_result_artifacts(tmp_path: Path) -> None:
-    repo, revision = _repo(tmp_path)
+    repo, _revision = _repo(tmp_path)
     observer = _clean_observer(repo)
+    revision = observer.current_revision()
     binding = observer.test_result_binding()
     artifact = TestResultArtifact(
         repository_id=REPOSITORY_ID,
@@ -224,8 +226,8 @@ def test_poll_rejects_an_oversized_or_wrongly_bound_result_artifact(tmp_path: Pa
     observer = _clean_observer(repo)
     binding = observer.test_result_binding()
     (repo / ".intent/cache/test-results.json").write_bytes(b"x" * (64 * 1024 + 1))
-    with pytest.raises(DevObserverError, match="development observation unavailable"):
-        observer.poll(at=NOW)
+    oversized = observer.poll(at=NOW)
+    assert {record.connector_type for record in oversized.evidence_candidates} == {"dev_observer"}
 
     artifact = TestResultArtifact(
         repository_id=REPOSITORY_ID,
@@ -240,8 +242,7 @@ def test_poll_rejects_an_oversized_or_wrongly_bound_result_artifact(tmp_path: Pa
         reviewed_commands=binding.reviewed_commands,
     )
     (repo / ".intent/cache/test-results.json").write_bytes(artifact.canonical_bytes())
-    with pytest.raises(DevObserverError, match="development observation unavailable"):
-        observer.poll(at=NOW)
+    assert observer.poll(at=NOW).evidence_candidates == ()
 
 
 @pytest.mark.anyio

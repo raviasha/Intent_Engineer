@@ -528,17 +528,21 @@ def _load_readiness_runtime(root: Path) -> ReadinessRuntime:
             project_directory.close()
 
 
-def load_runtime(root: Path) -> Runtime:
+def load_runtime(root: Path, *, assurance_workspace: Path | None = None) -> Runtime:
     """Locate one initialized workspace and assemble only reviewed local adapters."""
     root = Path(os.path.abspath(root))
     try:
         project_directory = SecureDirectory.open(root)
-        workspace_directory = project_directory.subdirectory(".intent")
+        workspace_directory = (
+            project_directory.subdirectory(".intent")
+            if assurance_workspace is None
+            else SecureDirectory.open(assurance_workspace)
+        )
         config_file = workspace_directory.file("config.yaml")
         loaded = yaml.safe_load(config_file.read_bytes().decode("utf-8"))
     except UnsafePathError as error:
         raise ProjectNotInitialized("local project is not initialized") from error
-    workspace = workspace_path(root)
+    workspace = workspace_path(root) if assurance_workspace is None else assurance_workspace
     if not isinstance(loaded, dict):
         raise TypeError("project configuration is invalid")
     config = ProjectConfig.model_validate_json(
@@ -666,16 +670,18 @@ class CheckRuntimeAdapter:
         principal_resolver: PrincipalResolver | None = None,
         mcp_connector_resolver: McpConnectorResolver | None = None,
         shared_state_restorer: SharedStateRestorer | None = None,
+        assurance_workspace: Path | None = None,
     ) -> None:
         self._root = Path(os.path.abspath(root))
         self._runtime: Runtime | None = None
         self._principal_resolver = principal_resolver
         self._mcp_connector_resolver = mcp_connector_resolver
         self._shared_state_restorer = shared_state_restorer
+        self._assurance_workspace = assurance_workspace
 
     def _opened(self) -> Runtime:
         if self._runtime is None:
-            self._runtime = load_runtime(self._root)
+            self._runtime = load_runtime(self._root, assurance_workspace=self._assurance_workspace)
         return self._runtime
 
     @property
@@ -754,6 +760,13 @@ class CheckRuntimeAdapter:
         finally:
             observer.close()
 
+    def require_ci_environment(self) -> None:
+        observer = self._test_observer()
+        try:
+            observer.require_immutable_execution()
+        finally:
+            observer.close()
+
     async def run_reviewed_tests(self, command_id: str, *, at: datetime) -> TestResultArtifact:
         observer = self._test_observer()
         try:
@@ -803,6 +816,12 @@ class CheckRuntimeAdapter:
         )
 
     def validate(self) -> ValidationReport:
+        if self._assurance_workspace is not None:
+            directory = SecureDirectory.open(self._assurance_workspace.parent)
+            try:
+                return validate_project_directory(directory)
+            finally:
+                directory.close()
         return validate_project_directory(self._opened().project_directory)
 
     async def assure(self) -> SyncRunResult:

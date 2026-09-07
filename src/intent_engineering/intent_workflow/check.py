@@ -51,6 +51,7 @@ class CheckReason(StrEnum):
     READINESS_REQUIRED = "readiness_required"
     TEST_RESULTS_REQUIRED = "test_results_required"
     TEST_RESULTS_INVALID = "test_results_invalid"
+    TEST_ENVIRONMENT_UNSUPPORTED = "test_environment_unsupported"
     TEST_RUN_FAILED = "test_run_failed"
     CAPTURE_PARTIAL = "capture_partial"
     CAPTURE_FAILED = "capture_failed"
@@ -317,6 +318,8 @@ class CheckRuntime(Protocol):
 
     def test_result_binding(self) -> TestResultBinding: ...
 
+    def require_ci_environment(self) -> None: ...
+
     async def run_reviewed_tests(self, command_id: str, *, at: datetime) -> TestResultArtifact: ...
 
     async def capture(
@@ -376,8 +379,7 @@ def validate_test_result_artifact(
         or (binding.command_ids and not set(artifact.test_ids).issubset(binding.command_ids))
         or (
             require_all_commands
-            and binding.command_ids
-            and set(artifact.test_ids) != set(binding.command_ids)
+            and (not binding.command_ids or set(artifact.test_ids) != set(binding.command_ids))
         )
     ):
         raise ValueError("invalid test result binding")
@@ -519,6 +521,16 @@ class CheckService:
                     1,
                     readiness=readiness.status,
                 )
+        if request.ci:
+            try:
+                self._runtime.require_ci_environment()
+            except Exception:  # noqa: BLE001 - mutable hosts cannot certify a CI snapshot
+                return self._result(
+                    CheckStatus.FAILED,
+                    CheckReason.TEST_ENVIRONMENT_UNSUPPORTED,
+                    1,
+                    readiness=readiness.status,
+                )
         try:
             capture = await self._runtime.capture(request.sources, artifact)
         except Exception:  # noqa: BLE001 - cancellation remains a BaseException
@@ -603,6 +615,8 @@ class CheckService:
             )
         if artifact is not None:
             try:
+                if request.ci:
+                    self._runtime.require_ci_environment()
                 validate_test_result_artifact(
                     artifact.canonical_bytes(),
                     repository_id=self._runtime.repository_id,

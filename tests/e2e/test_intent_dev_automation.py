@@ -170,7 +170,7 @@ def _clone(
     return target, trust
 
 
-def _check(repo: Path, trust: SharedStateTrust):
+def _check(repo: Path, trust: SharedStateTrust, *, ci: bool = True):
     with patch(
         "intent_engineering.cli.app.CheckService",
         lambda adapter: CheckService(adapter, clock=lambda: NOW),
@@ -181,7 +181,7 @@ def _check(repo: Path, trust: SharedStateTrust):
                 "check",
                 "--project",
                 str(repo),
-                "--ci",
+                *(["--ci"] if ci else []),
                 "--require-review",
                 "--test-results",
                 ".intent-ci/test-results.json",
@@ -229,8 +229,9 @@ def test_fresh_onboarded_clone_first_prompt_and_plugin_disabled_ci_backstop(
     assert artifact["commit_sha"] == original_head.decode().strip()
     assert artifact["status"] == "passed"
     result = _check(repo, trust)
-    assert result.exit_code == 0, (result.stdout, result.stderr, repr(result.exception))
-    assert json.loads(result.stdout)["reason"] == "checks_passed"
+    assert result.exit_code == 1, (result.stdout, result.stderr, repr(result.exception))
+    assert json.loads(result.stdout)["reason"] == "test_environment_unsupported"
+    assert _check(repo, trust, ci=False).exit_code == 0
     assert not (repo / "plugins").exists()
     assert git(repo, "rev-parse", "HEAD") == original_head
 
@@ -672,7 +673,7 @@ def test_clean_python_imports_pass_ci_without_creating_repository_bytecode(
     anyio.run(action.run_tests, repo, NOW)
     action.write_results(repo, NOW)
     assert not (repo / "__pycache__").exists()
-    result = _check(repo, trust)
+    result = _check(repo, trust, ci=False)
     assert result.exit_code == 0, (result.stdout, repr(result.exception))
 
 
@@ -771,7 +772,7 @@ def test_cache_directories_in_explicit_generated_dependency_and_external_scopes_
         (cache / "owned.pyc").write_bytes(b"preserved scope")
     anyio.run(action.run_tests, repo, NOW)
     action.write_results(repo, NOW)
-    assert _check(repo, trust).exit_code == 0
+    assert _check(repo, trust, ci=False).exit_code == 0
     assert all((cache / "owned.pyc").read_bytes() == b"preserved scope" for cache in caches)
 
 

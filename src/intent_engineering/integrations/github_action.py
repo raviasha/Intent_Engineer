@@ -10,7 +10,9 @@ from typing import Annotated
 import anyio
 from pydantic import ConfigDict, Field
 
-from intent_engineering.cli.runtime import CheckRuntimeAdapter, load_runtime
+from intent_engineering.capture.mcp.profile_loader import load_strict_yaml_mapping_bytes
+from intent_engineering.cli.runtime import CheckRuntimeAdapter
+from intent_engineering.core.models import ProjectConfig
 from intent_engineering.core.models._base import StrictModel
 from intent_engineering.intent_workflow.check import (
     SharedStateRestoreStatus,
@@ -45,14 +47,27 @@ def _clear_results(root: Path) -> None:
         directory.close()
 
 
-def _observer(root: Path, adapter: CheckRuntimeAdapter) -> DevObserver:
-    runtime = load_runtime(root)
+def _observer(
+    root: Path, adapter: CheckRuntimeAdapter, *, persist_artifacts: bool = True
+) -> DevObserver:
+    directory = SecureDirectory.open(root)
     try:
+        config = ProjectConfig.model_validate(
+            load_strict_yaml_mapping_bytes(
+                directory.read_relative(
+                    ".intent/config.yaml", nonblocking=True, max_bytes=8 * 1024 * 1024
+                ).content
+            )
+        )
         return DevObserver(
-            root, runtime.config, repository_id=adapter.repository_id, principals=adapter.principals
+            root,
+            config,
+            repository_id=adapter.repository_id,
+            principals=adapter.principals,
+            persist_artifacts=persist_artifacts,
         )
     finally:
-        runtime.close()
+        directory.close()
 
 
 def _require_snapshot(observer: DevObserver, expected: str) -> None:
@@ -81,15 +96,15 @@ def _write(root: Path, path: Path, content: bytes) -> None:
         directory.close()
 
 
-async def run_tests(root: Path, at: datetime) -> None:
+async def run_tests(root: Path, at: datetime, *, assurance_workspace: Path | None = None) -> None:
     """Run every restored, reviewed argv; stage evidence only if every command passed."""
-    adapter = CheckRuntimeAdapter(root)
+    adapter = CheckRuntimeAdapter(root, assurance_workspace=assurance_workspace)
     observer: DevObserver | None = None
     completed_write = False
     try:
         adapter.restore(require_shared=False)
         _clear_results(root)
-        observer = _observer(root, adapter)
+        observer = _observer(root, adapter, persist_artifacts=assurance_workspace is None)
         if not observer.command_ids:
             raise ValueError("reviewed tests failed")
         observer.prepare_clean_commit_execution()
@@ -137,9 +152,9 @@ async def run_tests(root: Path, at: datetime) -> None:
             _clear_results(root)
 
 
-def write_results(root: Path, at: datetime) -> None:
+def write_results(root: Path, at: datetime, *, assurance_workspace: Path | None = None) -> None:
     """Revalidate repository, HEAD, time and ACL before writing canonical CI evidence."""
-    adapter = CheckRuntimeAdapter(root)
+    adapter = CheckRuntimeAdapter(root, assurance_workspace=assurance_workspace)
     observer: DevObserver | None = None
     completed_write = False
     try:

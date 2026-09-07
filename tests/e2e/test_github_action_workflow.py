@@ -87,28 +87,22 @@ def test_required_check_is_independent_ordered_and_fail_closed() -> None:
     assert job["name"] == "Intent Engineering / check"
     assert job["environment"] == "intent-ci"
     assert job["timeout-minutes"] == "20"
-    assert job["runs-on"] == "macos-14"
+    assert job["runs-on"] == "ubuntu-24.04"
     steps = job["steps"]
     assert steps[0]["uses"].startswith("actions/checkout@")
     assert steps[0]["with"] == {"fetch-depth": "0", "persist-credentials": "false"}
     assert steps[1]["uses"].startswith("actions/setup-python@")
-    assert steps[2]["run"].splitlines() == [
-        "python -m pip install '.[dev]'",
-        "python -m venv --system-site-packages .venv",
+    assert steps[2]["run"] == "python -I -m pip install '.[dev]'"
+    assert [step.get("run") for step in steps[3:5]] == [
+        "python -I -m intent_engineering.integrations.github_action restore",
+        "python -I -m intent_engineering.integrations.immutable_ci",
     ]
-    assert [step.get("run") for step in steps[3:7]] == [
-        "python -m intent_engineering.integrations.github_action restore",
-        "python -m intent_engineering.integrations.github_action test",
-        "python -m intent_engineering.integrations.github_action results",
-        "intent check --ci --require-review --test-results .intent-ci/test-results.json",
-    ]
-    for index in (3, 6):
+    for index in (3, 4):
         assert steps[index]["env"] == {
             "INTENT_CI_SHARED_STATE_TRUST": "${{ secrets.INTENT_CI_SHARED_STATE_TRUST }}",
         }
-    assert "env" not in steps[4] and "env" not in steps[5]
-    assert steps[7]["uses"].startswith("actions/upload-artifact@")
-    assert steps[7]["with"] == {
+    assert steps[5]["uses"].startswith("actions/upload-artifact@")
+    assert steps[5]["with"] == {
         "name": "intent-test-results",
         "path": ".intent-ci/test-results.json",
         "retention-days": "7",

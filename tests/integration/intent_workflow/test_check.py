@@ -105,6 +105,7 @@ class _Runtime:
     validation_result: ValidationReport = field(default_factory=_validation)
     assurance_result: SyncRunResult = field(default_factory=_sync)
     artifact: bytes | None = None
+    immutable: bool = True
     revision: str = REVISION
     cases: tuple[ReconciliationCase, ...] = ()
     captured_artifact: TestResultArtifact | None = None
@@ -149,6 +150,10 @@ class _Runtime:
             command_ids=("test:export",),
         )
 
+    def require_ci_environment(self) -> None:
+        if not self.immutable:
+            raise ValueError("immutable execution unavailable")
+
     async def capture(
         self,
         sources: tuple[str, ...],
@@ -175,6 +180,17 @@ class _Runtime:
         self.events.append("render")
         assert cases == self.cases
         return "# bounded drift\n"
+
+
+@pytest.mark.anyio
+async def test_ci_refuses_passing_evidence_without_an_immutable_execution_boundary() -> None:
+    runtime = _Runtime(artifact=_artifact(), immutable=False)
+    result = await CheckService(runtime, clock=lambda: NOW).run(
+        CheckRequest(ci=True, test_results=Path("results.json"))
+    )
+    assert result.exit_code == 1
+    assert result.reason.value == "test_environment_unsupported"
+    assert "capture" not in runtime.events
 
 
 @pytest.mark.anyio

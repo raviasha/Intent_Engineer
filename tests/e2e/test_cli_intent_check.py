@@ -364,13 +364,13 @@ def test_ci_check_restores_the_signed_approved_ref_before_readiness_and_capture(
         env={TRUST_ENVIRONMENT_VARIABLE: trust_environment(trust)},
     )
 
-    assert result.exit_code == 0, (result.stdout, result.stderr, repr(result.exception))
+    assert result.exit_code == 1, (result.stdout, result.stderr, repr(result.exception))
     assert json.loads(result.stdout) | {} == {
         **json.loads(result.stdout),
-        "status": "passed",
-        "reason": "checks_passed",
+        "status": "failed",
+        "reason": "test_results_invalid",
         "readiness_status": "ready",
-        "exit_code": 0,
+        "exit_code": 1,
     }
     assert (repo / ".intent/cache/shared-state.json").is_file()
 
