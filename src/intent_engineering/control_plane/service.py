@@ -12,7 +12,10 @@ from datetime import UTC, datetime, timedelta
 from pathlib import PurePosixPath
 from typing import cast
 
-from intent_engineering.capture.mcp.profile_loader import load_connector_config_bytes
+from intent_engineering.capture.mcp.profile_loader import (
+    load_connector_config_bytes,
+    load_strict_yaml_mapping_bytes,
+)
 from intent_engineering.cli.intent_workflow import (
     confirm_proposal,
     proposal_payload,
@@ -50,6 +53,11 @@ from intent_engineering.intent_workflow.clarification import _digest as clarific
 from intent_engineering.intent_workflow.conversation import (
     ConversationCapture,
     validate_conversation_record,
+)
+from intent_engineering.intent_workflow.dev_observer import (
+    DevObserver,
+    ObservationResult,
+    TestRunResult,
 )
 from intent_engineering.intent_workflow.models import ClarificationIntentProposal, ProposalKind
 from intent_engineering.intent_workflow.onboarding import (
@@ -221,6 +229,7 @@ class ControlPlaneService:
         self._policy_file = self._approvals_directory.file("policy.yaml")
         self._plans_file = self._approvals_directory.file("plans.jsonl")
         self._pending_answers: dict[str, _PendingAnswer] = {}
+        self._dev_observer: DevObserver | None = None
         self._webauthn = WebAuthnService(
             project_id=runtime.config.project_id,
             repository_id=self.repository_id,
@@ -242,6 +251,40 @@ class ControlPlaneService:
         if type(value) is not bytes or len(value) != 32:
             raise ValueError("invalid control plane challenge")
         return f"challenge:{value.hex()}"
+
+    def _development_observer(self) -> DevObserver:
+        loaded = ProjectConfig.model_validate(
+            load_strict_yaml_mapping_bytes(
+                self._config_file.read_bytes_nonblocking(max_bytes=_MAX_AUTHORITY_FILE_BYTES)
+            )
+        )
+        if loaded != self._runtime.config:
+            raise ValueError("control plane configuration changed")
+        if self._dev_observer is None:
+            self._dev_observer = DevObserver(
+                self._runtime.root,
+                self._runtime.config,
+                repository_id=self.repository_id,
+                principals=frozenset({self._runtime.config.local_actor}),
+            )
+        return self._dev_observer
+
+    def observe_development(self) -> ObservationResult:
+        """Return passive evidence candidates without graph or completion mutation."""
+        try:
+            return self._development_observer().poll(at=self._now())
+        except Exception:  # noqa: BLE001 - fixed opaque observer boundary
+            raise ControlPlaneError() from None
+
+    async def run_reviewed_tests(self, command_id: str) -> TestRunResult:
+        """Run one configured test action without acquiring human authority."""
+        try:
+            return await self._development_observer().run_reviewed_tests(
+                command_id,
+                at=self._now(),
+            )
+        except Exception:  # noqa: BLE001 - cancellation remains a BaseException
+            raise ControlPlaneError() from None
 
     def _purge_pending_answers(self, now: datetime) -> None:
         expired = tuple(
@@ -1495,6 +1538,9 @@ class ControlPlaneService:
 
     def close(self) -> None:
         """Release descriptors owned by this service while leaving Runtime ownership intact."""
+        if self._dev_observer is not None:
+            self._dev_observer.close()
+            self._dev_observer = None
         self._config_file.close()
         self._policy_file.close()
         self._plans_file.close()

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from datetime import datetime
+from pathlib import PurePosixPath
 from types import MappingProxyType
 
 from pydantic import ConfigDict, Field, field_serializer, field_validator
@@ -22,6 +23,45 @@ _DEFAULT_CONTEXT_LIMITS = {
     "open_reconciliation_cases": 10,
     "evidence_refs": 20,
 }
+
+MAX_TEST_COMMANDS = 16
+MAX_TEST_COMMAND_ARGUMENTS = 128
+MAX_TEST_CONFIGURATION_ITEM_BYTES = 4096
+MAX_TEST_COMMAND_BYTES = 16 * 1024
+MAX_TEST_RESULT_PATHS = 16
+_SHELL_METACHARACTERS = frozenset(";&|`$<>*?{}[]()!\\")
+_DEVICE_NAMES = frozenset(
+    {
+        "con",
+        "prn",
+        "aux",
+        "nul",
+        *(f"com{number}" for number in range(1, 10)),
+        *(f"lpt{number}" for number in range(1, 10)),
+    }
+)
+
+
+def _safe_relative_path(value: str) -> PurePosixPath:
+    if (
+        type(value) is not str
+        or not value
+        or value != value.strip()
+        or len(value.encode("utf-8")) > MAX_TEST_CONFIGURATION_ITEM_BYTES
+        or "\x00" in value
+        or "\\" in value
+    ):
+        raise ValueError("invalid reviewed test path")
+    path = PurePosixPath(value)
+    if (
+        path.is_absolute()
+        or not path.parts
+        or any(part in {"", ".", ".."} for part in path.parts)
+        or path.parts[0].casefold() == "dev"
+        or any(part.split(".", 1)[0].casefold() in _DEVICE_NAMES for part in path.parts)
+    ):
+        raise ValueError("invalid reviewed test path")
+    return path
 
 
 class SyncCheckpoint(StrictModel):
@@ -56,6 +96,8 @@ class ProjectConfig(StrictModel):
     auto_apply_semantic: bool = False
     source_roles: tuple[SourceRoleAssignment, ...] = ()
     context_limits: Mapping[str, int] = Field(default_factory=lambda: dict(_DEFAULT_CONTEXT_LIMITS))
+    test_commands: tuple[tuple[str, ...], ...] = ()
+    test_result_paths: tuple[str, ...] = ()
 
     @field_validator("source_roles")
     @classmethod
@@ -82,3 +124,42 @@ class ProjectConfig(StrictModel):
     @field_serializer("context_limits")
     def serialize_context_limits(self, context_limits: Mapping[str, int]) -> dict[str, int]:
         return dict(context_limits)
+
+    @field_validator("test_commands")
+    @classmethod
+    def validate_test_commands(
+        cls, commands: tuple[tuple[str, ...], ...]
+    ) -> tuple[tuple[str, ...], ...]:
+        if len(commands) > MAX_TEST_COMMANDS or len(commands) != len(set(commands)):
+            raise ValueError("invalid reviewed test commands")
+        total_bytes = 0
+        for command in commands:
+            if (
+                type(command) is not tuple
+                or not command
+                or len(command) > MAX_TEST_COMMAND_ARGUMENTS
+            ):
+                raise ValueError("invalid reviewed test command")
+            for argument in command:
+                if (
+                    type(argument) is not str
+                    or not argument
+                    or len(argument.encode("utf-8")) > MAX_TEST_CONFIGURATION_ITEM_BYTES
+                    or any(character in argument for character in ("\x00", "\r", "\n"))
+                    or any(character in argument for character in _SHELL_METACHARACTERS)
+                ):
+                    raise ValueError("invalid reviewed test command")
+                total_bytes += len(argument.encode("utf-8")) + 1
+            _safe_relative_path(command[0])
+        if total_bytes > MAX_TEST_COMMAND_BYTES:
+            raise ValueError("invalid reviewed test commands")
+        return commands
+
+    @field_validator("test_result_paths")
+    @classmethod
+    def validate_test_result_paths(cls, paths: tuple[str, ...]) -> tuple[str, ...]:
+        if len(paths) > MAX_TEST_RESULT_PATHS or len(paths) != len(set(paths)):
+            raise ValueError("invalid reviewed test result paths")
+        for path in paths:
+            _safe_relative_path(path)
+        return paths

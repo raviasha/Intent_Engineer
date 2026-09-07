@@ -286,6 +286,42 @@ class CheckRuntime(Protocol):
     def render_drift(self, cases: tuple[ReconciliationCase, ...]) -> str: ...
 
 
+def validate_test_result_artifact(
+    raw: bytes,
+    *,
+    repository_id: str,
+    commit_sha: str,
+    at: datetime,
+    principals: frozenset[str],
+) -> TestResultArtifact:
+    """Parse and bind one artifact using the canonical check ingestion contract."""
+    if type(raw) is not bytes or not raw or len(raw) > MAX_TEST_RESULT_BYTES:
+        raise ValueError("invalid test result artifact")
+    loads_strict_object(raw.decode("utf-8"))
+    artifact = TestResultArtifact.model_validate_json(raw)
+    if (
+        type(repository_id) is not str
+        or type(commit_sha) is not str
+        or type(at) is not datetime
+        or at.tzinfo is None
+        or at.utcoffset() != timedelta(0)
+        or type(principals) is not frozenset
+        or any(type(principal) is not str or not principal for principal in principals)
+    ):
+        raise ValueError("invalid test result binding")
+    now = at.astimezone(UTC)
+    if (
+        artifact.repository_id != repository_id
+        or artifact.commit_sha != commit_sha
+        or artifact.status != "passed"
+        or artifact.observed_at > now
+        or now - artifact.observed_at > MAX_TEST_RESULT_AGE
+        or frozenset(artifact.acl).isdisjoint(principals)
+    ):
+        raise ValueError("invalid test result binding")
+    return artifact
+
+
 class CheckService:
     """Compose existing deterministic services without acquiring human authority."""
 
@@ -325,23 +361,14 @@ class CheckService:
 
     def _parse_test_result(self, path: Path) -> TestResultArtifact:
         raw = self._runtime.read_test_results(path)
-        if type(raw) is not bytes or not raw or len(raw) > MAX_TEST_RESULT_BYTES:
-            raise ValueError("invalid test result artifact")
-        loads_strict_object(raw.decode("utf-8"))
-        artifact = TestResultArtifact.model_validate_json(raw)
         now = self._clock()
-        if now.tzinfo is None or now.utcoffset() != timedelta(0):
-            raise ValueError("invalid check clock")
-        if (
-            artifact.repository_id != self._runtime.repository_id
-            or artifact.commit_sha != self._runtime.current_revision()
-            or artifact.status != "passed"
-            or artifact.observed_at > now
-            or now - artifact.observed_at > MAX_TEST_RESULT_AGE
-            or frozenset(artifact.acl).isdisjoint(self._runtime.principals)
-        ):
-            raise ValueError("invalid test result binding")
-        return artifact
+        return validate_test_result_artifact(
+            raw,
+            repository_id=self._runtime.repository_id,
+            commit_sha=self._runtime.current_revision(),
+            at=now,
+            principals=self._runtime.principals,
+        )
 
     async def run(self, request: CheckRequest) -> CheckResult:
         """Run ordered bounded checks and return one fixed machine result."""
@@ -512,4 +539,5 @@ __all__ = [
     "SharedStateRestoreStatus",
     "SharedStateRestorer",
     "TestResultArtifact",
+    "validate_test_result_artifact",
 ]
