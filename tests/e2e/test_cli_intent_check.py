@@ -191,6 +191,48 @@ def test_ci_check_never_initializes_an_unonboarded_repository(tmp_path: Path) ->
     assert not (repo / ".intent").exists()
 
 
+def test_ci_check_rejects_a_local_only_manufactured_baseline(tmp_path: Path) -> None:
+    """Catches local state satisfying CI without a verified approved shared baseline."""
+    repo = init_git_repo(tmp_path)
+    _ready(repo)
+    result_path = repo / "test-results.json"
+    _write_result(repo, result_path)
+    workspace = repo / ".intent"
+    before = {
+        str(path.relative_to(workspace)): path.read_bytes()
+        for path in sorted(workspace.rglob("*"))
+        if path.is_file() and not path.is_symlink()
+    }
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "check",
+            "--project",
+            str(repo),
+            "--ci",
+            "--test-results",
+            "test-results.json",
+            "--format",
+            "json",
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert json.loads(result.stdout) | {} == {
+        **json.loads(result.stdout),
+        "status": "failed",
+        "reason": "readiness_required",
+        "readiness_status": "shared_state_unavailable",
+        "exit_code": 1,
+    }
+    assert {
+        str(path.relative_to(workspace)): path.read_bytes()
+        for path in sorted(workspace.rglob("*"))
+        if path.is_file() and not path.is_symlink()
+    } == before
+
+
 def test_check_rejects_an_unknown_source_with_one_fixed_json_failure(tmp_path: Path) -> None:
     """Catches connector selection errors escaping the strict check result boundary."""
     repo = init_git_repo(tmp_path)
@@ -224,7 +266,6 @@ def test_check_ingests_a_bound_test_result_once_and_replay_is_a_byte_noop(
         "check",
         "--project",
         str(repo),
-        "--ci",
         "--sources",
         "markdown,git",
         "--test-results",

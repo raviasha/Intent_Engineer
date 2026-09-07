@@ -20,6 +20,8 @@ from intent_engineering.intent_workflow.check import (
     CheckRequest,
     CheckService,
     CheckStatus,
+    SharedStateRestoreResult,
+    SharedStateRestoreStatus,
     TestResultArtifact,
 )
 from intent_engineering.intent_workflow.readiness import (
@@ -27,6 +29,8 @@ from intent_engineering.intent_workflow.readiness import (
     EnsureStatus,
     ReadinessTarget,
 )
+from intent_engineering.storage.secure import SecureDirectory
+from intent_engineering.storage.transaction import LocalTransactionCoordinator
 from intent_engineering.sync.models import SyncRunResult, SyncRunStatus
 from intent_engineering.validation.service import ValidationReport
 
@@ -100,6 +104,15 @@ class _Runtime:
     revision: str = REVISION
     cases: tuple[ReconciliationCase, ...] = ()
     captured_artifact: TestResultArtifact | None = None
+    restore_result: SharedStateRestoreResult = field(
+        default_factory=lambda: SharedStateRestoreResult(
+            status=SharedStateRestoreStatus.VERIFIED,
+        )
+    )
+
+    def restore(self, *, require_shared: bool) -> SharedStateRestoreResult:
+        self.events.append("restore:shared" if require_shared else "restore:local")
+        return self.restore_result
 
     @property
     def repository_id(self) -> str:
@@ -161,6 +174,7 @@ async def test_check_runs_each_existing_boundary_in_order_and_returns_a_stable_p
     )
 
     assert runtime.events == [
+        "restore:local",
         "readiness",
         "test-result-read",
         "revision",
@@ -182,13 +196,36 @@ async def test_check_runs_each_existing_boundary_in_order_and_returns_a_stable_p
 
 
 @pytest.mark.anyio
+async def test_verified_ci_restore_precedes_readiness_capture_and_validation() -> None:
+    """Catches CI consuming local state before the approved baseline is restored."""
+    runtime = _Runtime(artifact=_artifact())
+
+    result = await CheckService(runtime, clock=lambda: NOW).run(
+        CheckRequest(ci=True, test_results=Path("results.json"))
+    )
+
+    assert result.exit_code == 0
+    assert runtime.events == [
+        "restore:shared",
+        "readiness",
+        "test-result-read",
+        "revision",
+        "capture",
+        "validation",
+        "assurance",
+        "cases",
+        "render",
+    ]
+
+
+@pytest.mark.anyio
 async def test_readiness_failure_stops_before_opening_mutating_runtime_boundaries() -> None:
     """Catches CI or local check initializing/capturing when readiness rejects the baseline."""
     runtime = _Runtime(readiness=_readiness(EnsureStatus.ONBOARDING_REQUIRED))
 
     result = await CheckService(runtime, clock=lambda: NOW).run(CheckRequest(ci=True))
 
-    assert runtime.events == ["readiness"]
+    assert runtime.events == ["restore:shared", "readiness"]
     assert (result.status, result.reason, result.exit_code) == (
         CheckStatus.FAILED,
         CheckReason.READINESS_REQUIRED,
@@ -231,7 +268,7 @@ async def test_invalid_canonical_state_stops_before_assurance() -> None:
 
     result = await CheckService(runtime, clock=lambda: NOW).run(CheckRequest())
 
-    assert runtime.events == ["readiness", "capture", "validation"]
+    assert runtime.events == ["restore:local", "readiness", "capture", "validation"]
     assert (result.reason, result.exit_code) == (CheckReason.VALIDATION_FAILED, 1)
 
 
@@ -258,7 +295,7 @@ async def test_ci_requires_an_explicit_passing_test_result_artifact() -> None:
 
     result = await CheckService(runtime, clock=lambda: NOW).run(CheckRequest(ci=True))
 
-    assert runtime.events == ["readiness"]
+    assert runtime.events == ["restore:shared", "readiness"]
     assert (result.reason, result.exit_code) == (CheckReason.TEST_RESULTS_REQUIRED, 1)
 
 
@@ -339,7 +376,117 @@ async def test_cancellation_is_preserved_without_rendering_a_false_result() -> N
     with pytest.raises(asyncio.CancelledError):
         await CheckService(runtime, clock=lambda: NOW).run(CheckRequest())
 
-    assert runtime.events == ["readiness"]
+    assert runtime.events == ["restore:local", "readiness"]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("restore_status", "readiness_status"),
+    [
+        (
+            SharedStateRestoreStatus.UNAVAILABLE,
+            EnsureStatus.SHARED_STATE_UNAVAILABLE,
+        ),
+        (SharedStateRestoreStatus.INVALID, EnsureStatus.SHARED_STATE_INVALID),
+        (SharedStateRestoreStatus.STALE, EnsureStatus.OFFLINE_STALE),
+        (SharedStateRestoreStatus.UPGRADE_REQUIRED, EnsureStatus.UPGRADE_REQUIRED),
+    ],
+)
+async def test_ci_shared_state_failure_stops_before_local_readiness(
+    restore_status: SharedStateRestoreStatus,
+    readiness_status: EnsureStatus,
+) -> None:
+    """Catches unavailable or untrusted shared state falling through to local readiness."""
+    runtime = _Runtime(
+        artifact=_artifact(),
+        restore_result=SharedStateRestoreResult(status=restore_status),
+    )
+
+    result = await CheckService(runtime, clock=lambda: NOW).run(
+        CheckRequest(ci=True, test_results=Path("results.json"))
+    )
+
+    assert runtime.events == ["restore:shared"]
+    assert (result.status, result.reason, result.exit_code) == (
+        CheckStatus.FAILED,
+        CheckReason.READINESS_REQUIRED,
+        1,
+    )
+    assert result.readiness_status is readiness_status
+
+
+@pytest.mark.anyio
+async def test_shared_state_restore_cancellation_propagates_before_readiness() -> None:
+    """Catches restore cancellation being reported as an ordinary CI failure."""
+    runtime = _Runtime()
+
+    def cancelled(*, require_shared: bool) -> SharedStateRestoreResult:
+        assert require_shared
+        raise asyncio.CancelledError
+
+    runtime.restore = cancelled  # type: ignore[method-assign]
+
+    with pytest.raises(asyncio.CancelledError):
+        await CheckService(runtime, clock=lambda: NOW).run(
+            CheckRequest(ci=True, test_results=Path("results.json"))
+        )
+
+
+@pytest.mark.anyio
+async def test_malformed_restore_result_is_a_fixed_readiness_failure() -> None:
+    """Catches a broken restore adapter escaping the strict check result boundary."""
+    runtime = _Runtime()
+    runtime.restore = lambda *, require_shared: object()  # type: ignore[method-assign,return-value]
+
+    result = await CheckService(runtime, clock=lambda: NOW).run(CheckRequest())
+
+    assert (result.status, result.reason, result.exit_code) == (
+        CheckStatus.FAILED,
+        CheckReason.READINESS_REQUIRED,
+        1,
+    )
+    assert runtime.events == []
+
+
+def test_local_restore_recovers_a_prepared_transaction_before_readiness(tmp_path: Path) -> None:
+    """Catches the restore boundary reading a torn graph before local recovery."""
+    project = tmp_path / "project"
+    project.mkdir()
+    initialize_project(project)
+    workspace = SecureDirectory.open(project / ".intent")
+
+    def crash(stage: str) -> None:
+        if stage == "target:graph":
+            raise SystemExit
+
+    coordinator = LocalTransactionCoordinator(
+        workspace.file("history/.local-transaction.json"),
+        {
+            "graph": workspace.file("graph.yaml"),
+            "history": workspace.file("history/changesets.jsonl"),
+            "cases": workspace.file("reconciliation/cases.jsonl"),
+        },
+        fault_hook=crash,
+    )
+    try:
+        with pytest.raises(SystemExit), coordinator.transaction() as transaction:
+            transaction.write("graph", b"torn: [")
+    finally:
+        coordinator.close()
+        workspace.close()
+
+    journal = project / ".intent/history/.local-transaction.json"
+    assert journal.exists()
+    adapter = CheckRuntimeAdapter(project)
+    try:
+        restored = adapter.restore(require_shared=False)
+        readiness = adapter.ensure()
+    finally:
+        adapter.close()
+
+    assert restored.status is SharedStateRestoreStatus.NOT_REQUIRED
+    assert readiness.status is EnsureStatus.ONBOARDING_REQUIRED
+    assert not journal.exists()
 
 
 @pytest.mark.anyio

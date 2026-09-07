@@ -53,8 +53,32 @@ class CheckReason(StrEnum):
     OPERATION_FAILED = "operation_failed"
 
 
+class SharedStateRestoreStatus(StrEnum):
+    """Bounded outcomes from an approved shared-baseline restore boundary."""
+
+    VERIFIED = "verified"
+    NOT_REQUIRED = "not_required"
+    UNAVAILABLE = "unavailable"
+    INVALID = "invalid"
+    STALE = "stale"
+    UPGRADE_REQUIRED = "upgrade_required"
+
+
 class _CheckModel(StrictModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+
+class SharedStateRestoreResult(_CheckModel):
+    """One secret-free result from verifying and restoring an approved baseline."""
+
+    schema_version: Literal[1] = 1
+    status: SharedStateRestoreStatus
+
+
+class SharedStateRestorer(Protocol):
+    """Future transport boundary; implementations must verify before restoring."""
+
+    def verify_and_restore_approved_baseline(self, root: Path) -> SharedStateRestoreResult: ...
 
 
 def _identifier(value: str) -> str:
@@ -239,6 +263,8 @@ class CheckRuntime(Protocol):
     @property
     def principals(self) -> frozenset[str]: ...
 
+    def restore(self, *, require_shared: bool) -> SharedStateRestoreResult: ...
+
     def ensure(self) -> EnsureResult: ...
 
     def read_test_results(self, path: Path) -> bytes: ...
@@ -324,6 +350,27 @@ class CheckService:
         readiness: EnsureResult | None = None
         artifact: TestResultArtifact | None = None
         evidence_id: str | None = None
+        try:
+            restored = self._runtime.restore(require_shared=request.ci)
+            if type(restored) is not SharedStateRestoreResult:
+                raise ValueError("invalid shared-state restore result")
+        except Exception:  # noqa: BLE001 - cancellation remains a BaseException
+            return self._result(CheckStatus.FAILED, CheckReason.READINESS_REQUIRED, 1)
+        failure_status = {
+            SharedStateRestoreStatus.UNAVAILABLE: EnsureStatus.SHARED_STATE_UNAVAILABLE,
+            SharedStateRestoreStatus.INVALID: EnsureStatus.SHARED_STATE_INVALID,
+            SharedStateRestoreStatus.STALE: EnsureStatus.OFFLINE_STALE,
+            SharedStateRestoreStatus.UPGRADE_REQUIRED: EnsureStatus.UPGRADE_REQUIRED,
+        }.get(restored.status)
+        if request.ci and restored.status is SharedStateRestoreStatus.NOT_REQUIRED:
+            failure_status = EnsureStatus.SHARED_STATE_UNAVAILABLE
+        if failure_status is not None:
+            return self._result(
+                CheckStatus.FAILED,
+                CheckReason.READINESS_REQUIRED,
+                1,
+                readiness=failure_status,
+            )
         try:
             readiness = self._runtime.ensure()
         except Exception:  # noqa: BLE001 - fixed readiness failure boundary
@@ -461,5 +508,8 @@ __all__ = [
     "CheckRuntime",
     "CheckService",
     "CheckStatus",
+    "SharedStateRestoreResult",
+    "SharedStateRestoreStatus",
+    "SharedStateRestorer",
     "TestResultArtifact",
 ]

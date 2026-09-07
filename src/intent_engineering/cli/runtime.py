@@ -45,7 +45,13 @@ from intent_engineering.core.policy.access import refs_allowed
 from intent_engineering.core.policy.project import ProjectNotInitialized, workspace_path
 from intent_engineering.extract.deterministic import DeterministicReasoner
 from intent_engineering.intent_workflow.assurance import AssuranceService
-from intent_engineering.intent_workflow.check import MAX_TEST_RESULT_BYTES, TestResultArtifact
+from intent_engineering.intent_workflow.check import (
+    MAX_TEST_RESULT_BYTES,
+    SharedStateRestorer,
+    SharedStateRestoreResult,
+    SharedStateRestoreStatus,
+    TestResultArtifact,
+)
 from intent_engineering.intent_workflow.models import (
     ClarificationEvent,
     IntentProposal,
@@ -525,11 +531,13 @@ class CheckRuntimeAdapter:
         *,
         principal_resolver: PrincipalResolver | None = None,
         mcp_connector_resolver: McpConnectorResolver | None = None,
+        shared_state_restorer: SharedStateRestorer | None = None,
     ) -> None:
         self._root = Path(os.path.abspath(root))
         self._runtime: Runtime | None = None
         self._principal_resolver = principal_resolver
         self._mcp_connector_resolver = mcp_connector_resolver
+        self._shared_state_restorer = shared_state_restorer
 
     def _opened(self) -> Runtime:
         if self._runtime is None:
@@ -551,6 +559,24 @@ class CheckRuntimeAdapter:
         ):
             raise ValueError("check principals are unavailable")
         return resolved
+
+    def restore(self, *, require_shared: bool) -> SharedStateRestoreResult:
+        if require_shared:
+            if self._shared_state_restorer is None:
+                return SharedStateRestoreResult(status=SharedStateRestoreStatus.UNAVAILABLE)
+            result = self._shared_state_restorer.verify_and_restore_approved_baseline(self._root)
+            if type(result) is not SharedStateRestoreResult:
+                return SharedStateRestoreResult(status=SharedStateRestoreStatus.INVALID)
+            if result.status is not SharedStateRestoreStatus.VERIFIED:
+                return result
+        self._opened()
+        return SharedStateRestoreResult(
+            status=(
+                SharedStateRestoreStatus.VERIFIED
+                if require_shared
+                else SharedStateRestoreStatus.NOT_REQUIRED
+            )
+        )
 
     def ensure(self) -> EnsureResult:
         readiness = load_readiness_runtime(self._root)
