@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import mmap
 import os
+import re
 import signal
 import stat
 import subprocess
@@ -20,7 +21,15 @@ from jsonschema import Draft7Validator
 from intent_engineering.cli.runtime import load_runtime
 from intent_engineering.core.models import Graph, Node, NodeType
 from intent_engineering.core.policy.project import initialize_project
-from intent_engineering.integrations.agent_host.advisory import codex_conversation_ref
+from intent_engineering.integrations.agent_host.advisory import (
+    codex_conversation_ref,
+    readiness_context,
+)
+from intent_engineering.intent_workflow.readiness import (
+    EnsureResult,
+    EnsureStatus,
+    ReadinessTarget,
+)
 
 REPO_ROOT = Path(__file__).parents[3]
 PLUGIN_ROOT = REPO_ROOT / "plugins" / "intent-advisor"
@@ -668,3 +677,48 @@ def test_skill_routes_clarifications_and_states_advisory_mcp_failure_boundary() 
     assert "capability token" in skill
     assert "advisory" in skill.casefold()
     assert "independently authenticated non-MCP local human" in skill
+
+
+def test_skill_human_attention_guidance_defers_to_the_route_selected_view() -> None:
+    """The skill must not replace a bounded readiness route with a fixed destination."""
+    skill = (PLUGIN_ROOT / "skills" / "intent-advisor" / "SKILL.md").read_text(encoding="utf-8")
+    start = skill.index("- For `action=human_attention_required`")
+    end = skill.index("\n- For `action=", start + 1)
+    guidance = skill[start:end]
+    results = (
+        EnsureResult(
+            status=EnsureStatus.HUMAN_ATTENTION_REQUIRED,
+            attention_route=ReadinessTarget.TEAM_STATE,
+            graph_version=7,
+            pending_proposal_ids=(),
+            open_case_ids=("case:private",),
+        ),
+        EnsureResult(
+            status=EnsureStatus.HUMAN_ATTENTION_REQUIRED,
+            attention_route=ReadinessTarget.PROPOSAL,
+            graph_version=7,
+            pending_proposal_ids=("proposal:private",),
+            open_case_ids=(),
+        ),
+    )
+    contexts = tuple(readiness_context(result) for result in results)
+    route_views = {
+        match.group("view")
+        for context in contexts
+        if (match := re.search(r"local (?P<view>.+?) view", context)) is not None
+    }
+
+    assert route_views == {"Proposal review", "Team state"}
+    narrowed_views = {
+        view
+        for view in {"Inbox", *route_views}
+        if f"local {view}".casefold() in guidance.casefold()
+    }
+    assert narrowed_views == set(), (
+        "human-attention skill guidance must not override the route-selected local view"
+    )
+    guidance_words = set(re.findall(r"[a-z]+", guidance.casefold()))
+    assert {"exact", "bounded", "local", "view", "route"} <= guidance_words
+    assert {"later", "prompt", "durable", "state"} <= guidance_words
+    assert all("case:private" not in context for context in contexts)
+    assert all("proposal:private" not in context for context in contexts)

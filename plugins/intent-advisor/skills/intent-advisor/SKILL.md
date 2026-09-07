@@ -30,8 +30,8 @@ request, display, persist, or infer a capability token. Do not weaken or work ar
   Use exactly the established public classifications: `no_semantic_impact`, `aligned`,
   `new_or_ambiguous`, and `conflicting`.
 - For `action=human_attention_required`, do not capture, classify, implement, or resolve the work
-  automatically. Direct the developer to complete the indicated local Inbox review, then wait for
-  a later prompt after that human workflow has changed the durable state.
+  automatically. Direct the developer to complete the exact bounded local view named by the route,
+  then wait for a later prompt after that human workflow has changed the durable state.
 - For `action=human_confirmation_required`, do not submit the prompt as an answer or approval over
   MCP. Explain that the hook cannot authenticate a local human and leave the clarification pending.
   An independently authenticated non-MCP local human integration must record the answer before the
