@@ -425,18 +425,11 @@ def test_ordinary_dev_replaces_automatic_owner_and_opens_with_ephemeral_bootstra
 ) -> None:
     project = _project(tmp_path)
     initialize_project(project)
-    owner = subprocess.Popen(
-        _command(
-            project,
-            "--no-open",
-            "--offline",
-            "--automatic",
-        ),
-        env=_environment(),
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+    assert dev_cli._start_or_reuse_background_service(
+        project,
+        dev_cli.SharedStateRestoreStatus.NOT_REQUIRED,
     )
+    automatic_pid = 0
     opened: list[str] = []
     monkeypatch.setattr(
         dev_cli.webbrowser,
@@ -511,7 +504,10 @@ def test_ordinary_dev_replaces_automatic_owner_and_opens_with_ephemeral_bootstra
 
     monkeypatch.setattr(dev_cli, "_wait_for_exit", exercise_authenticated_browser)
     try:
-        automatic = ControlPlaneProcessMetadata.model_validate(_wait_for_metadata(project, owner))
+        automatic = ControlPlaneProcessMetadata.model_validate(
+            json.loads((project / ".intent/cache/control-plane.json").read_bytes())
+        )
+        automatic_pid = automatic.pid
 
         result = CliRunner().invoke(app, ["dev", "--project", str(project)])
 
@@ -525,9 +521,18 @@ def test_ordinary_dev_replaces_automatic_owner_and_opens_with_ephemeral_bootstra
         # This project has no reviewed command, so behavior is unavailable only
         # after the authenticated write boundary accepts the ephemeral token.
         assert authenticated_results == [(503, "http_error")]
-        owner_stdout, owner_stderr = owner.communicate(timeout=10)
-        assert owner_stdout == f"intent dev: ready at {automatic.origin}\n"
-        assert owner_stderr == ""
+        deadline = time.monotonic() + 3
+        exited = False
+        while time.monotonic() < deadline:
+            try:
+                waited, _status = os.waitpid(automatic.pid, os.WNOHANG)
+            except ChildProcessError:
+                waited = automatic.pid
+            if waited == automatic.pid:
+                exited = True
+                break
+            time.sleep(0.02)
+        assert exited is True
         persisted = b"".join(
             path.read_bytes()
             for path in (project / ".intent").rglob("*")
@@ -535,8 +540,15 @@ def test_ordinary_dev_replaces_automatic_owner_and_opens_with_ephemeral_bootstra
         )
         assert opened[0].partition("#csrf=")[2].encode() not in persisted
     finally:
-        if owner.poll() is None:
-            _stop(owner)
+        if automatic_pid:
+            try:
+                os.kill(automatic_pid, signal.SIGINT)
+            except ProcessLookupError:
+                pass
+            try:
+                os.waitpid(automatic_pid, os.WNOHANG)
+            except ChildProcessError:
+                pass
 
 
 def test_ordinary_dev_reuses_a_manually_headless_owner_without_signaling(

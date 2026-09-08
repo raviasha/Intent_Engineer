@@ -298,6 +298,43 @@ def test_fresh_onboarded_clone_first_prompt_and_plugin_disabled_ci_backstop(
     assert git(repo, "rev-parse", "HEAD") == original_head
 
 
+def test_automatic_child_reauthenticates_when_refreshed_objects_were_temporary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catches a child trusting parent status when refreshed Git objects were not retained."""
+    repo, trust = _clone(tmp_path)
+    source = tmp_path / "source" / "project"
+    git(repo, "update-ref", "-d", "refs/remotes/origin/intent-state")
+    monkeypatch.setenv("INTENT_CI_SHARED_STATE_TRUST", trust_environment(trust))
+    packet = dev_cli._background_provenance_bytes()
+    read_descriptor, write_descriptor = os.pipe()
+    try:
+        os.write(write_descriptor, packet)
+    finally:
+        packet[:] = b"\x00" * len(packet)
+        packet.clear()
+        os.close(write_descriptor)
+    monkeypatch.setattr(
+        dev_cli,
+        "_inherited_provenance_descriptors",
+        lambda: (read_descriptor,),
+    )
+    refreshes: list[str] = []
+
+    def refresh(repository_id: str):
+        refreshes.append(repository_id)
+        return restore_module._GitRefReader(source)
+
+    monkeypatch.setattr(restore_module, "_refresh_state_ref", refresh)
+
+    result = dev_cli._automatic_shared_restore(repo)
+
+    assert result.status is dev_cli.SharedStateRestoreStatus.VERIFIED
+    assert refreshes == [trust.repository_id]
+    assert (repo / ".intent/cache/shared-state.json").is_file()
+
+
 @pytest.mark.parametrize("offline", [False, True], ids=("refreshed", "offline-cached"))
 def test_direct_dev_restores_team_state_before_starting_the_control_plane(
     tmp_path: Path,

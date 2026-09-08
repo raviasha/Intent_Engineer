@@ -19,6 +19,7 @@ from intent_engineering.core.models import Graph, Node, NodeType
 from intent_engineering.core.policy.project import initialize_project
 from intent_engineering.storage.transaction import LocalTransactionCoordinator
 from tests.helpers.readiness import apply_baseline
+from tests.helpers.shared_state import git, init_repository, keys, trust_environment
 
 NOW = datetime(2026, 9, 7, tzinfo=UTC)
 
@@ -29,11 +30,11 @@ def _reuse_bounded_service(
     request: pytest.FixtureRequest,
 ) -> None:
     """The real process lifecycle is covered by the automation journey."""
-    if (
-        request.node.name == "test_background_service_launch_is_argv_only_secret_free_and_bounded"
-        or request.node.name.startswith(
-            "test_background_readiness_fails_closed_on_a_reused_service_with_stale_health"
-        )
+    if request.node.name in {
+        "test_background_service_launch_is_argv_only_secret_free_and_bounded",
+        "test_cancelled_background_exec_closes_both_pipe_ends_and_scrubs_trust",
+    } or request.node.name.startswith(
+        "test_background_readiness_fails_closed_on_a_reused_service_with_stale_health"
     ):
         return
     monkeypatch.setattr(dev_cli, "_start_or_reuse_background_service", lambda _root, _status: True)
@@ -403,9 +404,15 @@ def test_background_service_launch_is_argv_only_secret_free_and_bounded(
 
     process = NeverExits()
 
+    provenance_read = -1
+
     def popen(argv: tuple[str, ...], **kwargs: object) -> NeverExits:
+        nonlocal provenance_read
         calls["argv"] = argv
         calls["kwargs"] = kwargs
+        pass_fds = kwargs.get("pass_fds")
+        assert type(pass_fds) is tuple and len(pass_fds) == 1
+        provenance_read = os.dup(pass_fds[0])
         return process
 
     monkeypatch.setenv("INTENT_CI_SHARED_STATE_TRUST", "PRIVATE-TRUST-MARKER")
@@ -431,7 +438,212 @@ def test_background_service_launch_is_argv_only_secret_free_and_bounded(
     assert set(kwargs["env"]) == {"LANG", "LC_ALL", "PATH"}
     assert "shell" not in kwargs
     argv = calls["argv"]
-    assert argv[-2:] == ("--shared-status", "verified")
+    assert "--automatic" not in argv
+    assert "--shared-status" not in argv
+    assert "verified" not in argv
+    assert provenance_read >= 0
+    try:
+        inherited = os.read(provenance_read, 64 * 1024)
+        os.set_blocking(provenance_read, False)
+        assert os.read(provenance_read, 1) == b""
+    finally:
+        os.close(provenance_read)
+    assert b"PRIVATE-TRUST-MARKER" in inherited
+    assert "PRIVATE-TRUST-MARKER" not in repr(argv)
+    assert "PRIVATE-TRUST-MARKER" not in repr(kwargs["env"])
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        ("--automatic", "--no-open"),
+        ("--shared-status", "verified", "--no-open"),
+        ("--automatic", "--shared-status", "verified", "--no-open"),
+    ],
+)
+def test_dev_rejects_caller_supplied_launch_and_shared_health_authority(
+    tmp_path: Path,
+    arguments: tuple[str, ...],
+) -> None:
+    """Catches ordinary argv being able to mint automatic/verified process metadata."""
+    project = tmp_path / "project"
+    project.mkdir()
+    _ready_project(project)
+
+    result = CliRunner().invoke(
+        app,
+        ["dev", "--project", str(project), "--offline", *arguments],
+    )
+
+    assert result.exit_code == 2
+    assert not (project / ".intent/cache/control-plane.json").exists()
+
+
+def _install_provenance_pipe(
+    monkeypatch: pytest.MonkeyPatch,
+    content: bytes | bytearray,
+) -> int:
+    read_descriptor, write_descriptor = os.pipe()
+    try:
+        os.write(write_descriptor, content)
+    finally:
+        os.close(write_descriptor)
+    monkeypatch.setattr(
+        dev_cli,
+        "_inherited_provenance_descriptors",
+        lambda: (read_descriptor,),
+    )
+    return read_descriptor
+
+
+def test_fabricated_status_pipe_cannot_claim_verified_health(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catches an inherited caller-authored status being treated as proof of verification."""
+    project = tmp_path / "project"
+    project.mkdir()
+    _ready_project(project)
+    descriptor = _install_provenance_pipe(monkeypatch, b"verified")
+
+    with pytest.raises(dev_cli._DevUnavailable):
+        dev_cli._automatic_shared_restore(project)
+
+    with pytest.raises(OSError):
+        os.fstat(descriptor)
+
+
+def test_wrong_repository_trust_pipe_derives_invalid_instead_of_verified(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catches well-formed trust being accepted without binding the destination repository."""
+    project = init_repository(tmp_path / "project")
+    _recipient, _signer, trust = keys()
+    git(project, "remote", "set-url", "origin", "https://github.com/acme/other.git")
+    monkeypatch.setenv("INTENT_CI_SHARED_STATE_TRUST", trust_environment(trust))
+    descriptor = _install_provenance_pipe(
+        monkeypatch,
+        dev_cli._background_provenance_bytes(),
+    )
+
+    result = dev_cli._automatic_shared_restore(project)
+
+    assert result.status is dev_cli.SharedStateRestoreStatus.INVALID
+    with pytest.raises(OSError):
+        os.fstat(descriptor)
+
+
+def test_local_automatic_provenance_is_consumed_once_and_derives_marker_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catches replayable descriptors or local launch packets carrying invented health."""
+    project = tmp_path / "project"
+    project.mkdir()
+    _ready_project(project)
+    monkeypatch.delenv("INTENT_CI_SHARED_STATE_TRUST", raising=False)
+    descriptor = _install_provenance_pipe(
+        monkeypatch,
+        dev_cli._background_provenance_bytes(),
+    )
+
+    result = dev_cli._automatic_shared_restore(project)
+
+    assert result.status is dev_cli.SharedStateRestoreStatus.NOT_REQUIRED
+    with pytest.raises(dev_cli._DevUnavailable):
+        dev_cli._automatic_shared_restore(project)
+    with pytest.raises(OSError):
+        os.fstat(descriptor)
+
+
+def test_cancelled_provenance_read_closes_descriptor_and_scrubs_trust(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catches cancellation retaining inherited private trust in descriptors or tracebacks."""
+    project = tmp_path / "project"
+    project.mkdir()
+    marker = "PRIVATE-INHERITED-TRUST-90210"
+    monkeypatch.setenv("INTENT_CI_SHARED_STATE_TRUST", marker)
+    packet = bytes(dev_cli._background_provenance_bytes())
+    descriptor = _install_provenance_pipe(monkeypatch, packet)
+    original_read = os.read
+    calls = 0
+
+    class Cancelled(BaseException):
+        pass
+
+    cancellation = Cancelled("stop")
+
+    def cancel_after_content(candidate: int, count: int) -> bytes:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return original_read(candidate, count)
+        raise cancellation
+
+    monkeypatch.setattr(dev_cli.os, "read", cancel_after_content)
+
+    with pytest.raises(Cancelled) as raised:
+        dev_cli._automatic_shared_restore(project)
+
+    retained: list[str] = []
+    traceback = raised.value.__traceback__
+    while traceback is not None:
+        if "/src/intent_engineering/" in traceback.tb_frame.f_code.co_filename:
+            retained.append(repr(traceback.tb_frame.f_locals))
+        traceback = traceback.tb_next
+    assert raised.value is cancellation
+    assert marker not in "\n".join(retained)
+    with pytest.raises(OSError):
+        os.fstat(descriptor)
+
+
+def test_cancelled_background_exec_closes_both_pipe_ends_and_scrubs_trust(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catches parent-side exec cancellation leaking the one-use trust channel."""
+    project = tmp_path / "project"
+    project.mkdir()
+    marker = "PRIVATE-PARENT-TRUST-41982"
+    cancellation = BaseException("stop")
+    descriptors: tuple[int, int] = ()
+    original_pipe = os.pipe
+
+    def capture_pipe() -> tuple[int, int]:
+        nonlocal descriptors
+        descriptors = original_pipe()
+        return descriptors
+
+    monkeypatch.setenv("INTENT_CI_SHARED_STATE_TRUST", marker)
+    monkeypatch.setattr(dev_cli, "_running_service", lambda _root: None)
+    monkeypatch.setattr(dev_cli.os, "pipe", capture_pipe)
+    monkeypatch.setattr(
+        dev_cli.subprocess,
+        "Popen",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(cancellation),
+    )
+
+    with pytest.raises(BaseException) as raised:
+        dev_cli._start_or_reuse_background_service(
+            project,
+            dev_cli.SharedStateRestoreStatus.VERIFIED,
+        )
+
+    retained: list[str] = []
+    traceback = raised.value.__traceback__
+    while traceback is not None:
+        if "/src/intent_engineering/" in traceback.tb_frame.f_code.co_filename:
+            retained.append(repr(traceback.tb_frame.f_locals))
+        traceback = traceback.tb_next
+    assert raised.value is cancellation
+    assert marker not in "\n".join(retained)
+    assert len(descriptors) == 2
+    for descriptor in descriptors:
+        with pytest.raises(OSError):
+            os.fstat(descriptor)
 
 
 @pytest.mark.parametrize("launch_mode", ["manual_headless", "interactive", "legacy"])

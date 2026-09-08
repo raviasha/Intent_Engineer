@@ -11,7 +11,10 @@ import json
 import os
 import re
 import secrets
+import selectors
 import socket
+import stat
+import struct
 import subprocess
 import sys
 import threading
@@ -98,10 +101,19 @@ _CSP = (
 _REPOSITORY_LOCKS: dict[tuple[int, int], threading.RLock] = {}
 _REPOSITORY_LOCKS_GUARD = threading.Lock()
 _BACKGROUND_ENTRYPOINT = (
-    "import runpy,sys;"
+    "import sys;"
     "sys.path.insert(0,sys.argv.pop(1));"
-    "runpy.run_module('intent_engineering.cli.app',run_name='__main__')"
+    "from pathlib import Path;"
+    "from intent_engineering.cli.dev import _automatic_child_entrypoint;"
+    "raise SystemExit(_automatic_child_entrypoint(Path(sys.argv[1])))"
 )
+_PROVENANCE_MAGIC = b"intent-automatic-v1\x00"
+_PROVENANCE_HEADER_BYTES = len(_PROVENANCE_MAGIC) + 5
+_MAX_PROVENANCE_BYTES = 32 * 1024
+_PROVENANCE_WAIT_SECONDS = 10.0
+_PROVENANCE_LOCAL = b"L"
+_PROVENANCE_TRUST = b"T"
+_PROVENANCE_INVALID = b"I"
 _LaunchMode = Literal["automatic", "manual_headless", "interactive", "legacy"]
 
 
@@ -1167,7 +1179,7 @@ def _run_with_repository_lease(
     status: bool,
     launch_mode: _LaunchMode,
     offline: bool,
-    inherited_shared_status: SharedStateRestoreStatus | None,
+    prevalidated_restore: SharedStateRestoreResult | None,
 ) -> None:
     """Recheck and own one process until every repository resource is quiescent."""
     workspace_directory: SecureDirectory | None = None
@@ -1181,19 +1193,19 @@ def _run_with_repository_lease(
     restore = SharedStateRestoreResult(status=SharedStateRestoreStatus.NOT_REQUIRED)
     try:
         if not status:
-            if inherited_shared_status is not None:
+            if prevalidated_restore is not None:
                 marker_status = _untrusted_shared_marker_status(root)
                 if (
-                    inherited_shared_status is SharedStateRestoreStatus.VERIFIED
+                    prevalidated_restore.status is SharedStateRestoreStatus.VERIFIED
                     and marker_status is not SharedStateRestoreStatus.UNAVAILABLE
                 ):
                     raise _DevUnavailable()
                 if (
-                    inherited_shared_status is SharedStateRestoreStatus.NOT_REQUIRED
+                    prevalidated_restore.status is SharedStateRestoreStatus.NOT_REQUIRED
                     and marker_status is not SharedStateRestoreStatus.NOT_REQUIRED
                 ):
                     raise _DevUnavailable()
-                restore = SharedStateRestoreResult(status=inherited_shared_status)
+                restore = prevalidated_restore
             else:
                 restore = _shared_restore(root, refresh_remote=not offline)
         _ensure_workspace(root, None if status else prd_value)
@@ -1360,7 +1372,7 @@ def _background_environment() -> dict[str, str]:
     }
 
 
-def _background_argv(root: Path, shared_state_status: SharedStateRestoreStatus) -> tuple[str, ...]:
+def _background_argv(root: Path) -> tuple[str, ...]:
     source_root = Path(__file__).resolve().parents[2]
     return (
         sys.executable,
@@ -1368,14 +1380,178 @@ def _background_argv(root: Path, shared_state_status: SharedStateRestoreStatus) 
         "-c",
         _BACKGROUND_ENTRYPOINT,
         str(source_root),
-        "dev",
-        "--project",
         str(root),
-        "--no-open",
-        "--automatic",
-        "--shared-status",
-        shared_state_status.value,
     )
+
+
+def _background_provenance_bytes() -> bytearray:
+    """Frame trust for one child without placing authority in argv, env, or disk."""
+    raw = os.environ.get(TRUST_ENVIRONMENT_VARIABLE)
+    kind = _PROVENANCE_LOCAL
+    payload = bytearray()
+    try:
+        if raw is not None:
+            kind = _PROVENANCE_TRUST
+            try:
+                payload.extend(raw.encode("utf-8"))
+            except UnicodeEncodeError:
+                kind = _PROVENANCE_INVALID
+            if not payload or len(payload) > _MAX_PROVENANCE_BYTES:
+                payload[:] = b"\x00" * len(payload)
+                payload.clear()
+                kind = _PROVENANCE_INVALID
+        return bytearray(_PROVENANCE_MAGIC + kind + struct.pack(">I", len(payload))) + payload
+    finally:
+        raw = None
+        payload[:] = b"\x00" * len(payload)
+        payload.clear()
+
+
+def _inherited_provenance_descriptors() -> tuple[int, ...]:
+    """Find the sole anonymous pipe deliberately retained across the isolated exec."""
+    names: list[str] | None = None
+    for directory in ("/dev/fd", "/proc/self/fd"):
+        try:
+            names = os.listdir(directory)
+            break
+        except OSError:
+            continue
+    if names is None:
+        return ()
+    candidates: list[int] = []
+    for name in names:
+        if not name.isascii() or not name.isdigit():
+            continue
+        descriptor = int(name)
+        if descriptor <= 2:
+            continue
+        try:
+            metadata = os.fstat(descriptor)
+        except OSError:
+            continue
+        if stat.S_ISFIFO(metadata.st_mode):
+            candidates.append(descriptor)
+    return tuple(sorted(candidates))
+
+
+def _consume_background_provenance() -> tuple[bytes, bytearray]:
+    """Consume and close exactly one bounded inherited automatic-launch proof."""
+    descriptors = _inherited_provenance_descriptors()
+    content = bytearray()
+    selector: selectors.BaseSelector | None = None
+    try:
+        if len(descriptors) != 1:
+            raise _DevUnavailable()
+        descriptor = descriptors[0]
+        os.set_blocking(descriptor, False)
+        selector = selectors.DefaultSelector()
+        selector.register(descriptor, selectors.EVENT_READ)
+        deadline = time.monotonic() + _PROVENANCE_WAIT_SECONDS
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or not selector.select(remaining):
+                raise _DevUnavailable()
+            chunk = os.read(descriptor, 4096)
+            if not chunk:
+                break
+            content.extend(chunk)
+            if len(content) > _PROVENANCE_HEADER_BYTES + _MAX_PROVENANCE_BYTES:
+                raise _DevUnavailable()
+        if len(content) < _PROVENANCE_HEADER_BYTES:
+            raise _DevUnavailable()
+        magic_end = len(_PROVENANCE_MAGIC)
+        if bytes(content[:magic_end]) != _PROVENANCE_MAGIC:
+            raise _DevUnavailable()
+        kind = bytes(content[magic_end : magic_end + 1])
+        declared = struct.unpack(">I", content[magic_end + 1 : magic_end + 5])[0]
+        payload = bytearray(content[_PROVENANCE_HEADER_BYTES:])
+        if declared != len(payload) or kind not in {
+            _PROVENANCE_LOCAL,
+            _PROVENANCE_TRUST,
+            _PROVENANCE_INVALID,
+        }:
+            payload[:] = b"\x00" * len(payload)
+            payload.clear()
+            raise _DevUnavailable()
+        if kind != _PROVENANCE_TRUST and payload:
+            payload[:] = b"\x00" * len(payload)
+            payload.clear()
+            raise _DevUnavailable()
+        return kind, payload
+    except _DevUnavailable:
+        raise
+    except (OSError, struct.error):
+        raise _DevUnavailable() from None
+    finally:
+        content[:] = b"\x00" * len(content)
+        content.clear()
+        if selector is not None:
+            selector.close()
+        for descriptor in descriptors:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+
+
+def _automatic_shared_restore(root: Path) -> SharedStateRestoreResult:
+    """Derive child health from local markers or authenticated shared-state bytes."""
+    kind = b""
+    payload = bytearray()
+    trust = None
+    environment: dict[str, str] = {}
+    raw = ""
+    cancellation: BaseException | None = None
+    result = SharedStateRestoreResult(status=SharedStateRestoreStatus.INVALID)
+    try:
+        kind, payload = _consume_background_provenance()
+        if kind == _PROVENANCE_LOCAL:
+            result = SharedStateRestoreResult(status=_untrusted_shared_marker_status(root))
+        elif kind == _PROVENANCE_INVALID:
+            result = SharedStateRestoreResult(status=SharedStateRestoreStatus.INVALID)
+        else:
+            raw = payload.decode("utf-8")
+            environment[TRUST_ENVIRONMENT_VARIABLE] = raw
+            trust = EnvironmentTrustProvider(environment).load()
+            if trust is None:
+                raise ValueError("shared-state trust unavailable")
+            result = GitSharedStateRestorer(
+                StaticTrustProvider(trust), refresh_remote=False
+            ).verify_and_restore_approved_baseline(root)
+            if result.status in {
+                SharedStateRestoreStatus.INVALID,
+                SharedStateRestoreStatus.STALE,
+                SharedStateRestoreStatus.UNAVAILABLE,
+            }:
+                result = GitSharedStateRestorer(
+                    StaticTrustProvider(trust), refresh_remote=True
+                ).verify_and_restore_approved_baseline(root)
+    except _DevUnavailable:
+        raise
+    except (OSError, UnicodeError, ValueError):
+        result = SharedStateRestoreResult(status=SharedStateRestoreStatus.INVALID)
+    except Exception as error:  # noqa: BLE001 - fixed secret-free child failure boundary
+        error.__traceback__ = None
+        error.__cause__ = None
+        error.__context__ = None
+        result = SharedStateRestoreResult(status=SharedStateRestoreStatus.INVALID)
+    except BaseException as error:  # noqa: BLE001 - scrub proof before cancellation
+        error.__traceback__ = None
+        error.__cause__ = None
+        error.__context__ = None
+        cancellation = error
+    finally:
+        trust = None
+        environment.clear()
+        raw = ""
+        kind = b""
+        payload[:] = b"\x00" * len(payload)
+        payload.clear()
+    if cancellation is not None:
+        caught = cancellation
+        cancellation = None
+        raise caught.with_traceback(None)
+    return result
 
 
 def _running_service(root: Path) -> ControlPlaneProcessMetadata | None:
@@ -1401,19 +1577,44 @@ def _start_or_reuse_background_service(
             current, current.repository_id
         ):
             return False
+    if os.name != "posix":
+        return False
     process: subprocess.Popen[bytes] | None = None
+    provenance_read = -1
+    provenance_write = -1
+    provenance = bytearray()
+    cancellation: BaseException | None = None
     ready = False
     try:
+        provenance = _background_provenance_bytes()
+        provenance_read, provenance_write = os.pipe()
+        os.set_inheritable(provenance_read, False)
+        os.set_inheritable(provenance_write, False)
         process = subprocess.Popen(
-            _background_argv(root, shared_state_status),
+            _background_argv(root),
             cwd="/",
             env=_background_environment(),
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             close_fds=True,
+            pass_fds=(provenance_read,),
             start_new_session=True,
         )
+        os.close(provenance_read)
+        provenance_read = -1
+        view = memoryview(provenance)
+        try:
+            written = 0
+            while written < len(view):
+                count = os.write(provenance_write, view[written:])
+                if count <= 0:
+                    raise OSError("automatic provenance unavailable")
+                written += count
+        finally:
+            view.release()
+        os.close(provenance_write)
+        provenance_write = -1
         deadline = time.monotonic() + _STARTUP_TIMEOUT_SECONDS
         while time.monotonic() < deadline:
             current = _running_service(root)
@@ -1427,7 +1628,18 @@ def _start_or_reuse_background_service(
         return False
     except (OSError, subprocess.SubprocessError):
         return False
+    except BaseException as error:  # noqa: BLE001 - scrub inherited proof before cancellation
+        error.__traceback__ = None
+        error.__cause__ = None
+        error.__context__ = None
+        cancellation = error
     finally:
+        if provenance_read >= 0:
+            os.close(provenance_read)
+        if provenance_write >= 0:
+            os.close(provenance_write)
+        provenance[:] = b"\x00" * len(provenance)
+        provenance.clear()
         if process is not None and not ready and process.poll() is None:
             process.terminate()
             try:
@@ -1439,6 +1651,64 @@ def _start_or_reuse_background_service(
                 except subprocess.TimeoutExpired:
                     pass
         process = None
+    if cancellation is not None:
+        caught = cancellation
+        cancellation = None
+        raise caught.with_traceback(None)
+    return False
+
+
+def _automatic_child_entrypoint(root: Path) -> int:
+    """Run the descriptor-authorized background lifecycle with child-earned health."""
+    restore = SharedStateRestoreResult(status=SharedStateRestoreStatus.INVALID)
+    project_directory: SecureDirectory | None = None
+    current: ControlPlaneProcessMetadata | None = None
+    try:
+        restore = _automatic_shared_restore(Path(os.path.abspath(root)))
+        root = Path(os.path.abspath(root))
+        project_directory = SecureDirectory.open(root)
+        deadline = time.monotonic() + _STARTUP_TIMEOUT_SECONDS
+        takeover_requested: set[tuple[int, str, str]] = set()
+        while True:
+            current = _live_repository_process(project_directory)
+            if current is not None:
+                if current.shared_state_status is restore.status:
+                    return 0
+                if current.launch_mode != "automatic":
+                    return 1
+                owner = (current.pid, current.process_start_id, current.instance_id)
+                if owner not in takeover_requested:
+                    if not _request_interactive_takeover(current, current.repository_id):
+                        return 1
+                    takeover_requested.add(owner)
+            with _try_repository_lifecycle_lock(project_directory) as acquired:
+                if acquired:
+                    _run_with_repository_lease(
+                        root,
+                        project_directory,
+                        prd_value=None,
+                        no_open=True,
+                        status=False,
+                        launch_mode="automatic",
+                        offline=True,
+                        prevalidated_restore=restore,
+                    )
+                    return 0
+            if time.monotonic() >= deadline:
+                return 1
+            time.sleep(0.01)
+    except BaseException as error:  # noqa: BLE001 - fixed secret-free child boundary
+        error.__traceback__ = None
+        error.__cause__ = None
+        error.__context__ = None
+        return 1
+    finally:
+        current = None
+        restore = SharedStateRestoreResult(status=SharedStateRestoreStatus.INVALID)
+        if project_directory is not None:
+            project_directory.close()
+        project_directory = None
+        root = Path()
 
 
 def _developer_readiness(root: Path, preset: EnsurePreset) -> EnsureResult:
@@ -1501,37 +1771,21 @@ def dev_command(
     no_open: bool = typer.Option(False, "--no-open"),
     offline: bool = typer.Option(False, "--offline"),
     status: bool = typer.Option(False, "--status"),
-    automatic: bool = typer.Option(False, "--automatic", hidden=True),
-    shared_status: SharedStateRestoreStatus | None = typer.Option(
-        None, "--shared-status", hidden=True
-    ),
 ) -> None:
     """Launch or inspect one trusted repository-bound local review process."""
     root = Path(os.path.abspath(project))
     prd_value = prd.as_posix() if prd is not None else None
-    automatic_value = automatic if type(automatic) is bool else False
     offline_value = offline if type(offline) is bool else False
-    shared_status_value = shared_status if type(shared_status) is SharedStateRestoreStatus else None
-    if automatic_value and (not no_open or status or prd_value is not None):
-        _fixed_error()
-    if shared_status_value is not None and not automatic_value:
-        _fixed_error()
-    launch_mode: _LaunchMode = (
-        "automatic" if automatic_value else "manual_headless" if no_open else "interactive"
-    )
+    launch_mode: _LaunchMode = "manual_headless" if no_open else "interactive"
     project_directory: SecureDirectory | None = None
     signal_error: BaseException | None = None
     takeover_requested: set[tuple[int, str, str]] = set()
-    desired_shared_status: SharedStateRestoreStatus | None = None
+    desired_restore: SharedStateRestoreResult | None = None
     try:
         if status and not (root / ".intent").exists():
             _fixed_error("not running")
         if not status:
-            desired_shared_status = shared_status_value
-            if desired_shared_status is None:
-                desired_shared_status = _shared_restore(
-                    root, refresh_remote=not offline_value
-                ).status
+            desired_restore = _shared_restore(root, refresh_remote=not offline_value)
         project_directory = SecureDirectory.open(root)
         deadline = time.monotonic() + _STARTUP_TIMEOUT_SECONDS
         while True:
@@ -1540,7 +1794,10 @@ def dev_command(
                 if status:
                     typer.echo(f"intent dev: running at {current.origin}")
                     return
-                if current.shared_state_status is not desired_shared_status:
+                if (
+                    desired_restore is not None
+                    and current.shared_state_status is not desired_restore.status
+                ):
                     if current.launch_mode != "automatic":
                         raise _DevUnavailable()
                 elif no_open or current.launch_mode != "automatic":
@@ -1561,7 +1818,7 @@ def dev_command(
                         status=status,
                         launch_mode=launch_mode,
                         offline=offline_value,
-                        inherited_shared_status=desired_shared_status,
+                        prevalidated_restore=desired_restore,
                     )
                     return
             if time.monotonic() >= deadline:
@@ -1592,7 +1849,7 @@ def dev_command(
             project_directory.close()
         project_directory = None
         root = Path()
-        desired_shared_status = None
+        desired_restore = None
         takeover_requested.clear()
     if signal_error is not None:
         caught = signal_error
