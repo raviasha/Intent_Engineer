@@ -59,7 +59,11 @@ from intent_engineering.storage.secure import (
 )
 from intent_engineering.storage.transaction import LocalTransactionCoordinator
 from intent_engineering.storage.yaml.graph_store import parse_graph
-from intent_engineering.team_state.archive import ARCHIVE_MAGIC, validate_archive
+from intent_engineering.team_state.archive import (
+    ARCHIVE_MAGIC,
+    ARCHIVE_V2_MAGIC,
+    validate_archive,
+)
 from intent_engineering.team_state.crypto import (
     ALGORITHM,
     EncryptedBundle,
@@ -81,14 +85,19 @@ from intent_engineering.team_state.models import (
     RemoteStateSnapshot,
     SignatureEnvelope,
     StateSignature,
-    StateSignatureEnvelope,
     StateSignatureEnvelopeV2,
     TeamManifest,
     TeamStateManifest,
     TeamStateManifestV2,
     canonical_manifest_bytes,
 )
+from intent_engineering.team_state.models import (
+    StateSignatureEnvelope as _StateSignatureEnvelope,
+)
 from intent_engineering.validation import validate_canonical_snapshot
+
+# Explicit v1 compatibility re-export used by the publication module.
+StateSignatureEnvelope = _StateSignatureEnvelope
 
 SIGNATURE_ALGORITHM: Final = "ed25519-v1"
 TRUST_ENVIRONMENT_VARIABLE = "INTENT_CI_SHARED_STATE_TRUST"
@@ -479,6 +488,8 @@ def _parse_payload(
 ) -> dict[str, bytes]:
     if not content or len(content) > MAX_BUNDLE_BYTES:
         raise ValueError("invalid shared-state payload")
+    if content.startswith(ARCHIVE_V2_MAGIC):
+        raise _UpgradeRequired("unsupported shared-state schema")
     if content.startswith(ARCHIVE_MAGIC):
         snapshot = validate_archive(content)
         if manifest is not None and (

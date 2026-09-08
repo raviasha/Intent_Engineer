@@ -1125,6 +1125,24 @@ class CanonicalStateSnapshot(_TeamStateModel):
         return BundleInventory(entries=entries, total_size=sum(item.size for item in entries))
 
 
+class RestoredSnapshotV2(_TeamStateModel):
+    """A canonical state snapshot paired with its encrypted v2 authority."""
+
+    snapshot: CanonicalStateSnapshot
+    authority: TeamAuthorityRegistryV2
+
+    @model_validator(mode="after")
+    def require_shared_scope(self) -> RestoredSnapshotV2:
+        snapshot = CanonicalStateSnapshot.model_validate(self.snapshot.model_dump(mode="python"))
+        authority = TeamAuthorityRegistryV2.model_validate(self.authority.model_dump(mode="python"))
+        if (
+            snapshot.project_id != authority.project_id
+            or snapshot.repository_id != authority.repository_id
+        ):
+            raise ValueError("restored state and authority scope changed")
+        return self
+
+
 class RecipientRecord(_TeamStateModel):
     """Reviewed public recipient material; private key bytes are never represented."""
 
@@ -1350,6 +1368,7 @@ __all__ = [
     "PublicationLineage",
     "RecipientRecord",
     "RemoteStateSnapshot",
+    "RestoredSnapshotV2",
     "SharedStateManifest",
     "SignatureEnvelope",
     "StateSignature",

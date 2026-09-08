@@ -23,6 +23,7 @@ from intent_engineering.intent_workflow.check import SharedStateRestoreStatus
 from intent_engineering.storage.secure import SecureDirectory, SecureFile
 from intent_engineering.storage.transaction import LocalTransactionCoordinator
 from intent_engineering.team_state import restore as restore_module
+from intent_engineering.team_state.archive import ARCHIVE_V2_MAGIC
 from intent_engineering.team_state.restore import (
     GitSharedStateRestorer,
     StaticTrustProvider,
@@ -476,6 +477,27 @@ def test_fails_closed_for_untrusted_or_incompatible_ref_state(
     ).verify_and_restore_approved_baseline(target)
 
     assert result.status is expected
+    assert not (target / ".intent").exists()
+
+
+def test_legacy_restore_reports_archive_v2_plaintext_as_upgrade_required(tmp_path: Path) -> None:
+    """Catches binary archive v2 being misclassified as corrupt legacy JSON."""
+    source = _approved_source(tmp_path)
+    target = init_repository(tmp_path / "target" / "project")
+    recipient, signer, trust = keys()
+    release = artifacts(
+        canonical_files(source),
+        recipient,
+        signer,
+        payload=ARCHIVE_V2_MAGIC + b"bounded-v2-body",
+    )
+    install_state_ref(target, release)
+
+    result = GitSharedStateRestorer(
+        StaticTrustProvider(trust)
+    ).verify_and_restore_approved_baseline(target)
+
+    assert result.status is SharedStateRestoreStatus.UPGRADE_REQUIRED
     assert not (target / ".intent").exists()
 
 

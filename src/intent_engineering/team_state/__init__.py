@@ -1,9 +1,14 @@
 """Signed and encrypted approved team-state restoration."""
 
 from intent_engineering.team_state.archive import (
+    ARCHIVE_V2_MAGIC,
+    AUTHORITY_PATH,
     RestoredSnapshot,
     build_archive,
+    build_archive_v2,
     validate_archive,
+    validate_archive_v2,
+    validate_versioned_archive,
 )
 from intent_engineering.team_state.crypto import (
     EncryptedBundle,
@@ -29,6 +34,7 @@ from intent_engineering.team_state.models import (
     PublicationLineage,
     RecipientRecord,
     RemoteStateSnapshot,
+    RestoredSnapshotV2,
     TeamStateManifest,
     canonical_manifest_bytes,
 )
@@ -56,6 +62,8 @@ from intent_engineering.team_state.restore import (
 )
 
 __all__ = [
+    "ARCHIVE_V2_MAGIC",
+    "AUTHORITY_PATH",
     "CANONICAL_STATE_PATHS",
     "BundleInventory",
     "BundleInventoryEntry",
@@ -83,6 +91,7 @@ __all__ = [
     "RecipientRecord",
     "RemoteStateSnapshot",
     "RestoredSnapshot",
+    "RestoredSnapshotV2",
     "SharedStateArtifacts",
     "SharedStateTrust",
     "StaticTrustProvider",
@@ -92,10 +101,13 @@ __all__ = [
     "TemporaryWorktreePublisher",
     "TrustedSigningKey",
     "build_archive",
+    "build_archive_v2",
     "build_state_payload",
     "canonical_manifest_bytes",
     "decrypt_bundle",
     "encrypt_bundle",
     "seal_state_payload",
     "validate_archive",
+    "validate_archive_v2",
+    "validate_versioned_archive",
 ]
