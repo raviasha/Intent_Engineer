@@ -373,7 +373,6 @@ def test_shipped_browser_completes_team_enrollment_without_rendering_identity_pr
     """Catches the team-state UI skipping GitHub proof, WebAuthn, cleanup, or status refresh."""
     result = _run(
         r"""
-await settle(); respond(take("/_intent/browser/bootstrap"), { status: "ok" }); await settle();
 respond(take("/api/v1/status"), statusProjection); await settle();
 respond(take("/api/v1/development/observation"), { current_revision: "a", command_ids: [], changed_paths: [], evidence_candidates: [] }); await settle();
 nav.find((item) => item.dataset.view === "team_state").click(); await settle();
