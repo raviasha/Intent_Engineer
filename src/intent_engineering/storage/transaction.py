@@ -379,6 +379,15 @@ class LocalTransactionCoordinator:
     def _snapshot(self) -> dict[str, bytes | None]:
         return {name: self._targets[name].read_optional() for name in sorted(self._targets)}
 
+    def _require_no_recovery_journal(self) -> None:
+        """Reject any journal entry by held-directory metadata without reading its payload."""
+        try:
+            present = self._journal.exists()
+        except UnsafePathError:
+            raise TransactionRecoveryError() from None
+        if present:
+            raise TransactionRecoveryError() from None
+
     def _journal_for(
         self,
         preimages: Mapping[str, bytes | None],
@@ -526,6 +535,40 @@ class LocalTransactionCoordinator:
             content = self._read_files(selected_files, policies)
         return LocalTransactionSnapshot(MappingProxyType(content), recovered)
 
+    def snapshot_without_recovery(
+        self,
+        extras: Mapping[str, SecureFile] | None = None,
+        *,
+        extra_read_policies: Mapping[str, LocalTransactionExtraReadPolicy] | None = None,
+        target_names: Collection[str] | None = None,
+    ) -> LocalTransactionSnapshot:
+        """Read an exact snapshot only when no transaction requires recovery."""
+        extra_files = dict(extras or {})
+        policies = self._extra_read_policies(extra_files, extra_read_policies)
+        selected_names = (
+            frozenset(self._targets) if target_names is None else frozenset(target_names)
+        )
+        if any(type(name) is not str for name in selected_names) or not selected_names.issubset(
+            self._targets
+        ):
+            raise ValueError("invalid local snapshot target selection")
+        if any(not _TARGET_PATTERN.fullmatch(name) for name in extra_files):
+            raise ValueError("invalid local snapshot targets")
+        if set(extra_files) & set(self._targets) or self._thread_state.active:
+            raise ValueError("read-only snapshot unavailable")
+        all_files = {**self._targets, **extra_files}
+        selected_files = {
+            **{name: self._targets[name] for name in selected_names},
+            **extra_files,
+        }
+        lock_keys = [self._journal.lock_key, *(item.lock_key for item in all_files.values())]
+        if len(lock_keys) != len(set(lock_keys)):
+            raise ValueError("duplicate local snapshot target")
+        with self._locks(extra_files):
+            self._require_no_recovery_journal()
+            content = self._read_files(selected_files, policies)
+        return LocalTransactionSnapshot(MappingProxyType(content), False)
+
     @contextmanager
     def read_transaction(
         self,
@@ -561,6 +604,37 @@ class LocalTransactionCoordinator:
             return
         with self._locks(extra_files):
             self._recover_unlocked()
+            transaction = LocalTransaction(
+                self,
+                extra_files,
+                read_only=True,
+                extra_read_policies=policies,
+            )
+            try:
+                yield transaction
+            finally:
+                transaction._finish()
+
+    @contextmanager
+    def read_transaction_without_recovery(
+        self,
+        extras: Mapping[str, SecureFile] | None = None,
+        *,
+        extra_read_policies: Mapping[str, LocalTransactionExtraReadPolicy] | None = None,
+    ) -> Iterator[LocalTransaction]:
+        """Hold a read-only view only when no transaction journal exists."""
+        extra_files = dict(extras or {})
+        policies = self._extra_read_policies(extra_files, extra_read_policies)
+        if any(not _TARGET_PATTERN.fullmatch(name) for name in extra_files):
+            raise ValueError("invalid local transaction extras")
+        if set(extra_files) & set(self._targets) or self._thread_state.active:
+            raise ValueError("read-only transaction unavailable")
+        all_files = {**self._targets, **extra_files}
+        lock_keys = [self._journal.lock_key, *(item.lock_key for item in all_files.values())]
+        if len(lock_keys) != len(set(lock_keys)):
+            raise ValueError("duplicate local transaction target")
+        with self._locks(extra_files):
+            self._require_no_recovery_journal()
             transaction = LocalTransaction(
                 self,
                 extra_files,

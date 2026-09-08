@@ -44,7 +44,7 @@ from intent_engineering.storage.transaction import (
 from intent_engineering.storage.yaml.graph_store import parse_graph
 
 if TYPE_CHECKING:
-    from intent_engineering.cli.runtime import Runtime
+    from intent_engineering.cli.runtime import AssessmentRuntimeProtocol
 
 _ASSESSMENT_TARGETS = frozenset({"graph", "evidence", "cases", "history", "intent_proposals"})
 _CONFIG_LIMIT = 1024 * 1024
@@ -559,11 +559,11 @@ def _snapshot_model(
 
 
 def _authenticate_preimages(
-    runtime: Runtime,
+    runtime: AssessmentRuntimeProtocol,
     extras: Mapping[str, SecureFile],
     held: LocalTransactionSnapshot,
 ) -> None:
-    with runtime.transactions.read_transaction(
+    with runtime.transactions.read_transaction_without_recovery(
         extras,
         extra_read_policies=_AUTHORITY_POLICIES,
     ) as transaction:
@@ -588,7 +588,10 @@ def _actor_principals(
     return frozenset(aliases)
 
 
-def _build_assessment_snapshot(runtime: Runtime, actor: str) -> AssessmentSnapshot:
+def _build_assessment_snapshot(
+    runtime: AssessmentRuntimeProtocol,
+    actor: str,
+) -> AssessmentSnapshot:
     if not _ASSESSMENT_TARGETS.issubset(runtime.transactions.target_names):
         raise ValueError("assessment transaction targets unavailable")
     config_file = runtime.workspace_directory.file("config.yaml")
@@ -598,7 +601,7 @@ def _build_assessment_snapshot(runtime: Runtime, actor: str) -> AssessmentSnapsh
     parsed: _ParsedSnapshot | None = None
     projection: _VisibleSnapshot | None = None
     try:
-        held = runtime.transactions.snapshot(
+        held = runtime.transactions.snapshot_without_recovery(
             extras,
             extra_read_policies=_AUTHORITY_POLICIES,
             target_names=_ASSESSMENT_TARGETS,
@@ -645,7 +648,10 @@ def _raise_signal(signal: BaseException) -> None:
     raise signal.with_traceback(None)
 
 
-def build_assessment_snapshot(runtime: Runtime, actor: str) -> AssessmentSnapshot:
+def build_assessment_snapshot(
+    runtime: AssessmentRuntimeProtocol,
+    actor: str,
+) -> AssessmentSnapshot:
     """Return one immutable visible projection or a fixed, context-free failure."""
     result: AssessmentSnapshot | None = None
     signal: BaseException | None = None
@@ -660,7 +666,7 @@ def build_assessment_snapshot(runtime: Runtime, actor: str) -> AssessmentSnapsho
         caught.__context__ = None
         signal = caught
     finally:
-        runtime = cast("Runtime", None)
+        runtime = cast("AssessmentRuntimeProtocol", None)
         actor = ""
     if signal is not None:
         caught_signal = signal

@@ -9,9 +9,9 @@ import stat
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, Protocol, cast
 
 import anyio
 import yaml  # type: ignore[import-untyped]
@@ -78,6 +78,7 @@ from intent_engineering.storage.jsonl.case_store import JsonlCaseStore, parse_ca
 from intent_engineering.storage.jsonl.evidence_store import JsonlEvidenceStore
 from intent_engineering.storage.secure import (
     SecureDirectory,
+    SecureFile,
     UnsafePathError,
     _read_descriptor,
     configured_graph_relative,
@@ -104,6 +105,42 @@ _GITHUB_REPOSITORY = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}\Z")
 type GitHubClientFactory = Callable[[GitHubCredentials], GitHubClient]
 type PrincipalResolver = Callable[[Runtime], frozenset[str]]
 type McpConnectorResolver = Callable[[Runtime], Sequence[Connector]]
+
+
+class AssessmentRuntimeProtocol(Protocol):
+    """The descriptor-held surface required by assessment snapshot acquisition."""
+
+    @property
+    def config(self) -> ProjectConfig: ...
+
+    @property
+    def workspace_directory(self) -> SecureDirectory: ...
+
+    @property
+    def transactions(self) -> LocalTransactionCoordinator: ...
+
+
+@dataclass(frozen=True)
+class AssessmentRuntime:
+    """Minimal no-recovery runtime for read-only graph assessment."""
+
+    root: Path
+    config: ProjectConfig
+    project_directory: SecureDirectory
+    workspace_directory: SecureDirectory
+    transactions: LocalTransactionCoordinator
+
+    def assessment_snapshot(self, actor: str) -> AssessmentSnapshot:
+        """Build one descriptor-held projection without recovering canonical state."""
+        from intent_engineering.assessment.snapshot import build_assessment_snapshot
+
+        return build_assessment_snapshot(self, actor)
+
+    def close(self) -> None:
+        """Release every descriptor held by this read-only runtime."""
+        self.transactions.close()
+        self.workspace_directory.close()
+        self.project_directory.close()
 
 
 class GitHubConfigurationError(ValueError):
@@ -658,6 +695,93 @@ def load_runtime(root: Path, *, assurance_workspace: Path | None = None) -> Runt
         workspace_directory=workspace_directory,
         transactions=transactions,
     )
+
+
+def load_assessment_runtime(root: Path) -> AssessmentRuntime:
+    """Open descriptor-held assessment inputs without performing any recovery."""
+    root = Path(os.path.abspath(root))
+    project_directory: SecureDirectory | None = None
+    workspace_directory: SecureDirectory | None = None
+    transactions: LocalTransactionCoordinator | None = None
+    opened: list[SecureFile] = []
+    try:
+        project_directory = SecureDirectory.open(root)
+        workspace_directory = project_directory.subdirectory(".intent")
+        config_file = workspace_directory.file("config.yaml")
+        opened.append(config_file)
+        config_content = config_file.read_optional_nonblocking(max_bytes=MAX_CANONICAL_FILE_BYTES)
+        if config_content is None:
+            raise ProjectNotInitialized("local project is not initialized")
+        loaded = yaml.safe_load(config_content.decode("utf-8"))
+        if not isinstance(loaded, dict):
+            raise TypeError("project configuration is invalid")
+        config = ProjectConfig.model_validate_json(
+            json.dumps(cast(dict[str, Any], loaded), ensure_ascii=False, separators=(",", ":"))
+        )
+        paths: Mapping[str, str | PurePosixPath] = {
+            "graph": configured_graph_relative(config.graph_path),
+            "history": "history/changesets.jsonl",
+            "cases": "reconciliation/cases.jsonl",
+            "evidence": "evidence/evidence.jsonl",
+            "receipts": "approvals/receipts.jsonl",
+            "approvals": "approvals/approvals.jsonl",
+            "intent_proposals": "history/intent-proposals.jsonl",
+            "webauthn_credentials": "approvals/webauthn-credentials.jsonl",
+            "webauthn_challenges": "approvals/webauthn-challenges.jsonl",
+        }
+        targets = {name: workspace_directory.file(path) for name, path in paths.items()}
+        opened.extend(targets.values())
+        journal = workspace_directory.file("history/.local-transaction.json")
+        opened.append(journal)
+        transactions = LocalTransactionCoordinator(
+            journal,
+            targets,
+            legacy_target_sets=(
+                frozenset({"graph", "history", "cases"}),
+                frozenset({"graph", "history", "cases", "evidence", "receipts"}),
+                frozenset(
+                    {"graph", "history", "cases", "evidence", "receipts", "intent_proposals"}
+                ),
+                frozenset(
+                    {
+                        "graph",
+                        "history",
+                        "cases",
+                        "evidence",
+                        "receipts",
+                        "intent_proposals",
+                        "webauthn_credentials",
+                        "webauthn_challenges",
+                    }
+                ),
+            ),
+        )
+        return AssessmentRuntime(
+            root=root,
+            config=config,
+            project_directory=project_directory,
+            workspace_directory=workspace_directory,
+            transactions=transactions,
+        )
+    except UnsafePathError as error:
+        if transactions is not None:
+            transactions.close()
+        if workspace_directory is not None:
+            workspace_directory.close()
+        if project_directory is not None:
+            project_directory.close()
+        raise ProjectNotInitialized("local project is not initialized") from error
+    except BaseException:
+        if transactions is not None:
+            transactions.close()
+        if workspace_directory is not None:
+            workspace_directory.close()
+        if project_directory is not None:
+            project_directory.close()
+        raise
+    finally:
+        for target in opened:
+            target.close()
 
 
 class CheckRuntimeAdapter:

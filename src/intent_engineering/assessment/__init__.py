@@ -1,5 +1,11 @@
 """Immutable contracts for deterministic, non-canonical graph assessment."""
 
+from intent_engineering.assessment.gate import (
+    AssessmentGate,
+    AssessmentGatePolicy,
+    GateGapIdentity,
+    GateResult,
+)
 from intent_engineering.assessment.models import (
     AssessmentDimension,
     AssessmentHealth,
@@ -22,6 +28,8 @@ from intent_engineering.assessment.snapshot import (
 __all__ = [
     "AssessmentComparison",
     "AssessmentDimension",
+    "AssessmentGate",
+    "AssessmentGatePolicy",
     "AssessmentHealth",
     "AssessmentPolicy",
     "AssessmentReport",
@@ -30,6 +38,8 @@ __all__ = [
     "BranchScorecard",
     "DimensionApplicability",
     "DimensionResult",
+    "GateGapIdentity",
+    "GateResult",
     "GraphAssessmentService",
     "NodeScorecard",
     "ProjectScorecard",

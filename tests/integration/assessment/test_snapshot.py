@@ -733,7 +733,7 @@ def test_cancellation_preserves_exact_signal_identity(assessment_runtime) -> Non
         except ValueError:
             raise signal
 
-    assessment_runtime.runtime.transactions.snapshot = cancel  # type: ignore[method-assign]
+    assessment_runtime.runtime.transactions.snapshot_without_recovery = cancel  # type: ignore[method-assign]
 
     with pytest.raises(CancellationSignal) as caught:
         build_assessment_snapshot(assessment_runtime.runtime, "local:asha")

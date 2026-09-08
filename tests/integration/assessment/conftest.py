@@ -106,7 +106,7 @@ class AssessmentRuntime:
 
     def replace_after_read(self, target: str) -> None:
         """Replace one canonical name after acquisition while retaining semantic versions."""
-        original = self.runtime.transactions.snapshot
+        original = self.runtime.transactions.snapshot_without_recovery
 
         def replaced(*args: object, **kwargs: object):
             held = original(*args, **kwargs)  # type: ignore[arg-type]
@@ -127,7 +127,7 @@ class AssessmentRuntime:
             os.replace(temporary, path)
             return held
 
-        self.runtime.transactions.snapshot = replaced  # type: ignore[method-assign]
+        self.runtime.transactions.snapshot_without_recovery = replaced  # type: ignore[method-assign]
 
 
 @pytest.fixture

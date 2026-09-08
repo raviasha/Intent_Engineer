@@ -267,12 +267,62 @@ def test_intent_sync_workflow_is_nightly_manual_read_only_and_ordered() -> None:
             "if-no-files-found": "error",
         },
     }
-    assert steps[8]["run"] == "intent check --require-review"
+    assert steps[8]["name"] == "Resolve exact comparison base"
+    assert "git merge-base HEAD HEAD^" in steps[8]["run"]
+    assert "git worktree add --detach" in steps[8]["run"]
+    assert steps[9] == {
+        "name": "Restore verified intent state at comparison base",
+        "if": "steps.assessment-base.outputs.available == 'true'",
+        "working-directory": "${{ runner.temp }}/intent-assessment-base",
+        "run": "python -m intent_engineering.integrations.github_action restore",
+        "env": {"INTENT_CI_SHARED_STATE_TRUST": "${{ secrets.INTENT_CI_SHARED_STATE_TRUST }}"},
+    }
+    assert steps[10]["name"] == "Capture comparison-base source versions"
+    assert steps[10]["if"] == "steps.assessment-base.outputs.available == 'true'"
+    assert steps[10]["working-directory"] == "${{ runner.temp }}/intent-assessment-base"
+    assert steps[10]["run"] == "intent sync --project . --sources markdown,git,github"
+    assert steps[11] == {
+        "name": "Assess exact comparison base",
+        "if": "steps.assessment-base.outputs.available == 'true'",
+        "working-directory": "${{ runner.temp }}/intent-assessment-base",
+        "run": "intent assess --project . --format json > $GITHUB_WORKSPACE/intent-assessment-base.json",
+    }
+    assert steps[12]["name"] == "Remove comparison-base worktree"
+    assert steps[12]["if"] == "always() && steps.assessment-base.outputs.available == 'true'"
+    assert steps[13] == {
+        "name": "Assess graph robustness",
+        "run": "intent assess --project . --format json > intent-assessment.json",
+    }
+    assert steps[14] == {
+        "uses": "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02",
+        "with": {
+            "name": "intent-assurance",
+            "path": "intent-drift.md\nintent-assessment.json\nintent-assessment-base.json\n",
+            "retention-days": "7",
+            "if-no-files-found": "error",
+        },
+    }
+    assert steps[15] == {
+        "name": "Gate assessment against exact comparison base",
+        "if": "steps.assessment-base.outputs.available == 'true'",
+        "run": (
+            "intent assessment-gate --project . "
+            "--base-report intent-assessment-base.json "
+            "--head-report intent-assessment.json --format json"
+        ),
+    }
+    assert steps[16] == {
+        "name": "Require resolution of pending review",
+        "run": "intent check --require-review",
+    }
+    assert steps.index(steps[14]) < steps.index(steps[15]) < steps.index(steps[16])
     assert "continue-on-error" not in text
     assert "permissions: write" not in text
     assert "|| true" not in text
     assert "; intent" not in text
     assert "intent init" not in text
+    assert "intent-advisor" not in text
+    assert "plugins/" not in text
 
 
 def test_required_check_is_independent_ordered_and_fail_closed() -> None:
