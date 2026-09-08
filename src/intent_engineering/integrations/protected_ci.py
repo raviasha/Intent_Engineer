@@ -14,7 +14,11 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import cast
 
-from intent_engineering.integrations.immutable_ci import _git, run_immutable_check
+from intent_engineering.integrations.immutable_ci import (
+    _git,
+    cleanup_ephemeral_ci,
+    run_immutable_check,
+)
 from intent_engineering.intent_workflow.dev_observer import (
     _GIT_ENVIRONMENT,
     _GIT_EXECUTABLE,
@@ -23,10 +27,12 @@ from intent_engineering.intent_workflow.dev_observer import (
 )
 from intent_engineering.storage.jsonl.strict import loads_strict_object
 from intent_engineering.storage.secure import _read_descriptor
+from intent_engineering.team_state.ci import CiTrustError, ci_trust_from_environment
 from intent_engineering.team_state.restore import TRUST_ENVIRONMENT_VARIABLE
 
 _REVISION = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?")
 _REPOSITORY = re.compile(r"[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}")
+_RUN_NUMBER = re.compile(r"[1-9][0-9]{0,19}")
 
 
 @dataclass(frozen=True)
@@ -35,6 +41,18 @@ class ProtectedRequest:
     repository: str
     number: int | None
     base: str | None = None
+
+
+def _workflow_owner(request: ProtectedRequest, environment: Mapping[str, str]) -> str:
+    """Bind Docker cleanup to this exact protected Actions run and attempt."""
+    try:
+        run_id = environment["GITHUB_RUN_ID"]
+        attempt = environment["GITHUB_RUN_ATTEMPT"]
+    except KeyError:
+        raise ValueError("protected CI unavailable") from None
+    if _RUN_NUMBER.fullmatch(run_id) is None or _RUN_NUMBER.fullmatch(attempt) is None:
+        raise ValueError("protected CI unavailable")
+    return f"{request.repository}:{run_id}:{attempt}"
 
 
 def _mapping(value: object) -> Mapping[str, object]:
@@ -97,10 +115,8 @@ def load_request(
         raise ValueError("protected CI unavailable") from None
 
 
-def fetch_proposed_revision(root: Path, request: ProtectedRequest, token: str) -> None:
+def fetch_proposed_revision(root: Path, request: ProtectedRequest, token: str) -> str:
     """Fetch one bounded PR head with read-only auth; never perform a checkout."""
-    if request.number is None:
-        return
     if not token or len(token) > 4096 or TRUST_ENVIRONMENT_VARIABLE in os.environ:
         raise ValueError("protected CI unavailable")
     header = (
@@ -129,15 +145,15 @@ def fetch_proposed_revision(root: Path, request: ProtectedRequest, token: str) -
             "fetch.unpackLimit=1",
             "fetch",
             "--no-tags",
-            "--depth=64" if request.base is not None else "--depth=1",
+            "--depth=64",
             "--no-write-fetch-head",
             "https://github.com/" + request.repository,
-            f"+refs/pull/{request.number}/head:refs/intent-ci/proposed",
             *(
-                ["+refs/heads/intent-state:refs/remotes/origin/intent-state"]
-                if request.base is not None
+                [f"+refs/pull/{request.number}/head:refs/intent-ci/proposed"]
+                if request.number is not None
                 else []
             ),
+            "+refs/heads/intent-state:refs/remotes/origin/intent-state",
         ],
         cwd=root,
         env={
@@ -159,24 +175,24 @@ def fetch_proposed_revision(root: Path, request: ProtectedRequest, token: str) -
         if process.poll() is None:
             os.killpg(process.pid, signal.SIGKILL)
             process.wait()
-    if (
+    if request.number is not None and (
         _git(root, ("rev-parse", "--verify", "refs/intent-ci/proposed"), 256).decode().strip()
         != request.revision
     ):
         raise ValueError("protected CI unavailable")
-    if (
-        request.base is not None
-        and _git(root, ("rev-parse", "--verify", "refs/remotes/origin/intent-state"), 256)
+    state_tip = (
+        _git(root, ("rev-parse", "--verify", "refs/remotes/origin/intent-state"), 256)
         .decode()
         .strip()
-        != request.base
+    )
+    if _REVISION.fullmatch(state_tip) is None or (
+        request.base is not None and state_tip != request.base
     ):
         raise ValueError("protected CI unavailable")
+    return state_tip
 
 
 def main(root: Path) -> int:
-    from intent_engineering.team_state.ci import CiTrustError
-
     try:
         descriptor = os.open(
             os.environ["GITHUB_EVENT_PATH"], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
@@ -194,7 +210,6 @@ def main(root: Path) -> int:
             fetch_proposed_revision(root, request, os.environ.get("GH_TOKEN", ""))
         elif sys.argv[1:] == ["validate-state"]:
             from intent_engineering.team_state.candidate import validate_candidate
-            from intent_engineering.team_state.ci import ci_trust_from_environment
 
             if request.base is None:
                 raise ValueError("protected CI unavailable")
@@ -214,7 +229,24 @@ def main(root: Path) -> int:
                 != request.revision
             ):
                 raise ValueError("protected CI unavailable")
-            run_immutable_check(root, at=datetime.now(UTC), revision=request.revision)
+            state_tip = (
+                _git(root, ("rev-parse", "--verify", "refs/remotes/origin/intent-state"), 256)
+                .decode()
+                .strip()
+            )
+            if _REVISION.fullmatch(state_tip) is None:
+                raise ValueError("protected CI unavailable")
+            owner = _workflow_owner(request, os.environ)
+            run_immutable_check(
+                root,
+                at=datetime.now(UTC),
+                revision=request.revision,
+                trust_provider=ci_trust_from_environment(root),
+                state_tip=state_tip,
+                owner=owner,
+            )
+        elif sys.argv[1:] == ["cleanup"]:
+            cleanup_ephemeral_ci(_workflow_owner(request, os.environ))
         else:
             raise ValueError("protected CI unavailable")
         return 0

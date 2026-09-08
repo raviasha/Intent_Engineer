@@ -2,8 +2,8 @@
 
 GitHub setup currently supports an **organization-owned repository** with a separately
 provisioned **self-hosted** runner recipient and an organization runner group restricted
-to one reviewed workflow. Personal repositories and unrestricted/shared runner groups
-are not supported by this setup path.
+to the exact two reviewed state-validation and code-check workflows. Personal
+repositories and unrestricted/shared runner groups are not supported by this setup path.
 Developer private keys never leave their OS keyring. Runner private keys also stay
 in that runner service account's OS keyring: do not put them in GitHub Secrets,
 Actions variables, Git, `.intent`, artifacts, command arguments, or logs.
@@ -24,12 +24,18 @@ Actions variables, Git, `.intent`, artifacts, command arguments, or logs.
 
    Configure the organization's non-default runner group named `intent-state` with
    selected-repository visibility for this repository and restricted workflow access
-   to exactly `acme/project/.github/workflows/intent-state.yml@refs/heads/main`
+   to exactly `acme/project/.github/workflows/intent-state.yml@refs/heads/main` and
+   `acme/project/.github/workflows/intent-check.yml@refs/heads/main`
    (substitute the real repository and default branch). Register the runner in that
    group with the exact name `release-01` used below and labels `self-hosted` and
    `intent-state`. The descriptor's `--runner` value must match the registered runner
    name, not merely a label. Setup checks the actual group's runner membership.
-   Do not execute candidate code or other untrusted workflows as this account.
+   Do not execute candidate code on the host or admit other workflows to this group.
+   Code checks use only the existing disposable, secret-free immutable sandbox;
+   state validation never executes candidate code. Both protected launchers use the
+   same independent CI recipient, without exporting a developer key or provisioning
+   another recipient. The runner must meet the Linux/Docker isolation requirements in
+   [required check setup](intent-aware-agent.md#required-github-check-setup).
    Configure a working OS keyring backend accessible to the runner service
    account (including after restart); a plaintext/file keyring backend is not
    an acceptable deployment. Run these commands **as that service account**:
@@ -65,7 +71,8 @@ Actions variables, Git, `.intent`, artifacts, command arguments, or logs.
    branch protection changes.” A fresh, distinct WebAuthn decision is required after
    setup verifies the exact remote tooling, default protection, runner group and rule.
 
-3. Review and merge the suggested workflow on the protected default branch before
+3. Review and merge all three staged files—CODEOWNERS, the state workflow, and the
+   code-check workflow—on the protected default branch before
    configuring state-branch protection or opening a state publication PR. Configure
    an active required-workflow ruleset that targets **`refs/heads/intent-state`**,
    with no bypass actors, and requires exactly this repository's
@@ -76,6 +83,13 @@ Actions variables, Git, `.intent`, artifacts, command arguments, or logs.
    governed. A rule that instead targets only the default branch does not protect
    state publications. Setup checks the effective rule for `intent-state` and its
    active source ruleset; a status name or Actions app ID alone is insufficient.
+
+   Configure a separate active, no-bypass required-workflow ruleset for the protected
+   default branch, sourcing exactly this repository's `.github/workflows/intent-check.yml`
+   at the same default-branch ref, with `do_not_enforce_on_create: false`. Default
+   branch protection must also require the strict `Intent Engineering / check` status
+   bound to GitHub Actions app ID `15368`. Setup verifies both effective workflow-source
+   rules; a matching status name alone does not prove which tooling ran.
 
    The generated job is exactly `Intent Engineering / state`, with:
 
@@ -125,14 +139,23 @@ Actions variables, Git, `.intent`, artifacts, command arguments, or logs.
    A missing key, wrong repository/key, malformed or writable public config,
    invalid signature, extra artifact, or non-linear candidate fails closed.
    `INTENT_CI_SHARED_STATE_TRUST` private-key JSON is explicitly rejected by this
-   production validator, even when a public config path is also supplied.
+   production validator and protected code-check launcher, even when a public config
+   path is also supplied. Neither workflow uploads decrypted state, test results or
+   logs as artifacts, uses an Actions cache, comments on PRs, or writes/merges branches.
+   The code check retains only its strict canonical result at runner-local
+   `.intent-trusted/.intent-ci/test-results.json` for in-job audit. Its final
+   `always()` step sweeps only bounded, exact Docker IDs carrying this repository,
+   Actions run ID, and run attempt in the runtime's `intent.ephemeral-ci` label,
+   removing containers before images. A separate nonce label scopes in-process
+   cleanup; neither path prunes unrelated or concurrently owned runner resources.
 
 ## Limits and lifecycle
 
 This is a trusted self-hosted-runner deployment, not GitHub-hosted key provisioning.
 Protect runner group access, its service account, public config, dependencies, and
-default-branch workflow together. A process allowed to run as that account can
-access its keyring. Do not share the account with candidate builds.
+default-branch workflows together. A process allowed to run as that account can
+access its keyring. Candidate builds must remain inside the existing disposable
+immutable sandbox, never as host processes or other workflows on that account.
 
 Setup records a bounded public bootstrap receipt before attempting state-ref
 creation. If the response is lost, restart and preview protection again; recovery

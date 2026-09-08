@@ -270,14 +270,17 @@ class _GitHubTransport:
         self.tooling = {
             "4" * 40: preview.codeowners_suggestion.encode(),
             "5" * 40: preview.workflow_suggestion.encode(),
+            "6" * 40: preview.check_workflow_suggestion.encode(),
         }
 
-    def workflow_parameters(self):
+    def workflow_parameters(self, *, state=True):
         return {
-            "do_not_enforce_on_create": True,
+            "do_not_enforce_on_create": state,
             "workflows": [
                 {
-                    "path": ".github/workflows/intent-state.yml",
+                    "path": ".github/workflows/intent-state.yml"
+                    if state
+                    else ".github/workflows/intent-check.yml",
                     "ref": "refs/heads/main",
                     "repository_id": 77,
                     "sha": "a" * 40,
@@ -317,6 +320,11 @@ class _GitHubTransport:
             }
         elif path.endswith("/branches/main/protection"):
             data = {
+                "required_status_checks": {
+                    "strict": True,
+                    "contexts": ["Intent Engineering / check"],
+                    "checks": [{"context": "Intent Engineering / check", "app_id": 15368}],
+                },
                 "enforce_admins": {"enabled": True},
                 "allow_deletions": {"enabled": False},
                 "allow_force_pushes": {"enabled": False},
@@ -328,7 +336,11 @@ class _GitHubTransport:
                 },
             }
         elif path == "/orgs/acme/actions/runner-groups":
-            assert params == {"per_page": "100", "visible_to_repository": "acme/project"}
+            assert params == {
+                "page": "1",
+                "per_page": "100",
+                "visible_to_repository": "acme/project",
+            }
             data = {
                 "total_count": 1,
                 "runner_groups": [
@@ -339,19 +351,28 @@ class _GitHubTransport:
                         "default": False,
                         "restricted_to_workflows": True,
                         "selected_workflows": [
-                            "acme/project/.github/workflows/intent-state.yml@refs/heads/main"
+                            "acme/project/.github/workflows/intent-check.yml@refs/heads/main",
+                            "acme/project/.github/workflows/intent-state.yml@refs/heads/main",
                         ],
                     }
                 ],
             }
-        elif path == "/repos/acme/project/rulesets/91":
+        elif path in {"/repos/acme/project/rulesets/91", "/repos/acme/project/rulesets/92"}:
+            state = path.endswith("91")
             data = {
-                "id": 91,
+                "id": 91 if state else 92,
                 "target": "branch",
                 "enforcement": "active",
                 "bypass_actors": [],
-                "conditions": {"ref_name": {"include": ["refs/heads/intent-state"], "exclude": []}},
-                "rules": [{"type": "workflows", "parameters": self.workflow_parameters()}],
+                "conditions": {
+                    "ref_name": {
+                        "include": ["refs/heads/intent-state" if state else "refs/heads/main"],
+                        "exclude": [],
+                    }
+                },
+                "rules": [
+                    {"type": "workflows", "parameters": self.workflow_parameters(state=state)}
+                ],
             }
         elif path.endswith("/branches/intent-state"):
             code = 404 if self.branch is None else 200
@@ -486,7 +507,13 @@ class _GitHubTransport:
                                 "mode": "100644",
                                 "type": "blob",
                                 "sha": "5" * 40,
-                            }
+                            },
+                            {
+                                "path": "intent-check.yml",
+                                "mode": "100644",
+                                "type": "blob",
+                                "sha": "6" * 40,
+                            },
                         ],
                     },
                     {"X-OAuth-Scopes": "repo, admin:org"},
@@ -598,15 +625,19 @@ class _GitHubTransport:
                 ),
                 etag=None,
             )
-        if path == "/repos/acme/project/rules/branches/intent-state":
+        if path in {
+            "/repos/acme/project/rules/branches/intent-state",
+            "/repos/acme/project/rules/branches/main",
+        }:
+            state = path.endswith("intent-state")
             return PageResult(
                 items=(
                     {
                         "type": "workflows",
                         "ruleset_source_type": "Repository",
                         "ruleset_source": "acme/project",
-                        "ruleset_id": 91,
-                        "parameters": self.workflow_parameters(),
+                        "ruleset_id": 91 if state else 92,
+                        "parameters": self.workflow_parameters(state=state),
                     },
                 ),
                 etag=None,
@@ -659,7 +690,14 @@ class _SetupVerifier(_TeamVerifier):
 @pytest.mark.anyio
 @pytest.mark.parametrize(
     "failure",
-    ["default-unprotected", "file-conflict", "anchor-race", "before-suggestions", "before-signing"],
+    [
+        "default-unprotected",
+        "file-conflict",
+        "check-workflow-conflict",
+        "anchor-race",
+        "before-suggestions",
+        "before-signing",
+    ],
 )
 async def test_protection_rejects_conflicts_and_branch_changes_at_write_boundaries(
     tmp_path, monkeypatch, failure
@@ -705,9 +743,14 @@ async def test_protection_rejects_conflicts_and_branch_changes_at_write_boundari
             assert not any(
                 name.startswith("intent-engineering-signing/") for name, _ in backend.values
             )
-        elif failure == "file-conflict":
-            (harness.project / ".github").mkdir()
-            (harness.project / ".github/CODEOWNERS").write_text("* @someone-else\n")
+        elif failure in {"file-conflict", "check-workflow-conflict"}:
+            target = harness.project / (
+                ".github/CODEOWNERS"
+                if failure == "file-conflict"
+                else ".github/workflows/intent-check.yml"
+            )
+            target.parent.mkdir(parents=True)
+            target.write_text("* @someone-else\n")
             with pytest.raises(ValueError):
                 await service.github_setup_action("protection-preview")
             assert transport.writes == []

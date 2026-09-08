@@ -1,0 +1,39 @@
+# Protected default-branch tooling only; candidate commits are inert Git objects.
+name: Intent Engineering
+"on":
+  pull_request_target:
+    branches: [intent-state]
+permissions:
+  contents: read
+concurrency:
+  group: intent-state-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+jobs:
+  state:
+    name: Intent Engineering / state
+    runs-on:
+      group: intent-state
+      labels: [self-hosted, intent-state]
+    environment: intent-ci
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: .intent-trusted
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: "3.12"
+      - name: Install protected hash-locked tooling dependencies
+        run: "python -I -m pip install --require-hashes --only-binary=:all: -r .intent-trusted/src/intent_engineering/integrations/ci-runtime.lock"
+      - name: Fetch state objects without checking out candidate code
+        run: python -I .intent-trusted/ci/launch.py fetch-state
+        env:
+          INTENT_CI_TOOLING_SHA: ${{ github.workflow_sha }}
+          GH_TOKEN: ${{ github.token }}
+      - name: Verify exact signed state candidate
+        run: python -I .intent-trusted/ci/launch.py validate-state
+        env:
+          INTENT_CI_TOOLING_SHA: ${{ github.workflow_sha }}

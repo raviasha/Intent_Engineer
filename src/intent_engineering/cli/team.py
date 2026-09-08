@@ -24,6 +24,7 @@ from intent_engineering.cli.writes import policy_actor_aliases
 from intent_engineering.control_plane.models import HumanDecisionPayload
 from intent_engineering.control_plane.webauthn_service import VerifiedHumanDecision
 from intent_engineering.core.models._base import StrictModel
+from intent_engineering.integrations.workflows import check_workflow, state_workflow
 from intent_engineering.team_state.github import (
     GitHubProtectionPreview,
     GitHubTeamStateStatus,
@@ -79,6 +80,10 @@ class GitHubEnablePreview(StrictModel):
     )
     codeowners_suggestion: str
     workflow_suggestion: str
+    check_workflow_path: Literal[".github/workflows/intent-check.yml"] = (
+        ".github/workflows/intent-check.yml"
+    )
+    check_workflow_suggestion: str
     code_suggestions: CodeSuggestionPreview | None = None
     ci_recipient: CiRecipientRecord | None = None
     preview_digest: str
@@ -289,46 +294,12 @@ def build_github_enable_preview(
             f"/ci/launch.py {code_owner}\n"
             f"/src/intent_engineering/ {code_owner}\n"
         )
-        workflow_suggestion = (
-            "# Protected default-branch tooling only; candidate commits are inert Git objects.\n"
-            "name: Intent Engineering\n"
-            '"on":\n'
-            "  pull_request_target:\n"
-            "    branches: [intent-state]\n"
-            "permissions:\n"
-            "  contents: read\n"
-            "jobs:\n"
-            "  state:\n"
-            "    name: Intent Engineering / state\n"
-            "    runs-on:\n"
-            "      group: intent-state\n"
-            "      labels: [self-hosted, intent-state]\n"
-            "    environment: intent-ci\n"
-            "    timeout-minutes: 10\n"
-            "    steps:\n"
-            "      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262\n"
-            "        with:\n"
-            "          ref: ${{ github.workflow_sha }}\n"
-            "          path: .intent-trusted\n"
-            "          fetch-depth: 0\n"
-            "          persist-credentials: false\n"
-            "      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065\n"
-            "        with:\n"
-            '          python-version: "3.12"\n'
-            "      - name: Install protected hash-locked tooling dependencies\n"
-            '        run: "python -I -m pip install --require-hashes --only-binary=:all: -r .intent-trusted/src/intent_engineering/integrations/ci-runtime.lock"\n'
-            "      - name: Fetch state objects without checking out candidate code\n"
-            "        run: python -I .intent-trusted/ci/launch.py fetch-state\n"
-            "        env:\n"
-            "          INTENT_CI_TOOLING_SHA: ${{ github.workflow_sha }}\n"
-            "          GH_TOKEN: ${{ github.token }}\n"
-            "      - name: Verify exact signed state candidate\n"
-            "        run: python -I .intent-trusted/ci/launch.py validate-state\n"
-            "        env:\n"
-            "          INTENT_CI_TOOLING_SHA: ${{ github.workflow_sha }}\n"
-        )
+        workflow_suggestion = state_workflow()
+        check_workflow_suggestion = check_workflow()
         suggestions = (
-            preview_code_suggestions(project, codeowners_suggestion, workflow_suggestion)
+            preview_code_suggestions(
+                project, codeowners_suggestion, workflow_suggestion, check_workflow_suggestion
+            )
             if (project / ".git").exists()
             else None
         )
@@ -349,6 +320,8 @@ def build_github_enable_preview(
             "repository_id": repository_id,
             "workflow_path": ".github/workflows/intent-state.yml",
             "workflow_suggestion": workflow_suggestion,
+            "check_workflow_path": ".github/workflows/intent-check.yml",
+            "check_workflow_suggestion": check_workflow_suggestion,
             "code_suggestions": None
             if suggestions is None
             else suggestions.model_dump(mode="json"),
@@ -360,6 +333,7 @@ def build_github_enable_preview(
             code_owner=code_owner,
             codeowners_suggestion=codeowners_suggestion,
             workflow_suggestion=workflow_suggestion,
+            check_workflow_suggestion=check_workflow_suggestion,
             code_suggestions=suggestions,
             ci_recipient=ci_recipient,
             preview_digest=_digest(payload),

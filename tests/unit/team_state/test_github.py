@@ -38,6 +38,9 @@ CODEOWNERS = (
     b"/src/intent_engineering/ @alice\n"
 )
 WORKFLOW = b"name: Intent Engineering\njobs:\n  state:\n    name: Intent Engineering / state\n"
+CHECK_WORKFLOW = (
+    b"name: Intent Engineering Check\njobs:\n  check:\n    name: Intent Engineering / check\n"
+)
 
 
 class QueueApi:
@@ -300,13 +303,20 @@ def _default_tooling(
     workflows_tree = "9" * 40
     codeowners_sha = "1" * 40
     workflow_sha = "2" * 40
+    check_workflow_sha = "4" * 40
     entries: list[dict[str, object]] = [
         {
             "path": "intent-state.yml",
             "mode": "100644",
             "type": "blob",
             "sha": workflow_sha,
-        }
+        },
+        {
+            "path": "intent-check.yml",
+            "mode": "100644",
+            "type": "blob",
+            "sha": check_workflow_sha,
+        },
     ]
     responses = [
         _response(
@@ -329,6 +339,16 @@ def _default_tooling(
                         "apps": [],
                     },
                 },
+                "required_status_checks": {
+                    "strict": True,
+                    "contexts": ["Intent Engineering / check"],
+                    "checks": [
+                        {
+                            "context": "Intent Engineering / check",
+                            "app_id": GITHUB_ACTIONS_APP_ID,
+                        }
+                    ],
+                },
             },
         ),
         _response(
@@ -343,7 +363,8 @@ def _default_tooling(
                         "default": False,
                         "restricted_to_workflows": True,
                         "selected_workflows": [
-                            "acme/project/.github/workflows/intent-state.yml@refs/heads/main"
+                            "acme/project/.github/workflows/intent-check.yml@refs/heads/main",
+                            "acme/project/.github/workflows/intent-state.yml@refs/heads/main",
                         ],
                     }
                 ],
@@ -364,6 +385,31 @@ def _default_tooling(
                             "workflows": [
                                 {
                                     "path": ".github/workflows/intent-state.yml",
+                                    "ref": "refs/heads/main",
+                                    "repository_id": 77,
+                                    "sha": "d" * 40,
+                                }
+                            ],
+                        },
+                    }
+                ],
+            },
+        ),
+        _response(
+            200,
+            {
+                "id": 92,
+                "target": "branch",
+                "enforcement": "active",
+                "bypass_actors": [],
+                "rules": [
+                    {
+                        "type": "workflows",
+                        "parameters": {
+                            "do_not_enforce_on_create": False,
+                            "workflows": [
+                                {
+                                    "path": ".github/workflows/intent-check.yml",
                                     "ref": "refs/heads/main",
                                     "repository_id": 77,
                                     "sha": "d" * 40,
@@ -441,6 +487,31 @@ def _required_workflow_page() -> PageResult:
     )
 
 
+def _required_check_workflow_page() -> PageResult:
+    return PageResult(
+        items=(
+            {
+                "type": "workflows",
+                "ruleset_source_type": "Repository",
+                "ruleset_source": "acme/project",
+                "ruleset_id": 92,
+                "parameters": {
+                    "do_not_enforce_on_create": False,
+                    "workflows": [
+                        {
+                            "path": ".github/workflows/intent-check.yml",
+                            "ref": "refs/heads/main",
+                            "repository_id": 77,
+                            "sha": "d" * 40,
+                        }
+                    ],
+                },
+            },
+        ),
+        etag=None,
+    )
+
+
 def _runner_page(*, runner_name: str = "intent-ci") -> PageResult:
     return PageResult(
         items=(
@@ -467,7 +538,10 @@ def _runner_group(group_id: int, *, exact: bool = False) -> dict[str, object]:
         "default": False,
         "restricted_to_workflows": True,
         "selected_workflows": (
-            ["acme/project/.github/workflows/intent-state.yml@refs/heads/main"]
+            [
+                "acme/project/.github/workflows/intent-check.yml@refs/heads/main",
+                "acme/project/.github/workflows/intent-state.yml@refs/heads/main",
+            ]
             if exact
             else ["acme/project/.github/workflows/other.yml@refs/heads/main"]
         ),
@@ -478,9 +552,12 @@ def _default_tooling_raw(
     *,
     codeowners: bytes = CODEOWNERS,
     workflow: bytes = WORKFLOW,
+    check_workflow: bytes = CHECK_WORKFLOW,
     extra_workflow: bytes | None = None,
 ) -> list[bytes]:
-    return [codeowners, workflow] + ([] if extra_workflow is None else [extra_workflow])
+    return [codeowners, workflow, check_workflow] + (
+        [] if extra_workflow is None else [extra_workflow]
+    )
 
 
 @pytest.mark.anyio
@@ -512,7 +589,7 @@ async def test_default_branch_tooling_is_bound_to_one_exact_protected_commit() -
     """Catches branch protection trusting local-only validator or CODEOWNERS bytes."""
     api = QueueApi(
         _inspection() + _default_tooling(),
-        pages=[_runner_page(), _required_workflow_page()],
+        pages=[_runner_page(), _required_workflow_page(), _required_check_workflow_page()],
         raw=_default_tooling_raw(),
     )
     client = GitHubTeamStateClient(api, expected_account_id="123", expected_login="alice")
@@ -521,12 +598,275 @@ async def test_default_branch_tooling_is_bound_to_one_exact_protected_commit() -
     tooling = await client.verify_default_branch_tooling(
         codeowners=CODEOWNERS,
         workflow=WORKFLOW,
+        check_workflow=CHECK_WORKFLOW,
         runner_id="intent-ci",
     )
 
     assert tooling.commit == "d" * 40
     assert tooling.codeowners_digest == "sha256:" + hashlib.sha256(CODEOWNERS).hexdigest()
     assert tooling.workflow_digest == "sha256:" + hashlib.sha256(WORKFLOW).hexdigest()
+
+
+@pytest.mark.anyio
+async def test_default_branch_tooling_binds_the_exact_check_workflow() -> None:
+    """Catches protecting a check name without binding its reviewed workflow bytes."""
+    api = QueueApi(
+        _inspection() + _default_tooling(),
+        pages=[_runner_page(), _required_workflow_page(), _required_check_workflow_page()],
+        raw=_default_tooling_raw(),
+    )
+    client = GitHubTeamStateClient(api, expected_account_id="123", expected_login="alice")
+    await client.inspect("acme/project")
+
+    tooling = await client.verify_default_branch_tooling(
+        codeowners=CODEOWNERS,
+        workflow=WORKFLOW,
+        check_workflow=CHECK_WORKFLOW,
+        runner_id="intent-ci",
+    )
+
+    assert tooling.check_workflow_digest == ("sha256:" + hashlib.sha256(CHECK_WORKFLOW).hexdigest())
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("remote", [b"", b"name: substituted\n"])
+async def test_default_branch_tooling_rejects_missing_or_wrong_check_workflow(
+    remote: bytes,
+) -> None:
+    api = QueueApi(
+        _inspection() + _default_tooling(),
+        pages=[
+            _runner_page(),
+            _required_workflow_page(),
+            _required_check_workflow_page(),
+        ],
+        raw=_default_tooling_raw(check_workflow=remote),
+    )
+    client = GitHubTeamStateClient(api, expected_account_id="123", expected_login="alice")
+    await client.inspect("acme/project")
+
+    with pytest.raises(GitHubTeamStateError):
+        await client.verify_default_branch_tooling(
+            codeowners=CODEOWNERS,
+            workflow=WORKFLOW,
+            check_workflow=CHECK_WORKFLOW,
+            runner_id="intent-ci",
+        )
+
+
+@pytest.mark.anyio
+async def test_runner_group_requires_exact_sorted_state_and_check_workflows() -> None:
+    """Catches a runner group omitting either protected workflow from its exact ACL."""
+    api = QueueApi(
+        _inspection() + _default_tooling(),
+        pages=[_runner_page(), _required_workflow_page(), _required_check_workflow_page()],
+        raw=_default_tooling_raw(),
+    )
+    client = GitHubTeamStateClient(api, expected_account_id="123", expected_login="alice")
+    await client.inspect("acme/project")
+
+    result = await client.verify_default_branch_tooling(
+        codeowners=CODEOWNERS,
+        workflow=WORKFLOW,
+        check_workflow=CHECK_WORKFLOW,
+        runner_id="intent-ci",
+    )
+
+    assert result.runner_group_digest.startswith("sha256:")
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("change", ["missing_check", "missing_state", "extra", "unsorted"])
+async def test_runner_group_rejects_any_other_selected_workflow_set(change: str) -> None:
+    tooling = _default_tooling()
+    group_payload = dict(tooling[2].payload)
+    groups = [dict(group_payload["runner_groups"][0])]
+    selected = list(groups[0]["selected_workflows"])
+    if change == "missing_check":
+        selected = selected[1:]
+    elif change == "missing_state":
+        selected = selected[:1]
+    elif change == "extra":
+        selected.append("acme/project/.github/workflows/other.yml@refs/heads/main")
+    else:
+        selected.reverse()
+    groups[0]["selected_workflows"] = selected
+    group_payload["runner_groups"] = groups
+    tooling[2] = _response(200, group_payload)
+    api = QueueApi(_inspection() + tooling)
+    client = GitHubTeamStateClient(api, expected_account_id="123", expected_login="alice")
+    await client.inspect("acme/project")
+
+    with pytest.raises(GitHubTeamStateError):
+        await client.verify_default_branch_tooling(
+            codeowners=CODEOWNERS,
+            workflow=WORKFLOW,
+            check_workflow=CHECK_WORKFLOW,
+            runner_id="intent-ci",
+        )
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("change", ["missing", "non_strict", "wrong_app"])
+async def test_default_branch_tooling_requires_strict_app_bound_check(change: str) -> None:
+    """Catches a spoofable or non-strict code check authorizing protected code history."""
+    tooling = _default_tooling()
+    protection = dict(tooling[1].payload)
+    checks = dict(protection["required_status_checks"])
+    if change == "missing":
+        protection.pop("required_status_checks")
+    elif change == "non_strict":
+        checks["strict"] = False
+        protection["required_status_checks"] = checks
+    else:
+        checks["checks"] = [{"context": "Intent Engineering / check", "app_id": 999}]
+        protection["required_status_checks"] = checks
+    tooling[1] = _response(200, protection)
+    api = QueueApi(
+        _inspection() + tooling,
+        pages=[_runner_page(), _required_workflow_page(), _required_check_workflow_page()],
+        raw=_default_tooling_raw(),
+    )
+    client = GitHubTeamStateClient(api, expected_account_id="123", expected_login="alice")
+    await client.inspect("acme/project")
+
+    with pytest.raises(GitHubTeamStateError):
+        await client.verify_default_branch_tooling(
+            codeowners=CODEOWNERS,
+            workflow=WORKFLOW,
+            check_workflow=CHECK_WORKFLOW,
+            runner_id="intent-ci",
+        )
+
+
+@pytest.mark.anyio
+async def test_default_branch_tooling_accepts_stronger_compatible_code_protection() -> None:
+    tooling = _default_tooling()
+    protection = dict(tooling[1].payload)
+    reviews = dict(protection["required_pull_request_reviews"])
+    reviews["required_approving_review_count"] = 3
+    protection["required_pull_request_reviews"] = reviews
+    checks = dict(protection["required_status_checks"])
+    checks["checks"] = [
+        *checks["checks"],
+        {"context": "Security / scan", "app_id": 1},
+    ]
+    protection["required_status_checks"] = checks
+    protection["restrictions"] = {
+        "users": [{"login": "release-bot"}],
+        "teams": [],
+        "apps": [],
+    }
+    tooling[1] = _response(200, protection)
+    api = QueueApi(
+        _inspection() + tooling,
+        pages=[
+            _runner_page(),
+            _required_workflow_page(),
+            _required_check_workflow_page(),
+        ],
+        raw=_default_tooling_raw(),
+    )
+    client = GitHubTeamStateClient(api, expected_account_id="123", expected_login="alice")
+    await client.inspect("acme/project")
+
+    result = await client.verify_default_branch_tooling(
+        codeowners=CODEOWNERS,
+        workflow=WORKFLOW,
+        check_workflow=CHECK_WORKFLOW,
+        runner_id="intent-ci",
+    )
+
+    assert result.protection_digest.startswith("sha256:")
+
+
+@pytest.mark.anyio
+async def test_default_branch_tooling_requires_exact_active_check_workflow_rule() -> None:
+    """Catches app-bound checks that are not enforced by the exact reviewed workflow."""
+    api = QueueApi(
+        _inspection() + _default_tooling(),
+        pages=[
+            _runner_page(),
+            _required_workflow_page(),
+            _required_check_workflow_page(),
+        ],
+        raw=_default_tooling_raw(),
+    )
+    client = GitHubTeamStateClient(api, expected_account_id="123", expected_login="alice")
+    await client.inspect("acme/project")
+
+    result = await client.verify_default_branch_tooling(
+        codeowners=CODEOWNERS,
+        workflow=WORKFLOW,
+        check_workflow=CHECK_WORKFLOW,
+        runner_id="intent-ci",
+    )
+
+    assert result.required_workflow_ruleset_digest.startswith("sha256:")
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "change",
+    [
+        "missing",
+        "duplicate",
+        "wrong_path",
+        "wrong_sha",
+        "create_exempt",
+        "wrong_source",
+        "inactive",
+        "bypass",
+    ],
+)
+async def test_default_branch_tooling_rejects_ambiguous_or_bypassable_check_rule(
+    change: str,
+) -> None:
+    tooling = _default_tooling()
+    page = _required_check_workflow_page()
+    if change == "missing":
+        page = PageResult(items=(), etag=None)
+    elif change == "duplicate":
+        page = PageResult(items=page.items + page.items, etag=None)
+    elif change in {"wrong_path", "wrong_sha", "create_exempt", "wrong_source"}:
+        item = dict(page.model_dump(mode="json")["items"][0])
+        if change == "wrong_source":
+            item["ruleset_source"] = "acme/other"
+        else:
+            parameters = dict(item["parameters"])
+            workflows = [dict(parameters["workflows"][0])]
+            if change == "wrong_path":
+                workflows[0]["path"] = ".github/workflows/other.yml"
+            elif change == "wrong_sha":
+                workflows[0]["sha"] = "c" * 40
+            else:
+                parameters["do_not_enforce_on_create"] = True
+            parameters["workflows"] = workflows
+            item["parameters"] = parameters
+        page = PageResult(items=(item,), etag=None)
+    else:
+        detail = dict(tooling[4].payload)
+        if change == "inactive":
+            detail["enforcement"] = "disabled"
+        else:
+            detail["bypass_actors"] = [
+                {"actor_id": 7, "actor_type": "Team", "bypass_mode": "always"}
+            ]
+        tooling[4] = _response(200, detail)
+    api = QueueApi(
+        _inspection() + tooling,
+        pages=[_runner_page(), _required_workflow_page(), page],
+    )
+    client = GitHubTeamStateClient(api, expected_account_id="123", expected_login="alice")
+    await client.inspect("acme/project")
+
+    with pytest.raises(GitHubTeamStateError):
+        await client.verify_default_branch_tooling(
+            codeowners=CODEOWNERS,
+            workflow=WORKFLOW,
+            check_workflow=CHECK_WORKFLOW,
+            runner_id="intent-ci",
+        )
 
 
 @pytest.mark.anyio
@@ -547,7 +887,7 @@ async def test_runner_group_pagination_finds_the_only_exact_group_on_page_two() 
     tooling[2:3] = [first, second]
     api = QueueApi(
         _inspection() + tooling,
-        pages=[_runner_page(), _required_workflow_page()],
+        pages=[_runner_page(), _required_workflow_page(), _required_check_workflow_page()],
         raw=_default_tooling_raw(),
     )
     client = GitHubTeamStateClient(api, expected_account_id="123", expected_login="alice")
@@ -556,6 +896,7 @@ async def test_runner_group_pagination_finds_the_only_exact_group_on_page_two() 
     result = await client.verify_default_branch_tooling(
         codeowners=CODEOWNERS,
         workflow=WORKFLOW,
+        check_workflow=CHECK_WORKFLOW,
         runner_id="intent-ci",
     )
 
@@ -593,6 +934,7 @@ async def test_runner_group_pagination_fails_closed_on_unbounded_or_repeated_pag
         await client.verify_default_branch_tooling(
             codeowners=CODEOWNERS,
             workflow=WORKFLOW,
+            check_workflow=CHECK_WORKFLOW,
             runner_id="intent-ci",
         )
 
@@ -641,7 +983,11 @@ async def test_default_branch_tooling_accepts_required_workflow_bound_by_protect
     tooling_responses[3] = _response(200, detail)
     api = QueueApi(
         _inspection() + tooling_responses,
-        pages=[_runner_page(), PageResult(items=(page_payload,), etag=None)],
+        pages=[
+            _runner_page(),
+            PageResult(items=(page_payload,), etag=None),
+            _required_check_workflow_page(),
+        ],
         raw=_default_tooling_raw(),
     )
     client = GitHubTeamStateClient(api, expected_account_id="123", expected_login="alice")
@@ -650,6 +996,7 @@ async def test_default_branch_tooling_accepts_required_workflow_bound_by_protect
     result = await client.verify_default_branch_tooling(
         codeowners=CODEOWNERS,
         workflow=WORKFLOW,
+        check_workflow=CHECK_WORKFLOW,
         runner_id="intent-ci",
     )
 
@@ -659,7 +1006,7 @@ async def test_default_branch_tooling_accepts_required_workflow_bound_by_protect
 @pytest.mark.anyio
 @pytest.mark.parametrize(
     "change",
-    ["unprotected", "missing", "wrong", "spoof"],
+    ["unprotected", "missing", "wrong"],
 )
 async def test_default_branch_tooling_rejects_missing_wrong_or_spoofable_workflow(
     change: str,
@@ -671,25 +1018,21 @@ async def test_default_branch_tooling_rejects_missing_wrong_or_spoofable_workflo
         tooling = _default_tooling(workflow=b"")
     elif change == "wrong":
         tooling = _default_tooling(workflow=b"name: other\n")
-    else:
-        tooling = _default_tooling(
-            extra_workflow=b"jobs:\n  spoof:\n    name: Intent Engineering / state\n"
-        )
     raw = (
         _default_tooling_raw(workflow=b"")
         if change == "missing"
         else _default_tooling_raw(workflow=b"name: other\n")
         if change == "wrong"
-        else _default_tooling_raw(
-            extra_workflow=b"jobs:\n  spoof:\n    name: Intent Engineering / state\n"
-        )
-        if change == "spoof"
         else _default_tooling_raw()
     )
     client = GitHubTeamStateClient(
         QueueApi(
             _inspection() + tooling,
-            pages=[_runner_page(), _required_workflow_page()],
+            pages=[
+                _runner_page(),
+                _required_workflow_page(),
+                _required_check_workflow_page(),
+            ],
             raw=raw,
         ),
         expected_account_id="123",
@@ -701,8 +1044,38 @@ async def test_default_branch_tooling_rejects_missing_wrong_or_spoofable_workflo
         await client.verify_default_branch_tooling(
             codeowners=CODEOWNERS,
             workflow=WORKFLOW,
+            check_workflow=CHECK_WORKFLOW,
             runner_id="intent-ci",
         )
+
+
+@pytest.mark.anyio
+async def test_other_workflows_are_bound_without_raw_substring_policy() -> None:
+    """Catches brittle byte scanning instead of exact workflow/ruleset enforcement."""
+    other = (
+        b"name: unrelated\njobs:\n  docs:\n    runs-on: ubuntu-latest\n"
+        b"    name: Intent Engineering / state\n# intent-state\n"
+    )
+    api = QueueApi(
+        _inspection() + _default_tooling(extra_workflow=other),
+        pages=[
+            _runner_page(),
+            _required_workflow_page(),
+            _required_check_workflow_page(),
+        ],
+        raw=_default_tooling_raw(extra_workflow=other),
+    )
+    client = GitHubTeamStateClient(api, expected_account_id="123", expected_login="alice")
+    await client.inspect("acme/project")
+
+    tooling = await client.verify_default_branch_tooling(
+        codeowners=CODEOWNERS,
+        workflow=WORKFLOW,
+        check_workflow=CHECK_WORKFLOW,
+        runner_id="intent-ci",
+    )
+
+    assert tooling.workflows_digest.startswith("sha256:")
 
 
 @pytest.mark.anyio
@@ -748,6 +1121,7 @@ async def test_default_branch_tooling_requires_one_exact_unbypassable_workflow_r
         await client.verify_default_branch_tooling(
             codeowners=CODEOWNERS,
             workflow=WORKFLOW,
+            check_workflow=CHECK_WORKFLOW,
             runner_id="intent-ci",
         )
 

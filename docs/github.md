@@ -45,13 +45,16 @@ permissions; it does not inherit this setup credential. Follow the complete
 
 Before local staging, the default branch must already enforce admins, PR approval,
 stale-review dismissal, no bypass, and disabled force pushes/deletions. The first
-WebAuthn decision stages suggestions only. Commit and merge the exact workflow and
+WebAuthn decision stages all three suggestions only. Commit and merge the exact state
+workflow, code-check workflow, and
 CODEOWNERS through protected default-branch review. Setup verifies the remote bytes
 and code-owner enforcement before a second protection authorization.
 
 The organization runner group must be named `intent-state`, non-default, visible
 only to selected repositories, and restricted to this repository's exact
-`.github/workflows/intent-state.yml@refs/heads/<default-branch>` workflow. The
+`.github/workflows/intent-state.yml@refs/heads/<default-branch>` and
+`.github/workflows/intent-check.yml@refs/heads/<default-branch>` workflows, with no
+additional workflow entries. The
 registered runner name must equal the CI descriptor's runner ID and have both
 `self-hosted` and `intent-state` labels; the workflow selects the group explicitly.
 
@@ -63,6 +66,12 @@ The required `Intent Engineering / state` status and GitHub Actions app ID `1536
 are supplementary—not substitutes for this workflow-source rule or runner isolation.
 Default CODEOWNERS protects tooling, while state PRs use generic human review and
 retain exactly three encrypted/signed artifacts.
+
+The default branch needs its own active, no-bypass required-workflow rule sourcing
+`.github/workflows/intent-check.yml` from the exact protected default-branch ref,
+without a creation exemption. Its strict required `Intent Engineering / check` status
+is also bound to Actions app ID `15368`. Setup verifies both effective rules and
+canonical workflow bytes, not just their status names.
 
 Keep public bootstrap/publication receipts when a provider response is ambiguous.
 Cancel is unavailable once recovery authority is required; retry/inspect instead.
@@ -147,6 +156,15 @@ The sync step supplies `GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}` and
 `Intent Engineering / check` status without any plugin dependency. Its GitHub Actions
 `GITHUB_TOKEN` is ephemeral and distinct from the local CLI credential sources
 above. It performs no external write.
+
+The code workflow excludes `intent-state` PRs; the separate `Intent Engineering / state`
+job accepts only those PRs and validates their three release artifacts without executing
+candidate code. Both checked-in workflows match their packaged canonical assets, run
+only the exact protected `github.workflow_sha`, and use the same restricted self-hosted
+keyring runner. Code checks restore signed approved state before disposable sandbox tests
+and independent final assurance. Neither required workflow accepts GitHub-hosted private
+key JSON, uploads artifacts, uses Actions caches, comments, or auto-merges. Per-PR
+concurrency cancels superseded runs. See [runner provisioning](ci-recipient.md).
 
 ## Scope and testing boundary
 

@@ -473,6 +473,7 @@ class GitHubSetupBridge:
                 self.service._runtime.root,
                 self.request.preview.codeowners_suggestion,
                 self.request.preview.workflow_suggestion,
+                self.request.preview.check_workflow_suggestion,
             )
             installed = all(
                 preimage is not None
@@ -481,6 +482,7 @@ class GitHubSetupBridge:
                 for preimage, content in (
                     (suggestions.codeowners_preimage, suggestions.codeowners_content),
                     (suggestions.workflow_preimage, suggestions.workflow_content),
+                    (suggestions.check_workflow_preimage, suggestions.check_workflow_content),
                 )
             )
             return "code_changes_staged" if installed else "enrolled"
@@ -709,6 +711,7 @@ class GitHubSetupBridge:
                     service._runtime.root,
                     self.request.preview.codeowners_suggestion,
                     self.request.preview.workflow_suggestion,
+                    self.request.preview.check_workflow_suggestion,
                 )
                 != self.suggestions
             ):
@@ -725,6 +728,7 @@ class GitHubSetupBridge:
                 live_tooling = await client.verify_default_branch_tooling(
                     codeowners=self.request.preview.codeowners_suggestion.encode("utf-8"),
                     workflow=self.request.preview.workflow_suggestion.encode("utf-8"),
+                    check_workflow=self.request.preview.check_workflow_suggestion.encode("utf-8"),
                     runner_id=self.request.preview.ci_recipient.runner_id
                     if self.request.preview.ci_recipient is not None
                     else "",
@@ -790,12 +794,14 @@ class GitHubSetupBridge:
                 service._runtime.root,
                 self.request.preview.codeowners_suggestion,
                 self.request.preview.workflow_suggestion,
+                self.request.preview.check_workflow_suggestion,
             )
             if action == "publication-preview":
                 baseline = await client.verify_default_branch_baseline()
                 publication_tooling = await client.verify_default_branch_tooling(
                     codeowners=self.request.preview.codeowners_suggestion.encode("utf-8"),
                     workflow=self.request.preview.workflow_suggestion.encode("utf-8"),
+                    check_workflow=self.request.preview.check_workflow_suggestion.encode("utf-8"),
                     runner_id=self.request.preview.ci_recipient.runner_id
                     if self.request.preview.ci_recipient is not None
                     else "",
@@ -886,6 +892,7 @@ class GitHubSetupBridge:
                 for existing, suggested in (
                     (suggestions.codeowners_preimage, suggestions.codeowners_content),
                     (suggestions.workflow_preimage, suggestions.workflow_content),
+                    (suggestions.check_workflow_preimage, suggestions.check_workflow_content),
                 ):
                     current = (
                         None
@@ -901,6 +908,9 @@ class GitHubSetupBridge:
                         tooling = await client.verify_default_branch_tooling(
                             codeowners=self.request.preview.codeowners_suggestion.encode("utf-8"),
                             workflow=self.request.preview.workflow_suggestion.encode("utf-8"),
+                            check_workflow=self.request.preview.check_workflow_suggestion.encode(
+                                "utf-8"
+                            ),
                             runner_id=self.request.preview.ci_recipient.runner_id
                             if self.request.preview.ci_recipient is not None
                             else "",
@@ -910,9 +920,9 @@ class GitHubSetupBridge:
                             "state": "code_changes_staged",
                             "repository_id": status.repository_id,
                             "guidance": (
-                                "Commit and merge the exact staged CODEOWNERS and validator workflow "
+                                "Commit and merge the exact staged CODEOWNERS and both protected workflows "
                                 "to the protected default branch, restrict the intent-state runner "
-                                "group to that workflow, then preview protection again."
+                                "group to exactly those workflows, then preview protection again."
                             ),
                         }
                 authority = self._authority()
@@ -1099,12 +1109,13 @@ class GitHubSetupBridge:
                     service._runtime.root,
                     self.request.preview.codeowners_suggestion,
                     self.request.preview.workflow_suggestion,
+                    self.request.preview.check_workflow_suggestion,
                 )
                 return {
                     "state": "code_changes_staged",
                     "repository_id": status.repository_id,
                     "guidance": (
-                        "Commit and merge the staged CODEOWNERS and validator workflow to the "
+                        "Commit and merge the staged CODEOWNERS and both protected workflows to the "
                         "protected default branch, then preview branch protection again."
                     ),
                 }

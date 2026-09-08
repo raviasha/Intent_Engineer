@@ -15,11 +15,13 @@ from typing import Self
 from pydantic import ConfigDict, model_validator
 
 from intent_engineering.core.models._base import StrictModel
+from intent_engineering.integrations.workflows import check_workflow as canonical_check_workflow
 from intent_engineering.storage.secure import SecureDirectory, UnsafePathError
 from intent_engineering.team_state.restore import _run_git as _run_git_bounded
 
 _CODEOWNERS_PATH = PurePosixPath(".github/CODEOWNERS")
 _WORKFLOW_PATH = PurePosixPath(".github/workflows/intent-state.yml")
+_CHECK_WORKFLOW_PATH = PurePosixPath(".github/workflows/intent-check.yml")
 _MAX_SUGGESTION_BYTES = 64 * 1024
 _MAX_GIT_OUTPUT_BYTES = 4096
 _COMMIT = re.compile(r"^[0-9a-f]{40}(?:[0-9a-f]{24})?$")
@@ -46,8 +48,10 @@ class CodeSuggestionPreview(StrictModel):
     head_commit: str
     codeowners_content: str
     workflow_content: str
+    check_workflow_content: str
     codeowners_preimage: str | None
     workflow_preimage: str | None
+    check_workflow_preimage: str | None
     digest: str
 
     @model_validator(mode="after")
@@ -56,8 +60,10 @@ class CodeSuggestionPreview(StrictModel):
             raise ValueError("invalid code suggestion binding")
         codeowners = _suggestion_bytes(self.codeowners_content)
         workflow = _suggestion_bytes(self.workflow_content)
+        check_workflow = _suggestion_bytes(self.check_workflow_content)
         codeowners_preimage = _decode_preimage(self.codeowners_preimage)
         workflow_preimage = _decode_preimage(self.workflow_preimage)
+        check_workflow_preimage = _decode_preimage(self.check_workflow_preimage)
         if _DIGEST.fullmatch(self.digest) is None or self.digest != _preview_digest(
             self.branch,
             self.head_commit,
@@ -65,6 +71,8 @@ class CodeSuggestionPreview(StrictModel):
             workflow,
             codeowners_preimage,
             workflow_preimage,
+            check_workflow,
+            check_workflow_preimage,
         ):
             raise ValueError("invalid code suggestion digest")
         return self
@@ -74,22 +82,28 @@ def preview_code_suggestions(
     root: Path,
     codeowners: str,
     workflow: str,
+    check_workflow: str | None = None,
 ) -> CodeSuggestionPreview:
     """Capture exact suggestions and their current developer-branch preimages."""
     project = SecureDirectory.open(root)
     try:
+        check_workflow = canonical_check_workflow() if check_workflow is None else check_workflow
         branch, head_commit = _code_head(project)
         codeowners_bytes = _suggestion_bytes(codeowners)
         workflow_bytes = _suggestion_bytes(workflow)
+        check_workflow_bytes = _suggestion_bytes(check_workflow)
         codeowners_preimage = _read_optional(project, _CODEOWNERS_PATH)
         workflow_preimage = _read_optional(project, _WORKFLOW_PATH)
+        check_workflow_preimage = _read_optional(project, _CHECK_WORKFLOW_PATH)
         return CodeSuggestionPreview(
             branch=branch,
             head_commit=head_commit,
             codeowners_content=codeowners,
             workflow_content=workflow,
+            check_workflow_content=check_workflow,
             codeowners_preimage=_encode_preimage(codeowners_preimage),
             workflow_preimage=_encode_preimage(workflow_preimage),
+            check_workflow_preimage=_encode_preimage(check_workflow_preimage),
             digest=_preview_digest(
                 branch,
                 head_commit,
@@ -97,6 +111,8 @@ def preview_code_suggestions(
                 workflow_bytes,
                 codeowners_preimage,
                 workflow_preimage,
+                check_workflow_bytes,
+                check_workflow_preimage,
             ),
         )
     finally:
@@ -122,6 +138,11 @@ def stage_code_suggestions(root: Path, preview: CodeSuggestionPreview) -> None:
                 _WORKFLOW_PATH,
                 _suggestion_bytes(preview.workflow_content),
                 _decode_preimage(preview.workflow_preimage),
+            ),
+            (
+                _CHECK_WORKFLOW_PATH,
+                _suggestion_bytes(preview.check_workflow_content),
+                _decode_preimage(preview.check_workflow_preimage),
             ),
         )
         observed = tuple(_read_optional(project, path) for path, _, _ in proposals)
@@ -355,6 +376,8 @@ def _preview_digest(
     workflow: bytes,
     codeowners_preimage: bytes | None,
     workflow_preimage: bytes | None,
+    check_workflow: bytes,
+    check_workflow_preimage: bytes | None,
 ) -> str:
     digest = hashlib.sha256()
     for label, value in (
@@ -364,6 +387,8 @@ def _preview_digest(
         (b"workflow", workflow),
         (b"codeowners-preimage", codeowners_preimage),
         (b"workflow-preimage", workflow_preimage),
+        (b"check-workflow", check_workflow),
+        (b"check-workflow-preimage", check_workflow_preimage),
     ):
         digest.update(len(label).to_bytes(2, "big"))
         digest.update(label)

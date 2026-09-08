@@ -19,6 +19,7 @@ from intent_engineering.team_state.models import PreparedPublication
 _REPOSITORY = re.compile(r"(?!-)(?!.*--)[a-z0-9-]{1,39}(?<!-)/[a-z0-9][a-z0-9._-]{0,99}\Z")
 _COMMIT = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?\Z")
 _REQUIRED_CHECK = "Intent Engineering / state"
+_CODE_REQUIRED_CHECK = "Intent Engineering / check"
 _GITHUB_ACTIONS_APP_ID = 15368
 _MAX_PROTECTION_SNAPSHOT_BYTES = 64 * 1024
 _MAX_PROTECTION_COLLECTION_ITEMS = 256
@@ -158,6 +159,7 @@ class GitHubDefaultBranchTooling(StrictModel):
     protection_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
     codeowners_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
     workflow_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    check_workflow_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
     workflows_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
     runner_group_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
     runner_membership_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
@@ -436,6 +438,92 @@ class GitHubTeamStateClient:
                 raise GitHubTeamStateError()
         raise GitHubTeamStateError()
 
+    async def _required_workflow_rule_snapshot(
+        self,
+        reviewed: GitHubTeamStateStatus,
+        *,
+        target_branch: str,
+        workflow_path: str,
+        do_not_enforce_on_create: bool,
+        commit_sha: str,
+    ) -> dict[str, object]:
+        repository = reviewed.repository_id.removeprefix("github.com/")
+        owner, _ = repository.split("/", 1)
+        effective_rules = await self._api.get_pages(
+            f"/repos/{repository}/rules/branches/{target_branch}",
+            {"per_page": "100"},
+        )
+        effective_items = effective_rules.model_dump(mode="json")["items"]
+        workflow_rules = [
+            rule
+            for rule in effective_items
+            if type(rule) is dict and rule.get("type") == "workflows"
+        ]
+        if effective_rules.not_modified or len(workflow_rules) != 1:
+            raise GitHubTeamStateError()
+        workflow_rule = workflow_rules[0]
+        parameters = workflow_rule.get("parameters")
+        ruleset_id = _integer(workflow_rule.get("ruleset_id"))
+        source_type = workflow_rule.get("ruleset_source_type")
+        source = workflow_rule.get("ruleset_source")
+        configured_workflows = parameters.get("workflows") if type(parameters) is dict else None
+        configured_workflow = (
+            configured_workflows[0]
+            if type(configured_workflows) is list and len(configured_workflows) == 1
+            else None
+        )
+        expected_workflow = {
+            "path": workflow_path,
+            "ref": f"refs/heads/{reviewed.default_branch}",
+            "repository_id": int(reviewed.repository_node_id),
+        }
+        if (
+            type(parameters) is not dict
+            or set(parameters) != {"do_not_enforce_on_create", "workflows"}
+            or parameters.get("do_not_enforce_on_create") is not do_not_enforce_on_create
+            or type(configured_workflow) is not dict
+            or set(configured_workflow) not in (set(expected_workflow), {*expected_workflow, "sha"})
+            or any(
+                configured_workflow.get(key) != value for key, value in expected_workflow.items()
+            )
+            or ("sha" in configured_workflow and configured_workflow.get("sha") != commit_sha)
+            or ruleset_id is None
+            or source_type not in {"Repository", "Organization"}
+            or (source_type == "Repository" and source != repository)
+            or (source_type == "Organization" and source != owner)
+        ):
+            raise GitHubTeamStateError()
+        ruleset_path = (
+            f"/repos/{repository}/rulesets/{ruleset_id}"
+            if source_type == "Repository"
+            else f"/orgs/{owner}/rulesets/{ruleset_id}"
+        )
+        ruleset = await self._api.request_json_object("GET", ruleset_path)
+        rules = ruleset.payload.get("rules")
+        if (
+            ruleset.payload.get("id") != ruleset_id
+            or ruleset.payload.get("target") != "branch"
+            or ruleset.payload.get("enforcement") != "active"
+            or ruleset.payload.get("bypass_actors") != []
+            or type(rules) is not list
+            or len(
+                [
+                    rule
+                    for rule in rules
+                    if type(rule) is dict
+                    and rule.get("type") == "workflows"
+                    and rule.get("parameters") == parameters
+                ]
+            )
+            != 1
+        ):
+            raise GitHubTeamStateError()
+        return {
+            "target_branch": target_branch,
+            "effective_rule": dict(workflow_rule),
+            "ruleset": dict(ruleset.payload),
+        }
+
     async def verify_default_branch_baseline(self) -> GitHubDefaultBranchBaseline:
         """Bind the protected, human-reviewed default branch before staging tooling."""
         reviewed = self._reviewed
@@ -685,6 +773,7 @@ class GitHubTeamStateClient:
         *,
         codeowners: bytes,
         workflow: bytes,
+        check_workflow: bytes,
         runner_id: str,
     ) -> GitHubDefaultBranchTooling:
         repository = reviewed.repository_id.removeprefix("github.com/")
@@ -710,6 +799,7 @@ class GitHubTeamStateClient:
             type(bypass) is dict
             and all(bypass.get(name) == [] for name in ("users", "teams", "apps"))
         )
+        default_policy = _protection_policy(protection.payload)
         if (
             _enabled(protection.payload.get("enforce_admins")) is not True
             or _enabled(protection.payload.get("allow_deletions")) is not False
@@ -720,12 +810,27 @@ class GitHubTeamStateClient:
             or type(approvals) is not int
             or approvals < 1
             or not bypass_empty
+            or default_policy.required_status_checks_strict is not True
+            or GitHubRequiredStatusCheck(
+                context=_CODE_REQUIRED_CHECK,
+                app_id=_GITHUB_ACTIONS_APP_ID,
+            )
+            not in default_policy.required_status_checks
         ):
             raise GitHubTeamStateError()
         owner, _ = repository.split("/", 1)
         groups = await self._organization_runner_groups(owner, repository)
-        expected_workflow = (
-            f"{repository}/.github/workflows/intent-state.yml@refs/heads/{reviewed.default_branch}"
+        expected_workflows = sorted(
+            (
+                (
+                    f"{repository}/.github/workflows/intent-check.yml@refs/heads/"
+                    f"{reviewed.default_branch}"
+                ),
+                (
+                    f"{repository}/.github/workflows/intent-state.yml@refs/heads/"
+                    f"{reviewed.default_branch}"
+                ),
+            )
         )
         matching_groups = [
             group
@@ -734,7 +839,7 @@ class GitHubTeamStateClient:
             and group.get("visibility") == "selected"
             and group.get("default") is False
             and group.get("restricted_to_workflows") is True
-            and group.get("selected_workflows") == [expected_workflow]
+            and group.get("selected_workflows") == expected_workflows
             and _integer(group.get("id")) is not None
         ]
         if len(matching_groups) != 1:
@@ -760,76 +865,20 @@ class GitHubTeamStateClient:
         ]
         if runner_page.not_modified or len(matching_runners) != 1:
             raise GitHubTeamStateError()
-        effective_rules = await self._api.get_pages(
-            f"/repos/{repository}/rules/branches/intent-state",
-            {"per_page": "100"},
+        state_workflow_rule = await self._required_workflow_rule_snapshot(
+            reviewed,
+            target_branch="intent-state",
+            workflow_path=".github/workflows/intent-state.yml",
+            do_not_enforce_on_create=True,
+            commit_sha=commit_sha,
         )
-        expected_required_workflow = {
-            "path": ".github/workflows/intent-state.yml",
-            "ref": f"refs/heads/{reviewed.default_branch}",
-            "repository_id": int(reviewed.repository_node_id),
-        }
-        effective_items = effective_rules.model_dump(mode="json")["items"]
-        workflow_rules = [rule for rule in effective_items if rule.get("type") == "workflows"]
-        if effective_rules.not_modified or len(workflow_rules) != 1:
-            raise GitHubTeamStateError()
-        workflow_rule = workflow_rules[0]
-        parameters = workflow_rule.get("parameters")
-        ruleset_id = _integer(workflow_rule.get("ruleset_id"))
-        source_type = workflow_rule.get("ruleset_source_type")
-        source = workflow_rule.get("ruleset_source")
-        configured_workflows = parameters.get("workflows") if type(parameters) is dict else None
-        configured_workflow = (
-            configured_workflows[0]
-            if type(configured_workflows) is list and len(configured_workflows) == 1
-            else None
+        check_workflow_rule = await self._required_workflow_rule_snapshot(
+            reviewed,
+            target_branch=reviewed.default_branch,
+            workflow_path=".github/workflows/intent-check.yml",
+            do_not_enforce_on_create=False,
+            commit_sha=commit_sha,
         )
-        if (
-            type(parameters) is not dict
-            or set(parameters) != {"do_not_enforce_on_create", "workflows"}
-            or parameters.get("do_not_enforce_on_create") is not True
-            or type(configured_workflow) is not dict
-            or set(configured_workflow)
-            not in (
-                set(expected_required_workflow),
-                {*expected_required_workflow, "sha"},
-            )
-            or any(
-                configured_workflow.get(key) != value
-                for key, value in expected_required_workflow.items()
-            )
-            or ("sha" in configured_workflow and configured_workflow.get("sha") != commit_sha)
-            or ruleset_id is None
-            or source_type not in {"Repository", "Organization"}
-            or (source_type == "Repository" and source != repository)
-            or (source_type == "Organization" and source != owner)
-        ):
-            raise GitHubTeamStateError()
-        ruleset_path = (
-            f"/repos/{repository}/rulesets/{ruleset_id}"
-            if source_type == "Repository"
-            else f"/orgs/{owner}/rulesets/{ruleset_id}"
-        )
-        ruleset = await self._api.request_json_object("GET", ruleset_path)
-        rules = ruleset.payload.get("rules")
-        if (
-            ruleset.payload.get("id") != ruleset_id
-            or ruleset.payload.get("target") != "branch"
-            or ruleset.payload.get("enforcement") != "active"
-            or ruleset.payload.get("bypass_actors") != []
-            or type(rules) is not list
-            or len(
-                [
-                    rule
-                    for rule in rules
-                    if type(rule) is dict
-                    and rule.get("type") == "workflows"
-                    and rule.get("parameters") == parameters
-                ]
-            )
-            != 1
-        ):
-            raise GitHubTeamStateError()
         commit_response = await self._api.request_json_object(
             "GET", f"/repos/{repository}/git/commits/{commit_sha}"
         )
@@ -862,7 +911,13 @@ class GitHubTeamStateClient:
         )
         workflow_entries = _tree_entries(workflows_response.payload, workflows_entry[2])
         intended = workflow_entries.get("intent-state.yml")
-        if intended is None or intended[:2] != ("100644", "blob"):
+        intended_check = workflow_entries.get("intent-check.yml")
+        if (
+            intended is None
+            or intended[:2] != ("100644", "blob")
+            or intended_check is None
+            or intended_check[:2] != ("100644", "blob")
+        ):
             raise GitHubTeamStateError()
         if (
             await self._api.request_bytes(
@@ -884,9 +939,21 @@ class GitHubTeamStateClient:
             != workflow
         ):
             raise GitHubTeamStateError()
-        other_workflows: list[tuple[str, str]] = []
+        if (
+            await self._api.request_bytes(
+                "GET",
+                f"/repos/{repository}/git/blobs/{intended_check[2]}",
+                max_bytes=_MAX_TOOLING_FILE_BYTES,
+                accept="application/vnd.github.raw+json",
+            )
+            != check_workflow
+        ):
+            raise GitHubTeamStateError()
+        other_workflows: list[dict[str, str]] = []
         for path, (mode, kind, sha) in sorted(workflow_entries.items()):
-            if path == "intent-state.yml" or not path.endswith((".yml", ".yaml")):
+            if path in {"intent-check.yml", "intent-state.yml"} or not path.endswith(
+                (".yml", ".yaml")
+            ):
                 continue
             if (mode, kind) != ("100644", "blob"):
                 raise GitHubTeamStateError()
@@ -896,9 +963,9 @@ class GitHubTeamStateClient:
                 max_bytes=_MAX_TOOLING_FILE_BYTES,
                 accept="application/vnd.github.raw+json",
             )
-            if _REQUIRED_CHECK.encode("utf-8") in content or b"intent-state" in content:
-                raise GitHubTeamStateError()
-            other_workflows.append((path, f"sha256:{hashlib.sha256(content).hexdigest()}"))
+            other_workflows.append(
+                {"path": path, "digest": f"sha256:{hashlib.sha256(content).hexdigest()}"}
+            )
         return GitHubDefaultBranchTooling(
             repository_id=reviewed.repository_id,
             branch=reviewed.default_branch,
@@ -906,13 +973,14 @@ class GitHubTeamStateClient:
             protection_digest=_json_digest(dict(protection.payload)),
             codeowners_digest=f"sha256:{hashlib.sha256(codeowners).hexdigest()}",
             workflow_digest=f"sha256:{hashlib.sha256(workflow).hexdigest()}",
+            check_workflow_digest=f"sha256:{hashlib.sha256(check_workflow).hexdigest()}",
             workflows_digest=_json_digest(other_workflows),
             runner_group_digest=_json_digest(matching_groups[0]),
             runner_membership_digest=_json_digest(matching_runners[0]),
             required_workflow_ruleset_digest=_json_digest(
                 {
-                    "effective_rule": dict(workflow_rule),
-                    "ruleset": dict(ruleset.payload),
+                    "state": state_workflow_rule,
+                    "check": check_workflow_rule,
                 }
             ),
         )
@@ -922,6 +990,7 @@ class GitHubTeamStateClient:
         *,
         codeowners: bytes,
         workflow: bytes,
+        check_workflow: bytes,
         runner_id: str,
     ) -> GitHubDefaultBranchTooling:
         """Bind exact reviewed validator bytes to one protected default-branch commit."""
@@ -934,6 +1003,9 @@ class GitHubTeamStateClient:
             or type(workflow) is not bytes
             or not workflow
             or len(workflow) > _MAX_TOOLING_FILE_BYTES
+            or type(check_workflow) is not bytes
+            or not check_workflow
+            or len(check_workflow) > _MAX_TOOLING_FILE_BYTES
             or type(runner_id) is not str
             or not runner_id
             or len(runner_id) > 64
@@ -945,6 +1017,7 @@ class GitHubTeamStateClient:
                 reviewed,
                 codeowners=codeowners,
                 workflow=workflow,
+                check_workflow=check_workflow,
                 runner_id=runner_id,
             )
         except cancelled_class:

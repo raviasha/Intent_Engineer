@@ -19,6 +19,7 @@ from intent_engineering.team_state.suggestions import (
 
 CODEOWNERS = "/.intent/ @acme\n/.github/workflows/intent-state.yml @acme\n"
 WORKFLOW = "name: Intent state\non: pull_request\n"
+CHECK_WORKFLOW = "name: Intent check\n"
 
 
 def _git(root: Path, *arguments: str) -> str:
@@ -63,15 +64,16 @@ def test_preview_binds_exact_json_safe_contents_preimages_and_code_head(tmp_path
     assert json.loads(json.dumps(preview.model_dump(mode="json")))["digest"] == preview.digest
 
 
-def test_stage_writes_both_exact_files_on_the_code_branch(tmp_path: Path) -> None:
+def test_stage_writes_three_exact_files_on_the_code_branch(tmp_path: Path) -> None:
     """Catches staging on an unbound path or altering the reviewed UTF-8 bytes."""
     root = _repository(tmp_path)
-    preview = preview_code_suggestions(root, CODEOWNERS, WORKFLOW)
+    preview = preview_code_suggestions(root, CODEOWNERS, WORKFLOW, CHECK_WORKFLOW)
 
     stage_code_suggestions(root, preview)
 
     assert (root / ".github" / "CODEOWNERS").read_bytes() == CODEOWNERS.encode()
     assert (root / ".github" / "workflows" / "intent-state.yml").read_bytes() == (WORKFLOW.encode())
+    assert (root / ".github/workflows/intent-check.yml").read_bytes() == CHECK_WORKFLOW.encode()
     assert _git(root, "branch", "--show-current") == "main"
 
 
@@ -80,13 +82,16 @@ def test_compatible_existing_files_are_an_exact_noop(tmp_path: Path) -> None:
     root = _repository(tmp_path)
     codeowners = root / ".github" / "CODEOWNERS"
     workflow = root / ".github" / "workflows" / "intent-state.yml"
+    check = root / ".github/workflows/intent-check.yml"
     workflow.parent.mkdir(parents=True)
     codeowners.write_text(CODEOWNERS, encoding="utf-8")
     workflow.write_text(WORKFLOW, encoding="utf-8")
-    preview = preview_code_suggestions(root, CODEOWNERS, WORKFLOW)
+    check.write_text(CHECK_WORKFLOW, encoding="utf-8")
+    preview = preview_code_suggestions(root, CODEOWNERS, WORKFLOW, CHECK_WORKFLOW)
     before = (
         (codeowners.stat().st_ino, codeowners.stat().st_mtime_ns),
         (workflow.stat().st_ino, workflow.stat().st_mtime_ns),
+        (check.stat().st_ino, check.stat().st_mtime_ns),
     )
 
     stage_code_suggestions(root, preview)
@@ -94,6 +99,7 @@ def test_compatible_existing_files_are_an_exact_noop(tmp_path: Path) -> None:
     after = (
         (codeowners.stat().st_ino, codeowners.stat().st_mtime_ns),
         (workflow.stat().st_ino, workflow.stat().st_mtime_ns),
+        (check.stat().st_ino, check.stat().st_mtime_ns),
     )
     assert after == before
 
@@ -212,7 +218,8 @@ def test_preview_rejects_state_branch_and_detached_head(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize("unsafe", ["symlink-target", "hardlink-target", "symlink-parent"])
-def test_preview_rejects_linked_targets_and_parents(tmp_path: Path, unsafe: str) -> None:
+@pytest.mark.parametrize("path", ["CODEOWNERS", "workflows/intent-check.yml"])
+def test_preview_rejects_linked_targets_and_parents(tmp_path: Path, unsafe: str, path: str) -> None:
     """Catches suggestion reads or writes escaping/reusing attacker-controlled inodes."""
     root = _repository(tmp_path)
     outside = tmp_path / "outside"
@@ -222,7 +229,8 @@ def test_preview_rejects_linked_targets_and_parents(tmp_path: Path, unsafe: str)
         github.symlink_to(tmp_path)
     else:
         github.mkdir()
-        target = github / "CODEOWNERS"
+        target = github / path
+        target.parent.mkdir(parents=True, exist_ok=True)
         if unsafe == "symlink-target":
             target.symlink_to(outside)
         else:

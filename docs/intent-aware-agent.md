@@ -120,7 +120,8 @@ The CLI diagnostic does not classify the request and does not mint a capability;
 
 The code-PR workflow in `.github/workflows/intent-check.yml` names its job exactly
 `Intent Engineering / check`. It uses the protected default-branch `pull_request_target` workflow,
-without path filters, and cancels older runs for the same PR. Its only GitHub permission is
+without path filters but excluding `intent-state` targets, and cancels older runs for the same
+PR. Its only GitHub permission is
 `contents: read`; checkout does not persist credentials. It never invokes the advisory plugin.
 The one checkout is `.intent-trusted` at the exact `github.workflow_sha`, never the proposed
 revision. Protected tooling fetches the PR head as Git objects and verifies the requested SHA;
@@ -128,7 +129,7 @@ it does not check out, install, build, or import the proposed package on the hos
 an unprotected/non-default base or execution ref fail closed instead of being skipped.
 
 Action code is part of this trusted bootstrap. Every action reference in `ci.yml`,
-`intent-check.yml` and `intent-sync.yml` uses a reviewed full commit SHA, not a movable version
+`intent-state.yml`, `intent-check.yml` and `intent-sync.yml` uses a reviewed full commit SHA, not a movable version
 tag. The pins resolve to official [checkout v4.4.0](https://github.com/actions/checkout/commit/11d5960a326750d5838078e36cf38b85af677262),
 [setup-python v5.6.0](https://github.com/actions/setup-python/commit/a26af69be951a213d495a4c3e4e4022e16d87065)
 and [upload-artifact v4.6.2](https://github.com/actions/upload-artifact/commit/ea165f8d65b6e75b540449e92b4886f43607fa02),
@@ -140,8 +141,10 @@ protected-tooling review. Pins prevent silent tag movement; they do not automati
 future security fixes or replace the trusted runner and environment controls described below.
 
 After installing the protected exact-version/hash wheel lock, a separate read-only-auth fetch
-step acquires the proposed commit. Only the protected launcher check step receives the state
-decryption trust bundle:
+step acquires the proposed commit. The protected launcher reconstructs state decryption
+trust from the dedicated runner's OS keyring and reviewed public `INTENT_CI_TRUST_PATH`
+configuration, restores the approved signed baseline before testing, and rejects private-key
+environment JSON. There is no GitHub-hosted or GitHub Secrets fallback:
 
 ```bash
 python -I .intent-trusted/ci/launch.py check
@@ -202,16 +205,23 @@ acceptance; repeated metadata scans or file notifications are not treated as an 
 The guarantee certifies the image's exact proposed commit, not the protected tooling checkout or
 continued immutability of an external checkout.
 
-Assurance stores use a fresh authenticated copy on a separate 128 MiB tmpfs; result output has a
-1 MiB tmpfs and temporary files have 64 MiB. No source/baseline bind mounts or Docker socket are
-exposed. Only the exact strict canonical artifact accepted by the final consumer is copied out
-for audit; host-side replay cannot establish CI eligibility. Trust is supplied over stdin only
-to the fresh consumer, never to reviewed processes, an image, build context, or command arguments.
-Docker/build subprocess environments exclude both state trust and GitHub credentials. The
-ephemeral image and intermediate layers are removed by their unique per-run label before success.
-The bounded legacy no-cache Docker builder is required so private baseline layers do not remain in
-a separate BuildKit cache; unavailable Docker, unsupported builders, cleanup failures, and unsafe
-container boundaries fail closed. The trusted host/daemon must not modify image storage.
+Assurance stores use a fresh authenticated copy on a separate 128 MiB tmpfs; project result output
+has a 1 MiB tmpfs and temporary files have 64 MiB. No source/baseline bind mounts or Docker socket
+are exposed. Only the exact strict canonical artifact accepted by the final consumer is written to
+runner-local `.intent-trusted/.intent-ci/test-results.json` for in-job audit; the workflow does not
+upload it, and host-side replay cannot establish CI eligibility. Runner-local keyring trust decrypts
+the signed baseline before image construction. Neither private trust nor a private key is supplied
+to a container, image, build context, command argument, or reviewed process; the fresh consumer gets
+only the authenticated baseline digest, state tip, and strict test result. Docker/build subprocess
+environments exclude both state trust and GitHub credentials. In-process cleanup removes images and
+intermediate layers by their unique per-run label. The workflow's `always()` janitor also removes
+only containers and images labelled for the exact validated repository, Actions run ID, and run
+attempt, with bounded exact-ID inventories and containers removed before images. A distinct
+per-process nonce label keeps in-process cleanup narrower still; neither path runs a broad Docker
+prune. The bounded legacy no-cache Docker builder is
+required so private baseline layers do not remain in a separate BuildKit cache; unavailable Docker,
+unsupported builders, cleanup failures, and unsafe container boundaries fail closed. The trusted
+host/daemon must not modify image storage.
 
 Both local and CI checks run bounded, read-only readiness before opening ordinary mutable
 stores, capturing evidence, or running reviewed tests. Unsafe canonical files and any existing
@@ -291,9 +301,10 @@ Configure these prerequisites before expecting the check to pass:
    approved shared configuration, for example `[["tools/test-runner"]]`. The first argv entry
    must be a regular executable file relative to the repository; shell strings, PATH executable
    lookup and arbitrary prompt commands are rejected. Script interpreters must satisfy the
-   existing observer's vetted-interpreter contract. The PR job uses `ubuntu-24.04` with rootful
-   Docker; its trusted image supplies root-owned regular `/bin/sh` and `/usr/bin/python3` rather
-   than relaxing the interpreter checks for distribution symlinks. The image creates `.venv`
+   existing observer's vetted-interpreter contract. The PR job uses the dedicated `intent-state`
+   self-hosted runner group with rootful Docker; its trusted image supplies root-owned regular
+   `/bin/sh` and `/usr/bin/python3` rather than relaxing the interpreter checks for distribution
+   symlinks. The image creates `.venv`
    with the locked test dependencies. Tests must explicitly exercise proposed code, not the
    protected adapter installed in site-packages. For a `src` layout, a reviewed `#!/bin/sh`
    wrapper can run `PYTHONPATH=src exec .venv/bin/python -m pytest -q --import-mode=importlib`.
@@ -304,11 +315,12 @@ Configure these prerequisites before expecting the check to pass:
    `test_result_paths` may remain empty because this workflow writes its own combined artifact.
    Review changes to the test runner, its imports, dependencies and workflow together with code.
 2. Provision a compatible signed, encrypted state release on a protected `intent-state` branch.
-   The checkout fetches full history, including that branch. Preserve the signed parent lineage;
-   do not merge the state branch into a code branch. Current restore supports the
+   The protected fetch step acquires that fixed ref explicitly with bounded history. Preserve the
+   signed parent lineage; do not merge the state branch into a code branch. Current restore supports the
    `seal_state_payload` envelope and independently pinned Ed25519 signing keys. Automatic team
-   enrollment, publication PR creation and WebAuthn-bound publication are not provided by this
-   workflow. The offline tests' fixed keys are fixtures and must never be used for deployment.
+   enrollment, publication PR creation and WebAuthn-bound publication remain trusted control-plane
+   operations rather than workflow authority. The offline tests' fixed keys are fixtures and must
+   never be used for deployment.
 3. Before team setup can even stage suggestions, the default branch must already enforce
    admins, required PR approval, stale-review dismissal, no review bypass, and disabled
    force pushes/deletions. First promote the reviewed launcher, adapter, hash lock, base digest
@@ -322,24 +334,32 @@ Configure these prerequisites before expecting the check to pass:
    runner keyring and reviewed public `INTENT_CI_TRUST_PATH` configuration; follow
    [dedicated CI recipient setup](ci-recipient.md). The older environment-JSON
    adapter remains a compatibility/test API, not a supported hosted-key deployment.
-   The existing code-check workflow's migration to that runner trust lifecycle is
-   separate from the generated required state-validation workflow.
+   Both required workflows use that same runner trust lifecycle. The first reviewed
+   staging action writes CODEOWNERS plus both canonical workflow files together;
+   either workflow's content or preimage changing invalidates the approval. The
+   checked-in workflows are tested byte-identical to the packaged setup contracts.
    Production team setup currently requires an organization-owned repository and a
    classic setup token with `repo` and `admin:org`, plus repository admin/read/write
    permission. Its organization runner group `intent-state` must have selected-repository
-   visibility and permit only the exact
+   visibility and permit only the exact two
    `<owner>/<repository>/.github/workflows/intent-state.yml@refs/heads/<default-branch>`
-   workflow. The CI descriptor's runner ID must match the registered runner name in
-   that group, with labels `self-hosted` and `intent-state`; labels alone are not an
+   and `<owner>/<repository>/.github/workflows/intent-check.yml@refs/heads/<default-branch>`
+   workflows. No other workflow may use the group. The CI descriptor's runner ID must
+   match the registered runner name in that group, with labels `self-hosted` and
+   `intent-state`; labels alone are not an
    isolation boundary. The generated workflow selects both the group and labels.
-4. Environment approval authorizes only protected tooling to handle the trust secret. Proposed
+4. Environment approval authorizes only protected tooling to handle the runner keyring trust. Proposed
    code, including fork code, executes solely in its secret-free, network-disabled container.
    Never add a head checkout, PR-authored action, package install, build hook or arbitrary PR
    command to this host job. `pull_request_target` is safe here only with that separation and the
    protected workflow source; merely selecting the event or naming an environment is insufficient.
    [GitHub documents the event's protected/default-branch context and risks](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#pull_request_target).
 5. Keep the two required-workflow boundaries distinct. The code-check workflow described
-   above governs proposed code updates to the default branch. The generated
+   above governs proposed code updates to the default branch: configure its own active,
+   no-bypass rule sourcing this repository's `.github/workflows/intent-check.yml` at
+   `refs/heads/<default-branch>`, with `do_not_enforce_on_create: false`, plus a strict
+   required `Intent Engineering / check` status bound to Actions app ID `15368`.
+   Setup verifies this effective code rule as well as the state rule. The generated
    `Intent Engineering / state` validator instead requires an active, no-bypass
    workflow ruleset targeting **`refs/heads/intent-state`** and sourcing exactly this
    repository's `.github/workflows/intent-state.yml` from
@@ -369,9 +389,10 @@ status; local trust is installed only after the merged artifacts and sole review
 parent have been verified. A linear-history merge may rewrite the commit SHA but
 must preserve those exact bytes.
 
-Only `.intent-trusted/.intent-ci/test-results.json` is uploaded by the PR job, with seven-day retention.
-It contains commit/project/test identifiers and ACL metadata, not decrypted canonical state or
-test stdout. Do not broaden its artifact path to `.intent`, the whole checkout or raw test logs.
+The required PR jobs do not upload artifacts, raw test logs, or decrypted canonical state,
+use Actions caches, post comments, or write/auto-merge branches. The code check copies only its
+strict canonical result to runner-local `.intent-trusted/.intent-ci/test-results.json` for in-job
+audit; do not add artifact or cache exports to these workflows.
 The nightly/manual workflow has separate concurrency and read-only source permissions. It uses
 the same protected environment to restore state, captures sources, validates canonical state,
 then renders and uploads the drift report before the final `intent check --require-review`.
