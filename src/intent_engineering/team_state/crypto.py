@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import hmac
 import json
 import os
 import re
@@ -41,6 +42,7 @@ ALGORITHM: Final = ENCRYPTION_ALGORITHM
 MAX_RECIPIENTS: Final = 64
 _NONCE_BYTES: Final = 12
 _KEY_BYTES: Final = 32
+_MAX_POSSESSION_SUBJECT_BYTES: Final = 64 * 1024
 _KEY_ID = re.compile(r"^[a-z][a-z0-9._:-]{0,127}$")
 _PROJECT_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _REPOSITORY_ID = re.compile(r"^[a-z0-9.-]+/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
@@ -288,6 +290,88 @@ def _derive_wrapping_key(shared_secret: bytes, aad: bytes, recipient_id: str) ->
     ).derive(shared_secret)
 
 
+def _derive_possession_proof(shared_secret: bytes, subject: bytes) -> bytes:
+    return HKDF(
+        algorithm=hashes.SHA256(),
+        length=_KEY_BYTES,
+        salt=hashes.Hash(hashes.SHA256()).finalize(),
+        info=b"intent.recipient-possession.v2\0" + subject,
+    ).derive(shared_secret)
+
+
+def _prepare_possession_failure(error: BaseException) -> BaseException:
+    error.__traceback__ = None
+    error.__cause__ = None
+    error.__context__ = None
+    error.args = ()
+    if isinstance(error, Exception):
+        return ValueError("unable to prove recipient possession")
+    return error
+
+
+def recipient_possession_proof(
+    recipient_private_key: bytes,
+    challenge_public_key: bytes,
+    subject: bytes,
+) -> bytes:
+    """Prove possession of one X25519 recipient key for an exact public subject."""
+    failure: BaseException | None = None
+    private: X25519PrivateKey | None = None
+    challenge: X25519PublicKey | None = None
+    try:
+        if (
+            type(recipient_private_key) is not bytes
+            or len(recipient_private_key) != _KEY_BYTES
+            or type(challenge_public_key) is not bytes
+            or len(challenge_public_key) != _KEY_BYTES
+            or type(subject) is not bytes
+            or not subject
+            or len(subject) > _MAX_POSSESSION_SUBJECT_BYTES
+        ):
+            raise ValueError("invalid recipient possession inputs")
+        private = X25519PrivateKey.from_private_bytes(recipient_private_key)
+        challenge = X25519PublicKey.from_public_bytes(challenge_public_key)
+        return _derive_possession_proof(private.exchange(challenge), subject)
+    except BaseException as error:  # noqa: BLE001 - scrub and preserve cancellation
+        failure = _prepare_possession_failure(error)
+    finally:
+        private = None
+        challenge = None
+    assert failure is not None
+    del private, challenge, recipient_private_key, challenge_public_key, subject
+    raise failure.with_traceback(None)
+
+
+def verify_recipient_possession_proof(
+    recipient_public_key: bytes,
+    challenge_private_key: bytes,
+    subject: bytes,
+    proof: bytes,
+) -> bool:
+    """Verify one domain-separated recipient possession proof without revealing a key."""
+    try:
+        if (
+            type(recipient_public_key) is not bytes
+            or len(recipient_public_key) != _KEY_BYTES
+            or type(challenge_private_key) is not bytes
+            or len(challenge_private_key) != _KEY_BYTES
+            or type(subject) is not bytes
+            or not subject
+            or len(subject) > _MAX_POSSESSION_SUBJECT_BYTES
+            or type(proof) is not bytes
+            or len(proof) != _KEY_BYTES
+        ):
+            return False
+        challenge = X25519PrivateKey.from_private_bytes(challenge_private_key)
+        recipient = X25519PublicKey.from_public_bytes(recipient_public_key)
+        expected = _derive_possession_proof(challenge.exchange(recipient), subject)
+        return hmac.compare_digest(expected, proof)
+    except (TypeError, ValueError):
+        return False
+    finally:
+        del challenge_private_key
+
+
 def _random_bytes(size: int) -> bytes:
     return os.urandom(size)
 
@@ -530,4 +614,6 @@ __all__ = [
     "decrypt_bundle",
     "decrypt_bundle_for_recipient",
     "encrypt_bundle",
+    "recipient_possession_proof",
+    "verify_recipient_possession_proof",
 ]

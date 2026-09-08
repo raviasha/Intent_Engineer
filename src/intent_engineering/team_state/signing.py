@@ -9,15 +9,20 @@ import os
 import re
 import stat
 import tempfile
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import MappingProxyType
-from typing import Protocol
+from typing import Annotated, Protocol
 
 import keyring
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from pydantic import ConfigDict, Field, field_validator, model_validator
 
+from intent_engineering.core.models._base import StrictModel
 from intent_engineering.storage._atomic import same_path_lock
+from intent_engineering.team_state.authority import derive_root_key_id
+from intent_engineering.team_state.models import TeamRootTrustV2
 
 _PROJECT_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _ACTOR = re.compile(r"^[a-z][a-z0-9._:-]{0,127}$")
@@ -208,4 +213,207 @@ class SigningKeyStore:
         return "SigningKeyStore()"
 
 
-__all__ = ["SigningKeyStore", "SigningKeyStoreError"]
+class RootEnrollmentBinding(StrictModel):
+    """Exact stable-root authority context approved for local key creation."""
+
+    model_config = ConfigDict(
+        extra="forbid", frozen=True, strict=True, revalidate_instances="always"
+    )
+
+    project_id: Annotated[str, Field(pattern=_PROJECT_ID.pattern)]
+    repository_id: Annotated[str, Field(pattern=_REPOSITORY_ID.pattern)]
+    authority_epoch: Annotated[int, Field(ge=1, le=2**31 - 1)]
+    created_at: datetime
+    predecessor_root_key_id: str | None = None
+
+    @field_validator("authority_epoch", mode="before")
+    @classmethod
+    def require_integer(cls, value: object) -> object:
+        if type(value) is not int:
+            raise ValueError("invalid root enrollment epoch")
+        return value
+
+    @field_validator("repository_id")
+    @classmethod
+    def require_repository(cls, value: str) -> str:
+        _validate_binding("root", value, "root:authority")
+        return value
+
+    @field_validator("created_at")
+    @classmethod
+    def require_utc_second(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() != timedelta(0) or value.microsecond != 0:
+            raise ValueError("invalid root enrollment time")
+        return value.astimezone(UTC)
+
+    @model_validator(mode="after")
+    def require_epoch_predecessor(self) -> RootEnrollmentBinding:
+        predecessor = self.predecessor_root_key_id
+        if (self.authority_epoch == 1) != (predecessor is None):
+            raise ValueError("invalid root enrollment predecessor")
+        if (
+            predecessor is not None
+            and re.fullmatch(r"root:sha256:[0-9a-f]{64}", predecessor) is None
+        ):
+            raise ValueError("invalid root enrollment predecessor")
+        return self
+
+
+class TeamRootKeyStore(Protocol):
+    """Non-exporting root signing boundary."""
+
+    def create(self, binding: RootEnrollmentBinding) -> TeamRootTrustV2: ...
+
+    def sign(self, root_key_id: str, preimage: bytes) -> bytes: ...
+
+    def root_trust(self) -> TeamRootTrustV2: ...
+
+
+def _prepare_root_failure(error: BaseException) -> BaseException:
+    error.__traceback__ = None
+    error.__cause__ = None
+    error.__context__ = None
+    error.args = ()
+    if isinstance(error, Exception):
+        return SigningKeyStoreError()
+    return error
+
+
+def _validated_root_binding(value: RootEnrollmentBinding) -> RootEnrollmentBinding:
+    if type(value) is not RootEnrollmentBinding:
+        raise ValueError("invalid root enrollment binding")
+    return RootEnrollmentBinding.model_validate(value.model_dump(mode="python"))
+
+
+def _root_account(binding: RootEnrollmentBinding) -> str:
+    content = json.dumps(
+        {
+            "authority_epoch": binding.authority_epoch,
+            "project_id": binding.project_id,
+            "repository_id": binding.repository_id,
+            "schema": "intent.team-root-storage.v2",
+        },
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode()
+    return f"root-slot:sha256:{hashlib.sha256(content).hexdigest()}"
+
+
+class KeyringTeamRootKeyStore:
+    """Create and use one stable Ed25519 team root without exporting its private key."""
+
+    def __init__(
+        self,
+        binding: RootEnrollmentBinding,
+        *,
+        backend: _KeyringBackend = keyring,
+        private_key_source: Callable[[], bytes] = _private_key_bytes,
+        lock_root: Path | None = None,
+    ) -> None:
+        self._binding = _validated_root_binding(binding)
+        self._backend = backend
+        self._private_key_source = private_key_source
+        self._service = f"intent-engineering-root-v2/{binding.project_id}"
+        self._account = _root_account(binding)
+        self._lock_target = _lock_target(
+            lock_root if lock_root is not None else _default_lock_root(),
+            self._service,
+            self._account,
+        )
+
+    def _private(self, *, create: bool) -> bytes:
+        with same_path_lock(self._lock_target):
+            stored = self._backend.get_password(self._service, self._account)
+            if stored is None:
+                if not create:
+                    raise ValueError("root key missing")
+                generated = self._private_key_source()
+                if type(generated) is not bytes or len(generated) != 32:
+                    raise ValueError("invalid root private key source")
+                encoded = _b64url(generated)
+                self._backend.set_password(self._service, self._account, encoded)
+                if self._backend.get_password(self._service, self._account) != encoded:
+                    raise ValueError("root key write mismatch")
+                return generated
+            return _decode_private(stored)
+
+    def _trust(self, private: bytes) -> TeamRootTrustV2:
+        public = Ed25519PrivateKey.from_private_bytes(private).public_key().public_bytes_raw()
+        public_text = _b64url(public)
+        return TeamRootTrustV2(
+            project_id=self._binding.project_id,
+            repository_id=self._binding.repository_id,
+            authority_epoch=self._binding.authority_epoch,
+            root_key_id=derive_root_key_id(
+                self._binding.project_id, self._binding.repository_id, public_text
+            ),
+            root_public_key=public_text,
+            created_at=self._binding.created_at,
+            predecessor_root_key_id=self._binding.predecessor_root_key_id,
+        )
+
+    def create(self, binding: RootEnrollmentBinding) -> TeamRootTrustV2:
+        """Create the bound root once, or return the existing root in the same slot."""
+        failure: BaseException | None = None
+        private = b""
+        try:
+            if _validated_root_binding(binding) != self._binding:
+                raise ValueError("root enrollment binding mismatch")
+            private = self._private(create=True)
+            return self._trust(private)
+        except BaseException as error:  # noqa: BLE001
+            failure = _prepare_root_failure(error)
+        finally:
+            private = b""
+        assert failure is not None
+        del private, binding, self
+        raise failure.with_traceback(None)
+
+    def root_trust(self) -> TeamRootTrustV2:
+        """Return public trust derived from the existing root secret."""
+        failure: BaseException | None = None
+        private = b""
+        try:
+            private = self._private(create=False)
+            return self._trust(private)
+        except BaseException as error:  # noqa: BLE001
+            failure = _prepare_root_failure(error)
+        finally:
+            private = b""
+        assert failure is not None
+        del private, self
+        raise failure.with_traceback(None)
+
+    def sign(self, root_key_id: str, preimage: bytes) -> bytes:
+        """Sign an exact bounded root-authority preimage."""
+        failure: BaseException | None = None
+        private = b""
+        try:
+            if type(preimage) is not bytes or not preimage or len(preimage) > 256 * 1024:
+                raise ValueError("invalid root signing preimage")
+            private = self._private(create=False)
+            trust = self._trust(private)
+            if type(root_key_id) is not str or root_key_id != trust.root_key_id:
+                raise ValueError("root key binding mismatch")
+            return Ed25519PrivateKey.from_private_bytes(private).sign(preimage)
+        except BaseException as error:  # noqa: BLE001
+            failure = _prepare_root_failure(error)
+        finally:
+            private = b""
+        assert failure is not None
+        del private, root_key_id, preimage, self
+        raise failure.with_traceback(None)
+
+    def __repr__(self) -> str:
+        return "KeyringTeamRootKeyStore()"
+
+
+__all__ = [
+    "KeyringTeamRootKeyStore",
+    "RootEnrollmentBinding",
+    "SigningKeyStore",
+    "SigningKeyStoreError",
+    "TeamRootKeyStore",
+]

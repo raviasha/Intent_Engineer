@@ -10,17 +10,21 @@ import re
 import stat
 import tempfile
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Annotated, Protocol, cast
 
 import keyring
 from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
 from pydantic import ConfigDict, Field, ValidationInfo, field_validator, model_validator
 
 from intent_engineering.core.models._base import StrictModel
 from intent_engineering.storage._atomic import same_path_lock
+from intent_engineering.team_state.authority import derive_recipient_key_id, derive_signature_id
+from intent_engineering.team_state.crypto import recipient_possession_proof
 from intent_engineering.team_state.models import RecipientRecord
 
 _PROJECT_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
@@ -133,6 +137,78 @@ class RecipientKeyStore(Protocol):
     def delete(self, key_id: str) -> None: ...
 
 
+class DeviceEnrollmentBinding(StrictModel):
+    """Exact public identity and device slot allowed to own paired v2 keys."""
+
+    model_config = ConfigDict(
+        extra="forbid", frozen=True, strict=True, revalidate_instances="always"
+    )
+
+    project_id: Annotated[str, Field(pattern=_PROJECT_ID.pattern)]
+    repository_id: Annotated[str, Field(pattern=_REPOSITORY_ID.pattern)]
+    actor: Annotated[str, Field(pattern=_ACTOR.pattern)]
+    github_account_id: Annotated[int, Field(gt=0)]
+    github_login: Annotated[str, Field(pattern=_GITHUB_LOGIN.pattern)]
+    device_id: Annotated[str, Field(pattern=r"^device:[0-9a-f]{32}$")]
+
+    @field_validator("github_account_id", mode="before")
+    @classmethod
+    def require_integer(cls, value: object) -> object:
+        if type(value) is not int:
+            raise ValueError("invalid device GitHub identity")
+        return value
+
+    @field_validator("repository_id")
+    @classmethod
+    def validate_device_repository(cls, value: str) -> str:
+        host, owner, repository = value.split("/")
+        if (
+            host != host.lower()
+            or owner in {".", ".."}
+            or repository in {".", ".."}
+            or repository.endswith(".git")
+        ):
+            raise ValueError("invalid device repository")
+        return value
+
+    @model_validator(mode="after")
+    def bind_actor_to_identity(self) -> DeviceEnrollmentBinding:
+        if self.actor != f"github:{self.github_account_id}" or "--" in self.github_login:
+            raise ValueError("invalid device identity binding")
+        return self
+
+
+@dataclass(frozen=True, slots=True)
+class DevicePublicMaterial:
+    device_id: str
+    recipient_key_id: str
+    recipient_public_key: bytes
+    signature_id: str
+    signing_public_key: bytes
+
+
+class DeviceKeyStore(Protocol):
+    """Non-exporting device recipient and signing key boundary."""
+
+    def create(self, binding: DeviceEnrollmentBinding) -> DevicePublicMaterial: ...
+
+    def sign(self, signature_id: str, preimage: bytes) -> bytes: ...
+
+    def prove_recipient_possession(
+        self, recipient_key_id: str, challenge_public_key: bytes, subject: bytes
+    ) -> bytes: ...
+
+
+def _prepare_device_failure(error: BaseException) -> BaseException:
+    error.__traceback__ = None
+    error.__cause__ = None
+    error.__context__ = None
+    error.args = ()
+    if isinstance(error, Exception):
+        return RecipientKeyStoreError()
+    return error
+
+
 class _KeyringBackend(Protocol):
     def get_password(self, service: str, account: str) -> str | None: ...
 
@@ -147,6 +223,10 @@ def _private_key_bytes() -> bytes:
         format=serialization.PrivateFormat.Raw,
         encryption_algorithm=serialization.NoEncryption(),
     )
+
+
+def _signing_private_key_bytes() -> bytes:
+    return Ed25519PrivateKey.generate().private_bytes_raw()
 
 
 def _b64url(content: bytes) -> str:
@@ -429,10 +509,230 @@ def restore_recipient(
         private = b""
 
 
+def _validated_device_binding(value: DeviceEnrollmentBinding) -> DeviceEnrollmentBinding:
+    if type(value) is not DeviceEnrollmentBinding:
+        raise ValueError("invalid device enrollment binding")
+    return DeviceEnrollmentBinding.model_validate(value.model_dump(mode="python"))
+
+
+def _device_account(binding: DeviceEnrollmentBinding) -> str:
+    content = json.dumps(
+        {
+            "actor": binding.actor,
+            "device_id": binding.device_id,
+            "github_account_id": binding.github_account_id,
+            "github_login": binding.github_login,
+            "project_id": binding.project_id,
+            "repository_id": binding.repository_id,
+            "schema": "intent.team-device-storage.v2",
+        },
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode()
+    return f"device-slot:sha256:{hashlib.sha256(content).hexdigest()}"
+
+
+class KeyringDeviceKeyStore:
+    """Own one device's independent X25519 recipient and Ed25519 signing keys."""
+
+    def __init__(
+        self,
+        binding: DeviceEnrollmentBinding,
+        *,
+        backend: _KeyringBackend = keyring,
+        recipient_private_key_source: Callable[[], bytes] = _private_key_bytes,
+        signing_private_key_source: Callable[[], bytes] = _signing_private_key_bytes,
+        lock_root: Path | None = None,
+    ) -> None:
+        self._binding = _validated_device_binding(binding)
+        self._backend = backend
+        self._recipient_source = recipient_private_key_source
+        self._signing_source = signing_private_key_source
+        self._recipient_service = f"intent-engineering-device-recipient-v2/{binding.project_id}"
+        self._signing_service = f"intent-engineering-device-signing-v2/{binding.project_id}"
+        self._account = _device_account(binding)
+        self._lock_target = _lock_target(
+            lock_root if lock_root is not None else _default_lock_root(),
+            f"{self._recipient_service}\0{self._signing_service}",
+            self._account,
+        )
+
+    def _load_or_create(self, *, create: bool) -> tuple[bytes, bytes]:
+        with same_path_lock(self._lock_target):
+            recipient_text = self._backend.get_password(self._recipient_service, self._account)
+            signing_text = self._backend.get_password(self._signing_service, self._account)
+            if (recipient_text is None) != (signing_text is None):
+                raise ValueError("incomplete device key pair")
+            if recipient_text is None or signing_text is None:
+                if not create:
+                    raise ValueError("device key pair missing")
+                recipient = self._recipient_source()
+                signing = self._signing_source()
+                if (
+                    type(recipient) is not bytes
+                    or len(recipient) != 32
+                    or type(signing) is not bytes
+                    or len(signing) != 32
+                ):
+                    raise ValueError("invalid device private key source")
+                X25519PrivateKey.from_private_bytes(recipient)
+                Ed25519PrivateKey.from_private_bytes(signing)
+                recipient_encoded = _b64url(recipient)
+                signing_encoded = _b64url(signing)
+                try:
+                    self._backend.set_password(
+                        self._recipient_service, self._account, recipient_encoded
+                    )
+                    self._backend.set_password(
+                        self._signing_service, self._account, signing_encoded
+                    )
+                    if (
+                        self._backend.get_password(self._recipient_service, self._account)
+                        != recipient_encoded
+                        or self._backend.get_password(self._signing_service, self._account)
+                        != signing_encoded
+                    ):
+                        raise ValueError("device key write mismatch")
+                except BaseException as write_error:  # noqa: BLE001
+                    self._rollback_known_empty_slots()
+                    raise write_error.with_traceback(None)
+                return recipient, signing
+            return _decode_private(recipient_text), _decode_private(signing_text)
+
+    def _rollback_known_empty_slots(self) -> None:
+        services = (self._recipient_service, self._signing_service)
+        cancellation: BaseException | None = None
+        for service in services:
+            try:
+                self._backend.delete_password(service, self._account)
+            except BaseException as cleanup_error:  # noqa: BLE001
+                cleanup_error.__traceback__ = None
+                cleanup_error.__cause__ = None
+                cleanup_error.__context__ = None
+                cleanup_error.args = ()
+                if not isinstance(cleanup_error, Exception) and cancellation is None:
+                    cancellation = cleanup_error
+        absent = True
+        for service in services:
+            try:
+                absent = self._backend.get_password(service, self._account) is None and absent
+            except BaseException as verify_error:  # noqa: BLE001
+                verify_error.__traceback__ = None
+                verify_error.__cause__ = None
+                verify_error.__context__ = None
+                verify_error.args = ()
+                if not isinstance(verify_error, Exception) and cancellation is None:
+                    cancellation = verify_error
+                absent = False
+        if cancellation is not None:
+            raise cancellation.with_traceback(None)
+        if not absent:
+            raise ValueError("device key rollback failed")
+
+    def _material(self, recipient: bytes, signing: bytes) -> DevicePublicMaterial:
+        recipient_public = (
+            X25519PrivateKey.from_private_bytes(recipient).public_key().public_bytes_raw()
+        )
+        signing_public = (
+            Ed25519PrivateKey.from_private_bytes(signing).public_key().public_bytes_raw()
+        )
+        return DevicePublicMaterial(
+            device_id=self._binding.device_id,
+            recipient_key_id=derive_recipient_key_id(
+                self._binding.project_id,
+                self._binding.repository_id,
+                _b64url(recipient_public),
+            ),
+            recipient_public_key=recipient_public,
+            signature_id=derive_signature_id(
+                self._binding.project_id,
+                self._binding.repository_id,
+                _b64url(signing_public),
+            ),
+            signing_public_key=signing_public,
+        )
+
+    def create(self, binding: DeviceEnrollmentBinding) -> DevicePublicMaterial:
+        """Create both private keys locally and return only their public material."""
+        failure: BaseException | None = None
+        recipient = b""
+        signing = b""
+        try:
+            if _validated_device_binding(binding) != self._binding:
+                raise ValueError("device enrollment binding mismatch")
+            recipient, signing = self._load_or_create(create=True)
+            return self._material(recipient, signing)
+        except BaseException as error:  # noqa: BLE001
+            failure = _prepare_device_failure(error)
+        finally:
+            recipient = b""
+            signing = b""
+        assert failure is not None
+        del recipient, signing, binding, self
+        raise failure.with_traceback(None)
+
+    def sign(self, signature_id: str, preimage: bytes) -> bytes:
+        """Sign one bounded preimage without returning device private material."""
+        failure: BaseException | None = None
+        recipient = b""
+        signing = b""
+        try:
+            if type(preimage) is not bytes or not preimage or len(preimage) > 256 * 1024:
+                raise ValueError("invalid device signing preimage")
+            recipient, signing = self._load_or_create(create=False)
+            if (
+                type(signature_id) is not str
+                or signature_id != self._material(recipient, signing).signature_id
+            ):
+                raise ValueError("device signing key mismatch")
+            return Ed25519PrivateKey.from_private_bytes(signing).sign(preimage)
+        except BaseException as error:  # noqa: BLE001
+            failure = _prepare_device_failure(error)
+        finally:
+            recipient = b""
+            signing = b""
+        assert failure is not None
+        del recipient, signing, signature_id, preimage, self
+        raise failure.with_traceback(None)
+
+    def prove_recipient_possession(
+        self, recipient_key_id: str, challenge_public_key: bytes, subject: bytes
+    ) -> bytes:
+        """Produce a response-bound proof without exposing the recipient private key."""
+        failure: BaseException | None = None
+        recipient = b""
+        signing = b""
+        try:
+            recipient, signing = self._load_or_create(create=False)
+            if (
+                type(recipient_key_id) is not str
+                or recipient_key_id != self._material(recipient, signing).recipient_key_id
+            ):
+                raise ValueError("device recipient key mismatch")
+            return recipient_possession_proof(recipient, challenge_public_key, subject)
+        except BaseException as error:  # noqa: BLE001
+            failure = _prepare_device_failure(error)
+        finally:
+            recipient = b""
+            signing = b""
+        assert failure is not None
+        del recipient, signing, recipient_key_id, challenge_public_key, subject, self
+        raise failure.with_traceback(None)
+
+    def __repr__(self) -> str:
+        return "KeyringDeviceKeyStore()"
+
+
 __all__ = [
+    "DeviceEnrollmentBinding",
+    "DeviceKeyStore",
+    "DevicePublicMaterial",
     "GitHubIdentity",
     "GitHubIdentityVerifier",
     "InMemoryRecipientKeyStore",
+    "KeyringDeviceKeyStore",
     "KeyringRecipientKeyStore",
     "RecipientEnrollmentBinding",
     "RecipientKeyStore",

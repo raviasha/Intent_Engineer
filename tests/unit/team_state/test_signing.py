@@ -4,12 +4,34 @@ from __future__ import annotations
 
 import base64
 import threading
+import traceback
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
 
-from intent_engineering.team_state.signing import SigningKeyStore, SigningKeyStoreError
+from intent_engineering.team_state.authority import derive_root_key_id
+from intent_engineering.team_state.signing import (
+    KeyringTeamRootKeyStore,
+    RootEnrollmentBinding,
+    SigningKeyStore,
+    SigningKeyStoreError,
+)
+
+NOW = datetime(2026, 9, 9, 10, tzinfo=UTC)
+
+
+def _production_traceback_locals(error: BaseException) -> list[dict[str, object]]:
+    return [
+        dict(frame.f_locals)
+        for frame, _lineno in traceback.walk_tb(error.__traceback__)
+        if frame.f_globals.get("__name__")
+        in {
+            "intent_engineering.team_state.signing",
+            "intent_engineering.team_state.authority",
+        }
+    ]
 
 
 class _Backend:
@@ -275,3 +297,110 @@ def test_load_and_public_keys_reuse_existing_signer_without_writes(tmp_path: Pat
     private_signature = Ed25519PrivateKey.from_private_bytes(created[signature_id]).sign(message)
     Ed25519PublicKey.from_public_bytes(public[signature_id]).verify(private_signature, message)
     assert [call[0] for call in backend.calls] == ["get", "get"]
+
+
+def test_team_root_is_context_bound_and_uses_a_distinct_keyring_namespace(
+    tmp_path: Path,
+) -> None:
+    """Catches a v2 root key colliding with an ordinary v1 publication signer."""
+    backend = _Backend()
+    binding = RootEnrollmentBinding(
+        project_id="alpha",
+        repository_id="github.com/acme/alpha",
+        authority_epoch=1,
+        created_at=NOW,
+    )
+    store = KeyringTeamRootKeyStore(
+        binding,
+        backend=backend,
+        private_key_source=lambda: b"r" * 32,
+        lock_root=tmp_path / "root-locks",
+    )
+
+    root = store.create(binding)
+    signature = store.sign(root.root_key_id, b"certificate preimage")
+
+    public = Ed25519PrivateKey.from_private_bytes(b"r" * 32).public_key().public_bytes_raw()
+    assert root.root_key_id == derive_root_key_id(
+        "alpha",
+        "github.com/acme/alpha",
+        base64.urlsafe_b64encode(public).rstrip(b"=").decode(),
+    )
+    Ed25519PublicKey.from_public_bytes(public).verify(signature, b"certificate preimage")
+    [(service, account)] = backend.values
+    assert service == "intent-engineering-root-v2/alpha"
+    assert account.startswith("root-slot:sha256:")
+    assert all(
+        service != "intent-engineering-signing/alpha" for service, _account in backend.values
+    )
+
+
+def test_team_root_failures_are_fixed_and_do_not_retain_private_material(
+    tmp_path: Path,
+) -> None:
+    """Catches root-key backend details escaping through enrollment errors."""
+    backend = _Backend()
+    binding = RootEnrollmentBinding(
+        project_id="alpha",
+        repository_id="github.com/acme/alpha",
+        authority_epoch=1,
+        created_at=NOW,
+    )
+    store = KeyringTeamRootKeyStore(
+        binding,
+        backend=backend,
+        private_key_source=lambda: b"r" * 32,
+        lock_root=tmp_path / "root-locks",
+    )
+    root = store.create(binding)
+    backend.failure = RuntimeError("root-private-token-value")
+
+    with pytest.raises(SigningKeyStoreError, match="^signing key unavailable$") as caught:
+        store.sign(root.root_key_id, b"certificate preimage")
+
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+    assert "root-private-token" not in repr(caught.value)
+
+    locals_by_frame = _production_traceback_locals(caught.value)
+    assert all(store not in values.values() for values in locals_by_frame)
+    assert all(backend not in values.values() for values in locals_by_frame)
+    assert all("caught" not in values for values in locals_by_frame)
+
+
+def test_team_root_cancellation_preserves_identity_but_scrubs_args_and_locals(
+    tmp_path: Path,
+) -> None:
+    """Catches cancellation retaining a root store or secret-producing source details."""
+
+    class Cancelled(BaseException):
+        pass
+
+    cancellation = Cancelled("root-source-private-token")
+
+    def cancel() -> bytes:
+        raise cancellation
+
+    backend = _Backend()
+    binding = RootEnrollmentBinding(
+        project_id="alpha",
+        repository_id="github.com/acme/alpha",
+        authority_epoch=1,
+        created_at=NOW,
+    )
+    store = KeyringTeamRootKeyStore(
+        binding,
+        backend=backend,
+        private_key_source=cancel,
+        lock_root=tmp_path / "root-locks",
+    )
+
+    with pytest.raises(Cancelled) as caught:
+        store.create(binding)
+
+    assert caught.value is cancellation
+    assert caught.value.args == ()
+    locals_by_frame = _production_traceback_locals(caught.value)
+    assert all(store not in values.values() for values in locals_by_frame)
+    assert all(backend not in values.values() for values in locals_by_frame)
+    assert all("caught" not in values and "private" not in values for values in locals_by_frame)

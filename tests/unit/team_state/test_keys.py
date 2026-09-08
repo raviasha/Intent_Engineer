@@ -4,14 +4,20 @@ from __future__ import annotations
 
 import base64
 import threading
+import traceback
 from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
 
+from intent_engineering.team_state.crypto import verify_recipient_possession_proof
 from intent_engineering.team_state.keys import (
+    DeviceEnrollmentBinding,
     GitHubIdentity,
     InMemoryRecipientKeyStore,
+    KeyringDeviceKeyStore,
     KeyringRecipientKeyStore,
     RecipientEnrollmentBinding,
     RecipientKeyStore,
@@ -19,6 +25,14 @@ from intent_engineering.team_state.keys import (
 )
 
 NOW = datetime(2026, 8, 30, 12, 0, tzinfo=UTC)
+
+
+def _device_traceback_locals(error: BaseException) -> list[dict[str, object]]:
+    return [
+        dict(frame.f_locals)
+        for frame, _lineno in traceback.walk_tb(error.__traceback__)
+        if frame.f_globals.get("__name__") == "intent_engineering.team_state.keys"
+    ]
 
 
 def _binding(**changes: object) -> RecipientEnrollmentBinding:
@@ -301,3 +315,318 @@ def test_in_memory_cancellation_preserves_type_without_source_traceback() -> Non
         frames.append(traceback.tb_frame.f_code.co_name)
         traceback = traceback.tb_next
     assert "secret_source" not in frames
+
+
+def test_device_store_creates_separate_recipient_and_signing_keys(
+    tmp_path: Path,
+) -> None:
+    """Catches key reuse or keyring namespace collision between device capabilities."""
+    backend = _Backend()
+    binding = DeviceEnrollmentBinding(
+        project_id="alpha",
+        repository_id="github.com/acme/alpha",
+        actor="github:101",
+        github_account_id=101,
+        github_login="asha",
+        device_id="device:" + "1" * 32,
+    )
+    store = KeyringDeviceKeyStore(
+        binding,
+        backend=backend,
+        recipient_private_key_source=lambda: b"x" * 32,
+        signing_private_key_source=lambda: b"s" * 32,
+        lock_root=tmp_path / "device-locks",
+    )
+
+    public = store.create(binding)
+    signed = store.sign(public.signature_id, b"state preimage")
+    challenge = X25519PrivateKey.from_private_bytes(b"c" * 32)
+    proof = store.prove_recipient_possession(
+        public.recipient_key_id,
+        challenge.public_key().public_bytes_raw(),
+        b"join response subject",
+    )
+
+    Ed25519PublicKey.from_public_bytes(public.signing_public_key).verify(signed, b"state preimage")
+    assert verify_recipient_possession_proof(
+        public.recipient_public_key,
+        challenge.private_bytes_raw(),
+        b"join response subject",
+        proof,
+    )
+    assert public.device_id == binding.device_id
+    assert len(backend.values) == 2
+    assert {service for service, _account in backend.values} == {
+        "intent-engineering-device-recipient-v2/alpha",
+        "intent-engineering-device-signing-v2/alpha",
+    }
+    assert public.recipient_key_id != public.signature_id
+
+
+def test_device_store_rejects_wrong_ids_without_leaking_private_values(tmp_path: Path) -> None:
+    """Catches cross-device key selection and secret-bearing backend diagnostics."""
+    backend = _Backend()
+    binding = DeviceEnrollmentBinding(
+        project_id="alpha",
+        repository_id="github.com/acme/alpha",
+        actor="github:101",
+        github_account_id=101,
+        github_login="asha",
+        device_id="device:" + "1" * 32,
+    )
+    store = KeyringDeviceKeyStore(
+        binding,
+        backend=backend,
+        recipient_private_key_source=lambda: b"x" * 32,
+        signing_private_key_source=lambda: b"s" * 32,
+        lock_root=tmp_path / "device-locks",
+    )
+    store.create(binding)
+
+    with pytest.raises(RecipientKeyStoreError, match="^recipient key unavailable$"):
+        store.prove_recipient_possession(
+            "recipient:sha256:" + "0" * 64,
+            X25519PrivateKey.generate().public_key().public_bytes_raw(),
+            b"subject",
+        )
+
+    backend.failure = RuntimeError("device-private-token-value")
+    with pytest.raises(RecipientKeyStoreError, match="^recipient key unavailable$") as caught:
+        store.sign("signer:sha256:" + "0" * 64, b"state")
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+    assert "device-private-token" not in repr(caught.value)
+
+    locals_by_frame = _device_traceback_locals(caught.value)
+    assert all(store not in values.values() for values in locals_by_frame)
+    assert all(backend not in values.values() for values in locals_by_frame)
+    assert all("caught" not in values for values in locals_by_frame)
+
+
+@pytest.mark.parametrize(
+    "failing_service",
+    (
+        "intent-engineering-device-recipient-v2/alpha",
+        "intent-engineering-device-signing-v2/alpha",
+    ),
+)
+def test_device_creation_rolls_back_a_durable_write_then_raise_for_either_key(
+    tmp_path: Path,
+    failing_service: str,
+) -> None:
+    """Catches a failed signing-key write stranding a usable recipient half-key."""
+
+    class DurableWriteThenFails(_Backend):
+        def set_password(self, service: str, account: str, value: str) -> None:
+            super().set_password(service, account, value)
+            if service == failing_service:
+                raise RuntimeError("ambiguous durable keyring write")
+
+    backend = DurableWriteThenFails()
+    binding = DeviceEnrollmentBinding(
+        project_id="alpha",
+        repository_id="github.com/acme/alpha",
+        actor="github:101",
+        github_account_id=101,
+        github_login="asha",
+        device_id="device:" + "1" * 32,
+    )
+    store = KeyringDeviceKeyStore(
+        binding,
+        backend=backend,
+        recipient_private_key_source=lambda: b"x" * 32,
+        signing_private_key_source=lambda: b"s" * 32,
+        lock_root=tmp_path / "device-locks",
+    )
+
+    with pytest.raises(RecipientKeyStoreError, match="^recipient key unavailable$"):
+        store.create(binding)
+
+    assert backend.values == {}
+    deleted_services = {
+        service for operation, service, _account in backend.calls if operation == "delete"
+    }
+    assert deleted_services == {
+        "intent-engineering-device-recipient-v2/alpha",
+        "intent-engineering-device-signing-v2/alpha",
+    }
+    for service in deleted_services:
+        assert (
+            sum(
+                operation == "get" and called_service == service
+                for operation, called_service, _account in backend.calls
+            )
+            >= 2
+        )
+
+
+def test_device_creation_fails_closed_when_rollback_cannot_verify_absence(
+    tmp_path: Path,
+) -> None:
+    """Catches cleanup reporting success while an ambiguously written private key remains."""
+
+    class UndeletableWrite(_Backend):
+        def set_password(self, service: str, account: str, value: str) -> None:
+            super().set_password(service, account, value)
+            raise RuntimeError("ambiguous durable keyring write")
+
+        def delete_password(self, service: str, account: str) -> None:
+            self.calls.append(("delete", service, account))
+            raise RuntimeError("cleanup unavailable")
+
+    backend = UndeletableWrite()
+    binding = DeviceEnrollmentBinding(
+        project_id="alpha",
+        repository_id="github.com/acme/alpha",
+        actor="github:101",
+        github_account_id=101,
+        github_login="asha",
+        device_id="device:" + "1" * 32,
+    )
+    store = KeyringDeviceKeyStore(binding, backend=backend, lock_root=tmp_path / "locks")
+
+    with pytest.raises(RecipientKeyStoreError, match="^recipient key unavailable$"):
+        store.create(binding)
+
+    assert backend.values
+    assert {service for operation, service, _account in backend.calls if operation == "delete"} == {
+        "intent-engineering-device-recipient-v2/alpha",
+        "intent-engineering-device-signing-v2/alpha",
+    }
+
+
+def test_device_rollback_preserves_cleanup_cancellation_identity(tmp_path: Path) -> None:
+    """Catches a cancellation during ambiguous-write cleanup being converted or ignored."""
+
+    class Cancelled(BaseException):
+        pass
+
+    cancellation = Cancelled("cleanup-private-token")
+
+    class CancellationDuringRollback(_Backend):
+        def set_password(self, service: str, account: str, value: str) -> None:
+            super().set_password(service, account, value)
+            raise RuntimeError("ambiguous durable keyring write")
+
+        def delete_password(self, service: str, account: str) -> None:
+            self.calls.append(("delete", service, account))
+            raise cancellation
+
+    backend = CancellationDuringRollback()
+    binding = DeviceEnrollmentBinding(
+        project_id="alpha",
+        repository_id="github.com/acme/alpha",
+        actor="github:101",
+        github_account_id=101,
+        github_login="asha",
+        device_id="device:" + "1" * 32,
+    )
+    store = KeyringDeviceKeyStore(binding, backend=backend, lock_root=tmp_path / "locks")
+
+    with pytest.raises(Cancelled) as caught:
+        store.create(binding)
+
+    assert caught.value is cancellation
+    assert caught.value.args == ()
+
+
+def test_device_rollback_never_deletes_a_preexisting_partial_slot(tmp_path: Path) -> None:
+    """Catches incomplete historical state being mistaken for this attempt's empty slots."""
+    original = base64.urlsafe_b64encode(b"p" * 32).rstrip(b"=").decode()
+
+    class PreexistingPartialSlot(_Backend):
+        def get_password(self, service: str, account: str) -> str | None:
+            self.calls.append(("get", service, account))
+            if service == "intent-engineering-device-recipient-v2/alpha":
+                return original
+            return None
+
+    backend = PreexistingPartialSlot()
+    binding = DeviceEnrollmentBinding(
+        project_id="alpha",
+        repository_id="github.com/acme/alpha",
+        actor="github:101",
+        github_account_id=101,
+        github_login="asha",
+        device_id="device:" + "1" * 32,
+    )
+    store = KeyringDeviceKeyStore(binding, backend=backend, lock_root=tmp_path / "locks")
+
+    with pytest.raises(RecipientKeyStoreError, match="^recipient key unavailable$"):
+        store.create(binding)
+
+    assert (
+        backend.get_password("intent-engineering-device-recipient-v2/alpha", "ignored") == original
+    )
+    assert all(operation != "delete" for operation, _service, _account in backend.calls)
+
+
+def test_same_device_id_under_different_github_identity_uses_distinct_slots(
+    tmp_path: Path,
+) -> None:
+    """Catches a device identifier replay reusing another GitHub member's private keys."""
+    backend = _Backend()
+    first = DeviceEnrollmentBinding(
+        project_id="alpha",
+        repository_id="github.com/acme/alpha",
+        actor="github:101",
+        github_account_id=101,
+        github_login="asha",
+        device_id="device:" + "1" * 32,
+    )
+    second = DeviceEnrollmentBinding(
+        project_id="alpha",
+        repository_id="github.com/acme/alpha",
+        actor="github:202",
+        github_account_id=202,
+        github_login="ben",
+        device_id=first.device_id,
+    )
+    first_store = KeyringDeviceKeyStore(first, backend=backend, lock_root=tmp_path / "locks")
+    second_store = KeyringDeviceKeyStore(second, backend=backend, lock_root=tmp_path / "locks")
+
+    first_store.create(first)
+    second_store.create(second)
+
+    assert len(backend.values) == 4
+    assert len({account for _service, account in backend.values}) == 2
+
+
+def test_device_cancellation_scrubs_args_store_backend_and_private_locals(
+    tmp_path: Path,
+) -> None:
+    """Catches cancellation retaining device-key source secrets in production frames."""
+
+    class Cancelled(BaseException):
+        pass
+
+    cancellation = Cancelled("device-source-private-token")
+
+    def cancel() -> bytes:
+        raise cancellation
+
+    backend = _Backend()
+    binding = DeviceEnrollmentBinding(
+        project_id="alpha",
+        repository_id="github.com/acme/alpha",
+        actor="github:101",
+        github_account_id=101,
+        github_login="asha",
+        device_id="device:" + "1" * 32,
+    )
+    store = KeyringDeviceKeyStore(
+        binding,
+        backend=backend,
+        recipient_private_key_source=cancel,
+        lock_root=tmp_path / "locks",
+    )
+
+    with pytest.raises(Cancelled) as caught:
+        store.create(binding)
+
+    assert caught.value is cancellation
+    assert caught.value.args == ()
+    locals_by_frame = _device_traceback_locals(caught.value)
+    assert all(store not in values.values() for values in locals_by_frame)
+    assert all(backend not in values.values() for values in locals_by_frame)
+    assert all("caught" not in values and "recipient" not in values for values in locals_by_frame)

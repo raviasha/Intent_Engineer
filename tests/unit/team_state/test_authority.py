@@ -4,20 +4,26 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import traceback
 from datetime import UTC, datetime, timedelta, timezone
 from typing import Literal
 
 import pytest
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from pydantic import ValidationError
 
 from intent_engineering.team_state.authority import (
     authority_digest,
+    canonical_authority_attestation_preimage,
     canonical_authority_bytes,
+    canonical_state_signature_preimage,
     derive_certificate_id,
     derive_member_id,
     derive_recipient_key_id,
     derive_root_key_id,
     derive_signature_id,
+    issue_device_certificate,
+    verify_v2_envelope,
 )
 from intent_engineering.team_state.models import (
     AuthorityAttestationV2,
@@ -31,11 +37,20 @@ from intent_engineering.team_state.models import (
     TeamAuthorityPolicyV2,
     TeamAuthorityRegistryV2,
     TeamRootTrustV2,
+    TeamStateManifestV2,
 )
 
 PROJECT = "project"
 REPOSITORY = "github.com/acme/project"
 NOW = datetime(2026, 9, 9, 10, tzinfo=UTC)
+
+
+def _authority_traceback_locals(error: BaseException) -> list[dict[str, object]]:
+    return [
+        dict(frame.f_locals)
+        for frame, _lineno in traceback.walk_tb(error.__traceback__)
+        if frame.f_globals.get("__name__") == "intent_engineering.team_state.authority"
+    ]
 
 
 def _b64(value: bytes) -> str:
@@ -568,3 +583,341 @@ def test_authority_attestation_requires_exact_transition_and_envelope_digest() -
                 "previous_authority_digest": None,
             }
         )
+
+
+class _RootStore:
+    def __init__(self, root_private: bytes) -> None:
+        self.private = Ed25519PrivateKey.from_private_bytes(root_private)
+        public = _b64(self.private.public_key().public_bytes_raw())
+        self.root = TeamRootTrustV2(
+            project_id=PROJECT,
+            repository_id=REPOSITORY,
+            authority_epoch=1,
+            root_key_id=derive_root_key_id(PROJECT, REPOSITORY, public),
+            root_public_key=public,
+            created_at=NOW,
+        )
+
+    def create(self, _binding: object) -> TeamRootTrustV2:
+        return self.root
+
+    def sign(self, root_key_id: str, preimage: bytes) -> bytes:
+        assert root_key_id == self.root.root_key_id
+        return self.private.sign(preimage)
+
+    def root_trust(self) -> TeamRootTrustV2:
+        return self.root
+
+
+def _real_certificate(
+    root_store: _RootStore,
+    *,
+    signing_private: bytes = b"s" * 32,
+    account_id: int = 1234,
+    login: str = "alice-dev",
+    device_digit: str = "1",
+    serial: int = 1,
+    expires_at: datetime = NOW + timedelta(days=366),
+) -> tuple[DeviceSignerCertificateV2, bytes]:
+    signer = Ed25519PrivateKey.from_private_bytes(signing_private)
+    recipient_public = _b64(bytes([serial % 251 + 1]) * 32)
+    signing_public = _b64(signer.public_key().public_bytes_raw())
+    claim = DeviceCertificateClaimsV2(
+        project_id=PROJECT,
+        repository_id=REPOSITORY,
+        authority_epoch=1,
+        member_id=derive_member_id(PROJECT, REPOSITORY, account_id),
+        device_id="device:" + device_digit * 32,
+        github_account_id=account_id,
+        github_login=login,
+        recipient_key_id=derive_recipient_key_id(PROJECT, REPOSITORY, recipient_public),
+        recipient_public_key=recipient_public,
+        signature_id=derive_signature_id(PROJECT, REPOSITORY, signing_public),
+        signing_public_key=signing_public,
+        webauthn_credential_digest="sha256:" + device_digit * 64,
+        serial=serial,
+        issued_at=NOW,
+        expires_at=expires_at,
+    )
+    return issue_device_certificate(claim, root_store), signing_private
+
+
+def _verified_authority(
+    root_store: _RootStore,
+    certificates: tuple[DeviceSignerCertificateV2, ...],
+    *,
+    roles: tuple[Literal["sponsor", "member"], ...],
+) -> TeamAuthorityRegistryV2:
+    members = tuple(
+        sorted(
+            (member_for(cert, role=role) for cert, role in zip(certificates, roles, strict=True)),
+            key=lambda item: item.member_id,
+        )
+    )
+    return authority(
+        certificate=certificates[0],
+        root=root_store.root,
+        members=members,
+        device_certificates=tuple(sorted(certificates, key=lambda item: item.certificate_id)),
+    )
+
+
+def _manifest_for(
+    parent: TeamAuthorityRegistryV2, *, digest: str | None = None
+) -> TeamStateManifestV2:
+    return TeamStateManifestV2(
+        project_id=PROJECT,
+        repository_id=REPOSITORY,
+        graph_version=3,
+        parent_bundle_digest="sha256:" + "9" * 64,
+        bundle_digest="sha256:" + "8" * 64,
+        bundle_size=100,
+        recipient_key_ids=parent.active_recipient_key_ids(),
+        authority_digest=digest or authority_digest(parent),
+        authority_epoch=1,
+        root_key_id=parent.root.root_key_id,
+        created_at=NOW,
+    )
+
+
+def _signed_envelope(
+    manifest: TeamStateManifestV2,
+    certificate: DeviceSignerCertificateV2,
+    private: bytes,
+    *,
+    attestation: AuthorityAttestationV2 | None = None,
+) -> StateSignatureEnvelopeV2:
+    signature = Ed25519PrivateKey.from_private_bytes(private).sign(
+        canonical_state_signature_preimage(manifest)
+    )
+    return StateSignatureEnvelopeV2(
+        manifest_digest="sha256:" + hashlib.sha256(manifest.canonical_bytes()).hexdigest(),
+        bundle_digest=manifest.bundle_digest,
+        authority_digest=manifest.authority_digest,
+        certificates=(certificate,),
+        signatures=(
+            CertifiedStateSignatureV2(
+                certificate_id=certificate.certificate_id,
+                signature_id=certificate.claims.signature_id,
+                signature=_b64(signature),
+            ),
+        ),
+        authority_attestation=attestation,
+    )
+
+
+def test_root_issued_certificate_and_ordinary_state_signature_verify() -> None:
+    """Catches accepting a device certificate or state signature under the wrong domain."""
+    root_store = _RootStore(b"r" * 32)
+    cert, private = _real_certificate(root_store)
+    parent = _verified_authority(root_store, (cert,), roles=("sponsor",))
+    manifest = _manifest_for(parent)
+    envelope = _signed_envelope(manifest, cert, private)
+
+    verified = verify_v2_envelope(manifest, envelope, root_store.root, parent, NOW)
+
+    assert verified.signer_certificate_ids == (cert.certificate_id,)
+    assert verified.authority_changed is False
+    forged = envelope.model_copy(
+        update={
+            "signatures": (
+                envelope.signatures[0].model_copy(update={"signature": cert.root_signature}),
+            )
+        }
+    )
+    with pytest.raises(ValueError, match="version two envelope verification failed"):
+        verify_v2_envelope(manifest, forged, root_store.root, parent, NOW)
+
+
+@pytest.mark.parametrize("case", ("expired", "revoked", "unknown", "wrong-parent", "empty"))
+def test_v2_verifier_rejects_ineligible_or_insufficient_device_signatures(case: str) -> None:
+    """Catches a non-active signer satisfying an ordinary publication threshold."""
+    root_store = _RootStore(b"r" * 32)
+    cert, private = _real_certificate(root_store)
+    parent = _verified_authority(root_store, (cert,), roles=("sponsor",))
+    manifest = _manifest_for(parent)
+    envelope = _signed_envelope(manifest, cert, private)
+    verify_at = NOW
+    if case == "expired":
+        cert, private = _real_certificate(root_store, expires_at=NOW + timedelta(days=1))
+        parent = _verified_authority(root_store, (cert,), roles=("sponsor",))
+        manifest = _manifest_for(parent).model_copy(update={"created_at": NOW + timedelta(days=2)})
+        envelope = _signed_envelope(manifest, cert, private)
+        verify_at = NOW + timedelta(days=2)
+    elif case == "revoked":
+        active, _ = _real_certificate(
+            root_store,
+            signing_private=b"a" * 32,
+            device_digit="2",
+            serial=2,
+        )
+        member = MemberRecordV2(
+            member_id=cert.claims.member_id,
+            actor="github:1234",
+            github_account_id=1234,
+            github_login="alice-dev",
+            role="sponsor",
+            status="active",
+            device_certificate_ids=tuple(sorted((cert.certificate_id, active.certificate_id))),
+            enrolled_at=NOW,
+        )
+        revocation = DeviceRevocationV2(
+            certificate_id=cert.certificate_id,
+            revoked_at=NOW,
+            reason="lost",
+            sponsor_member_id=member.member_id,
+        )
+        parent = authority(
+            root=root_store.root,
+            members=(member,),
+            device_certificates=tuple(sorted((cert, active), key=lambda item: item.certificate_id)),
+            revocations=(revocation,),
+        )
+    elif case == "unknown":
+        unknown, unknown_private = _real_certificate(
+            root_store,
+            signing_private=b"u" * 32,
+            account_id=2345,
+            login="unknown-dev",
+            device_digit="2",
+            serial=2,
+        )
+        envelope = _signed_envelope(manifest, unknown, unknown_private)
+    elif case == "wrong-parent":
+        parent = parent.model_copy(
+            update={"ci_recipient": parent.ci_recipient.model_copy(update={"runner_id": "other"})}
+        )
+    else:
+        envelope = envelope.model_copy(update={"certificates": (), "signatures": ()})
+
+    with pytest.raises(ValueError, match="version two envelope verification failed"):
+        verify_v2_envelope(manifest, envelope, root_store.root, parent, verify_at)
+
+
+def test_ordinary_member_cannot_authorize_an_authority_change() -> None:
+    """Catches an active non-sponsor mutating membership with a valid device key."""
+    root_store = _RootStore(b"r" * 32)
+    sponsor, _ = _real_certificate(root_store)
+    member, member_private = _real_certificate(
+        root_store,
+        signing_private=b"m" * 32,
+        account_id=2345,
+        login="bob-dev",
+        device_digit="2",
+        serial=2,
+    )
+    parent = _verified_authority(root_store, (sponsor, member), roles=("sponsor", "member"))
+    next_digest = "sha256:" + "7" * 64
+    manifest = _manifest_for(parent, digest=next_digest)
+    unsigned = AuthorityAttestationV2(
+        project_id=PROJECT,
+        repository_id=REPOSITORY,
+        authority_epoch=1,
+        previous_authority_digest=authority_digest(parent),
+        authority_digest=next_digest,
+        parent_bundle_digest=manifest.parent_bundle_digest,
+        operation="enroll",
+        subject_digest="sha256:" + "6" * 64,
+        sponsor_member_id=member.claims.member_id,
+        sponsor_device_certificate_id=member.certificate_id,
+        sponsor_decision_digest="sha256:" + "5" * 64,
+        decided_at=NOW,
+        root_key_id=root_store.root.root_key_id,
+        root_signature=_b64(b"0" * 64),
+    )
+    attestation = unsigned.model_copy(
+        update={
+            "root_signature": _b64(
+                root_store.sign(
+                    root_store.root.root_key_id,
+                    canonical_authority_attestation_preimage(unsigned),
+                )
+            )
+        }
+    )
+    envelope = _signed_envelope(manifest, member, member_private, attestation=attestation)
+
+    with pytest.raises(ValueError, match="version two envelope verification failed"):
+        verify_v2_envelope(manifest, envelope, root_store.root, parent, NOW)
+
+
+def test_sponsor_authority_attestation_is_root_verified_under_its_own_domain() -> None:
+    """Catches accepting a state-domain signature as a root authority attestation."""
+    root_store = _RootStore(b"r" * 32)
+    sponsor, private = _real_certificate(root_store)
+    parent = _verified_authority(root_store, (sponsor,), roles=("sponsor",))
+    next_digest = "sha256:" + "7" * 64
+    manifest = _manifest_for(parent, digest=next_digest)
+    unsigned = AuthorityAttestationV2(
+        project_id=PROJECT,
+        repository_id=REPOSITORY,
+        authority_epoch=1,
+        previous_authority_digest=authority_digest(parent),
+        authority_digest=next_digest,
+        parent_bundle_digest=manifest.parent_bundle_digest,
+        operation="enroll",
+        subject_digest="sha256:" + "6" * 64,
+        sponsor_member_id=sponsor.claims.member_id,
+        sponsor_device_certificate_id=sponsor.certificate_id,
+        sponsor_decision_digest="sha256:" + "5" * 64,
+        decided_at=NOW,
+        root_key_id=root_store.root.root_key_id,
+        root_signature=_b64(b"0" * 64),
+    )
+    attestation = unsigned.model_copy(
+        update={
+            "root_signature": _b64(
+                root_store.sign(
+                    root_store.root.root_key_id,
+                    canonical_authority_attestation_preimage(unsigned),
+                )
+            )
+        }
+    )
+    envelope = _signed_envelope(manifest, sponsor, private, attestation=attestation)
+
+    assert verify_v2_envelope(manifest, envelope, root_store.root, parent, NOW).authority_changed
+
+    wrong_domain = attestation.model_copy(
+        update={
+            "root_signature": _b64(
+                root_store.sign(
+                    root_store.root.root_key_id,
+                    canonical_state_signature_preimage(manifest),
+                )
+            )
+        }
+    )
+    forged = _signed_envelope(manifest, sponsor, private, attestation=wrong_domain)
+    with pytest.raises(ValueError, match="version two envelope verification failed"):
+        verify_v2_envelope(manifest, forged, root_store.root, parent, NOW)
+
+
+def test_certificate_issuance_cancellation_scrubs_root_store_args_and_locals() -> None:
+    """Catches root-store secrets surviving certificate-issuance cancellation."""
+
+    class Cancelled(BaseException):
+        pass
+
+    cancellation = Cancelled("root-store-private-token")
+
+    class CancellingRootStore(_RootStore):
+        def sign(self, root_key_id: str, preimage: bytes) -> bytes:
+            del root_key_id, preimage
+            raise cancellation
+
+    root_store = CancellingRootStore(b"r" * 32)
+    public = _b64(Ed25519PrivateKey.from_private_bytes(b"s" * 32).public_key().public_bytes_raw())
+    value = claims(
+        signing_public_key=public,
+        signature_id=derive_signature_id(PROJECT, REPOSITORY, public),
+    )
+
+    with pytest.raises(Cancelled) as caught:
+        issue_device_certificate(value, root_store)
+
+    assert caught.value is cancellation
+    assert caught.value.args == ()
+    locals_by_frame = _authority_traceback_locals(caught.value)
+    assert all(root_store not in values.values() for values in locals_by_frame)
+    assert all("root_store" not in values and "error" not in values for values in locals_by_frame)

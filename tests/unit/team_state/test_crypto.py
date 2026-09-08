@@ -19,6 +19,8 @@ from intent_engineering.team_state.crypto import (
     canonical_encrypted_bundle_bytes,
     decrypt_bundle,
     encrypt_bundle,
+    recipient_possession_proof,
+    verify_recipient_possession_proof,
 )
 from intent_engineering.team_state.models import RecipientRecord
 
@@ -434,3 +436,68 @@ def test_legacy_seal_scrubs_plaintext_on_crypto_failure_and_cancellation(
             }
         ),
     )
+
+
+def test_recipient_possession_proof_is_context_bound_and_non_reversible() -> None:
+    """Catches accepting a copied X25519 proof for another join response or key."""
+    recipient = X25519PrivateKey.from_private_bytes(b"d" * 32)
+    challenge = X25519PrivateKey.from_private_bytes(b"e" * 32)
+    subject = b"canonical join response subject"
+
+    proof = recipient_possession_proof(
+        recipient.private_bytes_raw(), challenge.public_key().public_bytes_raw(), subject
+    )
+
+    assert len(proof) == 32
+    assert proof != recipient.private_bytes_raw()
+    assert verify_recipient_possession_proof(
+        recipient.public_key().public_bytes_raw(),
+        challenge.private_bytes_raw(),
+        subject,
+        proof,
+    )
+    assert not verify_recipient_possession_proof(
+        recipient.public_key().public_bytes_raw(),
+        challenge.private_bytes_raw(),
+        subject + b"!",
+        proof,
+    )
+    assert not verify_recipient_possession_proof(
+        X25519PrivateKey.from_private_bytes(b"f" * 32).public_key().public_bytes_raw(),
+        challenge.private_bytes_raw(),
+        subject,
+        proof,
+    )
+
+
+def test_recipient_possession_cancellation_scrubs_args_and_private_locals(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catches possession-proof cancellation retaining recipient private material."""
+
+    class Cancelled(BaseException):
+        pass
+
+    cancellation = Cancelled("recipient-possession-private-token")
+    private = bytes(bytearray(b"d" * 32))
+
+    def cancel(_shared: bytes, _subject: bytes) -> bytes:
+        raise cancellation
+
+    monkeypatch.setattr(crypto, "_derive_possession_proof", cancel)
+    with pytest.raises(Cancelled) as caught:
+        recipient_possession_proof(
+            private,
+            X25519PrivateKey.from_private_bytes(b"e" * 32).public_key().public_bytes_raw(),
+            b"join subject",
+        )
+
+    assert caught.value is cancellation
+    assert caught.value.args == ()
+    for frame, _lineno in traceback.walk_tb(caught.value.__traceback__):
+        if frame.f_globals.get("__name__") != "intent_engineering.team_state.crypto":
+            continue
+        assert private not in frame.f_locals.values()
+        assert "recipient_private_key" not in frame.f_locals
+        assert "private" not in frame.f_locals
+        assert "pending" not in frame.f_locals
