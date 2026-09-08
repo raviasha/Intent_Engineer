@@ -219,6 +219,19 @@ class ClarificationAnswerDiscardRequest(HttpRequestModel):
         return value
 
 
+class ReviewedTestRunRequest(HttpRequestModel):
+    """One reviewed command identifier selected by the local human UI."""
+
+    command_id: str = Field(min_length=1, max_length=76)
+
+    @field_validator("command_id", mode="before")
+    @classmethod
+    def require_exact_command_id(cls, value: object) -> str:
+        if type(value) is not str:
+            raise ValueError("invalid reviewed test request")
+        return value
+
+
 class _HttpResponseModel(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True, validate_default=True)
 

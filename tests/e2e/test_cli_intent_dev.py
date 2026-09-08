@@ -836,6 +836,34 @@ def test_browser_open_failure_is_fixed_and_server_cleanup_still_runs(
     assert not (project / ".intent/cache/control-plane.json").exists()
 
 
+def test_real_dev_start_activates_passive_observation_before_reporting_ready(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Catches passive observation existing only as a directly-invoked Python method."""
+    project = _project(tmp_path)
+    started: list[ControlPlaneService] = []
+
+    def record_start(service: ControlPlaneService) -> None:
+        started.append(service)
+
+    monkeypatch.setattr(
+        ControlPlaneService,
+        "start_development_observation",
+        record_start,
+        raising=False,
+    )
+    monkeypatch.setattr(dev_cli, "_wait_for_exit", lambda _started: None)
+
+    result = CliRunner().invoke(
+        app,
+        ["dev", "--project", str(project), "--prd", "docs/PRD.md", "--no-open"],
+    )
+
+    assert result.exit_code == 0, repr(result.exception)
+    assert len(started) == 1
+    assert result.stdout.startswith("intent dev: ready at http://localhost:")
+
+
 def test_cancelled_wait_preserves_identity_cleans_metadata_and_scrubs_bootstrap(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

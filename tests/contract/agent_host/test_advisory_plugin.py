@@ -11,7 +11,7 @@ import stat
 import subprocess
 import sys
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -41,6 +41,21 @@ FALLBACK = (
     "Intent advisory prompt routing is unavailable. Do not mutate the intent graph, "
     "infer authorization, or treat this advisory as enforcement."
 )
+
+
+@pytest.fixture(autouse=True)
+def _stop_test_control_planes(tmp_path: Path) -> Iterator[None]:
+    """Stop any real developer service started by the prompt-hook contract."""
+    yield
+    for metadata in tmp_path.rglob("control-plane.json"):
+        if metadata.parent.name != "cache" or metadata.parent.parent.name != ".intent":
+            continue
+        try:
+            pid = json.loads(metadata.read_bytes())["pid"]
+            if type(pid) is int and pid > 1 and pid != os.getpid():
+                os.kill(pid, signal.SIGINT)
+        except (FileNotFoundError, KeyError, ProcessLookupError, TypeError, ValueError):
+            continue
 
 
 def _official_event(

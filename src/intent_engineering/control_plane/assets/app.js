@@ -11,6 +11,8 @@
     registrationVerify: "/api/v1/webauthn/register/verify",
     decisionOptions: "/api/v1/decisions/options",
     decisionVerify: "/api/v1/decisions/verify",
+    developmentObservation: "/api/v1/development/observation",
+    reviewedTests: "/api/v1/development/tests/run",
   });
   const viewNames = new Set(["home", "onboarding", "inbox", "proposal", "team_state"]);
   const app = document.getElementById("app");
@@ -24,6 +26,7 @@
     preview: null,
     selectedNodeIds: [],
     proposalGeneration: 0,
+    developmentObservation: null,
   };
   let csrfToken = readCsrfBootstrap();
 
@@ -160,6 +163,18 @@
       addText(section, "p", "Loading local review status.");
     }
     section.append(actionButton("Refresh readiness", refreshStatus));
+    if (state.developmentObservation) {
+      addText(section, "h3", "Development evidence");
+      addProjection(section, state.developmentObservation);
+      for (const commandId of state.developmentObservation.command_ids || []) {
+        section.append(
+          actionButton("Run reviewed tests", () => runReviewedTests(commandId))
+        );
+      }
+    }
+    section.append(
+      actionButton("Refresh development evidence", () => refreshDevelopmentObservation(false))
+    );
     return section;
   }
 
@@ -513,6 +528,39 @@
     }
   }
 
+  async function refreshDevelopmentObservation(quiet = false) {
+    try {
+      state.developmentObservation = await fetchJson(api.developmentObservation);
+      if (state.view === "home") {
+        render();
+      }
+      if (!quiet) {
+        announce("Development evidence updated.");
+      }
+    } catch (_error) {
+      if (!quiet) {
+        announce("Development evidence is temporarily unavailable.");
+      }
+    }
+  }
+
+  async function runReviewedTests(commandId) {
+    if (typeof commandId !== "string" || !/^test:sha256:[0-9a-f]{64}$/.test(commandId)) {
+      announce("Reviewed test selection is unavailable.");
+      return;
+    }
+    try {
+      const result = await fetchJson(api.reviewedTests, {
+        method: "POST",
+        body: JSON.stringify({ command_id: commandId }),
+      });
+      announce(`Reviewed tests finished with status ${result.status}.`);
+      await refreshDevelopmentObservation(true);
+    } catch (_error) {
+      announce("Reviewed tests could not run. No completion was asserted.");
+    }
+  }
+
   async function loadPreview() {
     if (!state.proposalId) {
       return;
@@ -789,4 +837,5 @@
 
   render();
   refreshStatus();
+  refreshDevelopmentObservation(true);
 })();

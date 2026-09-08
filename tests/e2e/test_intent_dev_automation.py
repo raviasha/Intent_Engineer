@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import importlib
 import json
+import os
 import shlex
+import signal
 import subprocess
+import time
 from pathlib import Path
 from unittest.mock import patch
 
@@ -190,16 +193,44 @@ def _check(repo: Path, trust: SharedStateTrust, *, ci: bool = True):
         )
 
 
+def _stop_background_dev(repo: Path) -> None:
+    metadata = repo / ".intent/cache/control-plane.json"
+    try:
+        pid = json.loads(metadata.read_bytes())["pid"]
+    except (FileNotFoundError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return
+    if type(pid) is not int or pid < 1:
+        return
+    try:
+        os.kill(pid, signal.SIGINT)
+    except ProcessLookupError:
+        return
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        try:
+            waited, _status = os.waitpid(pid, os.WNOHANG)
+        except ChildProcessError:
+            waited = 0
+        if waited == pid:
+            return
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return
+        time.sleep(0.02)
+
+
 def test_fresh_onboarded_clone_first_prompt_and_plugin_disabled_ci_backstop(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
 ) -> None:
     """Removing restore, reviewed execution, canonical binding or CLI assurance breaks this."""
     action = _action()
     repo, trust = _clone(tmp_path)
+    request.addfinalizer(lambda: _stop_background_dev(repo))
     monkeypatch.setenv("INTENT_CI_SHARED_STATE_TRUST", trust_environment(trust))
     original_head = git(repo, "rev-parse", "HEAD")
-    action.restore(repo)
     monkeypatch.chdir(repo)
     first_prompt = CliRunner().invoke(
         app,
@@ -221,6 +252,11 @@ def test_fresh_onboarded_clone_first_prompt_and_plugin_disabled_ci_backstop(
     context = json.loads(first_prompt.stdout)["hookSpecificOutput"]["additionalContext"]
     assert "intent_advisory_preflight" in context
     assert "onboarding" not in context.lower()
+    metadata = json.loads((repo / ".intent/cache/control-plane.json").read_bytes())
+    assert metadata["pid"] != os.getpid()
+    status = CliRunner().invoke(app, ["dev", "--project", str(repo), "--status"])
+    assert status.exit_code == 0, (status.stdout, status.stderr, repr(status.exception))
+    assert status.stdout == f"intent dev: running at {metadata['origin']}\n"
     assert git(repo, "rev-parse", "HEAD") == original_head
     # The GitHub path has no plugin invocation and restores from the signed ref again.
     anyio.run(action.run_tests, repo, NOW)

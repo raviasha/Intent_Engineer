@@ -16,6 +16,13 @@ from starlette.types import Message, Receive, Scope, Send
 from intent_engineering.control_plane import build_control_plane_app, http_models
 from intent_engineering.control_plane.http_models import RegistrationVerifyRequest
 from intent_engineering.control_plane.models import CredentialRecord, HumanDecisionPayload
+from intent_engineering.intent_workflow.dev_observer import (
+    ObservationResult,
+    TestRunStatus,
+)
+from intent_engineering.intent_workflow.dev_observer import (
+    TestRunResult as ObserverTestRunResult,
+)
 
 ORIGIN = "http://localhost:43127"
 CSRF = "csrf-process-secret-43127"
@@ -162,6 +169,25 @@ class _Service:
             "changeset_id": "changeset:result",
         }
 
+    def development_observation(self) -> ObservationResult:
+        self.calls.append(("development_observation", None))
+        self._fail()
+        return ObservationResult(
+            current_revision="1" * 40,
+            command_ids=("test:sha256:" + "2" * 64,),
+            changed_paths=("feature.py",),
+            evidence_candidates=(),
+        )
+
+    async def run_reviewed_tests(self, command_id: str) -> ObserverTestRunResult:
+        self.calls.append(("run_reviewed_tests", command_id))
+        self._fail()
+        return ObserverTestRunResult(
+            command_id=command_id,
+            status=TestRunStatus.PASSED,
+            exit_code=0,
+        )
+
 
 def _app(service: _Service):
     return build_control_plane_app(cast(Any, service), origin=ORIGIN, csrf_secret=CSRF)
@@ -246,6 +272,12 @@ def test_exact_routes_delegate_to_the_service_and_return_detached_json() -> None
         ),
         headers=_trusted_headers(),
     )
+    observation = client.get("/api/v1/development/observation", headers={"Origin": ORIGIN})
+    reviewed_tests = client.post(
+        "/api/v1/development/tests/run",
+        content=_json_bytes({"command_id": "test:sha256:" + "2" * 64}),
+        headers=_trusted_headers(),
+    )
 
     assert status.json() == service.status_result
     assert inbox.json() == {
@@ -266,6 +298,22 @@ def test_exact_routes_delegate_to_the_service_and_return_detached_json() -> None
     assert registration.json() == _credential().model_dump(mode="json")
     assert decision_options.json() == {"publicKey": {"userVerification": "required"}}
     assert decision.json()["status"] == "resolved"
+    assert observation.json() == {
+        "schema_version": 1,
+        "current_revision": "1" * 40,
+        "command_ids": ["test:sha256:" + "2" * 64],
+        "changed_paths": ["feature.py"],
+        "evidence_candidates": [],
+    }
+    assert reviewed_tests.json() == {
+        "schema_version": 1,
+        "command_id": "test:sha256:" + "2" * 64,
+        "status": "passed",
+        "exit_code": 0,
+        "stdout": "",
+        "stderr": "",
+        "artifact": None,
+    }
     assert service.calls == [
         ("status", None),
         ("inbox", None),
@@ -289,6 +337,8 @@ def test_exact_routes_delegate_to_the_service_and_return_detached_json() -> None
                 _decision_payload(),
             ),
         ),
+        ("development_observation", None),
+        ("run_reviewed_tests", "test:sha256:" + "2" * 64),
     ]
     for response in (
         status,
@@ -300,9 +350,41 @@ def test_exact_routes_delegate_to_the_service_and_return_detached_json() -> None
         registration,
         decision_options,
         decision,
+        observation,
+        reviewed_tests,
     ):
         assert response.headers["content-type"] == "application/json"
         _assert_security_headers(response)
+
+
+def test_reviewed_test_route_requires_same_origin_csrf_and_exact_json() -> None:
+    """Catches browser-triggered test execution bypassing the protected write boundary."""
+    service = _Service()
+    client = TestClient(_app(service), base_url=ORIGIN)
+    path = "/api/v1/development/tests/run"
+    body = _json_bytes({"command_id": "test:sha256:" + "2" * 64})
+
+    assert (
+        client.post(path, content=body, headers={"Content-Type": "application/json"}).status_code
+        == 403
+    )
+    assert (
+        client.post(
+            path,
+            content=body,
+            headers={**_trusted_headers(), "Origin": "http://localhost:43128"},
+        ).status_code
+        == 403
+    )
+    assert (
+        client.post(
+            path,
+            content=_json_bytes({"command_id": "test:sha256:" + "2" * 64, "extra": True}),
+            headers=_trusted_headers(),
+        ).status_code
+        == 400
+    )
+    assert service.calls == []
 
 
 def test_starlette_lifespan_starts_without_bypassing_the_http_boundary() -> None:

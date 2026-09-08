@@ -6,6 +6,7 @@ import hashlib
 import json
 import re
 import secrets
+import threading
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -231,6 +232,11 @@ class ControlPlaneService:
         self._plans_file = self._approvals_directory.file("plans.jsonl")
         self._pending_answers: dict[str, _PendingAnswer] = {}
         self._dev_observer: DevObserver | None = None
+        self._observation_guard = threading.Lock()
+        self._observation_state_guard = threading.Lock()
+        self._observation_stop = threading.Event()
+        self._observation_thread: threading.Thread | None = None
+        self._latest_observation: ObservationResult | None = None
         self._webauthn = WebAuthnService(
             project_id=runtime.config.project_id,
             repository_id=self.repository_id,
@@ -272,13 +278,70 @@ class ControlPlaneService:
 
     def observe_development(self) -> ObservationResult:
         """Return passive evidence candidates without graph or completion mutation."""
+        if not self._observation_guard.acquire(blocking=False):
+            raise ControlPlaneError() from None
         try:
-            return self._development_observer().poll(at=self._now())
+            result = self._development_observer().poll(at=self._now())
+            with self._observation_state_guard:
+                self._latest_observation = result
+            return result
         except Exception:  # noqa: BLE001 - fixed opaque observer boundary
             raise ControlPlaneError() from None
+        finally:
+            self._observation_guard.release()
+
+    def development_observation(self) -> ObservationResult:
+        """Return the latest detached passive result without initiating repository work."""
+        with self._observation_state_guard:
+            result = self._latest_observation
+            if result is None:
+                raise ControlPlaneError() from None
+            return ObservationResult.model_validate_json(result.model_dump_json())
+
+    def start_development_observation(self, *, interval_seconds: float = 2.0) -> None:
+        """Start one bounded-cadence passive observer owned by this service."""
+        if (
+            type(interval_seconds) not in {int, float}
+            or not 0.001 <= float(interval_seconds) <= 60.0
+        ):
+            raise ControlPlaneError() from None
+        with self._observation_state_guard:
+            if self._observation_thread is not None:
+                return
+            self._observation_stop.clear()
+
+            def run() -> None:
+                while not self._observation_stop.is_set():
+                    try:
+                        self.observe_development()
+                    except Exception as error:  # noqa: BLE001 - passive failures are opaque
+                        error.__traceback__ = None
+                    if self._observation_stop.wait(float(interval_seconds)):
+                        return
+
+            thread = threading.Thread(
+                target=run,
+                name="intent-dev-observer",
+                daemon=True,
+            )
+            self._observation_thread = thread
+            thread.start()
+
+    def _stop_development_observation(self) -> None:
+        with self._observation_state_guard:
+            thread = self._observation_thread
+            self._observation_stop.set()
+        if thread is not None:
+            thread.join(timeout=30)
+            if thread.is_alive():
+                raise ControlPlaneError() from None
+        with self._observation_state_guard:
+            self._observation_thread = None
 
     async def run_reviewed_tests(self, command_id: str) -> TestRunResult:
         """Run one configured test action without acquiring human authority."""
+        if not self._observation_guard.acquire(blocking=False):
+            raise ControlPlaneError() from None
         try:
             return await self._development_observer().run_reviewed_tests(
                 command_id,
@@ -286,6 +349,8 @@ class ControlPlaneService:
             )
         except Exception:  # noqa: BLE001 - cancellation remains a BaseException
             raise ControlPlaneError() from None
+        finally:
+            self._observation_guard.release()
 
     def _purge_pending_answers(self, now: datetime) -> None:
         expired = tuple(
@@ -1539,6 +1604,7 @@ class ControlPlaneService:
 
     def close(self) -> None:
         """Release descriptors owned by this service while leaving Runtime ownership intact."""
+        self._stop_development_observation()
         if self._dev_observer is not None:
             self._dev_observer.close()
             self._dev_observer = None

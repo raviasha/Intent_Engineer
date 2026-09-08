@@ -88,10 +88,12 @@ working directory. A remote executor must explicitly reproduce or configure that
 working directory; it must not assume `.` refers to the user's checkout.
 
 The bundle first runs the same non-authoritative readiness check as
-`intent ensure --project . --preset developer --format json`. It automatically offers onboarding
-when no approved baseline exists. If an approved graph has pending proposal review, an open
+`intent ensure --project . --preset developer --format json`. When approved shared-state trust is
+configured, that operation verifies and restores the signed baseline, then starts or reuses the
+repository-bound local service before returning. A fresh repository with no approved shared
+baseline still receives the unchanged onboarding offer and no state is created. If an approved graph has pending proposal review, an open
 reconciliation case, or unanswered clarification, it stops before capturing or classifying the
-prompt and directs the developer to the local Inbox. Otherwise, it persists the exact stdin prompt
+prompt and directs the developer to the already-running local review view. Otherwise, it persists the exact stdin prompt
 as untrusted `agent:codex` context, supplies only opaque conversation and evidence references, and
 routes the agent's bounded classification draft through token-free `intent_advisory_preflight`. The
 hook boundary is callable by the coding agent, so it never claims local-human attribution or
@@ -108,6 +110,12 @@ To inspect the machine-facing gate directly, run
 offer or disable/uninstall `intent-advisor`. A decline leaves the repository unchanged for that
 task; disabling the plugin leaves ordinary coding behavior unchanged. The CLI and MCP services
 remain usable independently.
+
+While `intent dev` is running, it polls bounded Git and test-result evidence at a fixed cadence
+without waiting for a browser request. The Home view shows the latest detached observation and
+offers an explicit **Run reviewed tests** action for command IDs from reviewed project
+configuration. The write uses the same-origin/CSRF boundary; it supplies an identifier, never a
+shell command, and neither polling nor test execution asserts implementation completion.
 
 ### Required GitHub check
 

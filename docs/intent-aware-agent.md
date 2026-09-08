@@ -350,14 +350,22 @@ and rendering failures are not masked. It does not claim fresh repository test e
 generated drift report also has seven-day retention.
 
 For an onboarded local checkout, the first ordinary prompt checks readiness automatically; the
-developer does not need to type an Intent command per task. Current prompt readiness examines the
-local baseline. A fresh team checkout must first receive a verified baseline through the restore
-integration; the prompt hook itself does not fetch or enroll team state. The offline release proof
-covers a real fresh clone, signed baseline restore, the first prompt, an implementation/test commit,
+developer does not need to type an Intent command per task. When approved shared-state trust is
+configured, the same prompt path verifies and restores the signed baseline before immutable
+readiness, then starts or reuses the repository-bound `intent dev` service with no browser popup.
+A repository with neither local state nor an approved shared baseline still receives the
+non-mutating onboarding offer. The offline release proof covers a real fresh clone, automatic signed
+baseline restore, automatic service startup, the first prompt, an implementation/test commit,
 local check/replay, and ambiguous/conflicting cases that block checks when the plugin is absent.
 A separate explicit rootful-Docker release gate proves immutable CI execution and consumption.
 Passing that check means the configured deterministic checks passed; it does not declare all
 software semantically complete.
+
+The running control plane passively polls the bounded development observer at a fixed cadence even
+when no browser page is open. Home reads only its latest detached projection. A user may explicitly
+run one reviewed test command through the protected loopback API; the request contains the reviewed
+command ID and is subject to exact origin, CSRF, JSON, timeout, output, repository, and executable
+bindings. Background polling never executes tests, mutates the graph, or records completion.
 
 ## 4. Clarification and review
 

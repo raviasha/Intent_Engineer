@@ -8,6 +8,8 @@ import hashlib
 import json
 import multiprocessing
 import os
+import threading
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -328,6 +330,34 @@ def _approval_harness(tmp_path: Path) -> _ApprovalHarness:
     plan = WritePlan.model_validate_json(json.dumps({"id": write_plan_id(material), **material}))
     assert workflow.plans.put(plan)
     return _ApprovalHarness(project, runtime, service, verifier, workflow, plan)
+
+
+def test_passive_observation_polls_without_browser_requests_and_stops_cleanly(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Catches the ordinary service lifecycle leaving passive evidence unreachable."""
+    harness = _harness(tmp_path)
+    calls: list[int] = []
+    polled = threading.Event()
+
+    def observe(_service: ControlPlaneService):
+        calls.append(len(calls) + 1)
+        polled.set()
+
+    monkeypatch.setattr(ControlPlaneService, "observe_development", observe)
+    harness.service.start_development_observation(interval_seconds=0.01)
+    assert polled.wait(timeout=1)
+    deadline = time.monotonic() + 1
+    while len(calls) < 2 and time.monotonic() < deadline:
+        time.sleep(0.01)
+
+    harness.service.close()
+    stopped_at = len(calls)
+    time.sleep(0.05)
+
+    assert stopped_at >= 2
+    assert len(calls) == stopped_at
+    harness.runtime.close()
 
 
 def test_registration_wrappers_own_actor_origin_time_and_return_detached_records(

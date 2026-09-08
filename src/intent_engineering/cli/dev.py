@@ -50,6 +50,10 @@ from intent_engineering.core.policy import (
     ProjectNotInitialized,
     initialize_project,
 )
+from intent_engineering.intent_workflow.check import (
+    SharedStateRestoreResult,
+    SharedStateRestoreStatus,
+)
 from intent_engineering.intent_workflow.onboarding import (
     OnboardingRuntime,
     OnboardingState,
@@ -60,12 +64,16 @@ from intent_engineering.intent_workflow.readiness import (
     EnsureRequest,
     EnsureResult,
     EnsureStatus,
-    ReadinessError,
     ReadinessService,
     ReadinessTarget,
 )
 from intent_engineering.storage._atomic import same_path_lock
 from intent_engineering.storage.secure import SecureDirectory, SecureFile, UnsafePathError
+from intent_engineering.team_state.restore import (
+    TRUST_ENVIRONMENT_VARIABLE,
+    EnvironmentTrustProvider,
+    GitSharedStateRestorer,
+)
 
 _METADATA_PATH = "cache/control-plane.json"
 _MAX_METADATA_BYTES = 4096
@@ -84,6 +92,11 @@ _CSP = (
 )
 _REPOSITORY_LOCKS: dict[tuple[int, int], threading.RLock] = {}
 _REPOSITORY_LOCKS_GUARD = threading.Lock()
+_BACKGROUND_ENTRYPOINT = (
+    "import runpy,sys;"
+    "sys.path.insert(0,sys.argv.pop(1));"
+    "runpy.run_module('intent_engineering.cli.app',run_name='__main__')"
+)
 
 
 def _reset_repository_locks_after_fork() -> None:
@@ -668,17 +681,16 @@ def _start(
     runtime = started.runtime
     if runtime is None:
         raise _DevUnavailable()
-    _provision_local_clarification_policy(runtime, runtime.config)
+    onboarding = inspect_onboarding(cast(OnboardingRuntime, runtime))
+    if prd is not None and onboarding.state is OnboardingState.REQUIRED:
+        _provision_local_clarification_policy(runtime, runtime.config)
     started.listener = _listener()
     port = cast(tuple[str, int], started.listener.getsockname())[1]
     origin = f"http://localhost:{port}"
     started.bootstrap = secrets.token_urlsafe(32)
     instance_id = f"instance:{secrets.token_hex(32)}"
     started.service = ControlPlaneService(runtime, origin=origin)
-    if (
-        prd is not None
-        and inspect_onboarding(cast(OnboardingRuntime, runtime)).state is OnboardingState.REQUIRED
-    ):
+    if prd is not None and onboarding.state is OnboardingState.REQUIRED:
         started.service.onboard_preview(prd)
     api = build_control_plane_app(
         started.service,
@@ -707,6 +719,7 @@ def _start(
     started.server = uvicorn.Server(configuration)
     started.thread, started.failures = _server_thread(started.server, started.listener)
     _wait_until_started(started.server, started.thread)
+    started.service.start_development_observation()
     process_start_id = _process_start_id(os.getpid())
     if process_start_id is None:
         raise _DevUnavailable()
@@ -910,47 +923,170 @@ def ensure_command(
     preset: EnsurePreset = typer.Option(EnsurePreset.DEVELOPER, "--preset"),
     output_format: OutputFormat = typer.Option(OutputFormat.TEXT, "--format"),
 ) -> None:
-    """Return a bounded readiness result without initializing or approving state."""
+    """Restore, validate and make the developer control plane ready without authority."""
     root = Path(os.path.abspath(project))
-    if not os.path.lexists(root / ".intent"):
-        emit(
-            EnsureResult(
-                status=EnsureStatus.ONBOARDING_REQUIRED,
-                attention_route=ReadinessTarget.ONBOARDING,
-                graph_version=0,
-                pending_proposal_ids=(),
-                open_case_ids=(),
-            ),
-            output_format,
+    emit(_developer_readiness(root, preset), output_format)
+
+
+def _readiness_result(
+    status: EnsureStatus,
+    route: ReadinessTarget,
+    *,
+    graph_version: int = 0,
+    pending_proposal_ids: tuple[str, ...] = (),
+    open_case_ids: tuple[str, ...] = (),
+) -> EnsureResult:
+    return EnsureResult(
+        status=status,
+        attention_route=route,
+        graph_version=graph_version,
+        pending_proposal_ids=pending_proposal_ids,
+        open_case_ids=open_case_ids,
+    )
+
+
+def _shared_restore(root: Path) -> SharedStateRestoreResult:
+    if TRUST_ENVIRONMENT_VARIABLE not in os.environ:
+        return SharedStateRestoreResult(status=SharedStateRestoreStatus.NOT_REQUIRED)
+    try:
+        result = GitSharedStateRestorer(
+            EnvironmentTrustProvider(),
+        ).verify_and_restore_approved_baseline(root)
+        if type(result) is SharedStateRestoreResult:
+            return result
+    except Exception as error:  # noqa: BLE001 - fixed secret-free restore boundary
+        error.__traceback__ = None
+    return SharedStateRestoreResult(status=SharedStateRestoreStatus.INVALID)
+
+
+def _background_environment() -> dict[str, str]:
+    return {
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+        "PATH": "/usr/bin:/bin",
+    }
+
+
+def _background_argv(root: Path) -> tuple[str, ...]:
+    source_root = Path(__file__).resolve().parents[2]
+    return (
+        sys.executable,
+        "-I",
+        "-c",
+        _BACKGROUND_ENTRYPOINT,
+        str(source_root),
+        "dev",
+        "--project",
+        str(root),
+        "--no-open",
+    )
+
+
+def _running_service(root: Path) -> ControlPlaneProcessMetadata | None:
+    project_directory: SecureDirectory | None = None
+    try:
+        project_directory = SecureDirectory.open(root)
+        return _live_repository_process(project_directory)
+    except (OSError, UnsafePathError):
+        return None
+    finally:
+        if project_directory is not None:
+            project_directory.close()
+
+
+def _start_or_reuse_background_service(root: Path) -> bool:
+    if _running_service(root) is not None:
+        return True
+    process: subprocess.Popen[bytes] | None = None
+    ready = False
+    try:
+        process = subprocess.Popen(
+            _background_argv(root),
+            cwd="/",
+            env=_background_environment(),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            close_fds=True,
+            start_new_session=True,
         )
-        return
+        deadline = time.monotonic() + _STARTUP_TIMEOUT_SECONDS
+        while time.monotonic() < deadline:
+            if _running_service(root) is not None:
+                ready = True
+                return True
+            if process.poll() is not None:
+                return _running_service(root) is not None
+            time.sleep(0.01)
+        return False
+    except (OSError, subprocess.SubprocessError):
+        return False
+    finally:
+        if process is not None and not ready and process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                try:
+                    process.wait(timeout=1)
+                except subprocess.TimeoutExpired:
+                    pass
+        process = None
+
+
+def _developer_readiness(root: Path, preset: EnsurePreset) -> EnsureResult:
+    """Own the bounded zero-command restore, readiness and service lifecycle."""
+    restore = _shared_restore(root)
+    configured = restore.status is not SharedStateRestoreStatus.NOT_REQUIRED
+    if not os.path.lexists(root / ".intent"):
+        if not configured:
+            return _readiness_result(EnsureStatus.ONBOARDING_REQUIRED, ReadinessTarget.ONBOARDING)
+        status = {
+            SharedStateRestoreStatus.UNAVAILABLE: EnsureStatus.SHARED_STATE_UNAVAILABLE,
+            SharedStateRestoreStatus.UPGRADE_REQUIRED: EnsureStatus.UPGRADE_REQUIRED,
+        }.get(restore.status, EnsureStatus.SHARED_STATE_INVALID)
+        return _readiness_result(status, ReadinessTarget.TEAM_STATE)
+    runtime = None
     try:
         runtime = load_readiness_runtime(root)
-    except Exception:  # noqa: BLE001 - fixed secret-free readiness result
-        emit(
-            EnsureResult(
-                status=EnsureStatus.SHARED_STATE_INVALID,
-                attention_route=ReadinessTarget.TEAM_STATE,
-                graph_version=0,
-                pending_proposal_ids=(),
-                open_case_ids=(),
-            ),
-            output_format,
-        )
-        return
-    try:
-        result = ReadinessService(runtime).ensure(EnsureRequest(preset=preset))
-    except ReadinessError:
-        result = EnsureResult(
-            status=EnsureStatus.SHARED_STATE_INVALID,
-            attention_route=ReadinessTarget.TEAM_STATE,
-            graph_version=0,
-            pending_proposal_ids=(),
-            open_case_ids=(),
-        )
+        local = ReadinessService(runtime).ensure(EnsureRequest(preset=preset))
+    except Exception:  # noqa: BLE001 - fixed readiness result
+        return _readiness_result(EnsureStatus.SHARED_STATE_INVALID, ReadinessTarget.TEAM_STATE)
     finally:
-        runtime.close()
-    emit(result, output_format)
+        if runtime is not None:
+            runtime.close()
+    if not _start_or_reuse_background_service(root):
+        return _readiness_result(EnsureStatus.SHARED_STATE_INVALID, ReadinessTarget.TEAM_STATE)
+    if restore.status is SharedStateRestoreStatus.INVALID:
+        return _readiness_result(
+            EnsureStatus.SHARED_STATE_INVALID,
+            ReadinessTarget.TEAM_STATE,
+            graph_version=local.graph_version,
+        )
+    if restore.status is SharedStateRestoreStatus.UPGRADE_REQUIRED:
+        return _readiness_result(
+            EnsureStatus.UPGRADE_REQUIRED,
+            ReadinessTarget.TEAM_STATE,
+            graph_version=local.graph_version,
+        )
+    if restore.status is SharedStateRestoreStatus.DIVERGED:
+        return _readiness_result(
+            EnsureStatus.HUMAN_ATTENTION_REQUIRED,
+            ReadinessTarget.TEAM_STATE,
+            graph_version=local.graph_version,
+            pending_proposal_ids=local.pending_proposal_ids,
+            open_case_ids=local.open_case_ids,
+        )
+    if restore.status in {SharedStateRestoreStatus.STALE, SharedStateRestoreStatus.UNAVAILABLE}:
+        return _readiness_result(
+            EnsureStatus.OFFLINE_STALE,
+            ReadinessTarget.TEAM_STATE,
+            graph_version=local.graph_version,
+            pending_proposal_ids=local.pending_proposal_ids,
+            open_case_ids=local.open_case_ids,
+        )
+    return local
 
 
 def dev_command(
@@ -1023,4 +1159,4 @@ def dev_command(
         raise caught.with_traceback(None)
 
 
-__all__ = ["ControlPlaneProcessMetadata", "dev_command"]
+__all__ = ["ControlPlaneProcessMetadata", "dev_command", "ensure_command"]

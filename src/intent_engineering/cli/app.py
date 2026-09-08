@@ -21,7 +21,7 @@ from intent_engineering.cli.connectors import (
     connector_catalog,
     connectors_app,
 )
-from intent_engineering.cli.dev import dev_command, ensure_command
+from intent_engineering.cli.dev import _developer_readiness, dev_command, ensure_command
 from intent_engineering.cli.github import GitHubDoctorResult, check_github
 from intent_engineering.cli.intent_workflow import (
     bootstrap_command,
@@ -35,7 +35,6 @@ from intent_engineering.cli.runtime import (
     GitHubConfigurationError,
     Runtime,
     github_repository_scope,
-    load_readiness_runtime,
     load_runtime,
     new_run_id,
     parse_sources,
@@ -88,10 +87,7 @@ from intent_engineering.intent_workflow.onboarding import (
 )
 from intent_engineering.intent_workflow.readiness import (
     EnsurePreset,
-    EnsureRequest,
     EnsureStatus,
-    ReadinessError,
-    ReadinessService,
 )
 from intent_engineering.reconcile import ResolutionUnavailable
 from intent_engineering.render import GraphRenderer, render_drift_report
@@ -155,23 +151,11 @@ def _onboarding_prompt_route() -> PromptRoute:
 
 
 def _prompt_readiness_route(project: Path, preset: EnsurePreset) -> PromptRoute | None:
-    """Return a fixed blocking route unless a no-recovery readiness snapshot is ready."""
-    runtime = None
+    """Return a fixed route after bounded restore, readiness and service startup."""
     try:
-        runtime = load_readiness_runtime(project)
-    except ProjectNotInitialized:
-        if os.path.lexists(project / ".intent"):
-            return readiness_unavailable_prompt_route()
-        return _onboarding_prompt_route()
+        result = _developer_readiness(project, preset)
     except Exception:  # noqa: BLE001 - readiness errors must block implementation
         return readiness_unavailable_prompt_route()
-    try:
-        result = ReadinessService(runtime).ensure(EnsureRequest(preset=preset))
-    except ReadinessError:
-        return readiness_unavailable_prompt_route()
-    finally:
-        if runtime is not None:
-            runtime.close()
     if result.status is EnsureStatus.READY:
         return None
     return readiness_prompt_route(result)

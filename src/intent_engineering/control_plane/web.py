@@ -27,6 +27,7 @@ from intent_engineering.control_plane.http_models import (
     InboxResponse,
     RegistrationOptionsRequest,
     RegistrationVerifyRequest,
+    ReviewedTestRunRequest,
     StatusResponse,
     canonical_json_object,
     detach_response_mapping,
@@ -59,6 +60,8 @@ _CSP = (
 _STATIC_METHODS = {
     "/api/v1/status": "GET",
     "/api/v1/inbox": "GET",
+    "/api/v1/development/observation": "GET",
+    "/api/v1/development/tests/run": "POST",
     "/api/v1/clarifications/answers/preview": "POST",
     "/api/v1/clarifications/answers/discard": "POST",
     "/api/v1/webauthn/register/options": "POST",
@@ -564,7 +567,14 @@ def _visible_status(service: ControlPlaneService) -> dict[str, object]:
     try:
         raw = service.status()
         status = StatusResponse.model_validate(raw)
-        inbox = InboxResponse.model_validate(service.inbox())
+        try:
+            inbox = InboxResponse.model_validate(service.inbox())
+        except Exception:  # noqa: BLE001 - unavailable authority reveals no identifiers
+            inbox = InboxResponse(
+                pending_proposal_ids=[],
+                open_case_ids=[],
+                clarification_sessions=[],
+            )
         visible_proposals.extend(inbox.pending_proposal_ids)
         visible_cases.extend(inbox.open_case_ids)
         projected = status.model_dump(mode="json")
@@ -649,6 +659,47 @@ def _make_handlers(
             caught.__context__ = None
             signal = caught
         finally:
+            result = None
+        return _end_handler(request, signal, response)
+
+    async def development_observation_endpoint(request: Request) -> Response:
+        response: Response | None = None
+        signal: BaseException | None = None
+        result: object = None
+        try:
+            result = service.development_observation()
+            response = _json_response(result.model_dump(mode="json"))
+        except Exception:  # noqa: BLE001 - fixed browser boundary
+            response = _fixed_response(503)
+        except BaseException as caught:  # noqa: BLE001 - scrub exact cancellation path
+            caught.__traceback__ = None
+            caught.__cause__ = None
+            caught.__context__ = None
+            signal = caught
+        finally:
+            result = None
+        return _end_handler(request, signal, response)
+
+    async def reviewed_tests_endpoint(request: Request) -> Response:
+        response: Response | None = None
+        signal: BaseException | None = None
+        model: ReviewedTestRunRequest | None = None
+        result: object = None
+        try:
+            model = cast(ReviewedTestRunRequest, _parse_body(request, ReviewedTestRunRequest))
+            result = await service.run_reviewed_tests(model.command_id)
+            response = _json_response(result.model_dump(mode="json"))
+        except _HandlerRequestError:
+            response = _fixed_response(400)
+        except Exception:  # noqa: BLE001 - fixed browser boundary
+            response = _fixed_response(503)
+        except BaseException as caught:  # noqa: BLE001 - scrub exact cancellation path
+            caught.__traceback__ = None
+            caught.__cause__ = None
+            caught.__context__ = None
+            signal = caught
+        finally:
+            model = None
             result = None
         return _end_handler(request, signal, response)
 
@@ -840,6 +891,8 @@ def _make_handlers(
     return {
         "status": status_endpoint,
         "inbox": inbox_endpoint,
+        "development_observation": development_observation_endpoint,
+        "reviewed_tests": reviewed_tests_endpoint,
         "proposal": proposal_endpoint,
         "clarification_answer_preview": clarification_answer_preview_endpoint,
         "clarification_answer_discard": clarification_answer_discard_endpoint,
@@ -874,6 +927,16 @@ def build_control_plane_app(
         routes=[
             Route("/api/v1/status", handlers["status"], methods=["GET"]),
             Route("/api/v1/inbox", handlers["inbox"], methods=["GET"]),
+            Route(
+                "/api/v1/development/observation",
+                handlers["development_observation"],
+                methods=["GET"],
+            ),
+            Route(
+                "/api/v1/development/tests/run",
+                handlers["reviewed_tests"],
+                methods=["POST"],
+            ),
             Route(
                 "/api/v1/proposals/{proposal_id}",
                 handlers["proposal"],

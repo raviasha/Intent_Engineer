@@ -29,7 +29,7 @@ from intent_engineering.integrations.agent_host.advisory import (
 )
 from intent_engineering.intent_workflow.conversation import ConversationCapture
 from intent_engineering.intent_workflow.readiness import (
-    EnsureRequest,
+    EnsurePreset,
     EnsureResult,
     EnsureStatus,
     ReadinessTarget,
@@ -795,6 +795,17 @@ def test_hidden_cli_reads_one_bounded_object_and_emits_fixed_secret_free_denial(
     project = tmp_path / "project"
     project.mkdir()
     _ready_runtime(project)
+    monkeypatch.setattr(
+        app_module,
+        "_developer_readiness",
+        lambda _project, _preset: EnsureResult(
+            status=EnsureStatus.READY,
+            attention_route=ReadinessTarget.HOME,
+            graph_version=1,
+            pending_proposal_ids=(),
+            open_case_ids=(),
+        ),
+    )
     monkeypatch.chdir(project)
     runner = CliRunner()
     valid = runner.invoke(app, ["agent-prompt-hook"], input=_event(project).model_dump_json())
@@ -835,23 +846,19 @@ def test_hidden_cli_blocks_prompt_capture_when_readiness_needs_human_review(
     runtime = _ready_runtime(project)
     runtime.close()
     before = _durable_bytes(project)
-    calls: list[EnsureRequest] = []
+    calls: list[tuple[Path, EnsurePreset]] = []
 
-    class AttentionReadinessService:
-        def __init__(self, _runtime: object) -> None:
-            pass
+    def attention(project_value: Path, preset: EnsurePreset) -> EnsureResult:
+        calls.append((project_value, preset))
+        return EnsureResult(
+            status=EnsureStatus.HUMAN_ATTENTION_REQUIRED,
+            attention_route=ReadinessTarget.INBOX,
+            graph_version=1,
+            pending_proposal_ids=(),
+            open_case_ids=("case:private",),
+        )
 
-        def ensure(self, request_value: EnsureRequest) -> EnsureResult:
-            calls.append(request_value)
-            return EnsureResult(
-                status=EnsureStatus.HUMAN_ATTENTION_REQUIRED,
-                attention_route=ReadinessTarget.INBOX,
-                graph_version=1,
-                pending_proposal_ids=(),
-                open_case_ids=("case:private",),
-            )
-
-    monkeypatch.setattr(app_module, "ReadinessService", AttentionReadinessService, raising=False)
+    monkeypatch.setattr(app_module, "_developer_readiness", attention)
     monkeypatch.chdir(project)
 
     result = CliRunner().invoke(app, ["agent-prompt-hook"], input=_event(project).model_dump_json())
@@ -866,7 +873,7 @@ def test_hidden_cli_blocks_prompt_capture_when_readiness_needs_human_review(
         mcp_tool=None,
         arguments={},
     ).model_dump(mode="json")
-    assert calls == [EnsureRequest()]
+    assert calls == [(project, EnsurePreset.DEVELOPER)]
     assert _durable_bytes(project) == before
 
 

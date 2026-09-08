@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -10,6 +11,7 @@ import pytest
 from typer.testing import CliRunner
 
 import intent_engineering.cli.runtime as runtime_module
+from intent_engineering.cli import dev as dev_cli
 from intent_engineering.cli.app import app
 from intent_engineering.cli.runtime import load_runtime
 from intent_engineering.core.models import Graph, Node, NodeType
@@ -18,6 +20,17 @@ from intent_engineering.storage.transaction import LocalTransactionCoordinator
 from tests.helpers.readiness import apply_baseline
 
 NOW = datetime(2026, 9, 7, tzinfo=UTC)
+
+
+@pytest.fixture(autouse=True)
+def _reuse_bounded_service(
+    monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
+) -> None:
+    """The real process lifecycle is covered by the automation journey."""
+    if request.node.name == "test_background_service_launch_is_argv_only_secret_free_and_bounded":
+        return
+    monkeypatch.setattr(dev_cli, "_start_or_reuse_background_service", lambda _root: True)
 
 
 def _ready_project(project: Path) -> None:
@@ -269,3 +282,58 @@ def test_ensure_redacts_graph_parse_failure_from_machine_output(tmp_path: Path) 
     assert result.exit_code == 0
     assert json.loads(result.stdout)["status"] == "shared_state_invalid"
     assert marker not in result.stdout + result.stderr
+
+
+def test_background_service_launch_is_argv_only_secret_free_and_bounded(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catches lifecycle cleanup blocking or forwarding shared-state trust to the server."""
+    project = tmp_path / "project"
+    project.mkdir()
+    calls: dict[str, object] = {}
+
+    class NeverExits:
+        def __init__(self) -> None:
+            self.wait_timeouts: list[float] = []
+            self.terminated = False
+            self.killed = False
+
+        def poll(self) -> None:
+            return None
+
+        def terminate(self) -> None:
+            self.terminated = True
+
+        def kill(self) -> None:
+            self.killed = True
+
+        def wait(self, timeout: float | None = None) -> None:
+            assert timeout is not None, "background cleanup must never wait without a deadline"
+            self.wait_timeouts.append(timeout)
+            raise subprocess.TimeoutExpired("intent dev", timeout)
+
+    process = NeverExits()
+
+    def popen(argv: tuple[str, ...], **kwargs: object) -> NeverExits:
+        calls["argv"] = argv
+        calls["kwargs"] = kwargs
+        return process
+
+    monkeypatch.setenv("INTENT_CI_SHARED_STATE_TRUST", "PRIVATE-TRUST-MARKER")
+    monkeypatch.setattr(dev_cli, "_running_service", lambda _root: None)
+    monkeypatch.setattr(dev_cli, "_STARTUP_TIMEOUT_SECONDS", 0.001)
+    monkeypatch.setattr(dev_cli.subprocess, "Popen", popen)
+
+    assert dev_cli._start_or_reuse_background_service(project) is False
+    assert process.terminated is True
+    assert process.killed is True
+    assert process.wait_timeouts == [1, 1]
+    assert type(calls["argv"]) is tuple
+    kwargs = calls["kwargs"]
+    assert type(kwargs) is dict
+    assert kwargs["cwd"] == "/"
+    assert kwargs["start_new_session"] is True
+    assert kwargs["close_fds"] is True
+    assert set(kwargs["env"]) == {"LANG", "LC_ALL", "PATH"}
+    assert "shell" not in kwargs
