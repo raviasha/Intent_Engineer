@@ -85,6 +85,7 @@ from intent_engineering.team_state.keys import (
     RecipientKeyStore,
     RecipientKeyStoreFactory,
     keyring_recipient_store,
+    restore_recipient,
 )
 from intent_engineering.team_state.models import RecipientRecord as TeamRecipientRecord
 
@@ -128,6 +129,8 @@ class _PendingTeamEnrollment:
     issued_at: datetime
     expires_at: datetime
     authority_digest: str
+    binding_digest: str
+    challenge_id: str
 
 
 @dataclass(slots=True)
@@ -269,6 +272,8 @@ class ControlPlaneService:
         self._team_repository_id = team_repository_id
         self._github_identity_verifier = github_identity_verifier
         self._recipient_key_store_factory = recipient_key_store_factory
+        self._team_enrollment_guard = threading.RLock()
+        self._team_enrollment_blocked = False
         self._pending_team_enrollment: _PendingTeamEnrollment | None = None
         self._team_recipient: TeamRecipientRecord | None = None
         self._team_key_store: RecipientKeyStore | None = None
@@ -288,27 +293,145 @@ class ControlPlaneService:
             transactions=runtime.transactions,
             verifier=webauthn_verifier,
         )
+        self._restore_team_recipient()
+
+    @staticmethod
+    def _recipient_matches_binding(
+        recipient: TeamRecipientRecord,
+        binding: RecipientEnrollmentBinding,
+    ) -> bool:
+        return (
+            recipient.project_id == binding.project_id
+            and recipient.repository_id == binding.repository_id
+            and recipient.actor == binding.actor
+            and recipient.github_account_id == binding.github_identity.account_id
+            and recipient.github_login == binding.github_identity.login
+            and recipient.webauthn_credential_id == binding.webauthn_credential_id
+            and recipient.webauthn_credential_public_key == binding.webauthn_credential_public_key
+            and recipient.enrolled_at == binding.enrolled_at
+        )
+
+    def _restore_team_recipient(self) -> None:
+        """Recover one complete durable enrollment or block replacement fail-closed."""
+        if self._team_repository_id is None:
+            return
+        authority: _Authority | None = None
+        try:
+            authority = self._authority()
+            credentials = tuple(
+                record
+                for record in self._webauthn.registered_credentials(
+                    authority.config.local_actor, self._origin
+                )
+                if not record.local_only
+            )
+            if not credentials:
+                return
+            self._team_enrollment_blocked = True
+            if len(credentials) != 1:
+                return
+            credential = credentials[0]
+            if credential.github_account_id is None or credential.github_login is None:
+                return
+            aliases = authority.policy.identities.get(credential.actor, frozenset())
+            if (
+                credential.actor != authority.config.local_actor
+                or credential.actor not in aliases
+                or f"github:{credential.github_login}" not in aliases
+            ):
+                return
+            binding = RecipientEnrollmentBinding(
+                project_id=credential.project_id,
+                repository_id=self._team_repository_id,
+                actor=credential.actor,
+                github_identity=GitHubIdentity(
+                    account_id=credential.github_account_id,
+                    login=credential.github_login,
+                ),
+                webauthn_credential_id=credential.credential_id,
+                webauthn_credential_public_key=credential.public_key,
+                enrolled_at=credential.created_at,
+            )
+            key_store = self._recipient_key_store_factory(binding)
+            recipient = restore_recipient(binding, key_store)
+            if not self._recipient_matches_binding(recipient, binding):
+                return
+            self._team_key_store = key_store
+            self._team_recipient = TeamRecipientRecord.model_validate(
+                recipient.model_dump(mode="python")
+            )
+            self._team_enrollment_blocked = False
+        except Exception:  # noqa: BLE001 - durable recovery is fail-closed
+            self._team_enrollment_blocked = True
+        finally:
+            if authority is not None:
+                authority.close()
+
+    def _team_binding_digest(
+        self,
+        authority: _Authority,
+        identity: GitHubIdentity,
+        at: datetime,
+    ) -> str:
+        return _digest(
+            {
+                "schema": "intent.team-enrollment.v1",
+                "project_id": authority.config.project_id,
+                "repository_id": self._team_repository_id,
+                "actor": authority.config.local_actor,
+                "github_account_id": identity.account_id,
+                "github_login": identity.login,
+                "authority_digest": _parent_digest(
+                    authority.snapshot.content,
+                    authority.membership_digest,
+                ),
+                "issued_at": at.isoformat(),
+                "generation": secrets.token_hex(32),
+            }
+        )
+
+    def _revoke_team_pending(self, pending: _PendingTeamEnrollment, at: datetime) -> None:
+        self._webauthn.revoke_registration(
+            pending.challenge_id,
+            pending.actor,
+            self._origin,
+            at,
+            pending.binding_digest,
+        )
+
+    def _purge_expired_team_pending(self, at: datetime) -> None:
+        pending = self._pending_team_enrollment
+        if pending is None or pending.expires_at > at:
+            return
+        try:
+            self._revoke_team_pending(pending, at)
+        except Exception as error:  # noqa: BLE001 - expired challenge is already unusable
+            error.__traceback__ = None
+            error.__cause__ = None
+            error.__context__ = None
+        self._pending_team_enrollment = None
 
     def team_enrollment_status(self) -> dict[str, object]:
-        """Return a credential-free projection of this process's team enrollment."""
+        """Return a credential-free projection of durable team enrollment."""
         try:
-            recipient = self._team_recipient
-            if recipient is None:
+            with self._team_enrollment_guard:
+                recipient = self._team_recipient
+                if recipient is None:
+                    return {
+                        "schema_version": 1,
+                        "status": "local_only",
+                        "repository_id": self._team_repository_id,
+                        "recipient_key_id": None,
+                        "github_login": None,
+                    }
+                validated = TeamRecipientRecord.model_validate(recipient.model_dump(mode="python"))
                 return {
                     "schema_version": 1,
-                    "status": "local_only",
-                    "repository_id": self._team_repository_id,
-                    "recipient_key_id": None,
-                    "github_login": None,
+                    "status": "enrolled",
+                    "repository_id": validated.repository_id,
+                    "recipient_key_id": validated.key_id,
+                    "github_login": validated.github_login,
                 }
-            validated = TeamRecipientRecord.model_validate(recipient.model_dump(mode="python"))
-            return {
-                "schema_version": 1,
-                "status": "enrolled",
-                "repository_id": validated.repository_id,
-                "recipient_key_id": validated.key_id,
-                "github_login": validated.github_login,
-            }
         except Exception:  # noqa: BLE001 - fixed browser projection boundary
             raise ControlPlaneError() from None
 
@@ -332,24 +455,31 @@ class ControlPlaneService:
             raise ValueError("GitHub identity is not authorized for actor")
         return identity
 
-    def team_enrollment_options(self, identity_proof: bytes) -> bytes:
+    def _team_enrollment_options(self, identity_proof: bytes) -> bytes:
         """Verify one GitHub identity, then start its user-verifying credential ceremony."""
         authority: _Authority | None = None
         result: bytes | None = None
         signal: BaseException | None = None
         pending: _PendingTeamEnrollment | None = None
         try:
-            if self._team_recipient is not None or self._pending_team_enrollment is not None:
+            at = self._now()
+            self._purge_expired_team_pending(at)
+            if (
+                self._team_recipient is not None
+                or self._team_enrollment_blocked
+                or self._pending_team_enrollment is not None
+            ):
                 raise ValueError("team enrollment already exists")
             authority = self._authority()
-            at = self._now()
             identity = self._team_identity(identity_proof, authority)
             if not self._authority_matches(authority):
                 raise ValueError("team enrollment authority changed")
-            result = self._webauthn.registration_options(
+            binding_digest = self._team_binding_digest(authority, identity, at)
+            result, challenge_id = self._webauthn.bound_registration_options(
                 authority.config.local_actor,
                 self._origin,
                 at,
+                binding_digest,
             )
             pending = _PendingTeamEnrollment(
                 identity=identity,
@@ -360,6 +490,8 @@ class ControlPlaneService:
                     authority.snapshot.content,
                     authority.membership_digest,
                 ),
+                binding_digest=binding_digest,
+                challenge_id=challenge_id,
             )
             if not self._authority_matches(authority):
                 raise ValueError("team enrollment authority changed")
@@ -376,6 +508,13 @@ class ControlPlaneService:
             signal = caught
         finally:
             identity_proof = b""
+            if result is None and pending is not None:
+                try:
+                    self._revoke_team_pending(pending, self._now())
+                except BaseException as cleanup_error:  # noqa: BLE001 - best-effort cleanup
+                    cleanup_error.__traceback__ = None
+                    cleanup_error.__cause__ = None
+                    cleanup_error.__context__ = None
             pending = None
             if authority is not None:
                 authority.close()
@@ -387,7 +526,12 @@ class ControlPlaneService:
             raise ControlPlaneError() from None
         return result
 
-    def complete_team_enrollment(self, response: bytes) -> TeamRecipientRecord:
+    def team_enrollment_options(self, identity_proof: bytes) -> bytes:
+        """Serialize enrollment generation with completion and cancellation."""
+        with self._team_enrollment_guard:
+            return self._team_enrollment_options(identity_proof)
+
+    def _complete_team_enrollment(self, response: bytes) -> TeamRecipientRecord:
         """Complete WebAuthn registration and generate its bound recipient key atomically."""
         authority: _Authority | None = None
         pending = self._pending_team_enrollment
@@ -432,6 +576,8 @@ class ControlPlaneService:
                     at,
                     github_account_id=pending.identity.account_id,
                     github_login=pending.identity.login,
+                    binding_digest=pending.binding_digest,
+                    expected_challenge_id=pending.challenge_id,
                 )
                 if (
                     registered.local_only
@@ -453,16 +599,7 @@ class ControlPlaneService:
                 )
                 key_store = self._recipient_key_store_factory(binding)
                 recipient = key_store.generate(binding.project_id, binding.actor)
-                if (
-                    recipient.project_id != binding.project_id
-                    or recipient.repository_id != binding.repository_id
-                    or recipient.actor != binding.actor
-                    or recipient.github_account_id != binding.github_identity.account_id
-                    or recipient.github_login != binding.github_identity.login
-                    or recipient.webauthn_credential_id != binding.webauthn_credential_id
-                    or recipient.webauthn_credential_public_key
-                    != binding.webauthn_credential_public_key
-                ):
+                if not self._recipient_matches_binding(recipient, binding):
                     raise ValueError("recipient binding changed")
                 if self._membership_now() != authority.membership_digest:
                     raise ValueError("team enrollment authority changed")
@@ -503,10 +640,24 @@ class ControlPlaneService:
             raise ControlPlaneError() from None
         return TeamRecipientRecord.model_validate(self._team_recipient.model_dump(mode="python"))
 
+    def complete_team_enrollment(self, response: bytes) -> TeamRecipientRecord:
+        """Serialize enrollment completion with options and cancellation."""
+        with self._team_enrollment_guard:
+            return self._complete_team_enrollment(response)
+
     def cancel_team_enrollment(self) -> dict[str, object]:
         """Forget a pending identity without creating credential or recipient material."""
-        self._pending_team_enrollment = None
-        return {"schema_version": 1, "status": "cancelled"}
+        try:
+            with self._team_enrollment_guard:
+                if self._team_recipient is not None:
+                    return {"schema_version": 1, "status": "enrolled"}
+                pending = self._pending_team_enrollment
+                if pending is not None:
+                    self._revoke_team_pending(pending, self._now())
+                    self._pending_team_enrollment = None
+                return {"schema_version": 1, "status": "cancelled"}
+        except Exception:  # noqa: BLE001 - fixed cancellation boundary
+            raise ControlPlaneError() from None
 
     def _now(self) -> datetime:
         value = self._clock()

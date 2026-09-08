@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import threading
 from dataclasses import dataclass
+from datetime import timedelta
 
 import pytest
 from starlette.testclient import TestClient
@@ -52,6 +54,9 @@ class _Stores:
         self.stores: list[RecipientKeyStore] = []
 
     def __call__(self, binding: RecipientEnrollmentBinding) -> RecipientKeyStore:
+        for previous, store in zip(self.bindings, self.stores, strict=True):
+            if previous == binding:
+                return store
         self.bindings.append(binding)
         store = InMemoryRecipientKeyStore(binding, private_key_source=lambda: b"r" * 32)
         self.stores.append(store)
@@ -63,6 +68,8 @@ class _TeamVerifier(_Verifier):
         self, response: bytes, request: RegistrationRequest
     ) -> VerifiedRegistration:
         assert response == _registration_response(request)
+        if self.registration_hook is not None:
+            self.registration_hook()
         return VerifiedRegistration(
             credential_id=b"team-control-plane-credential",
             public_key=b"team-control-plane-public-key",
@@ -71,18 +78,26 @@ class _TeamVerifier(_Verifier):
         )
 
 
-def _team_service(tmp_path, *, login: str = "asha"):
-    harness = _harness(tmp_path, actor="local:owner", aliases=("github:asha",))
+def _team_service(
+    tmp_path,
+    *,
+    login: str = "asha",
+    aliases: tuple[str, ...] = ("github:asha",),
+    clock=None,
+    challenge_source=None,
+    stores: _Stores | None = None,
+):
+    harness = _harness(tmp_path, actor="local:owner", aliases=aliases)
     harness.service.close()
     verifier = _TeamVerifier()
     harness.verifier = verifier
     identity = _IdentityVerifier(GitHubIdentity(account_id="101", login=login))
-    stores = _Stores()
+    stores = stores or _Stores()
     service = ControlPlaneService(
         harness.runtime,
         origin=ORIGIN,
-        clock=lambda: NOW,
-        challenge_source=lambda: b"t" * 32,
+        clock=clock or (lambda: NOW),
+        challenge_source=challenge_source or (lambda: b"t" * 32),
         webauthn_verifier=verifier,
         team_repository_id="github.com/acme/project",
         github_identity_verifier=identity,
@@ -177,6 +192,131 @@ def test_duplicate_or_replacement_enrollment_is_rejected(tmp_path) -> None:
         with pytest.raises(ControlPlaneError, match="control plane unavailable"):
             service.team_enrollment_options(b"github-device-proof")
         assert len(stores.stores) == 1
+    finally:
+        service.close()
+        harness.runtime.close()
+
+
+def test_cancelled_account_a_response_cannot_complete_account_b_enrollment(tmp_path) -> None:
+    """Catches a revoked GitHub-A challenge being relabeled as GitHub-B enrollment."""
+    challenges = iter((b"a" * 32, b"b" * 32))
+    harness, service, identity, stores = _team_service(
+        tmp_path,
+        aliases=("github:asha", "github:bela"),
+        challenge_source=lambda: next(challenges),
+    )
+    try:
+        service.team_enrollment_options(b"github-device-proof")
+        account_a = harness.verifier.registration_requests[-1]
+        assert service.cancel_team_enrollment()["status"] == "cancelled"
+        identity.identity = GitHubIdentity(account_id="202", login="bela")
+        service.team_enrollment_options(b"github-device-proof")
+
+        with pytest.raises(ControlPlaneError, match="control plane unavailable"):
+            service.complete_team_enrollment(_registration_response(account_a))
+
+        assert service.team_enrollment_status()["status"] == "local_only"
+        assert stores.stores == []
+    finally:
+        service.close()
+        harness.runtime.close()
+
+
+def test_cancel_and_complete_have_one_linearizable_outcome(tmp_path) -> None:
+    """Catches cancellation reporting success before an in-flight completion publishes."""
+    harness, service, _identity, _stores = _team_service(tmp_path)
+    cancel_started = threading.Barrier(2)
+    cancel_result: dict[str, object] = {}
+    cancel_workers: list[threading.Thread] = []
+
+    def cancel() -> None:
+        cancel_started.wait()
+        cancel_result.update(service.cancel_team_enrollment())
+
+    def during_verification() -> None:
+        worker = threading.Thread(target=cancel)
+        cancel_workers.append(worker)
+        worker.start()
+        cancel_started.wait()
+        worker.join(timeout=1)
+
+    harness.verifier.registration_hook = during_verification
+    try:
+        service.team_enrollment_options(b"github-device-proof")
+        request = harness.verifier.registration_requests[-1]
+        completed = False
+        try:
+            service.complete_team_enrollment(_registration_response(request))
+            completed = True
+        except ControlPlaneError:
+            pass
+        cancel_workers[0].join(timeout=3)
+        assert not cancel_workers[0].is_alive()
+
+        cancelled = cancel_result.get("status") == "cancelled"
+        assert (cancelled, completed) in {(True, False), (False, True)}
+        assert service.team_enrollment_status()["status"] == (
+            "local_only" if cancelled else "enrolled"
+        )
+    finally:
+        service.close()
+        harness.runtime.close()
+
+
+def test_enrolled_recipient_is_reconstructed_after_service_restart(tmp_path) -> None:
+    """Catches restart forgetting durable enrollment and permitting credential replacement."""
+    stores = _Stores()
+    harness, service, identity, stores = _team_service(tmp_path, stores=stores)
+    service.team_enrollment_options(b"github-device-proof")
+    request = harness.verifier.registration_requests[-1]
+    enrolled = service.complete_team_enrollment(_registration_response(request))
+    service.close()
+
+    restarted = ControlPlaneService(
+        harness.runtime,
+        origin=ORIGIN,
+        clock=lambda: NOW,
+        challenge_source=lambda: b"u" * 32,
+        webauthn_verifier=harness.verifier,
+        team_repository_id="github.com/acme/project",
+        github_identity_verifier=identity,
+        recipient_key_store_factory=stores,
+    )
+    try:
+        assert restarted.team_enrollment_status() == {
+            "schema_version": 1,
+            "status": "enrolled",
+            "repository_id": "github.com/acme/project",
+            "recipient_key_id": enrolled.key_id,
+            "github_login": "asha",
+        }
+        with pytest.raises(ControlPlaneError, match="control plane unavailable"):
+            restarted.team_enrollment_options(b"github-device-proof")
+    finally:
+        restarted.close()
+        harness.runtime.close()
+
+
+def test_expired_pending_enrollment_is_revoked_before_fresh_options(tmp_path) -> None:
+    """Catches an abandoned ceremony permanently blocking or authenticating a later attempt."""
+    current = [NOW]
+    challenges = iter((b"a" * 32, b"b" * 32))
+    harness, service, _identity, stores = _team_service(
+        tmp_path,
+        clock=lambda: current[0],
+        challenge_source=lambda: next(challenges),
+    )
+    try:
+        service.team_enrollment_options(b"github-device-proof")
+        expired = harness.verifier.registration_requests[-1]
+        current[0] = NOW + timedelta(minutes=6)
+
+        service.team_enrollment_options(b"github-device-proof")
+
+        assert len(harness.verifier.registration_requests) == 2
+        with pytest.raises(ControlPlaneError, match="control plane unavailable"):
+            service.complete_team_enrollment(_registration_response(expired))
+        assert stores.stores == []
     finally:
         service.close()
         harness.runtime.close()

@@ -391,7 +391,14 @@ class WebAuthnService:
                 current.append(latest[0])
         return tuple(sorted(current, key=lambda item: item.credential_id))
 
-    def _registration_options(self, actor: str, origin: str, now: datetime) -> bytes:
+    def _registration_options(
+        self,
+        actor: str,
+        origin: str,
+        now: datetime,
+        *,
+        binding_digest: str | None = None,
+    ) -> tuple[bytes, str]:
         issued_at = self._valid_actor_call(actor, origin, now)
         challenge = self._challenge_source(_CHALLENGE_BYTES)
         if type(challenge) is not bytes or len(challenge) != _CHALLENGE_BYTES:
@@ -407,22 +414,48 @@ class WebAuthnService:
             actor=actor,
             ceremony="registration",
             challenge=_b64url(challenge),
+            payload_digest=binding_digest,
             issued_at=issued_at,
             expires_at=issued_at + _CHALLENGE_LIFETIME,
         )
         if not self._challenges.issue(record):
             raise ValueError("challenge collision")
-        return options
+        return options, record.id
 
     def registration_options(self, actor: str, origin: str, now: datetime) -> bytes:
         """Create one exact five-minute user-verifying registration ceremony."""
         result: bytes | None = None
         try:
-            result = self._registration_options(actor, origin, now)
+            result, _ = self._registration_options(actor, origin, now)
         except Exception:  # noqa: BLE001 - fixed public authority boundary
             result = None
         finally:
             actor = origin = ""
+            now = _REDACTED_TIME
+        if result is None:
+            raise HumanAuthorityError("human authority unavailable") from None
+        return result
+
+    def bound_registration_options(
+        self,
+        actor: str,
+        origin: str,
+        now: datetime,
+        binding_digest: str,
+    ) -> tuple[bytes, str]:
+        """Create a registration ceremony bound to one external enrollment generation."""
+        result: tuple[bytes, str] | None = None
+        try:
+            result = self._registration_options(
+                actor,
+                origin,
+                now,
+                binding_digest=binding_digest,
+            )
+        except Exception:  # noqa: BLE001 - fixed public authority boundary
+            result = None
+        finally:
+            actor = origin = binding_digest = ""
             now = _REDACTED_TIME
         if result is None:
             raise HumanAuthorityError("human authority unavailable") from None
@@ -437,12 +470,21 @@ class WebAuthnService:
         *,
         github_account_id: str | None = None,
         github_login: str | None = None,
+        binding_digest: str | None = None,
+        expected_challenge_id: str | None = None,
     ) -> CredentialRecord:
         challenge = b""
         request = None
         try:
             verified_now = self._valid_actor_call(actor, origin, now)
             challenge = _registration_challenge(response)
+            if (binding_digest is None) != (expected_challenge_id is None):
+                raise ValueError("incomplete registration binding")
+            if (
+                expected_challenge_id is not None
+                and expected_challenge_id != f"challenge:{challenge.hex()}"
+            ):
+                raise ValueError("registration generation mismatch")
             request = self._registration_request(challenge, actor)
             with self._transactions.transaction(rollback_base_exceptions=True):
                 challenge_record = self._challenges.consume(
@@ -453,7 +495,7 @@ class WebAuthnService:
                     or challenge_record.repository_id != self._repository_id
                     or challenge_record.actor != actor
                     or challenge_record.ceremony != "registration"
-                    or challenge_record.payload_digest is not None
+                    or challenge_record.payload_digest != binding_digest
                     or challenge_record.challenge != _b64url(challenge)
                 ):
                     raise ValueError("registration binding mismatch")
@@ -503,6 +545,8 @@ class WebAuthnService:
         *,
         github_account_id: str | None = None,
         github_login: str | None = None,
+        binding_digest: str | None = None,
+        expected_challenge_id: str | None = None,
     ) -> CredentialRecord:
         """Verify and persist one repository-bound credential enrollment."""
         result: CredentialRecord | None = None
@@ -514,6 +558,8 @@ class WebAuthnService:
                 now,
                 github_account_id=github_account_id,
                 github_login=github_login,
+                binding_digest=binding_digest,
+                expected_challenge_id=expected_challenge_id,
             )
         except Exception:  # noqa: BLE001 - fixed public authority boundary
             result = None
@@ -521,7 +567,63 @@ class WebAuthnService:
             response = b""
             actor = origin = ""
             github_account_id = github_login = None
+            binding_digest = expected_challenge_id = None
             now = _REDACTED_TIME
+        if result is None:
+            raise HumanAuthorityError("human authority unavailable") from None
+        return result
+
+    def revoke_registration(
+        self,
+        challenge_id: str,
+        actor: str,
+        origin: str,
+        now: datetime,
+        binding_digest: str,
+    ) -> None:
+        """Durably revoke exactly one externally bound registration ceremony."""
+        failed = False
+        try:
+            verified_now = self._valid_actor_call(actor, origin, now)
+            revoked = self._challenges.revoke(
+                challenge_id,
+                verified_now,
+                project_id=self._project_id,
+                repository_id=self._repository_id,
+                actor=actor,
+                payload_digest=binding_digest,
+            )
+            if (
+                revoked.project_id != self._project_id
+                or revoked.repository_id != self._repository_id
+                or revoked.actor != actor
+                or revoked.ceremony != "registration"
+                or revoked.payload_digest != binding_digest
+                or revoked.id != challenge_id
+            ):
+                raise ValueError("registration revocation mismatch")
+        except Exception:  # noqa: BLE001 - fixed public authority boundary
+            failed = True
+        finally:
+            challenge_id = actor = origin = binding_digest = ""
+            now = _REDACTED_TIME
+        if failed:
+            raise HumanAuthorityError("human authority unavailable") from None
+
+    def registered_credentials(self, actor: str, origin: str) -> tuple[CredentialRecord, ...]:
+        """Return current repository-bound credentials for one exact configured actor."""
+        result: tuple[CredentialRecord, ...] | None = None
+        try:
+            if type(actor) is not str or not actor or origin != self._expected_origin:
+                raise ValueError("invalid authority call")
+            result = tuple(
+                CredentialRecord.model_validate_json(record.model_dump_json())
+                for record in self._current_credentials(actor)
+            )
+        except Exception:  # noqa: BLE001 - fixed public authority boundary
+            result = None
+        finally:
+            actor = origin = ""
         if result is None:
             raise HumanAuthorityError("human authority unavailable") from None
         return result

@@ -23,7 +23,7 @@ class _ChallengeFrame(ChallengeRecord):
 
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True, validate_default=True)
 
-    kind: Literal["issue", "consume"]
+    kind: Literal["issue", "consume", "revoke"]
     consumed_at: datetime | None = None
 
     @field_validator("consumed_at", mode="before")
@@ -238,14 +238,19 @@ class WebAuthnChallengeStore:
                     if record.id in issued:
                         return None
                     issued[record.id] = record
-                elif (
-                    issued.get(record.id) != record
-                    or record.id in consumed
-                    or frame.consumed_at is None
-                    or not _within_open_lifetime(record, frame.consumed_at)
-                ):
-                    return None
                 else:
+                    if (
+                        issued.get(record.id) != record
+                        or record.id in consumed
+                        or frame.consumed_at is None
+                    ):
+                        return None
+                    if frame.kind == "consume" and not _within_open_lifetime(
+                        record, frame.consumed_at
+                    ):
+                        return None
+                    if frame.kind == "revoke" and frame.consumed_at < record.issued_at:
+                        return None
                     consumed.add(record.id)
         except (TypeError, UnicodeError, ValidationError, ValueError):
             return None
@@ -315,6 +320,80 @@ class WebAuthnChallengeStore:
                             {
                                 **record.model_dump(mode="json"),
                                 "kind": "consume",
+                                "consumed_at": validated_now,
+                            }
+                        )
+                        append_durable_line(self._file, frame.canonical_bytes())
+                        result = record
+        except Exception:  # noqa: BLE001 - fixed public integrity boundary
+            unavailable = True
+        if unavailable or result is None:
+            raise ValueError("challenge unavailable")
+        return result
+
+    def revoke(
+        self,
+        challenge_id: str,
+        now: datetime,
+        *,
+        project_id: str,
+        repository_id: str,
+        actor: str,
+        payload_digest: str,
+    ) -> ChallengeRecord:
+        """Durably make an issued challenge unusable, including after expiration."""
+        invalid_now = False
+        validated_now: datetime | None = None
+        try:
+            validated_now = _ChallengeFrame.model_validate(
+                {
+                    **challenge_record_for_timestamp(now).model_dump(mode="json"),
+                    "kind": "revoke",
+                    "consumed_at": now,
+                }
+            ).consumed_at
+        except (TypeError, ValidationError, ValueError):
+            invalid_now = True
+        if (
+            invalid_now
+            or validated_now is None
+            or any(
+                type(value) is not str or not value
+                for value in (
+                    challenge_id,
+                    project_id,
+                    repository_id,
+                    actor,
+                    payload_digest,
+                )
+            )
+        ):
+            raise ValueError("challenge unavailable")
+        result: ChallengeRecord | None = None
+        unavailable = False
+        try:
+            with self._locked():
+                state = self._records_unlocked()
+                if state is None:
+                    unavailable = True
+                else:
+                    issued, consumed = state
+                    record = issued.get(challenge_id)
+                    if (
+                        record is None
+                        or challenge_id in consumed
+                        or validated_now < record.issued_at
+                        or record.project_id != project_id
+                        or record.repository_id != repository_id
+                        or record.actor != actor
+                        or record.payload_digest != payload_digest
+                    ):
+                        unavailable = True
+                    else:
+                        frame = _ChallengeFrame.model_validate(
+                            {
+                                **record.model_dump(mode="json"),
+                                "kind": "revoke",
                                 "consumed_at": validated_now,
                             }
                         )

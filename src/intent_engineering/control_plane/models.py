@@ -340,8 +340,6 @@ class ChallengeRecord(_ControlPlaneModel):
             raise ValueError("repository identifier must be canonical")
         if not _BASE64URL_PATTERN.fullmatch(self.challenge):
             raise ValueError("challenge must be base64url")
-        if self.ceremony == "registration" and self.payload_digest is not None:
-            raise ValueError("registration challenge cannot bind a decision payload")
         if self.ceremony == "authentication" and self.payload_digest is None:
             raise ValueError("authentication challenge must bind a decision payload")
         if (

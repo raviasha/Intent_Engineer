@@ -5,9 +5,13 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import os
 import re
+import stat
+import tempfile
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Annotated, Protocol, cast
 
 import keyring
@@ -16,6 +20,7 @@ from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
 from pydantic import ConfigDict, Field, ValidationInfo, field_validator, model_validator
 
 from intent_engineering.core.models._base import StrictModel
+from intent_engineering.storage._atomic import same_path_lock
 from intent_engineering.team_state.models import RecipientRecord
 
 _PROJECT_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
@@ -157,6 +162,15 @@ def _decode_private(value: object) -> bytes:
     return decoded
 
 
+def _raise_key_failure(caught: BaseException) -> None:
+    if isinstance(caught, Exception):
+        failure = RecipientKeyStoreError()
+        failure.__cause__ = None
+        failure.__context__ = None
+        raise failure from None
+    raise caught.with_traceback(None)
+
+
 def _validated_binding(value: RecipientEnrollmentBinding) -> RecipientEnrollmentBinding:
     if type(value) is not RecipientEnrollmentBinding:
         raise ValueError("invalid enrollment binding")
@@ -181,6 +195,25 @@ def _key_id(binding: RecipientEnrollmentBinding) -> str:
         sort_keys=True,
     ).encode("utf-8")
     return f"recipient:sha256:{hashlib.sha256(content).hexdigest()}"
+
+
+def _default_lock_root() -> Path:
+    return Path(tempfile.gettempdir()).resolve() / f"intent-engineering-recipient-{os.getuid()}"
+
+
+def _lock_target(root: Path, service: str, key_id: str) -> Path:
+    if not isinstance(root, Path) or not root.is_absolute():
+        raise ValueError("invalid recipient lock root")
+    root.mkdir(mode=0o700, parents=False, exist_ok=True)
+    metadata = root.lstat()
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != os.getuid()
+        or stat.S_IMODE(metadata.st_mode) & 0o077
+    ):
+        raise ValueError("invalid recipient lock root")
+    digest = hashlib.sha256(f"{service}\0{key_id}".encode()).hexdigest()
+    return root / digest
 
 
 def _record(binding: RecipientEnrollmentBinding, private_key: bytes) -> RecipientRecord:
@@ -215,12 +248,18 @@ class KeyringRecipientKeyStore:
         *,
         backend: _KeyringBackend = keyring,
         private_key_source: Callable[[], bytes] = _private_key_bytes,
+        lock_root: Path | None = None,
     ) -> None:
         self._binding = _validated_binding(binding)
         self._backend = backend
         self._private_key_source = private_key_source
         self._service = f"intent-engineering/{self._binding.project_id}"
         self._key_id = _key_id(self._binding)
+        self._lock_target = _lock_target(
+            lock_root if lock_root is not None else _default_lock_root(),
+            self._service,
+            self._key_id,
+        )
 
     def _check_call(self, project_id: object, actor: object) -> None:
         if (
@@ -236,34 +275,20 @@ class KeyringRecipientKeyStore:
         encoded = ""
         try:
             self._check_call(project_id, actor)
-            if self._backend.get_password(self._service, self._key_id) is not None:
-                raise ValueError("duplicate recipient")
-            private = self._private_key_source()
-            if type(private) is not bytes or len(private) != 32:
-                raise ValueError("invalid private key source")
-            encoded = _b64url(private)
-            self._backend.set_password(self._service, self._key_id, encoded)
-            if self._backend.get_password(self._service, self._key_id) != encoded:
-                try:
-                    self._backend.delete_password(self._service, self._key_id)
-                except Exception as cleanup_error:  # noqa: BLE001 - scrub backend detail
-                    cleanup_error.__traceback__ = None
-                    cleanup_error.__cause__ = None
-                    cleanup_error.__context__ = None
-                raise ValueError("recipient key write mismatch")
-            return _record(self._binding, private)
+            with same_path_lock(self._lock_target):
+                if self._backend.get_password(self._service, self._key_id) is not None:
+                    raise ValueError("duplicate recipient")
+                private = self._private_key_source()
+                if type(private) is not bytes or len(private) != 32:
+                    raise ValueError("invalid private key source")
+                encoded = _b64url(private)
+                self._backend.set_password(self._service, self._key_id, encoded)
+                if self._backend.get_password(self._service, self._key_id) != encoded:
+                    raise ValueError("recipient key write mismatch")
+                return _record(self._binding, private)
         finally:
             private = b""
             encoded = ""
-
-    @staticmethod
-    def _raise_failure(caught: BaseException) -> None:
-        if isinstance(caught, Exception):
-            failure = RecipientKeyStoreError()
-            failure.__cause__ = None
-            failure.__context__ = None
-            raise failure from None
-        raise caught.with_traceback(None)
 
     def generate(self, project_id: str, actor: str) -> RecipientRecord:
         """Generate and durably store one non-exportable-by-contract recipient key."""
@@ -276,13 +301,14 @@ class KeyringRecipientKeyStore:
             error.__context__ = None
             caught = error
         if caught is not None:
-            self._raise_failure(caught)
+            _raise_key_failure(caught)
         raise AssertionError("recipient key generation must return or raise")
 
     def _private_key(self, key_id: str) -> bytes:
         if type(key_id) is not str or _KEY_ID.fullmatch(key_id) is None or key_id != self._key_id:
             raise ValueError("recipient binding mismatch")
-        return _decode_private(self._backend.get_password(self._service, key_id))
+        with same_path_lock(self._lock_target):
+            return _decode_private(self._backend.get_password(self._service, key_id))
 
     def private_key(self, key_id: str) -> bytes:
         """Read exactly one verified raw X25519 private key."""
@@ -295,17 +321,18 @@ class KeyringRecipientKeyStore:
             error.__context__ = None
             caught = error
         if caught is not None:
-            self._raise_failure(caught)
+            _raise_key_failure(caught)
         raise AssertionError("recipient key read must return or raise")
 
     def _delete(self, key_id: str) -> None:
         if type(key_id) is not str or _KEY_ID.fullmatch(key_id) is None or key_id != self._key_id:
             raise ValueError("recipient binding mismatch")
-        if self._backend.get_password(self._service, key_id) is None:
-            raise ValueError("recipient key missing")
-        self._backend.delete_password(self._service, key_id)
-        if self._backend.get_password(self._service, key_id) is not None:
-            raise ValueError("recipient key deletion mismatch")
+        with same_path_lock(self._lock_target):
+            if self._backend.get_password(self._service, key_id) is None:
+                raise ValueError("recipient key missing")
+            self._backend.delete_password(self._service, key_id)
+            if self._backend.get_password(self._service, key_id) is not None:
+                raise ValueError("recipient key deletion mismatch")
 
     def delete(self, key_id: str) -> None:
         """Remove exactly the context-bound private key and verify absence."""
@@ -319,7 +346,7 @@ class KeyringRecipientKeyStore:
             error.__context__ = None
             caught = error
         if caught is not None:
-            self._raise_failure(caught)
+            _raise_key_failure(caught)
 
 
 class InMemoryRecipientKeyStore:
@@ -338,6 +365,7 @@ class InMemoryRecipientKeyStore:
 
     def generate(self, project_id: str, actor: str) -> RecipientRecord:
         private = b""
+        caught: BaseException | None = None
         try:
             if (
                 type(project_id) is not str
@@ -352,8 +380,16 @@ class InMemoryRecipientKeyStore:
                 raise RecipientKeyStoreError()
             self._keys[self._key_id] = private
             return _record(self._binding, private)
+        except BaseException as error:  # noqa: BLE001 - mirror production cancellation boundary
+            error.__traceback__ = None
+            error.__cause__ = None
+            error.__context__ = None
+            caught = error
         finally:
             private = b""
+        if caught is not None:
+            _raise_key_failure(caught)
+        raise AssertionError("recipient key generation must return or raise")
 
     def private_key(self, key_id: str) -> bytes:
         if type(key_id) is not str or key_id != self._key_id or key_id not in self._keys:
@@ -377,6 +413,22 @@ def keyring_recipient_store(binding: RecipientEnrollmentBinding) -> RecipientKey
     return cast(RecipientKeyStore, KeyringRecipientKeyStore(binding))
 
 
+def restore_recipient(
+    binding: RecipientEnrollmentBinding,
+    store: RecipientKeyStore,
+) -> RecipientRecord:
+    """Reconstruct public recipient material from durable enrollment and its keyring key."""
+    validated = _validated_binding(binding)
+    private = b""
+    try:
+        private = store.private_key(_key_id(validated))
+        if type(private) is not bytes or len(private) != 32:
+            raise RecipientKeyStoreError()
+        return _record(validated, private)
+    finally:
+        private = b""
+
+
 __all__ = [
     "GitHubIdentity",
     "GitHubIdentityVerifier",
@@ -387,4 +439,5 @@ __all__ = [
     "RecipientKeyStoreError",
     "RecipientKeyStoreFactory",
     "keyring_recipient_store",
+    "restore_recipient",
 ]
