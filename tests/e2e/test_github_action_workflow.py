@@ -76,8 +76,8 @@ def test_required_check_is_independent_ordered_and_fail_closed() -> None:
     text = path.read_text(encoding="utf-8")
     workflow = yaml.load(text, Loader=yaml.BaseLoader)
     assert workflow["name"] == "Intent Engineering"
-    assert set(workflow["on"]) == {"pull_request", "workflow_dispatch"}
-    assert workflow["on"]["pull_request"] == ""
+    assert set(workflow["on"]) == {"pull_request_target", "workflow_dispatch"}
+    assert workflow["on"]["pull_request_target"] == ""
     assert workflow["permissions"] == {"contents": "read"}
     assert workflow["concurrency"] == {
         "group": "intent-check-${{ github.event.pull_request.number || github.ref }}",
@@ -90,21 +90,33 @@ def test_required_check_is_independent_ordered_and_fail_closed() -> None:
     assert job["runs-on"] == "ubuntu-24.04"
     steps = job["steps"]
     assert steps[0]["uses"].startswith("actions/checkout@")
-    assert steps[0]["with"] == {"fetch-depth": "0", "persist-credentials": "false"}
+    assert steps[0]["with"] == {
+        "ref": "${{ github.workflow_sha }}",
+        "path": ".intent-trusted",
+        "fetch-depth": "0",
+        "persist-credentials": "false",
+    }
     assert steps[1]["uses"].startswith("actions/setup-python@")
-    assert steps[2]["run"] == "python -I -m pip install '.[dev]'"
+    assert steps[2]["run"] == (
+        "python -I -m pip install --require-hashes --only-binary=:all: "
+        "-r .intent-trusted/src/intent_engineering/integrations/ci-runtime.lock"
+    )
     assert [step.get("run") for step in steps[3:5]] == [
-        "python -I -m intent_engineering.integrations.github_action restore",
-        "python -I -m intent_engineering.integrations.immutable_ci",
+        "python -I .intent-trusted/ci/launch.py fetch",
+        "python -I .intent-trusted/ci/launch.py check",
     ]
-    for index in (3, 4):
-        assert steps[index]["env"] == {
-            "INTENT_CI_SHARED_STATE_TRUST": "${{ secrets.INTENT_CI_SHARED_STATE_TRUST }}",
-        }
+    assert steps[3]["env"] == {
+        "INTENT_CI_TOOLING_SHA": "${{ github.workflow_sha }}",
+        "GH_TOKEN": "${{ github.token }}",
+    }
+    assert steps[4]["env"] == {
+        "INTENT_CI_TOOLING_SHA": "${{ github.workflow_sha }}",
+        "INTENT_CI_SHARED_STATE_TRUST": "${{ secrets.INTENT_CI_SHARED_STATE_TRUST }}",
+    }
     assert steps[5]["uses"].startswith("actions/upload-artifact@")
     assert steps[5]["with"] == {
         "name": "intent-test-results",
-        "path": ".intent-ci/test-results.json",
+        "path": ".intent-trusted/.intent-ci/test-results.json",
         "retention-days": "7",
         "if-no-files-found": "error",
         "include-hidden-files": "true",
@@ -113,7 +125,6 @@ def test_required_check_is_independent_ordered_and_fail_closed() -> None:
         "continue-on-error",
         "|| true",
         "always()",
-        "pull_request_target",
         "intent init",
         "intent-advisor",
         "plugins/",
@@ -122,6 +133,25 @@ def test_required_check_is_independent_ordered_and_fail_closed() -> None:
     ):
         assert forbidden not in text
     assert all("if" not in step for step in steps)
+
+
+def test_trust_is_released_only_to_protected_tooling_not_a_pr_checkout() -> None:
+    workflow = yaml.load(
+        (Path(__file__).parents[2] / ".github/workflows/intent-check.yml").read_text(),
+        Loader=yaml.BaseLoader,
+    )
+    assert "pull_request_target" in workflow["on"]
+    assert "pull_request" not in workflow["on"]
+    steps = workflow["jobs"]["check"]["steps"]
+    checkout = [step for step in steps if step.get("uses", "").startswith("actions/checkout@")]
+    assert len(checkout) == 1
+    assert checkout[0]["with"]["ref"] == "${{ github.workflow_sha }}"
+    assert checkout[0]["with"]["path"] == ".intent-trusted"
+    trusted = [step for step in steps if "INTENT_CI_SHARED_STATE_TRUST" in step.get("env", {})]
+    assert len(trusted) == 1
+    assert trusted[0]["run"] == "python -I .intent-trusted/ci/launch.py check"
+    assert all("pip install ." not in step.get("run", "") for step in steps)
+    assert any("--require-hashes --only-binary=:all:" in step.get("run", "") for step in steps)
 
 
 def test_assurance_guard_fails_closed_on_clean_checkout_without_creating_state(

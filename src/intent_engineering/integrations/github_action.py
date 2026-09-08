@@ -96,7 +96,9 @@ def _write(root: Path, path: Path, content: bytes) -> None:
         directory.close()
 
 
-async def run_tests(root: Path, at: datetime, *, assurance_workspace: Path | None = None) -> None:
+async def run_tests(
+    root: Path, at: datetime, *, assurance_workspace: Path | None = None
+) -> TestResultArtifact:
     """Run every restored, reviewed argv; stage evidence only if every command passed."""
     adapter = CheckRuntimeAdapter(root, assurance_workspace=assurance_workspace)
     observer: DevObserver | None = None
@@ -105,6 +107,8 @@ async def run_tests(root: Path, at: datetime, *, assurance_workspace: Path | Non
         adapter.restore(require_shared=False)
         _clear_results(root)
         observer = _observer(root, adapter, persist_artifacts=assurance_workspace is None)
+        if assurance_workspace is not None:
+            observer.require_immutable_execution()
         if not observer.command_ids:
             raise ValueError("reviewed tests failed")
         observer.prepare_clean_commit_execution()
@@ -144,6 +148,7 @@ async def run_tests(root: Path, at: datetime, *, assurance_workspace: Path | Non
         _write(root, _STAGED_RESULT, staged.model_dump_json().encode("utf-8"))
         _require_snapshot(observer, snapshot)
         completed_write = True
+        return artifact
     finally:
         if observer is not None:
             observer.close()
@@ -172,6 +177,8 @@ def write_results(root: Path, at: datetime, *, assurance_workspace: Path | None 
             require_all_commands=True,
         )
         observer = _observer(root, adapter)
+        if assurance_workspace is not None:
+            observer.require_immutable_execution()
         _require_snapshot(observer, staged.snapshot)
         _write(root, _RESULT, artifact.canonical_bytes())
         _require_snapshot(observer, staged.snapshot)

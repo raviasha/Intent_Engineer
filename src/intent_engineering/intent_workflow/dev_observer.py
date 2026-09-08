@@ -577,7 +577,11 @@ class DevObserver:
             ".intent/" + configured_graph_relative(self._config.graph_path).as_posix(),
             ".intent/history/changesets.jsonl",
         )
-        digest = hashlib.sha256(b"intent.test-baseline.v2\0")
+        digest = hashlib.sha256(
+            b"intent.immutable-baseline.v1\0"
+            if self._immutable_guard is not None
+            else b"intent.test-baseline.v2\0"
+        )
         held: list[tuple[SecureFile, int, tuple[int, ...]]] = []
         ancestors: dict[str, tuple[int, int, int, int]] = {}
         with ExitStack() as resources:
@@ -616,7 +620,13 @@ class DevObserver:
                     raise ValueError("reviewed test configuration changed")
                 digest.update(
                     _canonical_bytes(
-                        (relative, hashlib.sha256(content).hexdigest(), _snapshot_token(metadata))
+                        (
+                            relative,
+                            hashlib.sha256(content).hexdigest(),
+                            None
+                            if self._immutable_guard is not None
+                            else _snapshot_token(metadata),
+                        )
                     )
                 )
             # Retained descriptors support local drift detection. Only the separate
@@ -798,7 +808,10 @@ class DevObserver:
         entries = tree.removesuffix("\0").split("\0") if tree else []
         if not entries or len(entries) > MAX_CHANGED_PATHS:
             raise ValueError("clean commit snapshot unavailable")
-        fingerprint = hashlib.sha256(revision.encode("ascii"))
+        fingerprint = hashlib.sha256(
+            (b"intent.immutable-commit.v1\0" if self._immutable_guard is not None else b"")
+            + revision.encode("ascii")
+        )
         ancestors: dict[str, tuple[int, int, int, int]] = {}
         tracked_metadata: dict[str, tuple[int, ...]] = {}
         total_bytes = 0
@@ -852,7 +865,9 @@ class DevObserver:
                 raise ValueError("clean commit snapshot unavailable")
             fingerprint.update(
                 _canonical_bytes(
-                    (path, source.identities, metadata.st_mtime_ns, metadata.st_ctime_ns, mode)
+                    (path, digest, mode)
+                    if self._immutable_guard is not None
+                    else (path, source.identities, metadata.st_mtime_ns, metadata.st_ctime_ns, mode)
                 )
             )
             tracked_metadata[path] = _snapshot_token(metadata)
@@ -911,7 +926,8 @@ class DevObserver:
         for parent, expected_metadata in sorted(ancestors.items()):
             if self._ancestor_metadata(parent) != expected_metadata:
                 raise ValueError("clean commit snapshot changed")
-            fingerprint.update(_canonical_bytes((parent, expected_metadata)))
+            if self._immutable_guard is None:
+                fingerprint.update(_canonical_bytes((parent, expected_metadata)))
         if time.monotonic() > deadline:
             raise ValueError("clean commit snapshot unavailable")
         return "sha256:" + fingerprint.hexdigest()

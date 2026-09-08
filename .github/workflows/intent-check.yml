@@ -1,7 +1,7 @@
 name: Intent Engineering
 
 "on":
-  pull_request:
+  pull_request_target:
   workflow_dispatch:
 
 permissions:
@@ -20,25 +20,29 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ github.workflow_sha }}
+          path: .intent-trusted
           fetch-depth: 0
           persist-credentials: false
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Install Intent Engineering and test dependencies
-        run: python -I -m pip install '.[dev]'
-      - name: Restore verified approved intent state
-        run: python -I -m intent_engineering.integrations.github_action restore
+      - name: Install protected hash-locked tooling dependencies
+        run: "python -I -m pip install --require-hashes --only-binary=:all: -r .intent-trusted/src/intent_engineering/integrations/ci-runtime.lock"
+      - name: Fetch proposed revision as Git objects only
+        run: python -I .intent-trusted/ci/launch.py fetch
         env:
-          INTENT_CI_SHARED_STATE_TRUST: ${{ secrets.INTENT_CI_SHARED_STATE_TRUST }}
-      - name: Execute and consume reviewed tests in one immutable image
-        run: python -I -m intent_engineering.integrations.immutable_ci
+          INTENT_CI_TOOLING_SHA: ${{ github.workflow_sha }}
+          GH_TOKEN: ${{ github.token }}
+      - name: Test then destroy before independent final assurance
+        run: python -I .intent-trusted/ci/launch.py check
         env:
+          INTENT_CI_TOOLING_SHA: ${{ github.workflow_sha }}
           INTENT_CI_SHARED_STATE_TRUST: ${{ secrets.INTENT_CI_SHARED_STATE_TRUST }}
       - uses: actions/upload-artifact@v4
         with:
           name: intent-test-results
-          path: .intent-ci/test-results.json
+          path: .intent-trusted/.intent-ci/test-results.json
           retention-days: 7
           if-no-files-found: error
           include-hidden-files: true

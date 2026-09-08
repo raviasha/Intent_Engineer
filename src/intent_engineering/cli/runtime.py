@@ -746,12 +746,19 @@ class CheckRuntimeAdapter:
 
     def _test_observer(self) -> DevObserver:
         runtime = self._opened()
-        return DevObserver(
+        observer = DevObserver(
             runtime.root,
             runtime.config,
             repository_id=self.repository_id,
             principals=self.principals,
         )
+        if self._assurance_workspace is not None:
+            try:
+                observer.require_immutable_execution()
+            except BaseException:
+                observer.close()
+                raise
+        return observer
 
     def test_result_binding(self) -> TestResultBinding:
         observer = self._test_observer()

@@ -1,16 +1,16 @@
 """Trusted, bounded Git-object-to-read-only-image CI execution adapter.
 
-Only the rootful container daemon and installed adapter are trusted. Reviewed
+Only the rootful container daemon and protected-base adapter are trusted. Reviewed
 commands never provide Dockerfiles, entrypoints, mounts, image IDs or eligibility
 assertions. Local evidence cannot authorize this path: every command is executed
-again and consumed inside the same immutable image/container.
+again, then its container is destroyed before consumption in a fresh container
+of the same exact immutable image.
 """
 
 from __future__ import annotations
 
 import contextlib
 import hashlib
-import importlib.metadata
 import io
 import json
 import os
@@ -32,7 +32,7 @@ import anyio
 
 import intent_engineering
 from intent_engineering.cli.runtime import CheckRuntimeAdapter
-from intent_engineering.integrations.github_action import _clear_results, run_tests, write_results
+from intent_engineering.integrations.github_action import _clear_results, _write, run_tests
 from intent_engineering.intent_workflow.check import (
     MAX_TEST_RESULT_BYTES,
     CheckRequest,
@@ -61,11 +61,16 @@ _REVISION = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?")
 _ROOT = Path("/project")
 _OUTPUT = Path("/output")
 _RESULT = Path(".intent-ci/test-results.json")
-_DOCKERFILE = """\
-FROM python:3.12-bookworm
+_BASE_IMAGE = "python@sha256:581429e3df12d76e6af4be5ab7d0e7fc2013eb57dc23d2de691411c8efdbb970"
+_DEPENDENCY_DOCKERFILE = """\
+FROM {base}
 LABEL intent.ephemeral-ci="{nonce}"
 COPY requirements.txt /build/requirements.txt
-RUN python -m pip install --no-cache-dir -r /build/requirements.txt
+RUN python -I -m pip install --no-cache-dir --require-hashes --only-binary=:all: -r /build/requirements.txt
+"""
+_DOCKERFILE = """\
+FROM {dependency_image}
+LABEL intent.ephemeral-ci="{nonce}"
 COPY adapter/ /usr/local/lib/python3.12/site-packages/intent_engineering/
 COPY repository/ /project/
 COPY baseline/ /build/
@@ -74,7 +79,7 @@ RUN python -I -m intent_engineering.integrations.immutable_ci materialize
 ENV PYTHONDONTWRITEBYTECODE=1
 WORKDIR /project
 USER 65532:65532
-ENTRYPOINT ["/usr/local/bin/python", "-I", "-m", "intent_engineering.integrations.immutable_ci", "consume"]
+ENTRYPOINT ["/usr/local/bin/python", "-I", "-m", "intent_engineering.integrations.immutable_ci"]
 """
 
 
@@ -187,10 +192,41 @@ def _git_material(root: Path, commit: str, state_tip: str) -> dict[str, tuple[by
     return result
 
 
-def build_context(root: Path, *, at: datetime) -> bytes:
+def _requirements() -> bytes:
+    lock = Path(__file__).with_name("ci-runtime.lock")
+    if lock.is_symlink() or lock.stat().st_size > 256 * 1024:
+        raise ValueError("immutable CI unavailable")
+    return lock.read_bytes()
+
+
+def _dependency_context(nonce: str) -> bytes:
+    """Networked dependency build receives only protected lock and trusted Dockerfile."""
+    result = io.BytesIO()
+    with tarfile.open(fileobj=result, mode="w:") as archive:
+        _member(
+            archive,
+            "Dockerfile",
+            _DEPENDENCY_DOCKERFILE.format(base=_BASE_IMAGE, nonce=nonce).encode(),
+        )
+        _member(archive, "requirements.txt", _requirements())
+    return result.getvalue()
+
+
+def build_context(
+    root: Path,
+    *,
+    at: datetime,
+    revision: str | None = None,
+    dependency_image: str = _BASE_IMAGE,
+    nonce: str | None = None,
+) -> bytes:
     """Capture immutable Git objects and authenticated baseline, never checkout bytes."""
     files = read_approved_baseline(root, EnvironmentTrustProvider(), at=at)
-    commit = _git(root, ("rev-parse", "--verify", "HEAD"), 256).strip()
+    commit = (
+        _git(root, ("rev-parse", "--verify", "HEAD"), 256).strip()
+        if revision is None
+        else revision.encode("ascii")
+    )
     if _REVISION.fullmatch(commit.decode("ascii")) is None:
         raise ValueError("immutable CI unavailable")
     state_tip = (
@@ -208,13 +244,23 @@ def build_context(root: Path, *, at: datetime) -> bytes:
     if len(commit) == 64:
         config += "[extensions]\nobjectFormat = sha256\n"
     material[".git/config"] = (config.encode("ascii"), 0o644)
-    requirements = importlib.metadata.requires("intent-engineering") or []
-    requirements = [line.split(";", 1)[0].strip() for line in requirements]
+    if dependency_image != _BASE_IMAGE and _IMAGE_ID.fullmatch(dependency_image) is None:
+        raise ValueError("immutable CI unavailable")
+    nonce = uuid.uuid4().hex if nonce is None else nonce
     package = Path(intent_engineering.__file__).parent
     result = io.BytesIO()
     with tarfile.open(fileobj=result, mode="w:") as archive:
-        _member(archive, "Dockerfile", _DOCKERFILE.format(nonce=uuid.uuid4().hex).encode())
-        _member(archive, "requirements.txt", "\n".join(requirements).encode())
+        _member(
+            archive,
+            "Dockerfile",
+            _DOCKERFILE.format(nonce=nonce, dependency_image=dependency_image).encode(),
+        )
+        _member(
+            archive,
+            "Dependency.Dockerfile",
+            _DEPENDENCY_DOCKERFILE.format(base=_BASE_IMAGE, nonce=nonce).encode(),
+        )
+        _member(archive, "requirements.txt", _requirements())
         for relative, (content, mode) in sorted(material.items()):
             item = tarfile.TarInfo("repository/" + relative)
             item.mode = mode
@@ -251,7 +297,25 @@ def _command(
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             start_new_session=True,
-            env={**os.environ, "DOCKER_BUILDKIT": "0"},
+            env={
+                **{
+                    key: value
+                    for key, value in os.environ.items()
+                    if key
+                    in {
+                        "PATH",
+                        "HOME",
+                        "TMPDIR",
+                        "DOCKER_HOST",
+                        "DOCKER_CONTEXT",
+                        "DOCKER_CONFIG",
+                        "DOCKER_CERT_PATH",
+                        "DOCKER_TLS_VERIFY",
+                        "SSL_CERT_FILE",
+                    }
+                },
+                "DOCKER_BUILDKIT": "0",
+            },
         )
         selector = selectors.DefaultSelector()
         retained = bytearray()
@@ -288,43 +352,14 @@ def _command(
                 process.stderr.close()
 
 
-def run_immutable_check(root: Path, *, at: datetime) -> TestResultArtifact:
-    """Run all steps in one exact read-only image; copy out only a strict result."""
-    _clear_results(root)
-    docker = shutil.which("docker")
-    if docker is None:
-        raise ValueError("immutable CI unavailable")
-    context = build_context(root, at=at)
-    with tarfile.open(fileobj=io.BytesIO(context), mode="r:") as archive:
-        dockerfile = archive.extractfile("Dockerfile")
-        commit_file = archive.extractfile("repository/.git/HEAD")
-        assert dockerfile is not None and commit_file is not None
-        label = re.search(rb'intent.ephemeral-ci="([0-9a-f]{32})"', dockerfile.read())
-        if label is None:
-            raise ValueError("immutable CI unavailable")
-        nonce = label[1].decode()
-        commit = commit_file.read().decode().strip()
-    image_id: str | None = None
-    container = "intent-ci-" + uuid.uuid4().hex
+def _run_stage(docker: str, image_id: str, stage: str, content: bytes) -> bytes:
+    """Destroy the entire container/cgroup before releasing its bounded result."""
+    container = "intent-ci-" + stage + "-" + uuid.uuid4().hex
     try:
-        image_id = (
-            _command(
-                [docker, "build", "--quiet", "--no-cache", "--force-rm", "-"],
-                content=context,
-            )
-            .decode("ascii")
-            .strip()
-        )
-        if _IMAGE_ID.fullmatch(image_id) is None:
-            raise ValueError("immutable CI unavailable")
-        request = json.dumps(
-            {"at": at.isoformat(), "trust": os.environ.get(TRUST_ENVIRONMENT_VARIABLE, "")}
-        ).encode()
-        raw = _command(
+        return _command(
             [
                 docker,
                 "run",
-                "--rm",
                 "--name",
                 container,
                 "--read-only",
@@ -340,23 +375,93 @@ def run_immutable_check(root: Path, *, at: datetime) -> TestResultArtifact:
                 "--tmpfs=/project/.intent-ci:rw,noexec,nosuid,size=1m,uid=65532,gid=65532",
                 "-i",
                 image_id,
+                stage,
             ],
-            content=request,
+            content=content,
             maximum=2 * 1024 * 1024,
         )
-        if len(raw) > MAX_TEST_RESULT_BYTES:
+    finally:
+        # Docker's completed removal tears down the PID namespace and cgroup,
+        # including descendants that escaped a reviewed process group/session.
+        _command([docker, "rm", "--force", container], timeout=30)
+        if _command(
+            [docker, "ps", "--all", "--quiet", "--filter", "name=^/" + container + "$"],
+            timeout=30,
+        ).strip():
             raise ValueError("immutable CI unavailable")
-        artifact = TestResultArtifact.model_validate_json(raw)
-        if (
-            raw != artifact.canonical_bytes()
-            or artifact.status != "passed"
-            or artifact.commit_sha != commit
-            or artifact.observed_at != at
-        ):
+
+
+def _strict_result(raw: bytes, commit: str, at: datetime) -> TestResultArtifact:
+    if len(raw) > MAX_TEST_RESULT_BYTES:
+        raise ValueError("immutable CI unavailable")
+    artifact = TestResultArtifact.model_validate_json(raw)
+    if (
+        raw != artifact.canonical_bytes()
+        or artifact.status != "passed"
+        or artifact.commit_sha != commit
+        or artifact.observed_at != at
+    ):
+        raise ValueError("immutable CI unavailable")
+    return artifact
+
+
+def run_immutable_check(
+    root: Path, *, at: datetime, revision: str | None = None
+) -> TestResultArtifact:
+    """Test and independently consume in separate containers of one exact image."""
+    _clear_results(root)
+    docker = shutil.which("docker")
+    if docker is None:
+        raise ValueError("immutable CI unavailable")
+    nonce = uuid.uuid4().hex
+    try:
+        dependency_image = (
+            _command(
+                [docker, "build", "--quiet", "--no-cache", "--force-rm", "-"],
+                content=_dependency_context(nonce),
+            )
+            .decode("ascii")
+            .strip()
+        )
+        if _IMAGE_ID.fullmatch(dependency_image) is None:
+            raise ValueError("immutable CI unavailable")
+        context = build_context(
+            root, at=at, revision=revision, dependency_image=dependency_image, nonce=nonce
+        )
+        with tarfile.open(fileobj=io.BytesIO(context), mode="r:") as archive:
+            commit_file = archive.extractfile("repository/.git/HEAD")
+            assert commit_file is not None
+            commit = commit_file.read().decode().strip()
+        image_id = (
+            _command(
+                [docker, "build", "--network=none", "--quiet", "--no-cache", "--force-rm", "-"],
+                content=context,
+            )
+            .decode("ascii")
+            .strip()
+        )
+        if _IMAGE_ID.fullmatch(image_id) is None:
+            raise ValueError("immutable CI unavailable")
+        tested = _run_stage(docker, image_id, "test", json.dumps({"at": at.isoformat()}).encode())
+        _strict_result(tested, commit, at)
+        # The test container no longer exists. Only its strict canonical result,
+        # never writable assurance files, crosses into the fresh consumer.
+        raw = _run_stage(
+            docker,
+            image_id,
+            "consume",
+            json.dumps(
+                {
+                    "at": at.isoformat(),
+                    "trust": os.environ.get(TRUST_ENVIRONMENT_VARIABLE, ""),
+                    "result": tested.decode("utf-8"),
+                }
+            ).encode(),
+        )
+        artifact = _strict_result(raw, commit, at)
+        if raw != tested:
             raise ValueError("immutable CI unavailable")
     finally:
-        with contextlib.suppress(OSError, ValueError, subprocess.SubprocessError):
-            _command([docker, "rm", "--force", container], timeout=30)
         # Legacy --no-cache builds retain no separate BuildKit cache. The unique
         # label resolves only our final/intermediate images, including failed builds.
         inventory = [
@@ -462,13 +567,18 @@ def _accepted_result(raw: bytes, evidence_id: str | None) -> bytes:
 
 
 async def _consume() -> bytes:
-    raw = sys.stdin.buffer.read(64 * 1024 + 1)
-    if len(raw) > 64 * 1024:
+    raw = sys.stdin.buffer.read(128 * 1024 + 1)
+    if len(raw) > 128 * 1024:
         raise ValueError("immutable CI unavailable")
     request = json.loads(raw)
-    if set(request) != {"at", "trust"} or type(request["trust"]) is not str:
+    if (
+        set(request) != {"at", "trust", "result"}
+        or type(request["trust"]) is not str
+        or type(request["result"]) is not str
+    ):
         raise ValueError("immutable CI unavailable")
     at = datetime.fromisoformat(request["at"])
+    tested = request["result"].encode("utf-8")
     os.environ[TRUST_ENVIRONMENT_VARIABLE] = request["trust"]
     try:
         files = read_approved_baseline(_ROOT, EnvironmentTrustProvider(), at=at)
@@ -478,10 +588,9 @@ async def _consume() -> bytes:
         raw = b""
     restorer = _VerifiedImageBaseline(files)
     restorer.verify_and_restore_approved_baseline(_ROOT)
-    initial_workspace = _workspace(files)
-    await run_tests(_ROOT, at, assurance_workspace=initial_workspace)
-    write_results(_ROOT, at, assurance_workspace=initial_workspace)
-    # Tests cannot poison the later assurance copy. Only authenticated bytes seed it.
+    commit = _git(_ROOT, ("rev-parse", "--verify", "HEAD"), 256).decode().strip()
+    _strict_result(tested, commit, at)
+    _write(_ROOT, _RESULT, tested)
     adapter = CheckRuntimeAdapter(
         _ROOT, assurance_workspace=_workspace(files), shared_state_restorer=restorer
     )
@@ -496,13 +605,39 @@ async def _consume() -> bytes:
         adapter.close()
 
 
+async def _test() -> bytes:
+    """No decryption key or inherited trust enters the reviewed-code container."""
+    from intent_engineering.team_state.restore import CANONICAL_STATE_PATHS
+
+    raw = sys.stdin.buffer.read(1025)
+    if len(raw) > 1024:
+        raise ValueError("immutable CI unavailable")
+    request = json.loads(raw)
+    if set(request) != {"at"}:
+        raise ValueError("immutable CI unavailable")
+    at = datetime.fromisoformat(request["at"])
+    directory = SecureDirectory.open(_ROOT)
+    try:
+        guard = ImmutableExecutionGuard(directory)
+        files = {}
+        for relative in (*CANONICAL_STATE_PATHS, "cache/shared-state.json"):
+            guard.require_file(directory, ".intent/" + relative)
+            files[relative] = directory.read_relative(
+                ".intent/" + relative, nonblocking=True, max_bytes=8 * 1024 * 1024
+            ).content
+    finally:
+        directory.close()
+    artifact = await run_tests(_ROOT, at, assurance_workspace=_workspace(files))
+    return artifact.canonical_bytes()
+
+
 def main() -> int:
     try:
         if sys.argv[1:] == ["materialize"]:
             _materialize()
-        elif sys.argv[1:] == ["consume"]:
+        elif sys.argv[1:] in (["test"], ["consume"]):
             with contextlib.redirect_stdout(sys.stderr):
-                result = anyio.run(_consume)
+                result = anyio.run(_test if sys.argv[1:] == ["test"] else _consume)
             sys.stdout.buffer.write(result)
         elif not sys.argv[1:]:
             run_immutable_check(Path.cwd(), at=datetime.now(UTC))
