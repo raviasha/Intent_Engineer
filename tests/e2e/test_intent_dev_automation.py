@@ -11,6 +11,7 @@ import subprocess
 import time
 from pathlib import Path
 from unittest.mock import patch
+from urllib.request import Request, urlopen
 
 import anyio
 import pytest
@@ -20,6 +21,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
 from typer.testing import CliRunner
 
+from intent_engineering.cli import dev as dev_cli
 from intent_engineering.cli.app import app
 from intent_engineering.cli.runtime import load_runtime
 from intent_engineering.core.models import (
@@ -32,7 +34,9 @@ from intent_engineering.intent_workflow.check import CheckService
 from intent_engineering.storage.executor import LocalChangeSetExecutor
 from intent_engineering.team_state import restore as restore_module
 from intent_engineering.team_state.restore import (
+    GitSharedStateRestorer,
     SharedStateTrust,
+    StaticTrustProvider,
     TrustedSigningKey,
     build_state_payload,
     seal_state_payload,
@@ -264,6 +268,18 @@ def test_fresh_onboarded_clone_first_prompt_and_plugin_disabled_ci_backstop(
     assert "onboarding" not in context.lower()
     metadata = json.loads((repo / ".intent/cache/control-plane.json").read_bytes())
     assert metadata["pid"] != os.getpid()
+    assert metadata["shared_state_status"] == "verified"
+    with urlopen(
+        Request(
+            metadata["origin"] + dev_cli._INSTANCE_PATH,
+            headers={
+                "Host": metadata["origin"].removeprefix("http://"),
+                "Origin": metadata["origin"],
+            },
+        ),
+        timeout=3,
+    ) as response:
+        assert json.loads(response.read())["shared_state_status"] == "verified"
     status = CliRunner().invoke(app, ["dev", "--project", str(repo), "--status"])
     assert status.exit_code == 0, (status.stdout, status.stderr, repr(status.exception))
     assert status.stdout == f"intent dev: running at {metadata['origin']}\n"
@@ -280,6 +296,79 @@ def test_fresh_onboarded_clone_first_prompt_and_plugin_disabled_ci_backstop(
     assert _check(repo, trust, ci=False).exit_code == 0
     assert not (repo / "plugins").exists()
     assert git(repo, "rev-parse", "HEAD") == original_head
+
+
+@pytest.mark.parametrize("offline", [False, True], ids=("refreshed", "offline-cached"))
+def test_direct_dev_restores_team_state_before_starting_the_control_plane(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    offline: bool,
+) -> None:
+    """Catches the primary CLI retaining a hidden manual restore prerequisite."""
+    repo, trust = _clone(tmp_path)
+    monkeypatch.setenv("INTENT_CI_SHARED_STATE_TRUST", trust_environment(trust))
+    refreshes: list[str] = []
+
+    def refresh(repository_id: str):
+        refreshes.append(repository_id)
+        if offline:
+            raise AssertionError("offline intent dev must not fetch")
+        return restore_module._GitRefReader(repo)
+
+    monkeypatch.setattr(restore_module, "_refresh_state_ref", refresh)
+    observed: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        dev_cli,
+        "_wait_for_exit",
+        lambda started: observed.append(started.service.status()),
+    )
+
+    result = CliRunner().invoke(
+        app,
+        ["dev", "--project", str(repo), "--no-open", *(["--offline"] if offline else [])],
+    )
+
+    assert result.exit_code == 0, (result.stdout, result.stderr, repr(result.exception))
+    assert (repo / ".intent/cache/shared-state.json").is_file()
+    assert observed[0]["status"] == "ready"
+    assert refreshes == ([] if offline else [trust.repository_id])
+
+
+def test_direct_offline_dev_preserves_missing_trust_as_offline_stale_team_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catches direct dev downgrading a previously governed checkout to local-only."""
+    repo, trust = _clone(tmp_path)
+    assert (
+        GitSharedStateRestorer(StaticTrustProvider(trust))
+        .verify_and_restore_approved_baseline(repo)
+        .status.value
+        == "verified"
+    )
+    monkeypatch.delenv("INTENT_CI_SHARED_STATE_TRUST", raising=False)
+    monkeypatch.setattr(
+        restore_module,
+        "_refresh_state_ref",
+        lambda _repository_id: (_ for _ in ()).throw(
+            AssertionError("offline intent dev must not fetch")
+        ),
+    )
+    observed: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        dev_cli,
+        "_wait_for_exit",
+        lambda started: observed.append(started.service.status()),
+    )
+
+    result = CliRunner().invoke(
+        app,
+        ["dev", "--project", str(repo), "--no-open", "--offline"],
+    )
+
+    assert result.exit_code == 0, (result.stdout, result.stderr, repr(result.exception))
+    assert observed[0]["status"] == "offline_stale"
+    assert observed[0]["attention_route"] == "team_state"
 
 
 @pytest.mark.parametrize("case_type", ["AMBIGUOUS_DIVERGENCE", "CONFLICTING_SOURCES"])

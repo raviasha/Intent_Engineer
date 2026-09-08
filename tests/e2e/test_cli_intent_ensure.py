@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from datetime import UTC, datetime
 from pathlib import Path
@@ -28,9 +29,14 @@ def _reuse_bounded_service(
     request: pytest.FixtureRequest,
 ) -> None:
     """The real process lifecycle is covered by the automation journey."""
-    if request.node.name == "test_background_service_launch_is_argv_only_secret_free_and_bounded":
+    if (
+        request.node.name == "test_background_service_launch_is_argv_only_secret_free_and_bounded"
+        or request.node.name.startswith(
+            "test_background_readiness_fails_closed_on_a_reused_service_with_stale_health"
+        )
+    ):
         return
-    monkeypatch.setattr(dev_cli, "_start_or_reuse_background_service", lambda _root: True)
+    monkeypatch.setattr(dev_cli, "_start_or_reuse_background_service", lambda _root, _status: True)
 
 
 def _ready_project(project: Path) -> None:
@@ -107,6 +113,88 @@ def test_ensure_reports_a_ready_initialized_repository(tmp_path: Path) -> None:
         "pending_proposal_ids": [],
         "open_case_ids": [],
     }
+
+
+@pytest.mark.parametrize(
+    ("marker_kind", "expected_status"),
+    [
+        ("valid", "offline_stale"),
+        ("corrupt", "shared_state_invalid"),
+        ("fifo", "shared_state_invalid"),
+    ],
+)
+def test_ensure_never_downgrades_a_governed_checkout_when_trust_is_missing(
+    tmp_path: Path,
+    marker_kind: str,
+    expected_status: str,
+) -> None:
+    """Catches a prior team checkout becoming local-ready when trust is absent or unusable."""
+    project = tmp_path / "governed-project"
+    project.mkdir()
+    _ready_project(project)
+    marker = project / ".intent/cache/shared-state.json"
+    if marker_kind == "valid":
+        marker.write_text(
+            json.dumps(
+                {
+                    "bundle_digest": "sha256:" + "a" * 64,
+                    "graph_version": 1,
+                    "ref_commit": "b" * 40,
+                    "schema_version": 1,
+                },
+                separators=(",", ":"),
+                sort_keys=True,
+            ),
+            encoding="utf-8",
+        )
+    elif marker_kind == "corrupt":
+        marker.write_text('{"schema_version":1,"schema_version":1}', encoding="utf-8")
+    else:
+        os.mkfifo(marker)
+
+    result = CliRunner().invoke(
+        app,
+        ["ensure", "--project", str(project), "--preset", "developer", "--format", "json"],
+    )
+
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["status"] == expected_status
+    assert payload["attention_route"] == "team_state"
+
+
+def test_ensure_treats_unusable_trust_for_a_governed_checkout_as_offline_stale(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catches malformed trust masking the valid marker that proves prior team governance."""
+    project = tmp_path / "governed-project"
+    project.mkdir()
+    _ready_project(project)
+    (project / ".intent/cache/shared-state.json").write_text(
+        json.dumps(
+            {
+                "bundle_digest": "sha256:" + "a" * 64,
+                "graph_version": 1,
+                "ref_commit": "b" * 40,
+                "schema_version": 1,
+            },
+            separators=(",", ":"),
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("INTENT_CI_SHARED_STATE_TRUST", "{")
+
+    result = CliRunner().invoke(
+        app,
+        ["ensure", "--project", str(project), "--preset", "developer", "--format", "json"],
+    )
+
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["status"] == "offline_stale"
+    assert payload["attention_route"] == "team_state"
 
 
 def test_ensure_reports_invalid_existing_state_without_leaking_details(tmp_path: Path) -> None:
@@ -325,7 +413,12 @@ def test_background_service_launch_is_argv_only_secret_free_and_bounded(
     monkeypatch.setattr(dev_cli, "_STARTUP_TIMEOUT_SECONDS", 0.001)
     monkeypatch.setattr(dev_cli.subprocess, "Popen", popen)
 
-    assert dev_cli._start_or_reuse_background_service(project) is False
+    assert (
+        dev_cli._start_or_reuse_background_service(
+            project, dev_cli.SharedStateRestoreStatus.VERIFIED
+        )
+        is False
+    )
     assert process.terminated is True
     assert process.killed is True
     assert process.wait_timeouts == [1, 1]
@@ -337,3 +430,41 @@ def test_background_service_launch_is_argv_only_secret_free_and_bounded(
     assert kwargs["close_fds"] is True
     assert set(kwargs["env"]) == {"LANG", "LC_ALL", "PATH"}
     assert "shell" not in kwargs
+    argv = calls["argv"]
+    assert argv[-2:] == ("--shared-status", "verified")
+
+
+@pytest.mark.parametrize("launch_mode", ["manual_headless", "interactive", "legacy"])
+def test_background_readiness_fails_closed_on_a_reused_service_with_stale_health(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    launch_mode: str,
+) -> None:
+    """Catches a manual or legacy UI silently retaining a contradictory shared status."""
+    project = tmp_path / "project"
+    project.mkdir()
+    metadata = dev_cli.ControlPlaneProcessMetadata(
+        pid=123,
+        process_start_id="sha256:" + "a" * 64,
+        instance_id="instance:" + "b" * 64,
+        project_id="project",
+        repository_id="repo:sha256:" + "c" * 64,
+        origin="http://localhost:43127",
+        launch_mode=launch_mode,
+        shared_state_status=dev_cli.SharedStateRestoreStatus.NOT_REQUIRED,
+    )
+    monkeypatch.setattr(dev_cli, "_running_service", lambda _root: metadata)
+    monkeypatch.setattr(
+        dev_cli.subprocess,
+        "Popen",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("a non-automatic owner cannot be replaced")
+        ),
+    )
+
+    assert (
+        dev_cli._start_or_reuse_background_service(
+            project, dev_cli.SharedStateRestoreStatus.INVALID
+        )
+        is False
+    )

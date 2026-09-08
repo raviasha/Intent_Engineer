@@ -45,7 +45,10 @@ from intent_engineering.core.models import (
 )
 from intent_engineering.core.policy.access import refs_allowed
 from intent_engineering.intent_workflow.bootstrap import BootstrapService
-from intent_engineering.intent_workflow.check import evidence_repository_id
+from intent_engineering.intent_workflow.check import (
+    SharedStateRestoreStatus,
+    evidence_repository_id,
+)
 from intent_engineering.intent_workflow.clarification import (
     ClarificationCoordinator,
     ProposalConfirmationService,
@@ -217,9 +220,12 @@ class ControlPlaneService:
         clock: Callable[[], datetime] | None = None,
         challenge_source: Callable[[], bytes] | None = None,
         webauthn_verifier: WebAuthnVerifier | None = None,
+        shared_state_status: SharedStateRestoreStatus = SharedStateRestoreStatus.NOT_REQUIRED,
     ) -> None:
         if type(runtime) is not Runtime:
             raise ValueError("invalid control plane runtime")
+        if type(shared_state_status) is not SharedStateRestoreStatus:
+            raise ValueError("invalid shared-state status")
         self._runtime = runtime
         self._origin = origin
         self._clock = clock or (lambda: datetime.now(UTC))
@@ -237,6 +243,7 @@ class ControlPlaneService:
         self._observation_stop = threading.Event()
         self._observation_thread: threading.Thread | None = None
         self._latest_observation: ObservationResult | None = None
+        self._shared_state_status = shared_state_status
         self._webauthn = WebAuthnService(
             project_id=runtime.config.project_id,
             repository_id=self.repository_id,
@@ -494,7 +501,31 @@ class ControlPlaneService:
                 )
                 for session in latest_sessions.values()
             )
-            if onboarding.state is OnboardingState.REQUIRED:
+            shared_projection = {
+                SharedStateRestoreStatus.INVALID: (
+                    DevStatus.SHARED_STATE_INVALID,
+                    AttentionRoute.TEAM_STATE,
+                ),
+                SharedStateRestoreStatus.UPGRADE_REQUIRED: (
+                    DevStatus.UPGRADE_REQUIRED,
+                    AttentionRoute.TEAM_STATE,
+                ),
+                SharedStateRestoreStatus.DIVERGED: (
+                    DevStatus.HUMAN_ATTENTION_REQUIRED,
+                    AttentionRoute.TEAM_STATE,
+                ),
+                SharedStateRestoreStatus.STALE: (
+                    DevStatus.OFFLINE_STALE,
+                    AttentionRoute.TEAM_STATE,
+                ),
+                SharedStateRestoreStatus.UNAVAILABLE: (
+                    DevStatus.OFFLINE_STALE,
+                    AttentionRoute.TEAM_STATE,
+                ),
+            }.get(self._shared_state_status)
+            if shared_projection is not None:
+                status, route = shared_projection
+            elif onboarding.state is OnboardingState.REQUIRED:
                 status, route = DevStatus.ONBOARDING_REQUIRED, AttentionRoute.ONBOARDING
             elif (
                 onboarding.state is OnboardingState.REVIEW_REQUIRED
@@ -503,7 +534,11 @@ class ControlPlaneService:
             ):
                 status, route = DevStatus.HUMAN_ATTENTION_REQUIRED, AttentionRoute.INBOX
             else:
-                status, route = DevStatus.LOCAL_ONLY, AttentionRoute.HOME
+                status, route = (
+                    (DevStatus.READY, AttentionRoute.HOME)
+                    if self._shared_state_status is SharedStateRestoreStatus.VERIFIED
+                    else (DevStatus.LOCAL_ONLY, AttentionRoute.HOME)
+                )
             return {
                 "schema_version": 1,
                 "status": status.value,
@@ -1614,6 +1649,7 @@ class ControlPlaneService:
         self._connectors_directory.close()
         self._approvals_directory.close()
         self._pending_answers.clear()
+        self._shared_state_status = SharedStateRestoreStatus.NOT_REQUIRED
 
 
 __all__ = ["ControlPlaneError", "ControlPlaneService"]

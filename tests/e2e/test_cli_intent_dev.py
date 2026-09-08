@@ -247,11 +247,13 @@ def test_process_metadata_is_strict_and_secret_free() -> None:
             "repository_id": "repo:sha256:" + "c" * 64,
             "origin": "http://localhost:43127",
             "launch_mode": "automatic",
+            "shared_state_status": "verified",
         }
     )
 
     assert metadata.origin == "http://localhost:43127"
     assert metadata.launch_mode == "automatic"
+    assert metadata.shared_state_status.value == "verified"
     with pytest.raises(ValueError):
         ControlPlaneProcessMetadata.model_validate(
             {**metadata.model_dump(), "csrf_secret": "must-not-be-persisted"}
@@ -401,7 +403,7 @@ def test_fresh_repository_starts_reuses_serves_assets_and_cleans_up(tmp_path: Pa
         assert reuse.stdout == f"intent dev: already running at {metadata.origin}\n"
         assert reuse.stderr == ""
         assert "<title>Intent Engineering review</title>" in page
-        assert "HttpOnly" in cookie and "SameSite=Strict" in cookie
+        assert cookie == ""
         assert metadata.pid == process.pid
         assert (project / ".intent/evidence/evidence.jsonl").read_bytes()
         persisted = b"".join(
@@ -448,7 +450,45 @@ def test_ordinary_dev_replaces_automatic_owner_and_opens_with_ephemeral_bootstra
         origin, _separator, bootstrap = opened_url.partition("/#csrf=")
         host = origin.removeprefix("http://")
         with urlopen(Request(origin, headers={"Host": host}), timeout=3) as response:
+            assert response.headers.get("Set-Cookie") is None
+        exchange_body = json.dumps(
+            {"token": bootstrap}, separators=(",", ":"), sort_keys=True
+        ).encode()
+        untrusted_body = json.dumps(
+            {"token": "x" * len(bootstrap)}, separators=(",", ":"), sort_keys=True
+        ).encode()
+        untrusted_exchange = Request(
+            origin + dev_cli._BROWSER_BOOTSTRAP_PATH,
+            data=untrusted_body,
+            headers={
+                "Content-Type": "application/json",
+                "Content-Length": str(len(untrusted_body)),
+                "Host": host,
+                "Origin": origin,
+            },
+            method="POST",
+        )
+        with pytest.raises(HTTPError) as untrusted:
+            urlopen(untrusted_exchange, timeout=3)
+        assert untrusted.value.code == 403
+        assert untrusted.value.headers.get("Set-Cookie") is None
+        exchange = Request(
+            origin + dev_cli._BROWSER_BOOTSTRAP_PATH,
+            data=exchange_body,
+            headers={
+                "Content-Type": "application/json",
+                "Content-Length": str(len(exchange_body)),
+                "Host": host,
+                "Origin": origin,
+            },
+            method="POST",
+        )
+        with urlopen(exchange, timeout=3) as response:
             cookie = response.headers["Set-Cookie"].partition(";")[0]
+            assert response.status == 204
+        with pytest.raises(HTTPError) as replay:
+            urlopen(exchange, timeout=3)
+        assert replay.value.code == 403
         request = Request(
             origin + "/api/v1/development/tests/run",
             data=json.dumps({"command_id": "test:sha256:" + "f" * 64}).encode(),
@@ -528,6 +568,43 @@ def test_ordinary_dev_reuses_a_manually_headless_owner_without_signaling(
         assert opened == []
     finally:
         _stop(owner)
+
+
+def test_direct_dev_refuses_to_reuse_a_service_with_contradictory_shared_health(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catches direct dev bypassing restore by returning an old local-only owner."""
+    project = _project(tmp_path)
+    initialize_project(project)
+    _project_id, repository_id = _repository_binding(project)
+    metadata = ControlPlaneProcessMetadata(
+        pid=os.getpid(),
+        process_start_id="sha256:" + "a" * 64,
+        instance_id="instance:" + "b" * 64,
+        project_id=project.name,
+        repository_id=repository_id,
+        origin="http://localhost:43127",
+        launch_mode="manual_headless",
+        shared_state_status=dev_cli.SharedStateRestoreStatus.NOT_REQUIRED,
+    )
+    monkeypatch.setattr(
+        dev_cli,
+        "_shared_restore",
+        lambda _root, **_kwargs: dev_cli.SharedStateRestoreResult(
+            status=dev_cli.SharedStateRestoreStatus.INVALID
+        ),
+    )
+    monkeypatch.setattr(dev_cli, "_live_repository_process", lambda _directory: metadata)
+
+    result = CliRunner().invoke(
+        app,
+        ["dev", "--project", str(project), "--no-open"],
+    )
+
+    assert result.exit_code == 1
+    assert result.stdout == ""
+    assert result.stderr == "intent dev: unavailable\n"
 
 
 def test_stale_and_foreign_pid_metadata_is_not_reused(tmp_path: Path) -> None:
@@ -1101,7 +1178,12 @@ def test_fresh_repository_milestone_one_release_journey_uses_one_runtime(
         load_calls.append(path)
         return original_load_runtime(path)
 
-    def service_factory(runtime: object, *, origin: str) -> ControlPlaneService:
+    def service_factory(
+        runtime: object,
+        *,
+        origin: str,
+        shared_state_status: dev_cli.SharedStateRestoreStatus,
+    ) -> ControlPlaneService:
         verifier = _ReleaseVerifier()
         nonce = iter(range(1, 64))
         service = ControlPlaneService(
@@ -1110,6 +1192,7 @@ def test_fresh_repository_milestone_one_release_journey_uses_one_runtime(
             clock=lambda: NOW,
             challenge_source=lambda: bytes([next(nonce)]) * 32,
             webauthn_verifier=verifier,
+            shared_state_status=shared_state_status,
         )
         captured.append((runtime, service, verifier))
         return service

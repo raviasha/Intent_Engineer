@@ -221,8 +221,7 @@ def _assert_security_headers(response: Any) -> None:
         "style-src 'self'; connect-src 'self'"
     )
     assert response.headers["referrer-policy"] == "no-referrer"
-    cookie = response.headers["set-cookie"]
-    assert cookie == f"intent_csrf={CSRF}; Path=/; HttpOnly; SameSite=Strict"
+    assert "set-cookie" not in response.headers
 
 
 def test_exact_routes_delegate_to_the_service_and_return_detached_json() -> None:

@@ -137,6 +137,46 @@ def test_opted_in_restore_maps_offline_or_absent_fixed_ref_to_unavailable(
     assert not (target / ".intent").exists()
 
 
+@pytest.mark.parametrize("existing_state", [False, True], ids=("fresh", "existing"))
+def test_refreshed_restore_rejects_a_destination_with_the_wrong_origin_before_fetch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    existing_state: bool,
+) -> None:
+    """Catches repo A's trusted state being installed into an unrelated repo B checkout."""
+    target = init_repository(tmp_path / "target" / "project")
+    if existing_state:
+        ready_project(target)
+    before = {
+        path.relative_to(target).as_posix(): path.read_bytes()
+        for path in target.rglob("*")
+        if path.is_file() and ".git" not in path.parts
+    }
+    git(target, "remote", "set-url", "origin", "https://github.com/acme/unrelated.git")
+    _recipient, _signer, trust = keys()
+
+    fetches: list[str] = []
+
+    def forbidden_fetch(repository_id: str):
+        fetches.append(repository_id)
+        raise restore_module._Unavailable("fetch must not run")
+
+    monkeypatch.setattr(restore_module, "_refresh_state_ref", forbidden_fetch)
+
+    result = GitSharedStateRestorer(
+        StaticTrustProvider(trust),
+        refresh_remote=True,
+    ).verify_and_restore_approved_baseline(target)
+
+    assert result.status is SharedStateRestoreStatus.INVALID
+    assert fetches == []
+    assert {
+        path.relative_to(target).as_posix(): path.read_bytes()
+        for path in target.rglob("*")
+        if path.is_file() and ".git" not in path.parts
+    } == before
+
+
 @pytest.mark.parametrize(
     ("program", "timeout"),
     [

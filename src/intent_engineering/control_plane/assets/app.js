@@ -13,6 +13,7 @@
     decisionVerify: "/api/v1/decisions/verify",
     developmentObservation: "/api/v1/development/observation",
     reviewedTests: "/api/v1/development/tests/run",
+    browserBootstrap: "/_intent/browser/bootstrap",
   });
   const viewNames = new Set(["home", "onboarding", "inbox", "proposal", "team_state"]);
   const app = document.getElementById("app");
@@ -41,6 +42,24 @@
 
   function announce(message) {
     statusRegion.textContent = message;
+  }
+
+  async function exchangeCsrfBootstrap() {
+    if (!csrfToken) {
+      return;
+    }
+    const response = await fetch(api.browserBootstrap, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ token: csrfToken }),
+      credentials: "same-origin",
+      cache: "no-store",
+      redirect: "error",
+    });
+    if (!response.ok) {
+      csrfToken = "";
+      throw new Error("Local review bootstrap is unavailable. Restart intent dev.");
+    }
   }
 
   function isWrite(method) {
@@ -835,7 +854,17 @@
     button.addEventListener("click", () => showView(button.dataset.view));
   }
 
-  render();
-  refreshStatus();
-  refreshDevelopmentObservation(true);
+  async function start() {
+    try {
+      await exchangeCsrfBootstrap();
+      render();
+      await refreshStatus();
+      await refreshDevelopmentObservation(true);
+    } catch (_error) {
+      render();
+      announce("Local review bootstrap is unavailable. Restart intent dev.");
+    }
+  }
+
+  void start();
 })();

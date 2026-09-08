@@ -711,10 +711,27 @@ def _parse_canonical_model(
 
 
 def _run_git(repo: Path, arguments: tuple[str, ...], *, maximum: int) -> bytes:
+    git_token = _git_executable_token()
     process = subprocess.Popen(
-        ("git", "--no-replace-objects", "-C", str(repo), *arguments),
+        (
+            str(_GIT_EXECUTABLE),
+            "--no-pager",
+            "--no-replace-objects",
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-C",
+            str(repo),
+            *arguments,
+        ),
+        cwd="/",
+        env=dict(_FETCH_ENVIRONMENT),
+        stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
+        close_fds=True,
+        shell=False,
     )
     output = process.stdout
     assert output is not None
@@ -740,6 +757,8 @@ def _run_git(repo: Path, arguments: tuple[str, ...], *, maximum: int) -> bytes:
         return_code = process.wait(timeout=max(0.001, deadline - time.monotonic()))
         if return_code != 0:
             raise subprocess.CalledProcessError(return_code, process.args)
+        if _git_executable_token() != git_token:
+            raise ValueError("Git executable unavailable")
         return b"".join(chunks)
     finally:
         selector.close()
@@ -936,7 +955,11 @@ def _refresh_state_ref(repository_id: str) -> _GitRefReader:
 
 
 def _origin_repository(repo: Path) -> str:
-    raw = _run_git(repo, ("remote", "get-url", "origin"), maximum=MAX_GIT_TEXT_BYTES)
+    raw = _run_git(
+        repo,
+        ("config", "--local", "--no-includes", "--get", "remote.origin.url"),
+        maximum=MAX_GIT_TEXT_BYTES,
+    )
     value = raw.decode("utf-8").strip()
     if re.fullmatch(r"[^/@:]+@([^/:]+):(.+)", value):
         matched = re.fullmatch(r"[^/@:]+@([^/:]+):(.+)", value)
@@ -2227,6 +2250,8 @@ class GitSharedStateRestorer:
             if type(trust) is not SharedStateTrust:
                 raise ValueError("invalid shared-state trust")
             root = Path(os.path.abspath(root))
+            if _origin_repository(root) != trust.repository_id:
+                raise ValueError("repository identity mismatch")
             project = SecureDirectory.open(root)
             try:
                 os.stat(".intent", dir_fd=project.descriptor, follow_symlinks=False)
@@ -2237,8 +2262,6 @@ class GitSharedStateRestorer:
             if self._refresh_remote:
                 reader = _refresh_state_ref(trust.repository_id)
             else:
-                if _origin_repository(root) != trust.repository_id:
-                    raise ValueError("repository identity mismatch")
                 reader = _GitRefReader(root)
             commit = reader.commit()
             now = self._clock()

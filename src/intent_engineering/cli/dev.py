@@ -73,6 +73,8 @@ from intent_engineering.team_state.restore import (
     TRUST_ENVIRONMENT_VARIABLE,
     EnvironmentTrustProvider,
     GitSharedStateRestorer,
+    StaticTrustProvider,
+    _read_local_marker,
 )
 
 _METADATA_PATH = "cache/control-plane.json"
@@ -82,6 +84,7 @@ _PROBE_TIMEOUT_SECONDS = 1.0
 _MAX_PROCESS_INSPECTION_BYTES = 1_048_576
 _INSTANCE_PATH = "/_intent/dev/instance"
 _SHUTDOWN_PATH = "/_intent/dev/shutdown"
+_BROWSER_BOOTSTRAP_PATH = "/_intent/browser/bootstrap"
 _MAX_SHUTDOWN_BYTES = 1024
 _PROCESS_DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _INSTANCE_ID = re.compile(r"instance:[0-9a-f]{64}\Z")
@@ -125,6 +128,7 @@ class ControlPlaneProcessMetadata(StrictModel):
     repository_id: str
     origin: str
     launch_mode: _LaunchMode = "legacy"
+    shared_state_status: SharedStateRestoreStatus = SharedStateRestoreStatus.NOT_REQUIRED
 
     @field_validator("process_start_id")
     @classmethod
@@ -177,6 +181,18 @@ class ControlPlaneProcessMetadata(StrictModel):
         ):
             raise ValueError("invalid loopback origin")
         return value
+
+    @field_validator("shared_state_status", mode="before")
+    @classmethod
+    def validate_shared_state_status(cls, value: object) -> SharedStateRestoreStatus:
+        if type(value) is not str:
+            if type(value) is SharedStateRestoreStatus:
+                return value
+            raise ValueError("invalid shared-state status")
+        try:
+            return SharedStateRestoreStatus(value)
+        except ValueError:
+            raise ValueError("invalid shared-state status") from None
 
     def canonical_bytes(self) -> bytes:
         """Return the only metadata representation written to the local cache."""
@@ -406,12 +422,18 @@ def _probe(metadata: ControlPlaneProcessMetadata, expected_repository_id: str) -
         "project_id": metadata.project_id,
         "repository_id": expected_repository_id,
         "launch_mode": metadata.launch_mode,
+        "shared_state_status": metadata.shared_state_status.value,
     }
     if instance == expected:
         return True
+    if metadata.shared_state_status is SharedStateRestoreStatus.NOT_REQUIRED:
+        expected.pop("shared_state_status")
+        if instance == expected:
+            return True
     if metadata.launch_mode != "legacy":
         return False
     expected.pop("launch_mode")
+    expected.pop("shared_state_status", None)
     return instance == expected
 
 
@@ -566,6 +588,7 @@ class _ControlPlaneSite:
         project_id: str,
         repository_id: str,
         launch_mode: _LaunchMode,
+        shared_state_status: SharedStateRestoreStatus,
         shutdown_requested: threading.Event,
     ) -> None:
         self._api = cast(Any, api)
@@ -574,6 +597,7 @@ class _ControlPlaneSite:
         self._csrf = csrf_secret
         self._launch_mode = launch_mode
         self._shutdown_requested = shutdown_requested
+        self._bootstrap_guard = threading.Lock()
         self._instance = json.dumps(
             {
                 "schema_version": 1,
@@ -581,6 +605,7 @@ class _ControlPlaneSite:
                 "project_id": project_id,
                 "repository_id": repository_id,
                 "launch_mode": launch_mode,
+                "shared_state_status": shared_state_status.value,
             },
             allow_nan=False,
             ensure_ascii=False,
@@ -606,6 +631,106 @@ class _ControlPlaneSite:
             separators=(",", ":"),
             sort_keys=True,
         ).encode("utf-8")
+        self._bootstrap_body = json.dumps(
+            {"token": csrf_secret},
+            allow_nan=False,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+
+    async def _browser_bootstrap(self, scope: Scope, receive: Receive, send: Send) -> None:
+        """Consume the in-memory fragment proof once before issuing the HttpOnly cookie."""
+        status = 403
+        accepted = False
+        content = bytearray()
+        expected = b""
+        chunk = b""
+        message: Any = {}
+        signal_error: BaseException | None = None
+        try:
+            headers = scope.get("headers")
+            expected_length = len(self._bootstrap_body)
+            if (
+                scope.get("type") != "http"
+                or scope.get("method") != "POST"
+                or scope.get("scheme") != "http"
+                or scope.get("raw_path") != _BROWSER_BOOTSTRAP_PATH.encode("ascii")
+                or scope.get("query_string") != b""
+                or type(headers) is not list
+            ):
+                raise ValueError
+            hosts = [value for name, value in headers if name.lower() == b"host"]
+            origins = [value for name, value in headers if name.lower() == b"origin"]
+            content_types = [value for name, value in headers if name.lower() == b"content-type"]
+            lengths = [value for name, value in headers if name.lower() == b"content-length"]
+            transfer_encodings = [
+                value for name, value in headers if name.lower() == b"transfer-encoding"
+            ]
+            if (
+                expected_length == 0
+                or hosts != [self._host]
+                or origins != [self._origin.encode("ascii")]
+                or content_types != [b"application/json"]
+                or lengths != [str(expected_length).encode("ascii")]
+                or transfer_encodings
+            ):
+                raise ValueError
+            while True:
+                message = await receive()
+                if message.get("type") != "http.request":
+                    raise ValueError
+                chunk = message.get("body", b"")
+                if type(chunk) is not bytes:
+                    raise ValueError
+                content.extend(chunk)
+                if len(content) > _MAX_SHUTDOWN_BYTES:
+                    raise ValueError
+                if not message.get("more_body", False):
+                    break
+            with self._bootstrap_guard:
+                expected = self._bootstrap_body
+                if not secrets.compare_digest(bytes(content), expected):
+                    raise ValueError
+                self._bootstrap_body = b""
+                accepted = True
+                status = 204
+        except (TypeError, ValueError, UnicodeError):
+            status = 403
+        except BaseException as error:  # noqa: BLE001 - scrub token-bearing cancellation frames
+            error.__traceback__ = None
+            error.__cause__ = None
+            error.__context__ = None
+            signal_error = error
+        finally:
+            if content:
+                content[:] = b"\x00" * len(content)
+            content.clear()
+            expected = b""
+            chunk = b""
+            message = {}
+        if signal_error is not None:
+            caught = signal_error
+            signal_error = None
+            raise caught.with_traceback(None)
+        headers = [
+            (b"content-length", b"0"),
+            (b"cache-control", b"no-store"),
+            (b"x-content-type-options", b"nosniff"),
+            (b"content-security-policy", _CSP.encode("ascii")),
+            (b"referrer-policy", b"no-referrer"),
+            (b"cross-origin-opener-policy", b"same-origin"),
+            (b"cross-origin-resource-policy", b"same-origin"),
+        ]
+        if accepted:
+            headers.append(
+                (
+                    b"set-cookie",
+                    f"intent_csrf={self._csrf}; Path=/; HttpOnly; SameSite=Strict".encode("ascii"),
+                )
+            )
+        await send({"type": "http.response.start", "status": status, "headers": headers})
+        await send({"type": "http.response.body", "body": b""})
 
     async def _shutdown(self, scope: Scope, receive: Receive, send: Send) -> None:
         status = 403
@@ -691,11 +816,12 @@ class _ControlPlaneSite:
         if path == _SHUTDOWN_PATH:
             await self._shutdown(scope, receive, send)
             return
+        if path == _BROWSER_BOOTSTRAP_PATH:
+            await self._browser_bootstrap(scope, receive, send)
+            return
         status = 404
         body = b'{"schema_version":1,"status":"rejected","reason":"request_unavailable"}'
         media_type = b"application/json"
-        trusted = False
-        set_cookie = False
         try:
             headers = scope.get("headers")
             raw_path = scope.get("raw_path")
@@ -714,7 +840,6 @@ class _ControlPlaneSite:
             origins = [value for name, value in headers if name.lower() == b"origin"]
             if hosts != [self._host] or (origins and origins != [self._origin.encode("ascii")]):
                 raise ValueError
-            trusted = True
             asset = (
                 (self._instance, b"application/json")
                 if path == _INSTANCE_PATH
@@ -723,7 +848,6 @@ class _ControlPlaneSite:
             if asset is not None:
                 body, media_type = asset
                 status = 200
-                set_cookie = path != _INSTANCE_PATH
         except (TypeError, ValueError, UnicodeError):
             status = 403
         response_headers = [
@@ -736,13 +860,6 @@ class _ControlPlaneSite:
             (b"cross-origin-opener-policy", b"same-origin"),
             (b"cross-origin-resource-policy", b"same-origin"),
         ]
-        if trusted and set_cookie:
-            response_headers.append(
-                (
-                    b"set-cookie",
-                    f"intent_csrf={self._csrf}; Path=/; HttpOnly; SameSite=Strict".encode("ascii"),
-                )
-            )
         await send({"type": "http.response.start", "status": status, "headers": response_headers})
         await send({"type": "http.response.body", "body": body})
 
@@ -754,6 +871,7 @@ class _ControlPlaneSite:
         self._launch_mode = "legacy"
         self._instance = b""
         self._shutdown_body = b""
+        self._bootstrap_body = b""
         self._shutdown_requested.clear()
         self._assets.clear()
 
@@ -806,6 +924,7 @@ def _start(
     repository_id: str,
     prd: str | None,
     launch_mode: _LaunchMode,
+    shared_state_status: SharedStateRestoreStatus,
 ) -> None:
     """Populate caller-owned lifecycle state before publishing its locator."""
     runtime = started.runtime
@@ -819,7 +938,11 @@ def _start(
     origin = f"http://localhost:{port}"
     started.bootstrap = secrets.token_urlsafe(32)
     instance_id = f"instance:{secrets.token_hex(32)}"
-    started.service = ControlPlaneService(runtime, origin=origin)
+    started.service = ControlPlaneService(
+        runtime,
+        origin=origin,
+        shared_state_status=shared_state_status,
+    )
     if prd is not None and onboarding.state is OnboardingState.REQUIRED:
         started.service.onboard_preview(prd)
     api = build_control_plane_app(
@@ -835,6 +958,7 @@ def _start(
         project_id=runtime.config.project_id,
         repository_id=repository_id,
         launch_mode=launch_mode,
+        shared_state_status=shared_state_status,
         shutdown_requested=started.shutdown_requested,
     )
     configuration = uvicorn.Config(
@@ -865,6 +989,7 @@ def _start(
         repository_id=repository_id,
         origin=origin,
         launch_mode=launch_mode,
+        shared_state_status=shared_state_status,
     )
     if not _probe(started.metadata, repository_id):
         raise _DevUnavailable()
@@ -1041,6 +1166,8 @@ def _run_with_repository_lease(
     no_open: bool,
     status: bool,
     launch_mode: _LaunchMode,
+    offline: bool,
+    inherited_shared_status: SharedStateRestoreStatus | None,
 ) -> None:
     """Recheck and own one process until every repository resource is quiescent."""
     workspace_directory: SecureDirectory | None = None
@@ -1051,7 +1178,24 @@ def _run_with_repository_lease(
     config_bytes = b""
     repository_id = ""
     current: ControlPlaneProcessMetadata | None = None
+    restore = SharedStateRestoreResult(status=SharedStateRestoreStatus.NOT_REQUIRED)
     try:
+        if not status:
+            if inherited_shared_status is not None:
+                marker_status = _untrusted_shared_marker_status(root)
+                if (
+                    inherited_shared_status is SharedStateRestoreStatus.VERIFIED
+                    and marker_status is not SharedStateRestoreStatus.UNAVAILABLE
+                ):
+                    raise _DevUnavailable()
+                if (
+                    inherited_shared_status is SharedStateRestoreStatus.NOT_REQUIRED
+                    and marker_status is not SharedStateRestoreStatus.NOT_REQUIRED
+                ):
+                    raise _DevUnavailable()
+                restore = SharedStateRestoreResult(status=inherited_shared_status)
+            else:
+                restore = _shared_restore(root, refresh_remote=not offline)
         _ensure_workspace(root, None if status else prd_value)
         workspace_directory = project_directory.subdirectory(".intent")
         target = workspace_directory.file(_METADATA_PATH)
@@ -1083,7 +1227,14 @@ def _run_with_repository_lease(
                 raise _DevUnavailable()
             started = _Started(runtime=runtime)
             runtime = None
-            _start(started, target, repository_id, prd_value, launch_mode)
+            _start(
+                started,
+                target,
+                repository_id,
+                prd_value,
+                launch_mode,
+                restore.status,
+            )
         if started.metadata is None:
             raise _DevUnavailable()
         origin = started.metadata.origin
@@ -1101,6 +1252,7 @@ def _run_with_repository_lease(
         origin = ""
         current = None
         repository_id = ""
+        restore = SharedStateRestoreResult(status=SharedStateRestoreStatus.NOT_REQUIRED)
         del config_bytes
         if target is not None:
             target.close()
@@ -1135,18 +1287,68 @@ def _readiness_result(
     )
 
 
-def _shared_restore(root: Path) -> SharedStateRestoreResult:
-    if TRUST_ENVIRONMENT_VARIABLE not in os.environ:
-        return SharedStateRestoreResult(status=SharedStateRestoreStatus.NOT_REQUIRED)
+def _untrusted_shared_marker_status(root: Path) -> SharedStateRestoreStatus:
+    """Detect prior governed state through bounded descriptor-safe marker validation."""
+    project: SecureDirectory | None = None
+    workspace: SecureDirectory | None = None
     try:
+        project = SecureDirectory.open(root)
+        try:
+            os.stat(".intent", dir_fd=project.descriptor, follow_symlinks=False)
+        except FileNotFoundError:
+            return SharedStateRestoreStatus.NOT_REQUIRED
+        workspace = project.subdirectory(".intent")
+        try:
+            os.stat("cache", dir_fd=workspace.descriptor, follow_symlinks=False)
+        except FileNotFoundError:
+            return SharedStateRestoreStatus.NOT_REQUIRED
+        marker = _read_local_marker(workspace)
+        return (
+            SharedStateRestoreStatus.UNAVAILABLE
+            if marker is not None
+            else SharedStateRestoreStatus.NOT_REQUIRED
+        )
+    except (OSError, UnicodeError, ValueError, UnsafePathError):
+        return SharedStateRestoreStatus.INVALID
+    finally:
+        if workspace is not None:
+            workspace.close()
+        if project is not None:
+            project.close()
+
+
+def _shared_restore(root: Path, *, refresh_remote: bool = True) -> SharedStateRestoreResult:
+    marker_status = _untrusted_shared_marker_status(root)
+    if TRUST_ENVIRONMENT_VARIABLE not in os.environ:
+        return SharedStateRestoreResult(status=marker_status)
+    trust = None
+    try:
+        try:
+            trust = EnvironmentTrustProvider().load()
+        except Exception as error:  # noqa: BLE001 - fixed secret-free trust failure boundary
+            error.__traceback__ = None
+            error.__cause__ = None
+            error.__context__ = None
+            return SharedStateRestoreResult(
+                status=(
+                    SharedStateRestoreStatus.UNAVAILABLE
+                    if marker_status is SharedStateRestoreStatus.UNAVAILABLE
+                    else SharedStateRestoreStatus.INVALID
+                )
+            )
+        if trust is None:
+            return SharedStateRestoreResult(status=marker_status)
         result = GitSharedStateRestorer(
-            EnvironmentTrustProvider(),
-            refresh_remote=True,
+            StaticTrustProvider(trust),
+            refresh_remote=refresh_remote,
         ).verify_and_restore_approved_baseline(root)
         if type(result) is SharedStateRestoreResult:
             return result
     except Exception as error:  # noqa: BLE001 - fixed secret-free restore boundary
         error.__traceback__ = None
+        return SharedStateRestoreResult(status=SharedStateRestoreStatus.INVALID)
+    finally:
+        trust = None
     return SharedStateRestoreResult(status=SharedStateRestoreStatus.INVALID)
 
 
@@ -1158,7 +1360,7 @@ def _background_environment() -> dict[str, str]:
     }
 
 
-def _background_argv(root: Path) -> tuple[str, ...]:
+def _background_argv(root: Path, shared_state_status: SharedStateRestoreStatus) -> tuple[str, ...]:
     source_root = Path(__file__).resolve().parents[2]
     return (
         sys.executable,
@@ -1171,6 +1373,8 @@ def _background_argv(root: Path) -> tuple[str, ...]:
         str(root),
         "--no-open",
         "--automatic",
+        "--shared-status",
+        shared_state_status.value,
     )
 
 
@@ -1186,14 +1390,22 @@ def _running_service(root: Path) -> ControlPlaneProcessMetadata | None:
             project_directory.close()
 
 
-def _start_or_reuse_background_service(root: Path) -> bool:
-    if _running_service(root) is not None:
-        return True
+def _start_or_reuse_background_service(
+    root: Path, shared_state_status: SharedStateRestoreStatus
+) -> bool:
+    current = _running_service(root)
+    if current is not None:
+        if current.shared_state_status is shared_state_status:
+            return True
+        if current.launch_mode != "automatic" or not _request_interactive_takeover(
+            current, current.repository_id
+        ):
+            return False
     process: subprocess.Popen[bytes] | None = None
     ready = False
     try:
         process = subprocess.Popen(
-            _background_argv(root),
+            _background_argv(root, shared_state_status),
             cwd="/",
             env=_background_environment(),
             stdin=subprocess.DEVNULL,
@@ -1204,11 +1416,13 @@ def _start_or_reuse_background_service(root: Path) -> bool:
         )
         deadline = time.monotonic() + _STARTUP_TIMEOUT_SECONDS
         while time.monotonic() < deadline:
-            if _running_service(root) is not None:
+            current = _running_service(root)
+            if current is not None and current.shared_state_status is shared_state_status:
                 ready = True
                 return True
             if process.poll() is not None:
-                return _running_service(root) is not None
+                current = _running_service(root)
+                return current is not None and current.shared_state_status is shared_state_status
             time.sleep(0.01)
         return False
     except (OSError, subprocess.SubprocessError):
@@ -1248,7 +1462,7 @@ def _developer_readiness(root: Path, preset: EnsurePreset) -> EnsureResult:
     finally:
         if runtime is not None:
             runtime.close()
-    if not _start_or_reuse_background_service(root):
+    if not _start_or_reuse_background_service(root, restore.status):
         return _readiness_result(EnsureStatus.SHARED_STATE_INVALID, ReadinessTarget.TEAM_STATE)
     if restore.status is SharedStateRestoreStatus.INVALID:
         return _readiness_result(
@@ -1288,13 +1502,19 @@ def dev_command(
     offline: bool = typer.Option(False, "--offline"),
     status: bool = typer.Option(False, "--status"),
     automatic: bool = typer.Option(False, "--automatic", hidden=True),
+    shared_status: SharedStateRestoreStatus | None = typer.Option(
+        None, "--shared-status", hidden=True
+    ),
 ) -> None:
     """Launch or inspect one trusted repository-bound local review process."""
-    del offline  # The process is local-only in both modes; the flag makes that intent explicit.
     root = Path(os.path.abspath(project))
     prd_value = prd.as_posix() if prd is not None else None
     automatic_value = automatic if type(automatic) is bool else False
+    offline_value = offline if type(offline) is bool else False
+    shared_status_value = shared_status if type(shared_status) is SharedStateRestoreStatus else None
     if automatic_value and (not no_open or status or prd_value is not None):
+        _fixed_error()
+    if shared_status_value is not None and not automatic_value:
         _fixed_error()
     launch_mode: _LaunchMode = (
         "automatic" if automatic_value else "manual_headless" if no_open else "interactive"
@@ -1302,9 +1522,16 @@ def dev_command(
     project_directory: SecureDirectory | None = None
     signal_error: BaseException | None = None
     takeover_requested: set[tuple[int, str, str]] = set()
+    desired_shared_status: SharedStateRestoreStatus | None = None
     try:
         if status and not (root / ".intent").exists():
             _fixed_error("not running")
+        if not status:
+            desired_shared_status = shared_status_value
+            if desired_shared_status is None:
+                desired_shared_status = _shared_restore(
+                    root, refresh_remote=not offline_value
+                ).status
         project_directory = SecureDirectory.open(root)
         deadline = time.monotonic() + _STARTUP_TIMEOUT_SECONDS
         while True:
@@ -1313,10 +1540,10 @@ def dev_command(
                 if status:
                     typer.echo(f"intent dev: running at {current.origin}")
                     return
-                if no_open:
-                    typer.echo(f"intent dev: already running at {current.origin}")
-                    return
-                if current.launch_mode != "automatic":
+                if current.shared_state_status is not desired_shared_status:
+                    if current.launch_mode != "automatic":
+                        raise _DevUnavailable()
+                elif no_open or current.launch_mode != "automatic":
                     typer.echo(f"intent dev: already running at {current.origin}")
                     return
                 owner = (current.pid, current.process_start_id, current.instance_id)
@@ -1333,6 +1560,8 @@ def dev_command(
                         no_open=no_open,
                         status=status,
                         launch_mode=launch_mode,
+                        offline=offline_value,
+                        inherited_shared_status=desired_shared_status,
                     )
                     return
             if time.monotonic() >= deadline:
@@ -1363,6 +1592,7 @@ def dev_command(
             project_directory.close()
         project_directory = None
         root = Path()
+        desired_shared_status = None
         takeover_requested.clear()
     if signal_error is not None:
         caught = signal_error

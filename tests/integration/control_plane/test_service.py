@@ -33,6 +33,7 @@ from intent_engineering.control_plane.webauthn_service import (
 from intent_engineering.core.models import (
     ChangeSet,
     EvidenceSide,
+    Graph,
     Node,
     NodeType,
     ProjectConfig,
@@ -46,6 +47,7 @@ from intent_engineering.core.models import (
 )
 from intent_engineering.core.policy.project import initialize_project
 from intent_engineering.intent_workflow.bootstrap import BootstrapService, BootstrapSubmission
+from intent_engineering.intent_workflow.check import SharedStateRestoreStatus
 from intent_engineering.intent_workflow.clarification import (
     ClarificationCoordinator,
     ProposalConfirmationPreview,
@@ -62,6 +64,7 @@ from intent_engineering.reconcile.service import transition_case
 from intent_engineering.storage.executor import LocalChangeSetExecutor
 from intent_engineering.storage.jsonl.approval_store import JsonlApprovalStore
 from tests.e2e.test_cli_write_approval import _approval_project
+from tests.helpers.readiness import apply_baseline
 from tests.unit.mutations.test_planner import base_plan
 
 NOW = datetime(2026, 8, 30, 12, 0, tzinfo=UTC)
@@ -166,6 +169,7 @@ def _harness(
     *,
     actor: str = "local:owner",
     aliases: tuple[str, ...] = (),
+    shared_state_status: SharedStateRestoreStatus = SharedStateRestoreStatus.NOT_REQUIRED,
 ) -> _Harness:
     project = tmp_path / "project"
     project.mkdir()
@@ -200,6 +204,7 @@ def _harness(
         clock=lambda: NOW,
         challenge_source=lambda: bytes([next(nonce)]) * 32,
         webauthn_verifier=verifier,
+        shared_state_status=shared_state_status,
     )
     assert runtime.webauthn_credentials.put(
         CredentialRecord(
@@ -214,6 +219,65 @@ def _harness(
         )
     )
     return _Harness(runtime, service, verifier, project)
+
+
+@pytest.mark.parametrize(
+    ("shared_status", "visible_status", "route"),
+    [
+        (SharedStateRestoreStatus.INVALID, "shared_state_invalid", "team_state"),
+        (SharedStateRestoreStatus.UPGRADE_REQUIRED, "upgrade_required", "team_state"),
+        (SharedStateRestoreStatus.DIVERGED, "human_attention_required", "team_state"),
+        (SharedStateRestoreStatus.STALE, "offline_stale", "team_state"),
+        (SharedStateRestoreStatus.UNAVAILABLE, "offline_stale", "team_state"),
+    ],
+)
+def test_service_preserves_exact_shared_state_health_in_its_visible_projection(
+    tmp_path: Path,
+    shared_status: SharedStateRestoreStatus,
+    visible_status: str,
+    route: str,
+) -> None:
+    """Catches the running UI downgrading governed state to local-only readiness."""
+    harness = _harness(tmp_path, shared_state_status=shared_status)
+    try:
+        result = harness.service.status()
+        assert result["status"] == visible_status
+        assert result["attention_route"] == route
+    finally:
+        harness.service.close()
+        harness.runtime.close()
+
+
+def test_service_projects_a_verified_shared_baseline_as_ready(tmp_path: Path) -> None:
+    """Catches verified shared health being downgraded to local-only after local validation."""
+    harness = _harness(tmp_path, shared_state_status=SharedStateRestoreStatus.VERIFIED)
+    try:
+        apply_baseline(
+            harness.runtime,
+            Graph(
+                id="graph:shared-service",
+                version=1,
+                nodes=(
+                    Node(
+                        id="intent:shared-service",
+                        type=NodeType.PRODUCT_INTENT,
+                        label="Preserve verified shared readiness",
+                        status="active",
+                        created_by="local:owner",
+                        created_at=NOW,
+                        last_modified_by="local:owner",
+                        last_modified_at=NOW,
+                    ),
+                ),
+                edges=(),
+            ),
+        )
+        result = harness.service.status()
+        assert result["status"] == "ready"
+        assert result["attention_route"] == "home"
+    finally:
+        harness.service.close()
+        harness.runtime.close()
 
 
 def _preview_digest(preview: dict[str, object]) -> str:

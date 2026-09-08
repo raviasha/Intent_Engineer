@@ -434,7 +434,6 @@ class _StrictLoopbackMiddleware:
         state: dict[str, object] | None = None
         secured_send: Send | None = None
         signal: BaseException | None = None
-        trusted = False
         failure_status: int | None = None
         try:
             headers, length = _validate_scope_and_headers(
@@ -443,7 +442,6 @@ class _StrictLoopbackMiddleware:
                 expected_origin=self._expected_origin,
                 csrf_secret=self._csrf_bytes,
             )
-            trusted = True
             body = await _read_body(receive, length)
             if scope["method"] == "GET" and body:
                 raise _HttpBoundaryError(400)
@@ -458,7 +456,7 @@ class _StrictLoopbackMiddleware:
             if _BODY_STATE_KEY in state:
                 raise _HttpBoundaryError(400)
             state[_BODY_STATE_KEY] = body
-            secured_send = _secure_sender(send, self._csrf_secret, set_cookie=True)
+            secured_send = _secure_sender(send, self._csrf_secret, set_cookie=False)
             await self._app(scope, _empty_receive, secured_send)
         except _HttpBoundaryError as error:
             failure_status = error.status_code
@@ -488,7 +486,7 @@ class _StrictLoopbackMiddleware:
             error_send = _secure_sender(
                 downstream_send,
                 self._csrf_secret,
-                set_cookie=trusted,
+                set_cookie=False,
             )
             error_signal: BaseException | None = None
             try:
