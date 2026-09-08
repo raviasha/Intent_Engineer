@@ -11,7 +11,6 @@ import json
 import os
 import re
 import secrets
-import signal
 import socket
 import subprocess
 import sys
@@ -82,6 +81,8 @@ _STARTUP_TIMEOUT_SECONDS = 10.0
 _PROBE_TIMEOUT_SECONDS = 1.0
 _MAX_PROCESS_INSPECTION_BYTES = 1_048_576
 _INSTANCE_PATH = "/_intent/dev/instance"
+_SHUTDOWN_PATH = "/_intent/dev/shutdown"
+_MAX_SHUTDOWN_BYTES = 1024
 _PROCESS_DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _INSTANCE_ID = re.compile(r"instance:[0-9a-f]{64}\Z")
 _REPOSITORY_ID = re.compile(r"repo:sha256:[0-9a-f]{64}\Z")
@@ -98,6 +99,7 @@ _BACKGROUND_ENTRYPOINT = (
     "sys.path.insert(0,sys.argv.pop(1));"
     "runpy.run_module('intent_engineering.cli.app',run_name='__main__')"
 )
+_LaunchMode = Literal["automatic", "manual_headless", "interactive", "legacy"]
 
 
 def _reset_repository_locks_after_fork() -> None:
@@ -122,6 +124,7 @@ class ControlPlaneProcessMetadata(StrictModel):
     project_id: str
     repository_id: str
     origin: str
+    launch_mode: _LaunchMode = "legacy"
 
     @field_validator("process_start_id")
     @classmethod
@@ -210,6 +213,7 @@ class _Started:
     failures: list[BaseException] = field(default_factory=list)
     service: ControlPlaneService | None = None
     site: _ControlPlaneSite | None = None
+    shutdown_requested: threading.Event = field(default_factory=threading.Event)
 
 
 def _strict_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -396,12 +400,35 @@ def _probe(metadata: ControlPlaneProcessMetadata, expected_repository_id: str) -
     ):
         return False
     instance = _probe_json(metadata, _INSTANCE_PATH, 1024)
-    return instance == {
+    expected = {
         "schema_version": 1,
         "instance_id": metadata.instance_id,
         "project_id": metadata.project_id,
         "repository_id": expected_repository_id,
+        "launch_mode": metadata.launch_mode,
     }
+    if instance == expected:
+        return True
+    if metadata.launch_mode != "legacy":
+        return False
+    expected.pop("launch_mode")
+    return instance == expected
+
+
+def _shutdown_payload(metadata: ControlPlaneProcessMetadata) -> bytes:
+    return json.dumps(
+        {
+            "schema_version": 1,
+            "instance_id": metadata.instance_id,
+            "project_id": metadata.project_id,
+            "repository_id": metadata.repository_id,
+            "launch_mode": "automatic",
+        },
+        allow_nan=False,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
 
 
 def _remove_exact_metadata(target: SecureFile, expected: bytes) -> None:
@@ -538,17 +565,22 @@ class _ControlPlaneSite:
         instance_id: str,
         project_id: str,
         repository_id: str,
+        launch_mode: _LaunchMode,
+        shutdown_requested: threading.Event,
     ) -> None:
         self._api = cast(Any, api)
         self._origin = origin
         self._host = origin.removeprefix("http://").encode("ascii")
         self._csrf = csrf_secret
+        self._launch_mode = launch_mode
+        self._shutdown_requested = shutdown_requested
         self._instance = json.dumps(
             {
                 "schema_version": 1,
                 "instance_id": instance_id,
                 "project_id": project_id,
                 "repository_id": repository_id,
+                "launch_mode": launch_mode,
             },
             allow_nan=False,
             ensure_ascii=False,
@@ -561,6 +593,92 @@ class _ControlPlaneSite:
             "/app.js": (control_plane_asset("app.js"), b"text/javascript; charset=utf-8"),
             "/styles.css": (control_plane_asset("styles.css"), b"text/css; charset=utf-8"),
         }
+        self._shutdown_body = json.dumps(
+            {
+                "schema_version": 1,
+                "instance_id": instance_id,
+                "project_id": project_id,
+                "repository_id": repository_id,
+                "launch_mode": "automatic",
+            },
+            allow_nan=False,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+
+    async def _shutdown(self, scope: Scope, receive: Receive, send: Send) -> None:
+        status = 403
+        body = b'{"schema_version":1,"status":"rejected"}'
+        accepted = False
+        content = bytearray()
+        try:
+            headers = scope.get("headers")
+            raw_path = scope.get("raw_path")
+            if (
+                self._launch_mode != "automatic"
+                or scope.get("type") != "http"
+                or scope.get("method") != "POST"
+                or scope.get("scheme") != "http"
+                or raw_path != _SHUTDOWN_PATH.encode("ascii")
+                or scope.get("query_string") != b""
+                or type(headers) is not list
+            ):
+                raise ValueError
+            hosts = [value for name, value in headers if name.lower() == b"host"]
+            origins = [value for name, value in headers if name.lower() == b"origin"]
+            content_types = [value for name, value in headers if name.lower() == b"content-type"]
+            lengths = [value for name, value in headers if name.lower() == b"content-length"]
+            if (
+                hosts != [self._host]
+                or origins != [self._origin.encode("ascii")]
+                or content_types != [b"application/json"]
+                or lengths != [str(len(self._shutdown_body)).encode("ascii")]
+            ):
+                raise ValueError
+            while True:
+                message = await receive()
+                if message.get("type") != "http.request":
+                    raise ValueError
+                chunk = message.get("body", b"")
+                if type(chunk) is not bytes:
+                    raise ValueError
+                content.extend(chunk)
+                if len(content) > _MAX_SHUTDOWN_BYTES:
+                    raise ValueError
+                if not message.get("more_body", False):
+                    break
+            if bytes(content) != self._shutdown_body:
+                raise ValueError
+            status = 202
+            body = json.dumps(
+                {
+                    "schema_version": 1,
+                    "status": "stopping",
+                    "instance_id": json.loads(self._shutdown_body)["instance_id"],
+                },
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+            accepted = True
+        except (TypeError, ValueError, UnicodeError):
+            status = 403
+        finally:
+            content.clear()
+        await send(
+            {
+                "type": "http.response.start",
+                "status": status,
+                "headers": [
+                    (b"content-type", b"application/json"),
+                    (b"content-length", str(len(body)).encode("ascii")),
+                    (b"cache-control", b"no-store"),
+                ],
+            }
+        )
+        await send({"type": "http.response.body", "body": body})
+        if accepted:
+            self._shutdown_requested.set()
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if type(scope) is dict and scope.get("type") == "lifespan":
@@ -569,6 +687,9 @@ class _ControlPlaneSite:
         path = scope.get("path") if type(scope) is dict else None
         if type(path) is str and path.startswith("/api/"):
             await self._api(scope, receive, send)
+            return
+        if path == _SHUTDOWN_PATH:
+            await self._shutdown(scope, receive, send)
             return
         status = 404
         body = b'{"schema_version":1,"status":"rejected","reason":"request_unavailable"}'
@@ -630,7 +751,10 @@ class _ControlPlaneSite:
         self._origin = ""
         self._host = b""
         self._csrf = ""
+        self._launch_mode = "legacy"
         self._instance = b""
+        self._shutdown_body = b""
+        self._shutdown_requested.clear()
         self._assets.clear()
 
 
@@ -681,6 +805,7 @@ def _start(
     target: SecureFile,
     repository_id: str,
     prd: str | None,
+    launch_mode: _LaunchMode,
 ) -> None:
     """Populate caller-owned lifecycle state before publishing its locator."""
     runtime = started.runtime
@@ -709,6 +834,8 @@ def _start(
         instance_id=instance_id,
         project_id=runtime.config.project_id,
         repository_id=repository_id,
+        launch_mode=launch_mode,
+        shutdown_requested=started.shutdown_requested,
     )
     configuration = uvicorn.Config(
         started.site,
@@ -737,6 +864,7 @@ def _start(
         project_id=runtime.config.project_id,
         repository_id=repository_id,
         origin=origin,
+        launch_mode=launch_mode,
     )
     if not _probe(started.metadata, repository_id):
         raise _DevUnavailable()
@@ -778,6 +906,7 @@ def _shutdown_started_locked(started: _Started, target: SecureFile) -> None:
     started.server = None
     started.thread = None
     started.failures.clear()
+    started.shutdown_requested.clear()
 
 
 def _wait_for_exit(started: _Started) -> None:
@@ -788,6 +917,8 @@ def _wait_for_exit(started: _Started) -> None:
         raise _DevUnavailable()
     try:
         while thread.is_alive():
+            if started.shutdown_requested.is_set():
+                server.should_exit = True
             thread.join(timeout=0.25)
         if started.failures:
             failure = started.failures.pop(0)
@@ -856,17 +987,50 @@ def _request_interactive_takeover(
     expected_repository_id: str,
 ) -> bool:
     """Ask one freshly re-attested owner to release its repository lifecycle lease."""
-    if metadata.pid == os.getpid():
+    if metadata.launch_mode != "automatic" or metadata.pid == os.getpid():
         return False
     if not _probe(metadata, expected_repository_id):
         return True
+    parsed = urlsplit(metadata.origin)
+    connection: http.client.HTTPConnection | None = None
+    content = b""
+    body = _shutdown_payload(metadata)
+    payload: object = None
     try:
-        os.kill(metadata.pid, signal.SIGINT)
-    except ProcessLookupError:
-        return True
-    except (OSError, ValueError):
+        connection = http.client.HTTPConnection(
+            "127.0.0.1",
+            cast(int, parsed.port),
+            timeout=_PROBE_TIMEOUT_SECONDS,
+        )
+        connection.request(
+            "POST",
+            _SHUTDOWN_PATH,
+            body=body,
+            headers={
+                "Host": parsed.netloc,
+                "Origin": metadata.origin,
+                "Content-Type": "application/json",
+                "Content-Length": str(len(body)),
+                "Accept": "application/json",
+            },
+        )
+        response = connection.getresponse()
+        content = response.read(_MAX_SHUTDOWN_BYTES + 1)
+        if response.status != 202 or len(content) > _MAX_SHUTDOWN_BYTES:
+            return False
+        payload = json.loads(content, object_pairs_hook=_strict_json_object)
+        return payload == {
+            "schema_version": 1,
+            "status": "stopping",
+            "instance_id": metadata.instance_id,
+        }
+    except (OSError, http.client.HTTPException, json.JSONDecodeError, ValueError):
         return False
-    return True
+    finally:
+        body = content = b""
+        payload = None
+        if connection is not None:
+            connection.close()
 
 
 def _run_with_repository_lease(
@@ -876,6 +1040,7 @@ def _run_with_repository_lease(
     prd_value: str | None,
     no_open: bool,
     status: bool,
+    launch_mode: _LaunchMode,
 ) -> None:
     """Recheck and own one process until every repository resource is quiescent."""
     workspace_directory: SecureDirectory | None = None
@@ -918,7 +1083,7 @@ def _run_with_repository_lease(
                 raise _DevUnavailable()
             started = _Started(runtime=runtime)
             runtime = None
-            _start(started, target, repository_id, prd_value)
+            _start(started, target, repository_id, prd_value, launch_mode)
         if started.metadata is None:
             raise _DevUnavailable()
         origin = started.metadata.origin
@@ -1005,6 +1170,7 @@ def _background_argv(root: Path) -> tuple[str, ...]:
         "--project",
         str(root),
         "--no-open",
+        "--automatic",
     )
 
 
@@ -1121,11 +1287,18 @@ def dev_command(
     no_open: bool = typer.Option(False, "--no-open"),
     offline: bool = typer.Option(False, "--offline"),
     status: bool = typer.Option(False, "--status"),
+    automatic: bool = typer.Option(False, "--automatic", hidden=True),
 ) -> None:
     """Launch or inspect one trusted repository-bound local review process."""
     del offline  # The process is local-only in both modes; the flag makes that intent explicit.
     root = Path(os.path.abspath(project))
     prd_value = prd.as_posix() if prd is not None else None
+    automatic_value = automatic if type(automatic) is bool else False
+    if automatic_value and (not no_open or status or prd_value is not None):
+        _fixed_error()
+    launch_mode: _LaunchMode = (
+        "automatic" if automatic_value else "manual_headless" if no_open else "interactive"
+    )
     project_directory: SecureDirectory | None = None
     signal_error: BaseException | None = None
     takeover_requested: set[tuple[int, str, str]] = set()
@@ -1143,6 +1316,9 @@ def dev_command(
                 if no_open:
                     typer.echo(f"intent dev: already running at {current.origin}")
                     return
+                if current.launch_mode != "automatic":
+                    typer.echo(f"intent dev: already running at {current.origin}")
+                    return
                 owner = (current.pid, current.process_start_id, current.instance_id)
                 if owner not in takeover_requested:
                     if not _request_interactive_takeover(current, current.repository_id):
@@ -1156,6 +1332,7 @@ def dev_command(
                         prd_value=prd_value,
                         no_open=no_open,
                         status=status,
+                        launch_mode=launch_mode,
                     )
                     return
             if time.monotonic() >= deadline:

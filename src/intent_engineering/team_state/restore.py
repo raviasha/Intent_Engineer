@@ -20,6 +20,7 @@ import selectors
 import signal
 import stat
 import subprocess
+import sys
 import tempfile
 import time
 from collections.abc import Callable, Mapping
@@ -105,6 +106,7 @@ _GIT_EXECUTABLE = Path("/usr/bin/git")
 _FETCH_ENVIRONMENT: Mapping[str, str] = {
     "GIT_ASKPASS": "/usr/bin/false",
     "GIT_CONFIG_GLOBAL": "/dev/null",
+    "GIT_CONFIG_SYSTEM": "/dev/null",
     "GIT_CONFIG_NOSYSTEM": "1",
     "GIT_NO_REPLACE_OBJECTS": "1",
     "GIT_OPTIONAL_LOCKS": "0",
@@ -114,6 +116,55 @@ _FETCH_ENVIRONMENT: Mapping[str, str] = {
     "PATH": "/usr/bin:/bin",
     "SSH_ASKPASS": "/usr/bin/false",
 }
+_FETCH_SUPERVISOR = (
+    "import os,subprocess,sys,time;"
+    "fd=int(sys.argv[1]);"
+    "child=subprocess.Popen(sys.argv[2:],stdin=subprocess.DEVNULL);"
+    "code=child.wait();"
+    "os.write(fd,(str(code)+'\\n').encode('ascii'));"
+    "os.close(fd);"
+    "time.sleep(3600)"
+)
+_FETCH_GIT_OPTIONS = (
+    "--no-pager",
+    "--no-replace-objects",
+    "-c",
+    "core.askPass=",
+    "-c",
+    "core.fsmonitor=false",
+    "-c",
+    "core.hooksPath=/dev/null",
+    "-c",
+    "core.sshCommand=/usr/bin/false",
+    "-c",
+    "credential.helper=",
+    "-c",
+    "credential.interactive=never",
+    "-c",
+    "fetch.fsckObjects=true",
+    "-c",
+    "gc.auto=0",
+    "-c",
+    "http.extraHeader=",
+    "-c",
+    "http.proxy=",
+    "-c",
+    "https.proxy=",
+    "-c",
+    "protocol.allow=never",
+    "-c",
+    "protocol.ext.allow=never",
+    "-c",
+    "protocol.file.allow=never",
+    "-c",
+    "protocol.git.allow=never",
+    "-c",
+    "protocol.ssh.allow=never",
+    "-c",
+    "protocol.https.allow=always",
+    "-c",
+    "submodule.recurse=false",
+)
 _GIT_COMMIT = re.compile(r"^[0-9a-f]{40}(?:[0-9a-f]{24})?$")
 
 
@@ -730,58 +781,41 @@ def _git_executable_token() -> tuple[int, int, int, int, str]:
 
 
 def _stop_fetch_process(process: subprocess.Popen[bytes]) -> None:
+    if process.poll() is not None:
+        return
     try:
         os.killpg(process.pid, signal.SIGKILL)
     except (PermissionError, ProcessLookupError):
-        try:
-            process.kill()
-        except ProcessLookupError:
-            pass
+        return
     try:
         process.wait(timeout=1)
     except subprocess.TimeoutExpired:
         pass
 
 
-def _refresh_state_ref(root: Path) -> None:
-    """Fetch only the protected state branch through one opaque bounded Git boundary."""
+def _run_bounded_fetch_git(arguments: tuple[str, ...]) -> None:
+    """Run pinned Git below a live group leader retained until bounded cleanup."""
     process: subprocess.Popen[bytes] | None = None
     selector = selectors.DefaultSelector()
     git_token: tuple[int, int, int, int, str] | None = None
+    status_read = -1
+    status_write = -1
+    status = bytearray()
     try:
         git_token = _git_executable_token()
+        status_read, status_write = os.pipe()
+        os.set_inheritable(status_read, False)
+        os.set_inheritable(status_write, True)
         argv = (
+            sys.executable,
+            "-I",
+            "-S",
+            "-c",
+            _FETCH_SUPERVISOR,
+            str(status_write),
             str(_GIT_EXECUTABLE),
-            "--no-pager",
-            "--no-replace-objects",
-            "-c",
-            "core.askPass=",
-            "-c",
-            "core.fsmonitor=false",
-            "-c",
-            "core.hooksPath=/dev/null",
-            "-c",
-            "credential.helper=",
-            "-c",
-            "credential.interactive=never",
-            "-c",
-            "fetch.fsckObjects=true",
-            "-c",
-            "gc.auto=0",
-            "-c",
-            "protocol.ext.allow=never",
-            "-c",
-            "submodule.recurse=false",
-            "-C",
-            str(root),
-            "fetch",
-            "--force",
-            "--no-tags",
-            "--no-recurse-submodules",
-            "--no-write-fetch-head",
-            "--quiet",
-            "origin",
-            "refs/heads/intent-state:refs/remotes/origin/intent-state",
+            *_FETCH_GIT_OPTIONS,
+            *arguments,
         )
         process = subprocess.Popen(
             argv,
@@ -791,14 +825,18 @@ def _refresh_state_ref(root: Path) -> None:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             close_fds=True,
+            pass_fds=(status_write,),
             start_new_session=True,
             shell=False,
             bufsize=0,
         )
         assert process.stdout is not None
         assert process.stderr is not None
+        os.close(status_write)
+        status_write = -1
         selector.register(process.stdout, selectors.EVENT_READ)
         selector.register(process.stderr, selectors.EVENT_READ)
+        selector.register(status_read, selectors.EVENT_READ)
         total = 0
         deadline = time.monotonic() + _FETCH_TIMEOUT_SECONDS
         while selector.get_map():
@@ -815,11 +853,18 @@ def _refresh_state_ref(root: Path) -> None:
                 if not chunk:
                     selector.unregister(key.fileobj)
                     continue
+                if descriptor == status_read:
+                    status.extend(chunk)
+                    if len(status) > 16 or b"\n" not in status:
+                        if len(status) > 16:
+                            raise ValueError("shared-state fetch unavailable")
+                        continue
+                    _stop_fetch_process(process)
+                    continue
                 total += len(chunk)
                 if total > MAX_FETCH_OUTPUT_BYTES:
                     raise ValueError("shared-state fetch unavailable")
-        remaining = deadline - time.monotonic()
-        if remaining <= 0 or process.wait(timeout=remaining) != 0:
+        if bytes(status) != b"0\n":
             raise ValueError("shared-state fetch unavailable")
         if _git_executable_token() != git_token:
             raise ValueError("shared-state fetch unavailable")
@@ -828,6 +873,11 @@ def _refresh_state_ref(root: Path) -> None:
         raise _Unavailable("shared-state ref unavailable") from None
     finally:
         selector.close()
+        status.clear()
+        if status_write >= 0:
+            os.close(status_write)
+        if status_read >= 0:
+            os.close(status_read)
         if process is not None:
             if process.stdout is not None:
                 process.stdout.close()
@@ -837,6 +887,52 @@ def _refresh_state_ref(root: Path) -> None:
                 _stop_fetch_process(process)
         process = None
         git_token = None
+
+
+def _trusted_github_url(repository_id: str) -> str:
+    matched = re.fullmatch(
+        r"github\.com/([A-Za-z0-9](?:[A-Za-z0-9-]{0,38}))/([A-Za-z0-9][A-Za-z0-9_.-]{0,99})",
+        repository_id,
+    )
+    if matched is None or matched.group(2) in {".", ".."} or matched.group(2).endswith(".git"):
+        raise _Unavailable("shared-state ref unavailable")
+    owner, repository = matched.groups()
+    return f"https://github.com/{owner}/{repository}.git"
+
+
+def _refresh_state_ref(repository_id: str) -> _GitRefReader:
+    """Fetch the protected ref in a clean repository derived only from trusted identity."""
+    temporary: tempfile.TemporaryDirectory[str] | None = None
+    try:
+        transport = _trusted_github_url(repository_id)
+        temporary = tempfile.TemporaryDirectory(prefix="intent-state-fetch-")
+        root = Path(temporary.name)
+        _run_bounded_fetch_git(("init", "--bare", "--quiet", str(root)))
+        _run_bounded_fetch_git(
+            (
+                "-C",
+                str(root),
+                "fetch",
+                "--force",
+                "--no-tags",
+                "--no-recurse-submodules",
+                "--no-write-fetch-head",
+                "--quiet",
+                transport,
+                "refs/heads/intent-state:refs/remotes/origin/intent-state",
+            )
+        )
+        reader = _GitRefReader(root, temporary=temporary)
+        temporary = None
+        return reader
+    except _Unavailable:
+        raise
+    except (OSError, subprocess.SubprocessError, TimeoutError, ValueError) as error:
+        error.__traceback__ = None
+        raise _Unavailable("shared-state ref unavailable") from None
+    finally:
+        if temporary is not None:
+            temporary.cleanup()
 
 
 def _origin_repository(repo: Path) -> str:
@@ -857,8 +953,20 @@ def _origin_repository(repo: Path) -> str:
 
 
 class _GitRefReader:
-    def __init__(self, root: Path) -> None:
+    def __init__(
+        self,
+        root: Path,
+        *,
+        temporary: tempfile.TemporaryDirectory[str] | None = None,
+    ) -> None:
         self._root = root
+        self._temporary = temporary
+
+    def close(self) -> None:
+        temporary = self._temporary
+        self._temporary = None
+        if temporary is not None:
+            temporary.cleanup()
 
     def commit(self) -> str:
         try:
@@ -2109,6 +2217,7 @@ class GitSharedStateRestorer:
         staged_workspace: SecureDirectory | None = None
         state: _PinnedState | None = None
         trust: SharedStateTrust | None = None
+        reader: _GitRefReader | None = None
         files: dict[str, bytes] = {}
         baseline_files: dict[str, bytes] = {}
         try:
@@ -2125,11 +2234,12 @@ class GitSharedStateRestorer:
                 pass
             else:
                 workspace = project.subdirectory(".intent")
-            if _origin_repository(root) != trust.repository_id:
-                raise ValueError("repository identity mismatch")
             if self._refresh_remote:
-                _refresh_state_ref(root)
-            reader = _GitRefReader(root)
+                reader = _refresh_state_ref(trust.repository_id)
+            else:
+                if _origin_repository(root) != trust.repository_id:
+                    raise ValueError("repository identity mismatch")
+                reader = _GitRefReader(root)
             commit = reader.commit()
             now = self._clock()
             if now.tzinfo is None or now.utcoffset() != timedelta(0):
@@ -2210,6 +2320,8 @@ class GitSharedStateRestorer:
                 workspace.close()
             if project is not None:
                 project.close()
+            if reader is not None:
+                reader.close()
 
 
 __all__ = [

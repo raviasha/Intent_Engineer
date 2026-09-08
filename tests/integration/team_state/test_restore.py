@@ -8,6 +8,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import time
 from dataclasses import replace
 from pathlib import Path
@@ -87,10 +88,16 @@ def test_opted_in_restore_refreshes_the_fixed_remote_ref_before_verification(
     second_commit = install_state_ref(target, second, parent=first_commit)
     git(target, "update-ref", restore_module.STATE_REF, first_commit)
     refreshed: list[Path] = []
+    fetched = tmp_path / "fetched-state.git"
+    fetched.mkdir()
+    git(fetched, "init", "--bare", "--quiet")
+    git(fetched, "fetch", "--quiet", str(target), second_commit)
+    git(fetched, "update-ref", restore_module.STATE_REF, second_commit)
 
-    def refresh(root: Path) -> None:
-        refreshed.append(root)
-        git(root, "update-ref", restore_module.STATE_REF, second_commit)
+    def refresh(repository_id: str) -> restore_module._GitRefReader:
+        assert repository_id == trust.repository_id
+        refreshed.append(fetched)
+        return restore_module._GitRefReader(fetched)
 
     monkeypatch.setattr(restore_module, "_refresh_state_ref", refresh, raising=False)
 
@@ -100,10 +107,11 @@ def test_opted_in_restore_refreshes_the_fixed_remote_ref_before_verification(
     ).verify_and_restore_approved_baseline(target)
 
     assert result.status is SharedStateRestoreStatus.VERIFIED
-    assert refreshed == [target]
+    assert refreshed == [fetched]
     marker = json.loads((target / ".intent/cache/shared-state.json").read_bytes())
     assert marker["graph_version"] == 1
     assert marker["ref_commit"] == second_commit
+    assert git(target, "rev-parse", restore_module.STATE_REF).decode().strip() == first_commit
 
 
 def test_opted_in_restore_maps_offline_or_absent_fixed_ref_to_unavailable(
@@ -115,7 +123,7 @@ def test_opted_in_restore_maps_offline_or_absent_fixed_ref_to_unavailable(
     _recipient, _signer, trust = keys()
     marker = "PRIVATE-FETCH-FAILURE-8197"
 
-    def unavailable(_root: Path) -> None:
+    def unavailable(_repository_id: str) -> restore_module._GitRefReader:
         raise restore_module._Unavailable(marker)
 
     monkeypatch.setattr(restore_module, "_refresh_state_ref", unavailable, raising=False)
@@ -144,7 +152,7 @@ def test_fixed_ref_fetch_is_argv_only_bounded_and_credential_free(
     timeout: float,
 ) -> None:
     """Catches prompt-time fetch using shell/config credentials or unbounded child work."""
-    target = init_repository(tmp_path / "target" / "project")
+    init_repository(tmp_path / "target" / "project")
     original_popen = subprocess.Popen
     calls: dict[str, object] = {}
     marker = "PRIVATE-FETCH-CREDENTIAL-8197"
@@ -165,22 +173,187 @@ def test_fixed_ref_fetch_is_argv_only_bounded_and_credential_free(
     started = time.monotonic()
 
     with pytest.raises(restore_module._Unavailable):
-        restore_module._refresh_state_ref(target)
+        restore_module._refresh_state_ref("github.com/committer/repository")
 
     assert time.monotonic() - started < 1
     argv = calls["argv"]
     kwargs = calls["kwargs"]
     assert type(argv) is tuple
     assert type(kwargs) is dict
-    assert argv[0] == "/usr/bin/git"
-    assert argv[-2:] == (
-        "origin",
-        "refs/heads/intent-state:refs/remotes/origin/intent-state",
+    assert argv[:5] == (
+        sys.executable,
+        "-I",
+        "-S",
+        "-c",
+        restore_module._FETCH_SUPERVISOR,
     )
     assert kwargs["shell"] is False
     assert kwargs["start_new_session"] is True
     assert kwargs["stdin"] is subprocess.DEVNULL
+    assert "protocol.allow=never" in argv
+    assert "protocol.https.allow=always" in argv
+    assert "protocol.ssh.allow=never" in argv
+    assert "protocol.ext.allow=never" in argv
+    assert "protocol.file.allow=never" in argv
+    assert "credential.helper=" in argv
+    assert "core.sshCommand=/usr/bin/false" in argv
+    assert kwargs["env"] == dict(restore_module._FETCH_ENVIRONMENT)
     assert marker not in repr(argv) + repr(kwargs)
+
+
+def test_refresh_uses_only_the_trust_derived_https_target(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catches remote names, local paths, or rewriteable transports entering fetch argv."""
+    calls: list[tuple[str, ...]] = []
+
+    def run(arguments: tuple[str, ...]) -> None:
+        calls.append(arguments)
+
+    monkeypatch.setattr(restore_module, "_run_bounded_fetch_git", run)
+    reader = restore_module._refresh_state_ref("github.com/committer/repository")
+    try:
+        assert len(calls) == 2
+        assert calls[1][-2:] == (
+            "https://github.com/committer/repository.git",
+            "refs/heads/intent-state:refs/remotes/origin/intent-state",
+        )
+        assert "origin" not in calls[1]
+        assert all(not item.startswith(("ssh:", "ext:", "file:", "git:")) for item in calls[1])
+    finally:
+        reader.close()
+
+
+@pytest.mark.parametrize(
+    "repository_id",
+    (
+        "gitlab.com/committer/repository",
+        "GITHUB.com/committer/repository",
+        "github.com/committer/repository.git",
+        "github.com/../repository",
+        "github.com/committer/repository?transport=ssh",
+    ),
+)
+def test_refresh_rejects_noncanonical_transport_identities(repository_id: str) -> None:
+    with pytest.raises(restore_module._Unavailable):
+        restore_module._refresh_state_ref(repository_id)
+
+
+def test_fetch_supervisor_reports_success_before_terminating_its_owned_group(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "clean.git"
+
+    restore_module._run_bounded_fetch_git(("init", "--bare", "--quiet", str(target)))
+
+    assert (target / "HEAD").is_file()
+
+
+def test_fetch_supervisor_kills_same_group_helper_after_git_leader_exits(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    marker = tmp_path / "helper-survived"
+    fake_git = tmp_path / "fake-git"
+    fake_git.write_text(
+        f"#!/bin/sh\n(sleep 0.4; /usr/bin/touch '{marker}') &\nexit 1\n",
+        encoding="utf-8",
+    )
+    fake_git.chmod(0o700)
+    monkeypatch.setattr(restore_module, "_GIT_EXECUTABLE", fake_git)
+    monkeypatch.setattr(
+        restore_module,
+        "_git_executable_token",
+        lambda: (1, 2, 3, 4, "a" * 64),
+    )
+
+    with pytest.raises(restore_module._Unavailable):
+        restore_module._run_bounded_fetch_git(("fetch",))
+    time.sleep(0.6)
+
+    assert not marker.exists()
+
+
+@pytest.mark.parametrize(
+    "hostile_configuration",
+    (
+        "core.sshCommand",
+        "url.ext.insteadOf",
+        "url.ssh.insteadOf",
+        "url.file.insteadOf",
+        "credential.helper",
+        "core.gitProxy",
+        "include.path",
+    ),
+)
+def test_refresh_never_loads_repository_local_transport_configuration(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    hostile_configuration: str,
+) -> None:
+    """Catches a prompt-time refresh executing commands selected by local Git config."""
+    target = init_repository(tmp_path / "target" / "project")
+    marker = tmp_path / f"executed-{hostile_configuration.replace('.', '-')}"
+    helper = tmp_path / "hostile-helper"
+    helper.write_text(f"#!/bin/sh\n/usr/bin/touch '{marker}'\nexit 1\n", encoding="utf-8")
+    helper.chmod(0o700)
+    included = tmp_path / "included.gitconfig"
+    included.write_text(
+        f'[url "ext::{helper}"]\n\tinsteadOf = https://github.com/\n',
+        encoding="utf-8",
+    )
+    if hostile_configuration == "core.sshCommand":
+        git(target, "remote", "set-url", "origin", "ssh://github.com/acme/project.git")
+        git(target, "config", "core.sshCommand", str(helper))
+    elif hostile_configuration == "url.ext.insteadOf":
+        git(target, "config", f"url.ext::{helper}.insteadOf", "https://github.com/")
+    elif hostile_configuration == "url.ssh.insteadOf":
+        git(target, "config", "url.ssh://github.com/.insteadOf", "https://github.com/")
+        git(target, "config", "core.sshCommand", str(helper))
+    elif hostile_configuration == "url.file.insteadOf":
+        git(target, "config", f"url.file://{tmp_path}/.insteadOf", "https://github.com/")
+    elif hostile_configuration == "credential.helper":
+        git(target, "config", "credential.helper", f"!{helper}")
+    elif hostile_configuration == "core.gitProxy":
+        git(target, "remote", "set-url", "origin", "git://github.com/acme/project.git")
+        git(target, "config", "core.gitProxy", str(helper))
+    else:
+        git(target, "config", "include.path", str(included))
+    monkeypatch.setattr(restore_module, "_FETCH_TIMEOUT_SECONDS", 0.2, raising=False)
+    _recipient, _signer, trust = keys()
+
+    result = GitSharedStateRestorer(
+        StaticTrustProvider(trust), refresh_remote=True
+    ).verify_and_restore_approved_baseline(target)
+
+    assert result.status is SharedStateRestoreStatus.UNAVAILABLE
+    assert not marker.exists()
+
+
+def test_failed_refresh_does_not_leave_a_detached_local_config_helper(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Catches failed Git leaders leaving command-capable descendants behind."""
+    target = init_repository(tmp_path / "target" / "project")
+    marker = tmp_path / "detached-helper-survived"
+    helper = tmp_path / "detaching-helper.py"
+    helper.write_text(
+        "#!/usr/bin/python3\n"
+        "import subprocess\n"
+        f"subprocess.Popen(['/bin/sh', '-c', 'sleep 0.4; touch {marker}'], start_new_session=True)\n",
+        encoding="utf-8",
+    )
+    helper.chmod(0o700)
+    git(target, "config", f"url.ext::{helper}.insteadOf", "https://github.com/")
+    monkeypatch.setattr(restore_module, "_FETCH_TIMEOUT_SECONDS", 0.2, raising=False)
+    _recipient, _signer, trust = keys()
+
+    result = GitSharedStateRestorer(
+        StaticTrustProvider(trust), refresh_remote=True
+    ).verify_and_restore_approved_baseline(target)
+    time.sleep(0.6)
+
+    assert result.status is SharedStateRestoreStatus.UNAVAILABLE
+    assert not marker.exists()
 
 
 def _canonical(value: object) -> bytes:

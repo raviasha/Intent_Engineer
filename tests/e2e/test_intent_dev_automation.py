@@ -231,12 +231,14 @@ def test_fresh_onboarded_clone_first_prompt_and_plugin_disabled_ci_backstop(
     repo, trust = _clone(tmp_path)
     request.addfinalizer(lambda: _stop_background_dev(repo))
     monkeypatch.setenv("INTENT_CI_SHARED_STATE_TRUST", trust_environment(trust))
-    monkeypatch.setattr(restore_module, "_origin_repository", lambda _root: trust.repository_id)
-    git(
-        repo,
-        "config",
-        f"url.file://{tmp_path / 'source' / 'project'}.insteadOf",
-        "https://github.com/acme/project.git",
+    monkeypatch.setattr(
+        restore_module,
+        "_refresh_state_ref",
+        lambda repository_id: (
+            restore_module._GitRefReader(repo)
+            if repository_id == trust.repository_id
+            else (_ for _ in ()).throw(AssertionError("wrong trusted repository"))
+        ),
     )
     original_head = git(repo, "rev-parse", "HEAD")
     monkeypatch.chdir(repo)

@@ -246,14 +246,98 @@ def test_process_metadata_is_strict_and_secret_free() -> None:
             "project_id": "project",
             "repository_id": "repo:sha256:" + "c" * 64,
             "origin": "http://localhost:43127",
+            "launch_mode": "automatic",
         }
     )
 
     assert metadata.origin == "http://localhost:43127"
+    assert metadata.launch_mode == "automatic"
     with pytest.raises(ValueError):
         ControlPlaneProcessMetadata.model_validate(
             {**metadata.model_dump(), "csrf_secret": "must-not-be-persisted"}
         )
+
+
+def test_legacy_process_metadata_is_reusable_but_not_replaceable() -> None:
+    """Catches an old locator being silently promoted to replaceable authority."""
+    metadata = ControlPlaneProcessMetadata.model_validate(
+        {
+            "schema_version": 1,
+            "pid": 123,
+            "process_start_id": "sha256:" + "a" * 64,
+            "instance_id": "instance:" + "b" * 64,
+            "project_id": "project",
+            "repository_id": "repo:sha256:" + "c" * 64,
+            "origin": "http://localhost:43127",
+        }
+    )
+
+    assert metadata.launch_mode == "legacy"
+    assert dev_cli._request_interactive_takeover(metadata, metadata.repository_id) is False
+
+
+def test_instance_rebound_shutdown_refuses_takeover_without_pid_signaling(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catches a stale probe stopping a rebound endpoint or an unrelated reused PID."""
+    requests: list[tuple[str, str, bytes, dict[str, str]]] = []
+
+    class Response:
+        status = 409
+
+        @staticmethod
+        def read(_maximum: int) -> bytes:
+            return b'{"schema_version":1,"status":"rejected"}'
+
+    class Connection:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+        def request(self, method: str, path: str, body: bytes, headers: dict[str, str]) -> None:
+            requests.append((method, path, body, headers))
+
+        @staticmethod
+        def getresponse() -> Response:
+            return Response()
+
+        @staticmethod
+        def close() -> None:
+            pass
+
+    metadata = ControlPlaneProcessMetadata(
+        pid=123,
+        process_start_id="sha256:" + "a" * 64,
+        instance_id="instance:" + "b" * 64,
+        project_id="project",
+        repository_id="repo:sha256:" + "c" * 64,
+        origin="http://localhost:43127",
+        launch_mode="automatic",
+    )
+    monkeypatch.setattr(dev_cli, "_probe", lambda *_args: True)
+    monkeypatch.setattr(dev_cli.http.client, "HTTPConnection", Connection)
+    monkeypatch.setattr(
+        dev_cli.os,
+        "kill",
+        lambda *_args: (_ for _ in ()).throw(AssertionError("PID signaling is forbidden")),
+    )
+    assert dev_cli._request_interactive_takeover(metadata, metadata.repository_id) is False
+    assert len(requests) == 1
+    method, path, body, headers = requests[0]
+    assert (method, path) == ("POST", dev_cli._SHUTDOWN_PATH)
+    assert json.loads(body) == {
+        "schema_version": 1,
+        "instance_id": metadata.instance_id,
+        "project_id": metadata.project_id,
+        "repository_id": metadata.repository_id,
+        "launch_mode": "automatic",
+    }
+    assert headers == {
+        "Host": "localhost:43127",
+        "Origin": metadata.origin,
+        "Content-Type": "application/json",
+        "Content-Length": str(len(body)),
+        "Accept": "application/json",
+    }
 
 
 def test_uninitialized_repository_requires_an_explicit_prd_without_mutation(tmp_path: Path) -> None:
@@ -338,8 +422,14 @@ def test_ordinary_dev_replaces_automatic_owner_and_opens_with_ephemeral_bootstra
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     project = _project(tmp_path)
+    initialize_project(project)
     owner = subprocess.Popen(
-        _command(project, "--prd", "docs/PRD.md", "--no-open", "--offline"),
+        _command(
+            project,
+            "--no-open",
+            "--offline",
+            "--automatic",
+        ),
         env=_environment(),
         text=True,
         stdout=subprocess.PIPE,
@@ -407,6 +497,37 @@ def test_ordinary_dev_replaces_automatic_owner_and_opens_with_ephemeral_bootstra
     finally:
         if owner.poll() is None:
             _stop(owner)
+
+
+def test_ordinary_dev_reuses_a_manually_headless_owner_without_signaling(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Catches takeover broadening from attested automatic owners to manual services."""
+    project = _project(tmp_path)
+    owner = subprocess.Popen(
+        _command(project, "--prd", "docs/PRD.md", "--no-open", "--offline"),
+        env=_environment(),
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    opened: list[str] = []
+    monkeypatch.setattr(
+        dev_cli.webbrowser, "open", lambda url, **_kwargs: opened.append(url) or True
+    )
+    try:
+        metadata = ControlPlaneProcessMetadata.model_validate(_wait_for_metadata(project, owner))
+
+        result = CliRunner().invoke(app, ["dev", "--project", str(project)])
+
+        assert result.exit_code == 0, repr(result.exception)
+        assert result.stdout == f"intent dev: already running at {metadata.origin}\n"
+        assert result.stderr == ""
+        assert metadata.launch_mode == "manual_headless"
+        assert owner.poll() is None
+        assert opened == []
+    finally:
+        _stop(owner)
 
 
 def test_stale_and_foreign_pid_metadata_is_not_reused(tmp_path: Path) -> None:
