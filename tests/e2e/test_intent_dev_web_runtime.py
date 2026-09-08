@@ -133,9 +133,14 @@ def _run(scenario: str) -> dict[str, object]:
     """Execute the shipped browser bundle with a deterministic, test-only DOM/runtime."""
     if NODE is None:
         pytest.skip("Node runtime is unavailable for deterministic browser-asset execution")
+    bootstrap = r"""
+await settle();
+respond(take("/_intent/browser/bootstrap"), { status: "ok" });
+await settle();
+"""
     completed = subprocess.run(
         [NODE, "--input-type=module"],
-        input=f"{_HARNESS}\n{_asset()}\n{scenario}",
+        input=f"{_HARNESS}\n{_asset()}\n{bootstrap}\n{scenario}",
         text=True,
         capture_output=True,
         check=False,
@@ -531,7 +536,11 @@ class _LaunchedJourneyService:
 def _launched_site(service: _LaunchedJourneyService) -> Iterator[str]:
     listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    listener.bind(("127.0.0.1", 0))
+    try:
+        listener.bind(("127.0.0.1", 0))
+    except PermissionError:
+        listener.close()
+        pytest.skip("host policy forbids the loopback listener required by this probe")
     port = cast(tuple[str, int], listener.getsockname())[1]
     origin = f"http://localhost:{port}"
     csrf = "launched-browser-csrf"
