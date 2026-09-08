@@ -1,0 +1,337 @@
+"""Canonical contracts for encrypted, Git-transported team intent state."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+from datetime import UTC, datetime, timedelta, timezone
+
+import pytest
+from pydantic import ValidationError
+
+from intent_engineering import team_state
+from intent_engineering.team_state.models import (
+    CANONICAL_STATE_PATHS,
+    MAX_FILE_BYTES,
+    BundleInventory,
+    BundleInventoryEntry,
+    CanonicalStateFile,
+    CanonicalStateSnapshot,
+    PreparedPublication,
+    PublicationLineage,
+    RecipientRecord,
+    RemoteStateSnapshot,
+    TeamStateManifest,
+    canonical_manifest_bytes,
+)
+from intent_engineering.team_state.restore import SharedStateManifest
+
+NOW = datetime(2026, 9, 7, 10, tzinfo=UTC)
+DIGEST_A = "sha256:" + "a" * 64
+DIGEST_B = "sha256:" + "b" * 64
+REPOSITORY = "github.com/acme/project"
+COMMIT = "c" * 40
+
+
+def manifest_values(**changes: object) -> dict[str, object]:
+    values: dict[str, object] = {
+        "schema_version": 1,
+        "project_id": "project",
+        "repository_id": REPOSITORY,
+        "graph_version": 3,
+        "parent_bundle_digest": DIGEST_A,
+        "bundle_digest": DIGEST_B,
+        "bundle_size": 17,
+        "encryption_algorithm": "x25519-hkdf-sha256-aes256gcm-v1",
+        "recipient_key_ids": ("recipient:alice", "recipient:bob"),
+        "required_signature_ids": ("signer:alice",),
+        "created_at": NOW,
+    }
+    values.update(changes)
+    return values
+
+
+def manifest(**changes: object) -> TeamStateManifest:
+    return TeamStateManifest(**manifest_values(**changes))
+
+
+def canonical_files() -> tuple[CanonicalStateFile, ...]:
+    return tuple(
+        CanonicalStateFile(path=path, content=path.encode()) for path in CANONICAL_STATE_PATHS
+    )
+
+
+def test_manifest_emits_one_bounded_canonical_wire_representation() -> None:
+    """Catches locale/order/default serialization changing the signed manifest bytes."""
+    value = manifest()
+
+    encoded = canonical_manifest_bytes(value)
+
+    assert encoded == (
+        b'{"bundle_digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",'
+        b'"bundle_size":17,"created_at":"2026-09-07T10:00:00Z",'
+        b'"encryption_algorithm":"x25519-hkdf-sha256-aes256gcm-v1","graph_version":3,'
+        b'"parent_bundle_digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",'
+        b'"project_id":"project","recipient_key_ids":["recipient:alice","recipient:bob"],'
+        b'"repository_id":"github.com/acme/project",'
+        b'"required_signature_ids":["signer:alice"],"schema_version":1}'
+    )
+    assert TeamStateManifest.model_validate_json(encoded) == value
+
+
+def test_restore_uses_the_same_manifest_type_and_canonical_bytes() -> None:
+    """Catches publication and restore evolving competing schema-version-1 wire types."""
+    value = manifest()
+    encoded = canonical_manifest_bytes(value)
+
+    assert SharedStateManifest is TeamStateManifest
+    assert canonical_manifest_bytes(SharedStateManifest.model_validate_json(encoded)) == encoded
+
+
+def test_team_state_package_exports_the_provider_neutral_contracts() -> None:
+    """Catches callers being forced back through the Git restore adapter for domain types."""
+    assert team_state.TeamStateManifest is TeamStateManifest
+    assert team_state.CanonicalStateSnapshot is CanonicalStateSnapshot
+    assert team_state.PreparedPublication is PreparedPublication
+    assert team_state.canonical_manifest_bytes is canonical_manifest_bytes
+
+
+@pytest.mark.parametrize(
+    ("field", "bad"),
+    [
+        ("project_id", "../project"),
+        ("repository_id", "https://github.com/acme/project"),
+        ("repository_id", "github.com/acme/project.git/extra"),
+        ("repository_id", "github.com/../project"),
+        ("repository_id", "github.com/acme/.."),
+        ("repository_id", "github.com/acme/project.git"),
+        ("bundle_digest", "SHA256:" + "b" * 64),
+        ("bundle_digest", "sha256:" + "B" * 64),
+        ("bundle_digest", "b" * 64),
+        ("parent_bundle_digest", "sha256:short"),
+        ("encryption_algorithm", "aes-gcm"),
+        ("graph_version", 0),
+        ("bundle_size", 0),
+    ],
+)
+def test_manifest_rejects_inexact_identity_digest_algorithm_and_bounds(
+    field: str, bad: object
+) -> None:
+    """Catches accepting ambiguous identities or metadata that cannot bind exact bytes."""
+    with pytest.raises(ValidationError):
+        manifest(**{field: bad})
+
+
+@pytest.mark.parametrize("field", ["recipient_key_ids", "required_signature_ids"])
+@pytest.mark.parametrize(
+    "bad",
+    [
+        ("recipient:bob", "recipient:alice"),
+        ("recipient:alice", "recipient:alice"),
+        (),
+        ["recipient:alice"],
+    ],
+)
+def test_manifest_requires_nonempty_sorted_unique_identifier_tuples(
+    field: str, bad: object
+) -> None:
+    """Catches alternate recipient/signer orderings changing authority over one release."""
+    with pytest.raises((ValidationError, ValueError)):
+        manifest(**{field: bad})
+
+
+def test_manifest_rejects_a_bundle_as_its_own_parent() -> None:
+    """Catches a self-cycle entering authenticated publication lineage."""
+    with pytest.raises(ValidationError):
+        manifest(bundle_digest=DIGEST_A, parent_bundle_digest=DIGEST_A)
+
+
+def test_manifest_requires_utc_and_canonical_z_json() -> None:
+    """Catches equivalent offset timestamps acquiring multiple signed byte forms."""
+    with pytest.raises(ValidationError):
+        manifest(created_at=NOW.replace(tzinfo=None))
+    with pytest.raises(ValidationError):
+        manifest(created_at=datetime(2026, 9, 7, 11, tzinfo=timezone(timedelta(hours=1))))
+
+    canonical = canonical_manifest_bytes(manifest())
+    with pytest.raises(ValueError, match="noncanonical"):
+        TeamStateManifest.model_validate_json(canonical.replace(b'Z"', b'+00:00"'))
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        lambda raw: raw.replace(b'"bundle_size":17', b'"bundle_size":"17"'),
+        lambda raw: raw.replace(b'{"bundle_digest"', b'{ "bundle_digest"'),
+        lambda raw: raw.replace(
+            b'{"bundle_digest":',
+            b'{"bundle_size":17,"bundle_digest":',
+        ),
+    ],
+)
+def test_manifest_parser_rejects_typed_noncanonical_and_duplicate_json(mutation: object) -> None:
+    """Catches accepting a second byte representation for the signed manifest object."""
+    raw = canonical_manifest_bytes(manifest())
+    changed = mutation(raw)  # type: ignore[operator]
+
+    with pytest.raises((TypeError, ValueError, ValidationError)):
+        TeamStateManifest.model_validate_json(changed)
+
+
+@pytest.mark.parametrize("path", ["/graph.yaml", "../graph.yaml", "a\\graph.yaml", "graph//x"])
+def test_snapshot_rejects_unsafe_or_noncanonical_paths(path: str) -> None:
+    """Catches archive construction receiving a path that could escape the restore root."""
+    with pytest.raises(ValidationError):
+        CanonicalStateFile(path=path, content=b"x")
+
+
+def test_snapshot_is_complete_sorted_unique_bounded_and_frozen() -> None:
+    """Catches omitted, reordered, duplicate, oversized, or mutable canonical state."""
+    files = canonical_files()
+    value = CanonicalStateSnapshot(
+        project_id="project",
+        repository_id=REPOSITORY,
+        graph_version=3,
+        files=files,
+    )
+
+    assert value.files == files
+    with pytest.raises(ValidationError):
+        CanonicalStateSnapshot(
+            project_id="project",
+            repository_id=REPOSITORY,
+            graph_version=3,
+            files=files[:-1],
+        )
+    with pytest.raises(ValidationError):
+        CanonicalStateSnapshot(
+            project_id="project",
+            repository_id=REPOSITORY,
+            graph_version=3,
+            files=tuple(reversed(files)),
+        )
+    with pytest.raises(ValidationError):
+        CanonicalStateFile(path="graph.yaml", content=b"x" * (MAX_FILE_BYTES + 1))
+    with pytest.raises(ValidationError):
+        value.graph_version = 4
+
+
+def test_snapshot_inventory_binds_every_path_size_digest_and_total() -> None:
+    """Catches an inventory that can describe bytes other than the snapshot it accompanies."""
+    files = canonical_files()
+    snapshot = CanonicalStateSnapshot(
+        project_id="project",
+        repository_id=REPOSITORY,
+        graph_version=3,
+        files=files,
+    )
+
+    inventory = snapshot.inventory()
+
+    expected = tuple(
+        BundleInventoryEntry(
+            path=item.path,
+            size=len(item.content),
+            sha256="sha256:" + hashlib.sha256(item.content).hexdigest(),
+        )
+        for item in files
+    )
+    assert inventory == BundleInventory(
+        entries=expected,
+        total_size=sum(item.size for item in expected),
+    )
+    with pytest.raises(ValidationError):
+        BundleInventory(entries=expected, total_size=1)
+
+
+def test_recipient_is_project_actor_and_webauthn_bound_without_private_material() -> None:
+    """Catches a public recipient key being reusable across a project or decision policy."""
+    recipient = RecipientRecord(
+        key_id="recipient:alice",
+        project_id="project",
+        actor="github:1234",
+        public_key="YWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXowMTIzNDU",
+        encryption_algorithm="x25519-hkdf-sha256-aes256gcm-v1",
+        decision_algorithm="webauthn-decision-v1",
+        enrolled_at=NOW,
+    )
+
+    assert "private" not in json.dumps(recipient.model_dump(mode="json"))
+    with pytest.raises(ValidationError):
+        RecipientRecord(**{**recipient.model_dump(), "public_key": "not-base64"})
+    with pytest.raises(ValidationError):
+        RecipientRecord(**{**recipient.model_dump(), "decision_algorithm": "agent-approval-v1"})
+
+
+def test_publication_lineage_distinguishes_genesis_from_descendants() -> None:
+    """Catches a release claiming genesis while carrying ancestry, or self-parenting."""
+    assert (
+        PublicationLineage(
+            bundle_digest=DIGEST_A,
+            parent_bundle_digest=None,
+            ancestor_bundle_digests=(),
+        ).parent_bundle_digest
+        is None
+    )
+    descendant = PublicationLineage(
+        bundle_digest=DIGEST_B,
+        parent_bundle_digest=DIGEST_A,
+        ancestor_bundle_digests=(DIGEST_A,),
+    )
+    assert descendant.ancestor_bundle_digests == (DIGEST_A,)
+    for values in (
+        {
+            "bundle_digest": DIGEST_B,
+            "parent_bundle_digest": None,
+            "ancestor_bundle_digests": (DIGEST_A,),
+        },
+        {
+            "bundle_digest": DIGEST_A,
+            "parent_bundle_digest": DIGEST_A,
+            "ancestor_bundle_digests": (DIGEST_A,),
+        },
+        {
+            "bundle_digest": DIGEST_B,
+            "parent_bundle_digest": DIGEST_A,
+            "ancestor_bundle_digests": (),
+        },
+    ):
+        with pytest.raises(ValidationError):
+            PublicationLineage(**values)
+
+
+def test_remote_snapshot_and_prepared_publication_bind_exact_manifest_and_artifacts() -> None:
+    """Catches a ref or publication swapping bytes after the typed manifest was validated."""
+    bundle = b"encrypted-bundle"
+    bound_manifest = manifest(
+        bundle_size=len(bundle),
+        bundle_digest="sha256:" + hashlib.sha256(bundle).hexdigest(),
+    )
+    manifest_bytes = canonical_manifest_bytes(bound_manifest)
+    remote = RemoteStateSnapshot(
+        repository_id=REPOSITORY,
+        ref="refs/remotes/origin/intent-state",
+        commit=COMMIT,
+        manifest=bound_manifest,
+        manifest_bytes=manifest_bytes,
+    )
+    digest_hex = bound_manifest.bundle_digest.removeprefix("sha256:")
+    prepared = PreparedPublication(
+        repository_id=REPOSITORY,
+        branch=f"intent-publication/{digest_hex}",
+        manifest=bound_manifest,
+        manifest_bytes=manifest_bytes,
+        bundle=bundle,
+        signatures=b'{"signatures":[]}',
+        bundle_path=f"bundles/3-{digest_hex}.intent",
+        signature_path=f"signatures/3-{digest_hex}.json",
+        decision_algorithm="webauthn-decision-v1",
+    )
+
+    assert remote.manifest == prepared.manifest
+    with pytest.raises(ValidationError):
+        RemoteStateSnapshot(**{**remote.model_dump(), "manifest_bytes": manifest_bytes + b"\n"})
+    with pytest.raises(ValidationError):
+        PreparedPublication(**{**prepared.model_dump(), "bundle": bundle + b"x"})
+    with pytest.raises(ValidationError):
+        PreparedPublication(**{**prepared.model_dump(), "bundle_path": "../bundle.intent"})

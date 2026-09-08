@@ -22,6 +22,7 @@ dependencies = [
   "uvicorn>=0.31,<1",
   "webauthn>=3,<4",
   "cryptography>=50,<51",
+  "keyring>=25.7,<26",
 ]
 
 [project.optional-dependencies]

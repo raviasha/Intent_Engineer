@@ -65,18 +65,23 @@ from intent_engineering.storage.secure import (
 )
 from intent_engineering.storage.transaction import LocalTransactionCoordinator
 from intent_engineering.storage.yaml.graph_store import parse_graph
+from intent_engineering.team_state.models import (
+    CANONICAL_STATE_PATHS,
+    MAX_BUNDLE_BYTES,
+    MAX_FILE_BYTES,
+    MAX_MANIFEST_BYTES,
+    MAX_SIGNATURE_BYTES,
+    MAX_STATE_BYTES,
+    MAX_STATE_FILES,
+    STATE_REF,
+    TeamStateManifest,
+    canonical_manifest_bytes,
+)
 from intent_engineering.validation import validate_canonical_snapshot
 
 ALGORITHM: Final = "x25519-hkdf-sha256-aes256gcm-v1"
 SIGNATURE_ALGORITHM: Final = "ed25519-v1"
-STATE_REF = "refs/remotes/origin/intent-state"
 TRUST_ENVIRONMENT_VARIABLE = "INTENT_CI_SHARED_STATE_TRUST"
-MAX_MANIFEST_BYTES = 64 * 1024
-MAX_SIGNATURE_BYTES = 64 * 1024
-MAX_BUNDLE_BYTES = 24 * 1024 * 1024
-MAX_STATE_BYTES = 16 * 1024 * 1024
-MAX_FILE_BYTES = 8 * 1024 * 1024
-MAX_STATE_FILES = 32
 MAX_TRUST_BYTES = 32 * 1024
 MAX_GIT_TEXT_BYTES = 4096
 MAX_FETCH_OUTPUT_BYTES = 64 * 1024
@@ -85,18 +90,6 @@ _FETCH_TIMEOUT_SECONDS = 10.0
 MAX_CLOCK_SKEW = timedelta(minutes=5)
 MAX_ANCESTRY_COMMITS = 64
 
-CANONICAL_STATE_PATHS = (
-    "approvals/approvals.jsonl",
-    "approvals/plans.jsonl",
-    "approvals/policy.yaml",
-    "approvals/receipts.jsonl",
-    "config.yaml",
-    "evidence/evidence.jsonl",
-    "graph.yaml",
-    "history/changesets.jsonl",
-    "history/intent-proposals.jsonl",
-    "reconciliation/cases.jsonl",
-)
 _REQUIRED_PATHS = frozenset(CANONICAL_STATE_PATHS)
 _SHA256 = re.compile(r"^sha256:[0-9a-f]{64}$")
 _KEY_ID = re.compile(r"^[a-z][a-z0-9._:-]{0,127}$")
@@ -229,44 +222,7 @@ def _b64decode(
     return decoded
 
 
-class SharedStateManifest(_RestoreModel):
-    """The only readable metadata stored on the protected state ref."""
-
-    schema_version: Literal[1] = 1
-    project_id: Annotated[str, Field(pattern=_PROJECT_ID.pattern)]
-    repository_id: Annotated[str, Field(pattern=_REPOSITORY_ID.pattern)]
-    graph_version: Annotated[int, Field(ge=1)]
-    parent_bundle_digest: Annotated[str, Field(pattern=_SHA256.pattern)] | None = None
-    bundle_digest: Annotated[str, Field(pattern=_SHA256.pattern)]
-    bundle_size: Annotated[int, Field(gt=0, le=MAX_BUNDLE_BYTES)]
-    encryption_algorithm: Literal["x25519-hkdf-sha256-aes256gcm-v1"] = ALGORITHM
-    recipient_key_ids: Annotated[tuple[str, ...], Field(max_length=64)]
-    required_signature_ids: Annotated[tuple[str, ...], Field(max_length=64)]
-    created_at: datetime
-
-    @field_validator("schema_version", "graph_version", "bundle_size", mode="before")
-    @classmethod
-    def require_integer(cls, value: object) -> object:
-        if type(value) is not int:
-            raise ValueError("invalid shared-state integer")
-        return value
-
-    @field_validator("recipient_key_ids", "required_signature_ids", mode="before")
-    @classmethod
-    def require_json_lists(cls, value: object, info: ValidationInfo) -> object:
-        return _json_tuple(value, info)
-
-    @field_validator("recipient_key_ids", "required_signature_ids")
-    @classmethod
-    def require_sorted_ids(cls, values: tuple[str, ...]) -> tuple[str, ...]:
-        return _unique_sorted(values)
-
-    @field_validator("created_at")
-    @classmethod
-    def require_utc(cls, value: datetime) -> datetime:
-        if value.tzinfo is None or value.utcoffset() != timedelta(0):
-            raise ValueError("shared-state time must be UTC")
-        return value.astimezone(UTC)
+SharedStateManifest = TeamStateManifest
 
 
 class WrappedContentKey(_RestoreModel):
@@ -642,7 +598,7 @@ def seal_state_payload(
         required_signature_ids=signer_ids,
         created_at=created_at,
     )
-    manifest = _canonical_json(manifest_model.model_dump(mode="json"))
+    manifest = canonical_manifest_bytes(manifest_model)
     signed = _canonical_json(
         {
             "schema_version": 1,
@@ -695,9 +651,7 @@ class _Diverged(ValueError):
     pass
 
 
-def _parse_canonical_model(
-    content: bytes, model: type[_RestoreModel], maximum: int
-) -> _RestoreModel:
+def _parse_canonical_model(content: bytes, model: type[StrictModel], maximum: int) -> StrictModel:
     if not content or len(content) > maximum:
         raise ValueError("invalid shared-state object")
     loaded = loads_strict_object(content.decode("utf-8"))
