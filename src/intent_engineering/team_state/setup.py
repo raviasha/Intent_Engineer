@@ -12,7 +12,7 @@ from datetime import timedelta
 from typing import TYPE_CHECKING, cast
 
 import anyio
-from pydantic import ConfigDict, Field
+from pydantic import ConfigDict, Field, model_validator
 
 from intent_engineering.capture.github.auth import GitHubCredentials
 from intent_engineering.capture.github.client import GitHubClient
@@ -26,10 +26,14 @@ from intent_engineering.control_plane.models import (
 from intent_engineering.control_plane.webauthn_service import VerifiedHumanDecision
 from intent_engineering.core.models._base import StrictModel
 from intent_engineering.storage._atomic import same_path_lock
+from intent_engineering.team_state.ci import CiTrustConfig
 from intent_engineering.team_state.github import (
+    GitHubDefaultBranchBaseline,
+    GitHubDefaultBranchTooling,
     GitHubJsonResponse,
     GitHubTeamStateApi,
     GitHubTeamStateClient,
+    GitHubTeamStateError,
     GitHubTeamStateStatus,
 )
 from intent_engineering.team_state.keys import GitHubIdentity
@@ -62,6 +66,29 @@ class EncryptedPublicationDraft(StrictModel):
     bundle: str = Field(max_length=MAX_BUNDLE_BYTES * 2)
     signatures: str = Field(max_length=1024 * 1024)
     anchor: str = Field(pattern=r"^[0-9a-f]{40}$")
+    external_write_attempted: bool = False
+    publication_commit: str | None = Field(default=None, pattern=r"^[0-9a-f]{40}$")
+    pull_request_number: int | None = Field(default=None, gt=0)
+    pull_request_url: str | None = Field(default=None, min_length=1, max_length=2048)
+
+    @model_validator(mode="after")
+    def validate_pending_receipt(self) -> EncryptedPublicationDraft:
+        if self.publication_commit is not None and not self.external_write_attempted:
+            raise ValueError("invalid publication receipt")
+        if self.publication_commit is None and (
+            self.pull_request_number is not None or self.pull_request_url is not None
+        ):
+            raise ValueError("invalid publication receipt")
+        if (self.pull_request_number is None) != (self.pull_request_url is None):
+            raise ValueError("invalid publication receipt")
+        if self.pull_request_number is not None:
+            expected = (
+                f"https://github.com/{self.manifest.repository_id.removeprefix('github.com/')}"
+                f"/pull/{self.pull_request_number}"
+            )
+            if self.pull_request_url != expected:
+                raise ValueError("invalid publication receipt")
+        return self
 
     def publication(self) -> PreparedPublication:
         suffix = (
@@ -79,11 +106,88 @@ class EncryptedPublicationDraft(StrictModel):
         )
 
 
+class GitHubBootstrapReceipt(StrictModel):
+    """Durable public receipt for one owned canonical empty orphan anchor."""
+
+    model_config = ConfigDict(frozen=True, strict=True, extra="forbid")
+
+    repository_id: str
+    anchor: str = Field(pattern=r"^[0-9a-f]{40}$")
+    tree: str = Field(pattern=r"^[0-9a-f]{40}$")
+    tooling: GitHubDefaultBranchTooling
+    authority_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+
+
+def _parse_publication_draft(content: bytes) -> tuple[EncryptedPublicationDraft, bytes, bool]:
+    try:
+        raw = json.loads(content)
+    except (TypeError, ValueError):
+        raise ValueError("GitHub publication draft changed") from None
+    if type(raw) is not dict:
+        raise ValueError("GitHub publication draft changed")
+    legacy = "external_write_attempted" not in raw
+    if legacy:
+        raw["external_write_attempted"] = True
+        migrated_input = json.dumps(
+            raw,
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+        ).encode()
+        draft = EncryptedPublicationDraft.model_validate_json(migrated_input)
+    else:
+        draft = EncryptedPublicationDraft.model_validate_json(content)
+    if legacy:
+        if draft.model_dump_json(exclude={"external_write_attempted"}).encode() != content:
+            raise ValueError("GitHub publication draft changed")
+    elif draft.model_dump_json().encode() != content:
+        raise ValueError("GitHub publication draft changed")
+    return draft, draft.model_dump_json().encode(), legacy
+
+
+def _bootstrap_receipt(
+    runtime: Runtime,
+    *,
+    receipt: GitHubBootstrapReceipt | None = None,
+    discard: bool = False,
+) -> GitHubBootstrapReceipt | None:
+    target = runtime.workspace_directory.file("team-bootstrap.json")
+    try:
+        with same_path_lock(target):
+            content = target.read_optional_nonblocking(max_bytes=65536)
+            if receipt is None:
+                if content is None:
+                    return None
+                existing = GitHubBootstrapReceipt.model_validate_json(content)
+                if existing.model_dump_json().encode() != content:
+                    raise ValueError("GitHub bootstrap receipt changed")
+                return existing
+            encoded = receipt.model_dump_json().encode()
+            if len(encoded) > 65536:
+                raise ValueError("GitHub bootstrap receipt unavailable")
+            if content is not None and content != encoded:
+                raise ValueError("GitHub bootstrap receipt changed")
+            if discard:
+                if content is not None:
+                    target.unlink()
+                return None
+            if content is None:
+                target.atomic_write(encoded, reject_target_races=True)
+            return receipt
+    finally:
+        target.close()
+
+
 def _draft(
     runtime: Runtime,
     *,
     prepared: PreparedPublication | None = None,
     anchor: str | None = None,
+    publication_commit: str | None = None,
+    pull_request_number: int | None = None,
+    pull_request_url: str | None = None,
+    external_write_attempted: bool | None = None,
+    restart_closed: bool = False,
     discard: bool = False,
 ) -> EncryptedPublicationDraft | None:
     target = runtime.workspace_directory.file("team-publication.json")
@@ -93,27 +197,81 @@ def _draft(
                 max_bytes=MAX_BUNDLE_BYTES * 2 + 2 * 1024 * 1024
             )
             if prepared is not None:
+                existing: EncryptedPublicationDraft | None = None
+                if content is not None:
+                    existing, migrated, legacy = _parse_publication_draft(content)
+                    if legacy:
+                        target.atomic_write(migrated, reject_target_races=True)
+                        content = migrated
                 draft = EncryptedPublicationDraft(
                     manifest=prepared.manifest,
                     bundle=base64.b64encode(prepared.bundle).decode("ascii"),
                     signatures=base64.b64encode(prepared.signatures).decode("ascii"),
                     anchor=cast(str, anchor),
+                    external_write_attempted=(
+                        external_write_attempted
+                        if external_write_attempted is not None
+                        else (existing.external_write_attempted if existing is not None else False)
+                    ),
+                    publication_commit=publication_commit,
+                    pull_request_number=pull_request_number,
+                    pull_request_url=pull_request_url,
                 )
                 encoded = draft.model_dump_json().encode()
-                if content is not None and content != encoded:
+                if content is None:
+                    if discard:
+                        return None
+                    target.atomic_write(encoded, reject_target_races=True)
+                    return draft
+                assert existing is not None
+                if (
+                    existing.manifest != draft.manifest
+                    or existing.bundle != draft.bundle
+                    or existing.signatures != draft.signatures
+                    or existing.anchor != draft.anchor
+                ):
                     raise ValueError("GitHub publication draft changed")
                 if discard:
-                    if content is not None:
-                        target.unlink()
+                    target.unlink()
                     return None
-                if content is None:
-                    target.atomic_write(encoded, reject_target_races=True)
+                if existing == draft:
+                    return existing
+                existing_rank = (
+                    3
+                    if existing.pull_request_number is not None
+                    else 2
+                    if existing.publication_commit is not None
+                    else 1
+                    if existing.external_write_attempted
+                    else 0
+                )
+                draft_rank = (
+                    3
+                    if draft.pull_request_number is not None
+                    else 2
+                    if draft.publication_commit is not None
+                    else 1
+                    if draft.external_write_attempted
+                    else 0
+                )
+                closed_restart = (
+                    restart_closed
+                    and existing_rank == 3
+                    and draft_rank == 2
+                    and existing.publication_commit == draft.publication_commit
+                )
+                if (draft_rank <= existing_rank and not closed_restart) or (
+                    existing.publication_commit is not None
+                    and existing.publication_commit != draft.publication_commit
+                ):
+                    raise ValueError("GitHub publication draft changed")
+                target.atomic_write(encoded, reject_target_races=True)
                 return draft
             if content is None:
                 return None
-            draft = EncryptedPublicationDraft.model_validate_json(content)
-            if draft.model_dump_json().encode() != content:
-                raise ValueError("GitHub publication draft changed")
+            draft, migrated, legacy = _parse_publication_draft(content)
+            if legacy:
+                target.atomic_write(migrated, reject_target_races=True)
             return draft
     finally:
         target.close()
@@ -234,6 +392,21 @@ class _GuardedApi:
     ) -> PageResult:
         return await self.api.get_pages(path, params, etag)
 
+    async def request_bytes(
+        self,
+        method: str,
+        path: str,
+        *,
+        max_bytes: int,
+        accept: str,
+    ) -> bytes:
+        return await self.api.request_bytes(
+            method,
+            path,
+            max_bytes=max_bytes,
+            accept=accept,
+        )
+
     async def aclose(self) -> None:
         await self.api.aclose()
 
@@ -261,9 +434,13 @@ class GitHubSetupBridge:
         self.suggestions: CodeSuggestionPreview | None = None
         self.authority_digest: str | None = None
         self.protection_digest: str | None = None
+        self.tooling: GitHubDefaultBranchTooling | None = None
+        self.baseline: GitHubDefaultBranchBaseline | None = None
+        self.setup_phase: str | None = None
         self.publication: PublicationService | None = None
         self.recipient_snapshot: RecipientRecord | None = None
         self.transport = _PublicationTransport()
+        self.publication_restart_required = False
         self.guard = anyio.Lock()
         service._team_repository_id = request.preview.repository_id
         service._restore_team_recipient()
@@ -276,7 +453,13 @@ class GitHubSetupBridge:
         if draft is not None:
             if draft.manifest.repository_id != self.request.preview.repository_id:
                 raise ValueError("GitHub publication draft changed")
-            return "publication_draft"
+            return (
+                "publication_pending"
+                if draft.pull_request_number is not None
+                else "publication_recovery_required"
+                if draft.external_write_attempted
+                else "publication_draft"
+            )
         try:
             SigningKeyStore(
                 self.service._runtime.config.project_id,
@@ -284,7 +467,23 @@ class GitHubSetupBridge:
                 self.service._runtime.config.local_actor,
             ).public_keys()
         except ValueError:
-            return "enrolled"
+            from intent_engineering.team_state.suggestions import preview_code_suggestions
+
+            suggestions = preview_code_suggestions(
+                self.service._runtime.root,
+                self.request.preview.codeowners_suggestion,
+                self.request.preview.workflow_suggestion,
+            )
+            installed = all(
+                preimage is not None
+                and base64.urlsafe_b64decode(preimage + "=" * (-len(preimage) % 4))
+                == content.encode("utf-8")
+                for preimage, content in (
+                    (suggestions.codeowners_preimage, suggestions.codeowners_content),
+                    (suggestions.workflow_preimage, suggestions.workflow_content),
+                )
+            )
+            return "code_changes_staged" if installed else "enrolled"
         return "protection_configured"
 
     def _authority(self) -> str:
@@ -321,8 +520,15 @@ class GitHubSetupBridge:
         if recipient is None or self._authority() != self.authority_digest:
             raise ValueError("GitHub publication authority changed")
         signing = SigningKeyStore(recipient.project_id, recipient.repository_id, recipient.actor)
+        ci = self.request.preview.ci_recipient
+        if (
+            ci is None
+            or ci.project_id != recipient.project_id
+            or ci.repository_id != recipient.repository_id
+        ):
+            raise ValueError("CI recipient unavailable")
         return PublicationAuthority(
-            recipients=(recipient,),
+            recipients=tuple(sorted((recipient, ci), key=lambda item: item.key_id)),
             signing_private_keys=signing.load_signing_keys(),
             remote_state=None,
             publication_base_commit=reviewed.branch_commit,
@@ -352,6 +558,65 @@ class GitHubSetupBridge:
             or result.payload.get("truncated") is not False
         ):
             raise ValueError("GitHub bootstrap anchor changed")
+
+    async def _finalize_merged_publication(
+        self,
+        client: GitHubTeamStateClient,
+        status: GitHubTeamStateStatus,
+    ) -> dict[str, object] | None:
+        """Persist trust only after the exact reviewed PR commit becomes protected state."""
+        draft = _draft(self.service._runtime)
+        if draft is None or draft.publication_commit is None:
+            return None
+        if status.branch_commit == draft.anchor:
+            if draft.pull_request_number is not None:
+                state = await client.publication_pull_request_state(
+                    draft.publication(),
+                    expected_head_commit=draft.publication_commit,
+                    expected_base_commit=draft.anchor,
+                    pull_request_number=draft.pull_request_number,
+                )
+                self.publication_restart_required = state == "closed"
+            return None
+        if (
+            status.branch_commit is None
+            or draft.pull_request_number is None
+            or draft.pull_request_url is None
+        ):
+            raise ValueError("GitHub publication merge changed")
+        await client.confirm_publication_merge(
+            draft.publication(),
+            expected_head_commit=draft.publication_commit,
+            expected_base_commit=draft.anchor,
+            pull_request_number=draft.pull_request_number,
+        )
+        from intent_engineering.team_state.local_trust import save_local_trust
+
+        save_local_trust(
+            self.service._runtime,
+            self._recipient(status),
+            SigningKeyStore(
+                self.service._runtime.config.project_id,
+                status.repository_id,
+                self.service._runtime.config.local_actor,
+            ).public_keys(),
+        )
+        _draft(
+            self.service._runtime,
+            prepared=draft.publication(),
+            anchor=draft.anchor,
+            publication_commit=draft.publication_commit,
+            pull_request_number=draft.pull_request_number,
+            pull_request_url=draft.pull_request_url,
+            discard=True,
+        )
+        _complete_setup_request(self.service._runtime, self.request)
+        self.service._github_setup_bridge = None
+        return {
+            "state": "published",
+            "pull_request_url": draft.pull_request_url,
+            "repository_id": status.repository_id,
+        }
 
     async def action(
         self, action: str, *, payload: HumanDecisionPayload | None = None, response: bytes = b""
@@ -389,11 +654,24 @@ class GitHubSetupBridge:
         if load_setup_request(service._runtime) != self.request:
             raise ValueError("GitHub setup request changed")
         if action == "cancel":
+            draft = _draft(service._runtime)
+            bootstrap = _bootstrap_receipt(service._runtime)
+            if (
+                draft is not None
+                and (
+                    draft.external_write_attempted
+                    or draft.publication_commit is not None
+                    or draft.pull_request_number is not None
+                    or draft.pull_request_url is not None
+                )
+            ) or bootstrap is not None:
+                raise ValueError(
+                    "GitHub provider state must be reconciled before setup can restart"
+                )
             self.pending = None
             self.publication = None
             self.transport.publisher = None
             service.cancel_team_enrollment()
-            draft = _draft(service._runtime)
             if draft is not None:
                 if draft.manifest.repository_id != self.request.preview.repository_id:
                     raise ValueError("GitHub publication draft changed")
@@ -436,6 +714,23 @@ class GitHubSetupBridge:
             ):
                 raise ValueError("GitHub code suggestions changed")
             await self._anchor(api, reviewed)
+            if self.baseline is None:
+                raise ValueError("GitHub default-branch baseline unavailable")
+            live_baseline = await client.verify_default_branch_baseline()
+            if live_baseline != self.baseline:
+                raise ValueError("GitHub default-branch baseline changed")
+            if self.setup_phase in {"protection", "publication"}:
+                if self.tooling is None:
+                    raise ValueError("GitHub default-branch tooling unavailable")
+                live_tooling = await client.verify_default_branch_tooling(
+                    codeowners=self.request.preview.codeowners_suggestion.encode("utf-8"),
+                    workflow=self.request.preview.workflow_suggestion.encode("utf-8"),
+                    runner_id=self.request.preview.ci_recipient.runner_id
+                    if self.request.preview.ci_recipient is not None
+                    else "",
+                )
+                if live_tooling != self.tooling:
+                    raise ValueError("GitHub default-branch tooling changed")
             if (
                 self._authority() != self.authority_digest
                 or load_setup_request(service._runtime) != self.request
@@ -457,15 +752,29 @@ class GitHubSetupBridge:
             status = await client.inspect(self.repository)
             if status.repository_id != self.request.preview.repository_id:
                 raise ValueError("GitHub repository changed")
+            if self.request.preview.code_owner != f"@{status.login}":
+                raise ValueError(
+                    "GitHub code owner unavailable; configure exactly one github:<login> alias "
+                    "for the local actor"
+                )
+            completed = await self._finalize_merged_publication(client, status)
+            if completed is not None:
+                return completed
             if action == "inspect":
+                draft = _draft(service._runtime)
                 return {
-                    "state": "identity_verified"
-                    if service._team_recipient is None
-                    else self.status(),
+                    "state": (
+                        "identity_verified"
+                        if service._team_recipient is None
+                        else "publication_restart_required"
+                        if self.publication_restart_required
+                        else self.status()
+                    ),
                     "repository_id": status.repository_id,
                     "github_account_id": status.account_id,
                     "github_login": status.login,
                     "enrollment": service.team_enrollment_status(),
+                    "pull_request_url": draft.pull_request_url if draft is not None else None,
                 }
             if action == "enroll":
                 verifier = _OneTimeIdentity(identity)
@@ -477,17 +786,32 @@ class GitHubSetupBridge:
                     verifier.identity = None
                     service._github_identity_verifier = None
             self._recipient(status)
-            await self._anchor(api, status)
+            suggestions = preview_code_suggestions(
+                service._runtime.root,
+                self.request.preview.codeowners_suggestion,
+                self.request.preview.workflow_suggestion,
+            )
             if action == "publication-preview":
+                baseline = await client.verify_default_branch_baseline()
+                publication_tooling = await client.verify_default_branch_tooling(
+                    codeowners=self.request.preview.codeowners_suggestion.encode("utf-8"),
+                    workflow=self.request.preview.workflow_suggestion.encode("utf-8"),
+                    runner_id=self.request.preview.ci_recipient.runner_id
+                    if self.request.preview.ci_recipient is not None
+                    else "",
+                )
+                await self._anchor(api, status)
+                ci_recipient = self.request.preview.ci_recipient
+                if ci_recipient is None:
+                    raise ValueError("CI recipient unavailable")
                 if not status.protection_compatible or status.branch_commit is None:
                     raise ValueError("GitHub protection required")
                 self.reviewed, self.authority_digest = status, self._authority()
                 self.recipient_snapshot = service._team_recipient
-                self.suggestions = preview_code_suggestions(
-                    service._runtime.root,
-                    self.request.preview.codeowners_suggestion,
-                    self.request.preview.workflow_suggestion,
-                )
+                self.suggestions = suggestions
+                self.baseline = baseline
+                self.tooling = publication_tooling
+                self.setup_phase = "publication"
                 self.publication = PublicationService(
                     service._runtime,
                     repository_id=status.repository_id,
@@ -536,31 +860,86 @@ class GitHubSetupBridge:
                             key: base64.urlsafe_b64encode(value).rstrip(b"=").decode("ascii")
                             for key, value in signing.public_keys().items()
                         },
+                        "ci_trust": CiTrustConfig(
+                            recipient=ci_recipient,
+                            signing_public_keys={
+                                key: base64.b64encode(value).decode("ascii")
+                                for key, value in signing.public_keys().items()
+                            },
+                        ).model_dump(mode="json"),
                     },
                 }
             if action == "protection-preview":
-                suggestions = preview_code_suggestions(
-                    service._runtime.root,
-                    self.request.preview.codeowners_suggestion,
-                    self.request.preview.workflow_suggestion,
-                )
+                try:
+                    baseline = await client.verify_default_branch_baseline()
+                except GitHubTeamStateError:
+                    return {
+                        "state": "default_branch_prerequisite",
+                        "repository_id": status.repository_id,
+                        "guidance": (
+                            "Protect the default branch with enforced administrators, stale-review "
+                            "dismissal, at least one human approval, no bypass allowances, and no "
+                            "force pushes or deletions before staging setup files."
+                        ),
+                    }
+                installed = True
                 for existing, suggested in (
                     (suggestions.codeowners_preimage, suggestions.codeowners_content),
                     (suggestions.workflow_preimage, suggestions.workflow_content),
                 ):
-                    if existing is not None and base64.urlsafe_b64decode(
-                        existing + "=" * (-len(existing) % 4)
-                    ) != suggested.encode("utf-8"):
+                    current = (
+                        None
+                        if existing is None
+                        else base64.urlsafe_b64decode(existing + "=" * (-len(existing) % 4))
+                    )
+                    if current is not None and current != suggested.encode("utf-8"):
                         raise ValueError("GitHub code suggestions conflict")
-                protection = client.protection_preview()
-                self.recipient_snapshot = service._team_recipient
+                    installed = installed and current == suggested.encode("utf-8")
+                tooling: GitHubDefaultBranchTooling | None = None
+                if installed:
+                    try:
+                        tooling = await client.verify_default_branch_tooling(
+                            codeowners=self.request.preview.codeowners_suggestion.encode("utf-8"),
+                            workflow=self.request.preview.workflow_suggestion.encode("utf-8"),
+                            runner_id=self.request.preview.ci_recipient.runner_id
+                            if self.request.preview.ci_recipient is not None
+                            else "",
+                        )
+                    except GitHubTeamStateError:
+                        return {
+                            "state": "code_changes_staged",
+                            "repository_id": status.repository_id,
+                            "guidance": (
+                                "Commit and merge the exact staged CODEOWNERS and validator workflow "
+                                "to the protected default branch, restrict the intent-state runner "
+                                "group to that workflow, then preview protection again."
+                            ),
+                        }
                 authority = self._authority()
+                bootstrap = _bootstrap_receipt(service._runtime)
+                if bootstrap is not None:
+                    if (
+                        bootstrap.repository_id != status.repository_id
+                        or bootstrap.tooling != tooling
+                        or bootstrap.authority_digest != authority
+                        or (status.branch_present and status.branch_commit != bootstrap.anchor)
+                    ):
+                        raise ValueError("GitHub bootstrap receipt changed")
+                    if status.branch_present:
+                        await self._anchor(api, status)
+                protection = client.protection_preview() if tooling is not None else None
+                self.recipient_snapshot = service._team_recipient
                 subject = _digest(
                     {
-                        "protection": protection.model_dump(mode="json"),
+                        "phase": "protection" if tooling is not None else "code_changes",
+                        "protection": (
+                            None if protection is None else protection.model_dump(mode="json")
+                        ),
                         "status": status.model_dump(mode="json"),
                         "suggestions": suggestions.model_dump(mode="json"),
+                        "tooling": None if tooling is None else tooling.model_dump(mode="json"),
                         "authority": authority,
+                        "baseline": baseline.model_dump(mode="json"),
                         "recipient": service._team_recipient.model_dump(mode="json")
                         if service._team_recipient
                         else None,
@@ -583,17 +962,24 @@ class GitHubSetupBridge:
                     issued_at=now,
                     expires_at=now + timedelta(minutes=5),
                 )
-                self.reviewed, self.suggestions, self.authority_digest, self.protection_digest = (
+                self.reviewed, self.suggestions, self.authority_digest = (
                     status,
                     suggestions,
                     authority,
-                    protection.digest,
                 )
+                self.protection_digest = None if protection is None else protection.digest
+                self.tooling = tooling
+                self.baseline = baseline
+                self.setup_phase = "protection" if tooling is not None else "code_changes"
                 return {
                     "payload": self.pending.model_dump(mode="json"),
                     "preview": {
-                        "protection": protection.model_dump(mode="json"),
+                        "phase": self.setup_phase,
+                        "protection": (
+                            None if protection is None else protection.model_dump(mode="json")
+                        ),
                         "suggestions": suggestions.model_dump(mode="json"),
+                        "tooling": None if tooling is None else tooling.model_dump(mode="json"),
                         "github_account_id": status.account_id,
                         "github_login": status.login,
                     },
@@ -607,11 +993,6 @@ class GitHubSetupBridge:
                 raise ValueError("GitHub setup decision changed")
             if status != self.reviewed or self._authority() != self.authority_digest:
                 raise ValueError("GitHub setup authority changed")
-            suggestions = preview_code_suggestions(
-                service._runtime.root,
-                self.request.preview.codeowners_suggestion,
-                self.request.preview.workflow_suggestion,
-            )
             if suggestions != self.suggestions:
                 raise ValueError("GitHub code suggestions changed")
             if action == "options":
@@ -643,6 +1024,40 @@ class GitHubSetupBridge:
                 publication = self.publication
                 if publication is None:
                     raise ValueError("GitHub publication unavailable")
+                pending_draft = _draft(service._runtime)
+                if pending_draft is None or pending_draft.anchor != status.branch_commit:
+                    raise ValueError("GitHub publication draft changed")
+                if self.publication_restart_required:
+                    if (
+                        pending_draft.publication_commit is None
+                        or pending_draft.pull_request_number is None
+                        or await client.publication_pull_request_state(
+                            pending_draft.publication(),
+                            expected_head_commit=pending_draft.publication_commit,
+                            expected_base_commit=pending_draft.anchor,
+                            pull_request_number=pending_draft.pull_request_number,
+                        )
+                        != "closed"
+                    ):
+                        raise ValueError("GitHub publication restart changed")
+                    _draft(
+                        service._runtime,
+                        prepared=pending_draft.publication(),
+                        anchor=pending_draft.anchor,
+                        external_write_attempted=True,
+                        publication_commit=pending_draft.publication_commit,
+                        restart_closed=True,
+                    )
+                    pending_draft = cast(EncryptedPublicationDraft, _draft(service._runtime))
+                _draft(
+                    service._runtime,
+                    prepared=pending_draft.publication(),
+                    anchor=pending_draft.anchor,
+                    external_write_attempted=True,
+                    publication_commit=pending_draft.publication_commit,
+                    pull_request_number=pending_draft.pull_request_number,
+                    pull_request_url=pending_draft.pull_request_url,
+                )
                 self.transport.publisher = GitHubApiPublisher(api, client, status)
                 try:
                     prepared = await anyio.to_thread.run_sync(
@@ -653,44 +1068,79 @@ class GitHubSetupBridge:
                 self.publication = None
                 if self.transport.published_commit is None:
                     raise ValueError("GitHub publication commit unavailable")
+                _draft(
+                    service._runtime,
+                    prepared=prepared,
+                    anchor=status.branch_commit,
+                    external_write_attempted=True,
+                    publication_commit=self.transport.published_commit,
+                )
                 pr = await client.open_publication_pr(
                     prepared, expected_head_commit=self.transport.published_commit
-                )
-                from intent_engineering.team_state.local_trust import save_local_trust
-
-                await require_write_authority()
-                save_local_trust(
-                    service._runtime,
-                    self._recipient(status),
-                    SigningKeyStore(
-                        service._runtime.config.project_id,
-                        status.repository_id,
-                        service._runtime.config.local_actor,
-                    ).public_keys(),
                 )
                 _draft(
                     service._runtime,
                     prepared=prepared,
                     anchor=status.branch_commit,
-                    discard=True,
+                    external_write_attempted=True,
+                    publication_commit=self.transport.published_commit,
+                    pull_request_number=pr.number,
+                    pull_request_url=pr.url,
                 )
-                _complete_setup_request(service._runtime, self.request)
-                service._github_setup_bridge = None
                 return {
-                    "state": "published",
+                    "state": "publication_pending",
                     "pull_request_url": pr.url,
                     "repository_id": pr.repository_id,
                 }
-            updated = await client.configure_protection(cast(str, self.protection_digest))
+            if self.setup_phase == "code_changes":
+                await require_write_authority()
+                stage_code_suggestions(service._runtime.root, suggestions)
+                self.suggestions = preview_code_suggestions(
+                    service._runtime.root,
+                    self.request.preview.codeowners_suggestion,
+                    self.request.preview.workflow_suggestion,
+                )
+                return {
+                    "state": "code_changes_staged",
+                    "repository_id": status.repository_id,
+                    "guidance": (
+                        "Commit and merge the staged CODEOWNERS and validator workflow to the "
+                        "protected default branch, then preview branch protection again."
+                    ),
+                }
+            if self.setup_phase != "protection" or self.protection_digest is None:
+                raise ValueError("GitHub setup phase changed")
+            tooling = self.tooling
+            if tooling is None or self.authority_digest is None:
+                raise ValueError("GitHub bootstrap authority unavailable")
+            bootstrap = _bootstrap_receipt(service._runtime)
+
+            def record_bootstrap(anchor: str, tree: str) -> None:
+                _bootstrap_receipt(
+                    service._runtime,
+                    receipt=GitHubBootstrapReceipt(
+                        repository_id=status.repository_id,
+                        anchor=anchor,
+                        tree=tree,
+                        tooling=tooling,
+                        authority_digest=cast(str, self.authority_digest),
+                    ),
+                )
+
+            updated = await client.configure_protection(
+                self.protection_digest,
+                record_bootstrap=record_bootstrap,
+                expected_bootstrap_anchor=(None if bootstrap is None else bootstrap.anchor),
+            )
             await self._anchor(api, updated)
             await require_write_authority()
-            stage_code_suggestions(service._runtime.root, suggestions)
-            self.suggestions = preview_code_suggestions(
-                service._runtime.root,
-                self.request.preview.codeowners_suggestion,
-                self.request.preview.workflow_suggestion,
-            )
-            await require_write_authority()
+            completed_bootstrap = _bootstrap_receipt(service._runtime)
+            if completed_bootstrap is not None:
+                _bootstrap_receipt(
+                    service._runtime,
+                    receipt=completed_bootstrap,
+                    discard=True,
+                )
             SigningKeyStore(
                 service._runtime.config.project_id,
                 status.repository_id,

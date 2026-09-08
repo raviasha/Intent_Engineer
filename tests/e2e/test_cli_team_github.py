@@ -28,6 +28,7 @@ from intent_engineering.core.policy import initialize_project
 from intent_engineering.team_state.github import (
     GitHubProtectionPolicy,
     GitHubProtectionPreview,
+    GitHubRequiredStatusCheck,
     GitHubTeamStateStatus,
     PublicationPullRequest,
 )
@@ -36,10 +37,20 @@ from intent_engineering.team_state.publication import PublicationPreview
 from tests.helpers.shared_state import git
 
 
-def _project(tmp_path: Path) -> Path:
+def _project(tmp_path: Path, *, github_aliases: tuple[str, ...] = ("github:alice",)) -> Path:
     root = tmp_path / "project"
     root.mkdir()
     initialize_project(root)
+    aliases = ["local", *github_aliases]
+    (root / ".intent/approvals/policy.yaml").write_text(
+        "schema_version: 1\n"
+        "contributors: [local]\n"
+        "approvers: [local]\n"
+        "executors: [local]\n"
+        "identities:\n"
+        f"  local: {json.dumps(aliases)}\n",
+        encoding="utf-8",
+    )
     return root
 
 
@@ -125,22 +136,102 @@ def test_team_enable_github_is_a_no_network_preview_before_confirmation(
     payload = json.loads(result.stdout)
     assert payload["state"] == "confirmation_required"
     assert payload["repository_id"] == "github.com/acme/project"
+    assert payload["code_owner"] == "@alice"
     assert payload["codeowners_path"] == ".github/CODEOWNERS"
     assert payload["workflow_path"] == ".github/workflows/intent-state.yml"
     assert payload["codeowners_suggestion"] == (
-        "/.intent/ @acme\n/.github/workflows/intent-state.yml @acme\n"
+        "/.intent/ @alice\n"
+        "/.github/workflows/ @alice\n"
+        "/ci/launch.py @alice\n"
+        "/src/intent_engineering/ @alice\n"
     )
     import yaml
 
     workflow = yaml.safe_load(payload["workflow_suggestion"])
     assert workflow["on"]["pull_request_target"]["branches"] == ["intent-state"]
     state_job = workflow["jobs"]["state"]
+    assert state_job["runs-on"] == {
+        "group": "intent-state",
+        "labels": ["self-hosted", "intent-state"],
+    }
+    assert "INTENT_CI_SHARED_STATE_TRUST" not in state_job["steps"][-1]["env"]
     assert state_job["name"] == "Intent Engineering / state"
     assert state_job["steps"][0]["with"]["ref"] == "${{ github.workflow_sha }}"
     assert state_job["steps"][0]["with"]["persist-credentials"] is False
     assert state_job["steps"][-1]["run"] == "python -I .intent-trusted/ci/launch.py validate-state"
     assert payload["preview_digest"].startswith("sha256:")
     assert called is False
+
+
+def test_setup_imports_public_ci_descriptor_and_refuses_missing_ci(tmp_path: Path) -> None:
+    """Production setup cannot publish a bundle that the required state check cannot read."""
+    from intent_engineering.team_state.models import CiRecipientRecord
+
+    project = _project(tmp_path)
+    runner = CliRunner()
+    args = [
+        "team",
+        "enable",
+        "github",
+        "--project",
+        str(project),
+        "--repository",
+        "acme/project",
+        "--format",
+        "json",
+    ]
+    preview = json.loads(runner.invoke(app, args).stdout)
+    missing = runner.invoke(app, [*args, "--confirm-preview", preview["preview_digest"]])
+    assert missing.exit_code == 1
+    assert "--ci-recipient" in missing.output
+    assert not (project / ".intent/team-setup.json").exists()
+    recipient = CiRecipientRecord(
+        project_id="project",
+        repository_id="github.com/acme/project",
+        runner_id="release-01",
+        public_key=base64.urlsafe_b64encode(
+            X25519PrivateKey.generate().public_key().public_bytes_raw()
+        )
+        .rstrip(b"=")
+        .decode(),
+    )
+    descriptor = tmp_path / "ci.json"
+    descriptor.write_text(recipient.model_dump_json())
+    imported = runner.invoke(app, [*args, "--ci-recipient", str(descriptor)])
+    assert imported.exit_code == 4, imported.output
+    reviewed = json.loads(imported.stdout)
+    assert reviewed["ci_recipient"]["key_id"] == recipient.key_id
+    assert reviewed["preview_digest"] != preview["preview_digest"]
+    changed = recipient.model_copy(update={"runner_id": "release-02", "key_id": ""})
+    descriptor.write_text(changed.model_dump_json())
+    stale = runner.invoke(
+        app,
+        [*args, "--ci-recipient", str(descriptor), "--confirm-preview", reviewed["preview_digest"]],
+    )
+    assert stale.exit_code == 1
+    assert not (project / ".intent/team-setup.json").exists()
+
+
+@pytest.mark.parametrize(
+    "aliases",
+    [(), ("github:alice", "github:bob"), ("github:acme/team",)],
+)
+def test_team_enable_requires_one_exact_github_user_code_owner(
+    tmp_path: Path, aliases: tuple[str, ...]
+) -> None:
+    """Catches a repository owner, ambiguous alias, or team-shaped guess entering CODEOWNERS."""
+    project = _project(tmp_path, github_aliases=aliases)
+
+    result = CliRunner().invoke(
+        app,
+        ["team", "enable", "github", "--project", str(project)],
+        env={"GITHUB_REPOSITORY": "acme/project"},
+    )
+
+    assert result.exit_code == 1
+    assert "GitHub code owner unavailable" in result.output
+    assert "github:<login> alias" in result.output
+    assert "@acme" not in result.output
 
 
 def test_team_enable_github_requires_exact_preview_and_second_protection_confirmation(
@@ -231,11 +322,33 @@ def test_confirmed_cli_routes_to_control_plane_for_platform_webauthn(
     """Catches the default CLI replacing required platform WebAuthn with a fixed failure."""
     monkeypatch.setattr("intent_engineering.cli.dev.dev_command", lambda **_: None)
     project = _project(tmp_path)
+    from intent_engineering.team_state.ci import CiKeyStore
+    from tests.unit.team_state.test_ci_recipient import Backend
+
+    ci_recipient = CiKeyStore(
+        "project",
+        "github.com/acme/project",
+        "release-01",
+        backend=Backend(),
+        lock_root=tmp_path / "locks",
+    ).provision()
+    descriptor = tmp_path / "ci.json"
+    descriptor.write_text(ci_recipient.model_dump_json())
     runner = CliRunner()
     env = {"GITHUB_REPOSITORY": "acme/project"}
     preview = runner.invoke(
         app,
-        ["team", "enable", "github", "--project", str(project), "--format", "json"],
+        [
+            "team",
+            "enable",
+            "github",
+            "--project",
+            str(project),
+            "--ci-recipient",
+            str(descriptor),
+            "--format",
+            "json",
+        ],
         env=env,
     )
     preview_digest = json.loads(preview.stdout)["preview_digest"]
@@ -248,6 +361,8 @@ def test_confirmed_cli_routes_to_control_plane_for_platform_webauthn(
             "github",
             "--project",
             str(project),
+            "--ci-recipient",
+            str(descriptor),
             "--confirm-preview",
             preview_digest,
             "--format",
@@ -285,8 +400,12 @@ async def test_confirmed_enablement_runs_real_reviewed_orchestration_without_sid
         dismiss_stale_reviews=True,
         require_code_owner_reviews=False,
         required_approving_review_count=1,
+        bypass_pull_request_allowances_empty=True,
         required_status_checks_strict=True,
         required_status_check_contexts=("Intent Engineering / state",),
+        required_status_checks=(
+            GitHubRequiredStatusCheck(context="Intent Engineering / state", app_id=15368),
+        ),
         restrictions_digest=None,
     )
 

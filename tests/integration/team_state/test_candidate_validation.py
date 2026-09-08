@@ -1,21 +1,19 @@
 """Read-only protected tooling validates inert candidate Git objects."""
 
+import base64
 import json
 
 import pytest
 from typer.testing import CliRunner
 
 from intent_engineering.cli.app import app
-from intent_engineering.team_state.restore import TRUST_ENVIRONMENT_VARIABLE
 from tests.helpers.shared_state import (
-    artifacts,
     canonical_files,
     git,
     init_repository,
     install_state_ref,
     keys,
     ready_project,
-    trust_environment,
 )
 
 
@@ -27,10 +25,48 @@ def test_validator_requires_exact_linear_signed_artifacts_and_never_restores(
     source.mkdir(parents=True)
     ready_project(source)
     repo = init_repository(tmp_path / "target" / "project")
-    recipient, signer, trust = keys()
+    _recipient, signer, _trust = keys()
+    import keyring
+
+    from intent_engineering.team_state.ci import CiKeyStore, CiTrustConfig
+    from intent_engineering.team_state.restore import build_state_payload, seal_state_payload
+    from tests.helpers.shared_state import NOW
+    from tests.unit.team_state.test_ci_recipient import Backend
+
+    backend = Backend()
+    monkeypatch.setattr(keyring, "get_password", backend.get_password)
+    monkeypatch.setattr(keyring, "set_password", backend.set_password)
+    machine = CiKeyStore(
+        "project",
+        "github.com/acme/project",
+        "release-01",
+        backend=backend,
+        lock_root=tmp_path / "ci-locks",
+    ).provision()
+    protected = tmp_path / "protected"
+    protected.mkdir(mode=0o700)
+    config_path = protected / "trust.json"
+    config_path.write_bytes(
+        CiTrustConfig(
+            recipient=machine,
+            signing_public_keys={
+                "signer:release": base64.b64encode(signer.public_key().public_bytes_raw()).decode()
+            },
+        ).canonical_bytes()
+    )
+    config_path.chmod(0o600)
     tree = git(repo, "mktree", input_bytes=b"").decode().strip()
     base = git(repo, "commit-tree", tree, input_bytes=b"bootstrap\n").decode().strip()
-    release = artifacts(canonical_files(source), recipient, signer)
+    release = seal_state_payload(
+        build_state_payload(canonical_files(source)),
+        project_id="project",
+        repository_id="github.com/acme/project",
+        graph_version=1,
+        parent_bundle_digest=None,
+        created_at=NOW,
+        recipient_public_keys={machine.key_id: base64.urlsafe_b64decode(machine.public_key + "=")},
+        signing_private_keys={"signer:release": signer.private_bytes_raw()},
+    )
     if change == "signature":
         from dataclasses import replace
 
@@ -53,7 +89,7 @@ def test_validator_requires_exact_linear_signed_artifacts_and_never_restores(
     result = CliRunner().invoke(
         app,
         ["team", "validate-state", "--project", str(repo), "--base", argument_base, "--head", head],
-        env={TRUST_ENVIRONMENT_VARIABLE: trust_environment(trust)},
+        env={"INTENT_CI_TRUST_PATH": str(config_path)},
     )
     assert result.exit_code == (0 if change is None else 1), result.output
     assert not (repo / ".intent").exists()
@@ -80,9 +116,17 @@ def test_validator_requires_exact_linear_signed_artifacts_and_never_restores(
             "GITHUB_EVENT_NAME": "pull_request_target",
             "GITHUB_SERVER_URL": "https://github.com",
             "INTENT_CI_TOOLING_SHA": tooling,
-            TRUST_ENVIRONMENT_VARIABLE: trust_environment(trust),
+            "INTENT_CI_TRUST_PATH": str(config_path),
         }.items():
             monkeypatch.setenv(key, value)
         monkeypatch.setattr("sys.argv", ["launch.py", "validate-state"])
         assert main(repo) == 0
         assert not (repo / ".intent").exists()
+        backend.values.clear()
+        missing = CliRunner().invoke(
+            app,
+            ["team", "validate-state", "--project", str(repo), "--base", base, "--head", head],
+            env={"INTENT_CI_TRUST_PATH": str(config_path)},
+        )
+        assert missing.exit_code == 1
+        assert "intent team ci provision" in missing.output

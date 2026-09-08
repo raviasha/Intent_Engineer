@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 from collections.abc import Awaitable, Callable, Mapping
 from datetime import UTC, datetime, timedelta
@@ -47,6 +48,8 @@ _CANONICAL_REPOSITORY = re.compile(
     r"(?!-)(?!.*--)[a-z0-9-]{1,39}(?<!-)/[a-z0-9][a-z0-9._-]{0,99}\Z"
 )
 _RATE_SCALAR_MAX = 1_000_000_000
+_MAX_RESPONSE_BYTES = 1024 * 1024
+_MAX_RAW_RESPONSE_BYTES = 32 * 1024 * 1024
 
 
 class RetryPolicy(StrictModel):
@@ -380,6 +383,28 @@ class GitHubClient:
         authorization_secret = None
         return overlap
 
+    @staticmethod
+    async def _close_response(response: httpx.Response) -> None:
+        with anyio.CancelScope(shield=True):
+            await response.aclose()
+
+    async def _read_bounded_response(
+        self,
+        response: httpx.Response,
+        endpoint: str,
+        *,
+        max_bytes: int = _MAX_RESPONSE_BYTES,
+    ) -> bytes:
+        content = bytearray()
+        try:
+            async for chunk in response.aiter_bytes():
+                if len(chunk) > max_bytes - len(content):
+                    raise GitHubProtocolError(endpoint)
+                content.extend(chunk)
+            return bytes(content)
+        finally:
+            content.clear()
+
     async def _request_page(
         self,
         url: httpx.URL,
@@ -387,7 +412,10 @@ class GitHubClient:
         params: Mapping[str, str] | None,
         etag: str | None,
         endpoint: str,
-    ) -> httpx.Response:
+        readable_statuses: frozenset[int],
+        max_bytes: int = _MAX_RESPONSE_BYTES,
+        accept: str | None = None,
+    ) -> tuple[httpx.Response, bytes]:
         if self.is_closed:
             raise RuntimeError("GitHub client is closed")
         headers = (
@@ -395,9 +423,12 @@ class GitHubClient:
         )
         if etag is not None:
             headers["If-None-Match"] = etag
+        if accept is not None:
+            headers["Accept"] = accept
         request_url = url.copy_merge_params(params) if params else url
         for attempt in range(1, self._retry_policy.max_attempts + 1):
             transport_failed = False
+            response: httpx.Response | None = None
             try:
                 request = httpx.Request(
                     "GET",
@@ -409,20 +440,34 @@ class GitHubClient:
                     request,
                     auth=None,
                     follow_redirects=False,
+                    stream=True,
                 )
+                if response.status_code in readable_statuses:
+                    content = await self._read_bounded_response(
+                        response, endpoint, max_bytes=max_bytes
+                    )
+                else:
+                    content = b""
             except httpx.TransportError:
                 transport_failed = True
+            except BaseException:
+                if response is not None:
+                    await self._close_response(response)
+                raise
 
             if transport_failed:
+                if response is not None:
+                    await self._close_response(response)
                 if attempt == self._retry_policy.max_attempts:
                     raise GitHubTransientError(endpoint, attempt_count=attempt)
                 await self._sleeper(self._retry_policy.delay_after(attempt))
                 continue
 
+            assert response is not None
             if 500 <= response.status_code <= 599:
                 status_code = response.status_code
                 request_id = self._safe_request_id(response.headers.get("X-GitHub-Request-Id"))
-                await response.aclose()
+                await self._close_response(response)
                 if attempt == self._retry_policy.max_attempts:
                     raise GitHubTransientError(
                         endpoint,
@@ -432,7 +477,7 @@ class GitHubClient:
                     )
                 await self._sleeper(self._retry_policy.delay_after(attempt))
                 continue
-            return response
+            return response, content
         raise AssertionError("retry loop must return or raise")
 
     def _status_error(self, response: httpx.Response, endpoint: str) -> GitHubApiError:
@@ -482,22 +527,23 @@ class GitHubClient:
         if current is None:  # pragma: no cover - canonical repository makes this unreachable
             raise GitHubProtocolError("/")
         endpoint = self._safe_endpoint(current.path)
-        response = await self._request_page(
+        response, content = await self._request_page(
             current,
             params=None,
             etag=None,
             endpoint=endpoint,
+            readable_statuses=frozenset(range(200, 300)),
         )
         if not 200 <= response.status_code <= 299:
             error = self._status_error(response, endpoint)
-            await response.aclose()
+            await self._close_response(response)
             del response
             raise error from None
 
         malformed = False
         payload: Any = None
         try:
-            payload = response.json()
+            payload = json.loads(content)
         except (UnicodeError, ValueError):
             malformed = True
         rate_status = _repository_rate_status(response.headers)
@@ -520,7 +566,7 @@ class GitHubClient:
             or reflected_provider_material
         ):
             malformed = True
-        await response.aclose()
+        await self._close_response(response)
         del response
         payload = None
         if malformed or rate_status is None:
@@ -571,11 +617,12 @@ class GitHubClient:
         response: httpx.Response | None = None
         try:
             if method == "GET":
-                response = await self._request_page(
+                response, content = await self._request_page(
                     current,
                     params=params,
                     etag=None,
                     endpoint=endpoint,
+                    readable_statuses=allowed_statuses,
                 )
             else:
                 headers = (
@@ -595,19 +642,23 @@ class GitHubClient:
                         request,
                         auth=None,
                         follow_redirects=False,
+                        stream=True,
                     )
                 except httpx.TransportError:
                     raise GitHubTransientError(endpoint, attempt_count=1) from None
             if response.status_code not in allowed_statuses:
                 raise self._status_error(response, endpoint)
-            content = response.content
-            malformed = len(content) > 1024 * 1024
-            parsed: Any = None
-            if not malformed:
+            if method != "GET":
                 try:
-                    parsed = response.json()
-                except (UnicodeError, ValueError):
-                    malformed = True
+                    content = await self._read_bounded_response(response, endpoint)
+                except httpx.TransportError:
+                    raise GitHubTransientError(endpoint, attempt_count=1) from None
+            malformed = False
+            parsed: Any = None
+            try:
+                parsed = json.loads(content)
+            except (UnicodeError, ValueError):
+                malformed = True
             oauth_scopes = response.headers.get("X-OAuth-Scopes")
             if (
                 malformed
@@ -625,7 +676,45 @@ class GitHubClient:
             )
         finally:
             if response is not None:
-                await response.aclose()
+                await self._close_response(response)
+
+    async def request_bytes(
+        self,
+        method: str,
+        path: str,
+        *,
+        max_bytes: int,
+        accept: str,
+    ) -> bytes:
+        """Issue one streamed raw-media GET under an explicit caller-supplied bound."""
+        if (
+            method != "GET"
+            or type(max_bytes) is not int
+            or not 1 <= max_bytes <= _MAX_RAW_RESPONSE_BYTES
+            or accept != "application/vnd.github.raw+json"
+        ):
+            raise GitHubProtocolError("/")
+        current = self._absolute_url(path, pagination=False)
+        if current is None:
+            raise GitHubProtocolError("/")
+        endpoint = self._safe_endpoint(current.path)
+        response: httpx.Response | None = None
+        try:
+            response, content = await self._request_page(
+                current,
+                params=None,
+                etag=None,
+                endpoint=endpoint,
+                readable_statuses=frozenset({200}),
+                max_bytes=max_bytes,
+                accept=accept,
+            )
+            if response.status_code != 200:
+                raise self._status_error(response, endpoint)
+            return content
+        finally:
+            if response is not None:
+                await self._close_response(response)
 
     async def get_pages(
         self,
@@ -652,29 +741,30 @@ class GitHubClient:
                 raise GitHubProtocolError(endpoint)
             seen.add(request_key)
 
-            response = await self._request_page(
+            response, content = await self._request_page(
                 current,
                 params=page_params,
                 etag=page_etag,
                 endpoint=endpoint,
+                readable_statuses=frozenset({200, 304}),
             )
             page_number += 1
 
             if response.status_code == 304:
-                await response.aclose()
+                await self._close_response(response)
                 if page_number != 1 or etag is None:
                     raise GitHubProtocolError(endpoint)
                 return PageResult(items=(), etag=etag, not_modified=True)
 
             if not 200 <= response.status_code <= 299:
                 error = self._status_error(response, endpoint)
-                await response.aclose()
+                await self._close_response(response)
                 del response
                 raise error from None
 
             malformed_json = False
             try:
-                payload: Any = response.json()
+                payload: Any = json.loads(content)
             except (UnicodeError, ValueError):
                 malformed_json = True
                 payload = None
@@ -683,7 +773,7 @@ class GitHubClient:
                 or type(payload) is not list
                 or any(type(item) is not dict for item in payload)
             ):
-                await response.aclose()
+                await self._close_response(response)
                 del response
                 payload = None
                 raise GitHubProtocolError(endpoint) from None
@@ -696,7 +786,7 @@ class GitHubClient:
                 )
             )
             if reflected_provider_material:
-                await response.aclose()
+                await self._close_response(response)
                 del response
                 payload = None
                 first_etag = None
@@ -713,7 +803,7 @@ class GitHubClient:
             except GitHubProtocolError:
                 next_failed = True
                 next_value = None
-            await response.aclose()
+            await self._close_response(response)
             del response
             payload = None
             if next_failed:

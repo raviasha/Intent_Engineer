@@ -175,6 +175,8 @@ def fetch_proposed_revision(root: Path, request: ProtectedRequest, token: str) -
 
 
 def main(root: Path) -> int:
+    from intent_engineering.team_state.ci import CiTrustError
+
     try:
         descriptor = os.open(
             os.environ["GITHUB_EVENT_PATH"], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
@@ -192,13 +194,13 @@ def main(root: Path) -> int:
             fetch_proposed_revision(root, request, os.environ.get("GH_TOKEN", ""))
         elif sys.argv[1:] == ["validate-state"]:
             from intent_engineering.team_state.candidate import validate_candidate
-            from intent_engineering.team_state.restore import EnvironmentTrustProvider
+            from intent_engineering.team_state.ci import ci_trust_from_environment
 
             if request.base is None:
                 raise ValueError("protected CI unavailable")
             validate_candidate(
                 root,
-                EnvironmentTrustProvider(),
+                ci_trust_from_environment(root),
                 base=request.base,
                 head=request.revision,
                 at=datetime.now(UTC),
@@ -216,6 +218,9 @@ def main(root: Path) -> int:
         else:
             raise ValueError("protected CI unavailable")
         return 0
+    except CiTrustError:
+        print(f"Intent protected CI unavailable: {CiTrustError()}", file=sys.stderr)
+        return 1
     except Exception:  # noqa: BLE001 - no event, credential, PR output, or trust leakage
         print("Intent protected CI unavailable", file=sys.stderr)
         return 1

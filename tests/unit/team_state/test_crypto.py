@@ -80,6 +80,31 @@ def _keys() -> tuple[X25519PrivateKey, X25519PrivateKey]:
     )
 
 
+def test_independent_machine_recipient_decrypts_without_human_identity() -> None:
+    """Omitting CI wrapping leaves a real runner unable to decrypt a setup release."""
+    from intent_engineering.team_state import models
+
+    human, machine = _keys()
+    ci = models.CiRecipientRecord(
+        project_id="project",
+        repository_id=REPOSITORY,
+        runner_id="release-01",
+        public_key=_b64(machine.public_key().public_bytes_raw()),
+    )
+    recipients = tuple(sorted((_recipient("recipient:alice", human), ci), key=lambda x: x.key_id))
+    aad = _aad(recipient_ids=tuple(item.key_id for item in recipients))
+    encrypted = encrypt_bundle(b"approved state", recipients, aad)
+    assert decrypt_bundle(encrypted, human.private_bytes_raw(), aad) == b"approved state"
+    assert decrypt_bundle(encrypted, machine.private_bytes_raw(), aad) == b"approved state"
+    assert "actor" not in ci.model_dump()
+    with pytest.raises(ValueError):
+        encrypt_bundle(
+            b"approved state",
+            (ci.model_copy(update={"repository_id": "github.com/other/repo"}),),
+            aad,
+        )
+
+
 def _recipients() -> tuple[RecipientRecord, ...]:
     alice, bob = _keys()
     return (_recipient("recipient:alice", alice), _recipient("recipient:bob", bob))

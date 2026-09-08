@@ -402,6 +402,58 @@ class RecipientRecord(_TeamStateModel):
         return _require_utc(value)
 
 
+class CiRecipientRecord(_TeamStateModel):
+    """Dedicated runner encryption identity; it conveys no human decision authority."""
+
+    schema_version: Literal[1] = 1
+    kind: Literal["ci"] = "ci"
+    project_id: Annotated[str, Field(pattern=_PROJECT_ID.pattern)]
+    repository_id: Annotated[str, Field(pattern=_REPOSITORY_ID.pattern)]
+    runner_id: Annotated[str, Field(pattern=r"^[a-z][a-z0-9._-]{0,63}$")]
+    public_key: str
+    key_id: str = ""
+    encryption_algorithm: Literal["x25519-hkdf-sha256-aes256gcm-v1"] = ENCRYPTION_ALGORITHM
+
+    @field_validator("schema_version", mode="before")
+    @classmethod
+    def require_integer_version(cls, value: object) -> object:
+        if type(value) is not int:
+            raise ValueError("invalid CI recipient version")
+        return value
+
+    @model_validator(mode="after")
+    def require_bound_key(self) -> CiRecipientRecord:
+        _decode_base64url(
+            self.public_key, label="CI public key", maximum_encoded=64, exact_decoded=32
+        )
+        identity = _canonical_json(
+            {
+                "project_id": self.project_id,
+                "repository_id": self.repository_id,
+                "runner_id": self.runner_id,
+                "public_key": self.public_key,
+                "schema": "intent.ci-recipient.v1",
+            }
+        )
+        expected = f"recipient:ci:sha256:{hashlib.sha256(identity).hexdigest()}"
+        if self.key_id and self.key_id != expected:
+            raise ValueError("CI recipient binding changed")
+        object.__setattr__(self, "key_id", expected)
+        return self
+
+
+EncryptionRecipient = RecipientRecord | CiRecipientRecord
+
+
+def validate_encryption_recipient(value: object) -> EncryptionRecipient:
+    """Revalidate exact public records, including instances made without validation."""
+    if type(value) is RecipientRecord:
+        return RecipientRecord.model_validate(value.model_dump(mode="python"))
+    if type(value) is CiRecipientRecord:
+        return CiRecipientRecord.model_validate(value.model_dump(mode="python"))
+    raise ValueError("invalid encryption recipient")
+
+
 class PublicationLineage(_TeamStateModel):
     """A release digest plus its nearest-first authenticated ancestry."""
 

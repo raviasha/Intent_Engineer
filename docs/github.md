@@ -32,7 +32,42 @@ gh auth login
 The token remains in memory only. It is never written to `.intent`, evidence,
 checkpoints, reports, logs, or error messages. Grant the least read permission
 needed for repository contents, issues, and pull requests; do not grant write
-permission for this read-only slice.
+permission for evidence ingestion alone. The separately confirmed team-state setup
+below has a different, explicitly write-authorized credential contract.
+
+## Reviewed GitHub team-state setup
+
+`intent team enable github` currently requires an organization-owned repository,
+a classic setup token with `repo` and `admin:org`, repository admin/read/write
+permission, and an independent CI recipient. The generated CI job uses read-only
+permissions; it does not inherit this setup credential. Follow the complete
+[dedicated CI recipient and operator setup](ci-recipient.md).
+
+Before local staging, the default branch must already enforce admins, PR approval,
+stale-review dismissal, no bypass, and disabled force pushes/deletions. The first
+WebAuthn decision stages suggestions only. Commit and merge the exact workflow and
+CODEOWNERS through protected default-branch review. Setup verifies the remote bytes
+and code-owner enforcement before a second protection authorization.
+
+The organization runner group must be named `intent-state`, non-default, visible
+only to selected repositories, and restricted to this repository's exact
+`.github/workflows/intent-state.yml@refs/heads/<default-branch>` workflow. The
+registered runner name must equal the CI descriptor's runner ID and have both
+`self-hosted` and `intent-state` labels; the workflow selects the group explicitly.
+
+An active, no-bypass required-workflow ruleset must target `refs/heads/intent-state`
+and source that exact workflow from the default-branch ref. Set
+`do_not_enforce_on_create: true` only for the initial reviewed empty orphan; later
+updates remain governed. Default-branch-only enforcement does not protect state PRs.
+The required `Intent Engineering / state` status and GitHub Actions app ID `15368`
+are supplementary—not substitutes for this workflow-source rule or runner isolation.
+Default CODEOWNERS protects tooling, while state PRs use generic human review and
+retain exactly three encrypted/signed artifacts.
+
+Keep public bootstrap/publication receipts when a provider response is ambiguous.
+Cancel is unavailable once recovery authority is required; retry/inspect instead.
+After a PR opens, merge in GitHub and refresh to verify its exact merged artifacts
+before local trust is established. No recipient private key belongs in GitHub Secrets.
 
 ## Diagnose and sync
 
@@ -94,8 +129,11 @@ intent drift --project . --format markdown --output intent-drift.md
 ```
 
 Because `.intent` is ignored, a clean checkout restores its approved baseline from the fetched
-protected `intent-state` ref using `INTENT_CI_SHARED_STATE_TRUST` in the protected `intent-ci`
-environment. Missing keys, invalid signatures or incompatible state fail closed. The workflow
+protected `intent-state` ref. The older sync workflow uses a legacy environment-trust
+adapter and is not the production key-provisioning path. Do not place recipient private
+keys in GitHub Secrets. New team setup requires a [dedicated CI recipient](ci-recipient.md)
+whose key remains in its self-hosted runner OS keyring. Missing keys, invalid signatures
+or incompatible state fail closed. The workflow
 never runs `intent init` and cannot report an empty graph version 0 as clean. See
 [CI setup and trust prerequisites](intent-aware-agent.md#required-github-check-setup).
 After uploading the report, the final step runs `intent check --require-review`. Pending review
@@ -112,9 +150,10 @@ above. It performs no external write.
 
 ## Scope and testing boundary
 
-Hosted OAuth, GitHub App installation, webhooks, pull-request annotations or
-comments, and all external writes are non-goals for this local public-alpha
-slice. MCP write-back and Slack, Notion, Jira, and Confluence integrations are
+Hosted OAuth, GitHub App installation, webhooks, and pull-request annotations or
+comments are non-goals for evidence ingestion. Its commands remain read-only;
+the separately reviewed team-state setup above performs only its bounded authorized
+provider writes. MCP write-back and Slack, Notion, Jira, and Confluence integrations are
 not claimed as complete here.
 
 All shipped tests use a deterministic fake GitHub API. An optional live smoke

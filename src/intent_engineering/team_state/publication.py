@@ -43,10 +43,12 @@ from intent_engineering.team_state.models import (
     CANONICAL_STATE_PATHS,
     CanonicalStateFile,
     CanonicalStateSnapshot,
+    EncryptionRecipient,
     PreparedPublication,
     RecipientRecord,
     RemoteStateSnapshot,
     TeamStateManifest,
+    validate_encryption_recipient,
 )
 from intent_engineering.team_state.restore import (
     StateSignatureEnvelope,
@@ -89,7 +91,7 @@ _GIT_SUPERVISOR = (
 
 @dataclass(frozen=True, slots=True)
 class PublicationAuthority:
-    recipients: tuple[RecipientRecord, ...]
+    recipients: tuple[EncryptionRecipient, ...]
     signing_private_keys: Mapping[str, bytes]
     remote_state: RemoteStateSnapshot | None
     publication_base_commit: str | None = None
@@ -590,13 +592,10 @@ class PublicationService:
         *,
         project_id: str,
         repository_id: str,
-    ) -> tuple[tuple[RecipientRecord, ...], dict[str, bytes], str | None, str | None, bytes]:
+    ) -> tuple[tuple[EncryptionRecipient, ...], dict[str, bytes], str | None, str | None, bytes]:
         if type(authority) is not PublicationAuthority:
             raise ValueError("publication authority unavailable")
-        recipients = tuple(
-            RecipientRecord.model_validate(item.model_dump(mode="python"))
-            for item in authority.recipients
-        )
+        recipients = tuple(validate_encryption_recipient(item) for item in authority.recipients)
         key_ids = tuple(item.key_id for item in recipients)
         if not recipients or key_ids != tuple(sorted(key_ids)) or len(key_ids) != len(set(key_ids)):
             raise ValueError("publication recipients are invalid")
@@ -865,7 +864,8 @@ class PublicationService:
         exact_recipients = tuple(
             item
             for item in recipients
-            if item.project_id == credential.project_id
+            if isinstance(item, RecipientRecord)
+            and item.project_id == credential.project_id
             and item.repository_id == self._repository_id
             and item.actor == credential.actor
             and item.webauthn_credential_id == credential.credential_id

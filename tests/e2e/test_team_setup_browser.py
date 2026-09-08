@@ -125,8 +125,79 @@ process.stdout.write(JSON.stringify({setupText,app:app.textContent,cancelBody:ca
     assert "Team setup cancelled" in result["app"] or "setup_required" in result["app"]
 
 
+def test_pending_publication_refresh_shows_pr_and_finalizes_without_reauthorization() -> None:
+    """A browser restart must not strand an opened PR or request another enrollment."""
+    result = _run(r"""
+respond(take("/api/v1/status"),projection); await settle();
+nav.find((item)=>item.dataset.view==="team_state").click(); await settle();
+respond(take("/api/v1/team/setup"),{state:"publication_pending",repository_id:"github.com/acme/alpha"}); await settle();
+respond(take("/api/v1/team/setup/inspect"),{state:"publication_pending",repository_id:"github.com/acme/alpha",pull_request_url:"https://github.com/acme/alpha/pull/7"}); await settle();
+const pendingText=app.textContent;
+button("Refresh publication merge status").click(); await settle();
+respond(take("/api/v1/team/setup/inspect"),{state:"published",pull_request_url:"https://github.com/acme/alpha/pull/7"}); await settle();
+process.stdout.write(JSON.stringify({pendingText,app:app.textContent,buttons:walk(app).filter((node)=>node.tagName==="button").map((node)=>node.textContent),createCount,getCount}));
+""")
+    assert "https://github.com/acme/alpha/pull/7" in result["pendingText"]
+    assert "Merge the reviewed pull request in GitHub" in result["pendingText"]
+    assert "published" in result["app"]
+    assert "Refresh publication merge status" not in result["buttons"]
+    assert result["createCount"] == result["getCount"] == 0
+    assert "Cancel team setup" not in result["buttons"]
+
+
+def test_code_staging_requires_a_separate_review_after_remote_tooling_merge() -> None:
+    """Local staging must not suggest protection already exists or lose actionable remote guidance."""
+    result = _run(r"""
+respond(take("/api/v1/status"),projection); await settle();
+nav.find((item)=>item.dataset.view==="team_state").click(); await settle();
+respond(take("/api/v1/team/setup"),{state:"enrolled",repository_id:"github.com/acme/alpha"}); await settle();
+button("Preview branch protection changes").click(); await settle();
+const stagingPayload=payload("approve_external_write","code-staging");
+respond(take("/api/v1/team/setup/protection-preview"),{preview:{phase:"code_changes",suggestions:{workflow:"review exact contents"}},payload:stagingPayload}); await settle();
+button("Authorize code suggestion staging with WebAuthn").click(); await settle();
+respond(take("/api/v1/team/setup/options"),{publicKey:{challenge:"Y2hhbGxlbmdl",allowCredentials:[{id:"Y3JlZGVudGlhbA",type:"public-key"}]}}); await settle();
+respond(take("/api/v1/team/setup/verify"),{state:"code_changes_staged",guidance:"Commit and merge staged files to the protected default branch."}); await settle();
+const stagedText=app.textContent;
+button("Preview branch protection changes").click(); await settle();
+respond(take("/api/v1/team/setup/protection-preview"),{state:"code_changes_staged",guidance:"Restrict the runner group to the reviewed default-branch workflow, then retry."}); await settle();
+const blockedText=app.textContent,blockedButtons=walk(app).filter((node)=>node.tagName==="button").map((node)=>node.textContent);
+button("Preview branch protection changes").click(); await settle();
+respond(take("/api/v1/team/setup/protection-preview"),{preview:{phase:"protection",tooling:{commit:"reviewed-main"}},payload:payload("approve_external_write","protection")}); await settle();
+process.stdout.write(JSON.stringify({stagedText,blockedText,blockedButtons,buttons:walk(app).filter((node)=>node.tagName==="button").map((node)=>node.textContent),getCount}));
+""")
+    assert "Commit and merge" in result["stagedText"]
+    assert "Restrict the runner group" in result["blockedText"]
+    assert "Authorize branch protection with WebAuthn" not in result["blockedButtons"]
+    assert "Authorize branch protection with WebAuthn" in result["buttons"]
+    assert result["getCount"] == 1
+
+
+def test_refused_cancel_preserves_recovery_guidance_instead_of_claiming_expiry() -> None:
+    """A durable bootstrap receipt cannot be discarded or described as expiring authority."""
+    result = _run(r"""
+respond(take("/api/v1/status"),projection); await settle();
+nav.find((item)=>item.dataset.view==="team_state").click(); await settle();
+respond(take("/api/v1/team/setup"),{state:"code_changes_staged",repository_id:"github.com/acme/alpha"}); await settle();
+button("Cancel team setup").click(); await settle();
+respond(take("/api/v1/team/setup/cancel"),{error:"unavailable"},400); await settle();
+process.stdout.write(JSON.stringify({app:app.textContent,notice:status.textContent}));
+""")
+    assert "code_changes_staged" in result["app"]
+    assert "Recovery state was retained" in result["notice"]
+    assert "expire" not in result["notice"]
+
+
 @pytest.mark.parametrize(
-    "progress", ["enrolled", "protection_configured", "publication_draft", "cancelled"]
+    "progress",
+    [
+        "enrolled",
+        "default_branch_prerequisite",
+        "code_changes_staged",
+        "protection_configured",
+        "publication_draft",
+        "publication_recovery_required",
+        "cancelled",
+    ],
 )
 def test_refresh_routes_to_recoverable_next_action_without_reenrollment(progress):
     result = _run(
@@ -137,9 +208,15 @@ process.stdout.write(JSON.stringify({buttons:walk(app).filter((node)=>node.tagNa
 """.replace("PROGRESS", json.dumps(progress))
     )
     assert "Enroll this device with WebAuthn" not in result["buttons"]
-    if progress == "enrolled":
+    if progress in {"enrolled", "code_changes_staged", "default_branch_prerequisite"}:
         assert "Preview branch protection changes" in result["buttons"]
-    elif progress in {"protection_configured", "publication_draft"}:
+    elif progress in {
+        "protection_configured",
+        "publication_draft",
+        "publication_recovery_required",
+    }:
         assert "Preview encrypted team-state publication" in result["buttons"]
+        if progress == "publication_recovery_required":
+            assert "Cancel team setup" not in result["buttons"]
     else:
         assert "Cancel team setup" not in result["buttons"]

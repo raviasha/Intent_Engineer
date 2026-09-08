@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import warnings
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
 from datetime import UTC, datetime
 from email.utils import format_datetime
 from types import MappingProxyType
@@ -47,6 +47,91 @@ def _client(
         transport=transport_factory(handler),
         **kwargs,
     )
+
+
+class _OversizedStreamingBody(httpx.AsyncByteStream):
+    """Expose clients that consume the transport stream after crossing the body cap."""
+
+    def __init__(self) -> None:
+        self.chunks_read = 0
+        self.closed = False
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        for _ in range(16):
+            self.chunks_read += 1
+            yield b"x" * (64 * 1024)
+        self.chunks_read += 1
+        yield b"x"
+        raise AssertionError("client consumed the response after crossing its size limit")
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
+@pytest.mark.anyio
+async def test_object_response_is_streamed_and_stops_immediately_after_crossing_body_cap(
+    github_credentials: GitHubCredentials,
+    transport_factory: TransportFactory,
+) -> None:
+    stream = _OversizedStreamingBody()
+
+    def handler(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, stream=stream)
+
+    client = _client(github_credentials, handler, transport_factory)
+    with pytest.raises(GitHubProtocolError):
+        await client.request_json_object("GET", "/items")
+    await client.aclose()
+
+    assert stream.chunks_read == 17
+    assert stream.closed is True
+
+
+@pytest.mark.anyio
+async def test_raw_media_response_streams_beyond_json_cap_with_caller_bound(
+    github_credentials: GitHubCredentials,
+    transport_factory: TransportFactory,
+) -> None:
+    raw = b"x" * (1024 * 1024 + 1)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.headers["Accept"] == "application/vnd.github.raw+json"
+        return httpx.Response(200, content=raw)
+
+    client = _client(github_credentials, handler, transport_factory)
+    response = await client.request_bytes(
+        "GET",
+        "/repos/acme/demo/git/blobs/" + "a" * 40,
+        max_bytes=len(raw),
+        accept="application/vnd.github.raw+json",
+    )
+    await client.aclose()
+
+    assert response == raw
+
+
+@pytest.mark.anyio
+async def test_raw_media_response_stops_and_closes_at_its_explicit_bound(
+    github_credentials: GitHubCredentials,
+    transport_factory: TransportFactory,
+) -> None:
+    stream = _OversizedStreamingBody()
+
+    def handler(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, stream=stream)
+
+    client = _client(github_credentials, handler, transport_factory)
+    with pytest.raises(GitHubProtocolError):
+        await client.request_bytes(
+            "GET",
+            "/repos/acme/demo/git/blobs/" + "a" * 40,
+            max_bytes=1024 * 1024,
+            accept="application/vnd.github.raw+json",
+        )
+    await client.aclose()
+
+    assert stream.chunks_read == 17
+    assert stream.closed is True
 
 
 @pytest.mark.anyio

@@ -6,6 +6,7 @@ import re
 from datetime import datetime
 from pathlib import Path
 
+from intent_engineering.team_state.ci import CiTrustError
 from intent_engineering.team_state.restore import (
     SharedStateTrust,
     TrustProvider,
@@ -60,6 +61,8 @@ def validate_candidate(
         failure = (
             caught
             if not isinstance(caught, Exception)
+            else CiTrustError()
+            if type(caught) is CiTrustError
             else ValueError("state candidate unavailable")
         )
     finally:

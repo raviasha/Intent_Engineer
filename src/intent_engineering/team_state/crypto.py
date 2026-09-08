@@ -33,7 +33,8 @@ from intent_engineering.team_state.models import (
     ENCRYPTION_ALGORITHM,
     MAX_BUNDLE_BYTES,
     MAX_MANIFEST_BYTES,
-    RecipientRecord,
+    EncryptionRecipient,
+    validate_encryption_recipient,
 )
 
 ALGORITHM: Final = ENCRYPTION_ALGORITHM
@@ -389,7 +390,7 @@ def _raise_safely(
 
 def encrypt_bundle(
     plaintext: bytes,
-    recipients: tuple[RecipientRecord, ...],
+    recipients: tuple[EncryptionRecipient, ...],
     aad: bytes,
 ) -> EncryptedBundle:
     """Encrypt exact plaintext once and wrap its random key for every recipient."""
@@ -399,12 +400,7 @@ def encrypt_bundle(
     try:
         if type(recipients) is not tuple or not recipients:
             raise _InvalidRecipients("invalid recipient set")
-        validated = tuple(
-            RecipientRecord.model_validate(item.model_dump(mode="python"))
-            if isinstance(item, RecipientRecord)
-            else (_ for _ in ()).throw(_InvalidRecipients("invalid recipient"))
-            for item in recipients
-        )
+        validated = tuple(validate_encryption_recipient(item) for item in recipients)
         ids = tuple(item.key_id for item in validated)
         authorities = {(item.project_id, item.repository_id) for item in validated}
         try:

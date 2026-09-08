@@ -116,6 +116,43 @@ def _prepared(root: Path) -> PreparedPublication:
         runtime.close()  # type: ignore[union-attr]
 
 
+def test_machine_recipient_is_bound_to_human_authorized_publication(tmp_path: Path) -> None:
+    """A machine may decrypt but cannot replace the enrolled human's WebAuthn binding."""
+    from intent_engineering.team_state.models import CiRecipientRecord
+
+    tmp_path = tmp_path / "project"
+    tmp_path.mkdir()
+    ready_project(tmp_path)
+    machine = CiRecipientRecord(
+        project_id="project",
+        repository_id=REPOSITORY_ID,
+        runner_id="release-01",
+        public_key=_b64(X25519PrivateKey.generate().public_key().public_bytes_raw()),
+    )
+    signer = {"signer:release": Ed25519PrivateKey.generate().private_bytes_raw()}
+    for recipients, allowed in (
+        ((machine,), False),
+        ((_recipient(X25519PrivateKey.generate()), machine), True),
+    ):
+        authority = PublicationAuthority(
+            recipients=recipients, signing_private_keys=signer, remote_state=None
+        )
+        publisher = RecordingPublisher()
+        runtime, service = _service(tmp_path, authority, publisher)
+        try:
+            preview = service.preview(now=NOW)
+            decision = VerifiedHumanDecision(preview.payload, _credential(), NOW)
+            if allowed:
+                prepared = service.prepare(decision, now=NOW)
+                assert machine.key_id in prepared.manifest.recipient_key_ids
+            else:
+                with pytest.raises(ValueError, match="publication decision changed"):
+                    service.prepare(decision, now=NOW)
+                assert not publisher.publications
+        finally:
+            runtime.close()
+
+
 def test_preview_is_stable_for_one_snapshot_and_prepare_requires_its_exact_decision(
     tmp_path: Path,
 ) -> None:

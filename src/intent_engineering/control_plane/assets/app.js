@@ -398,16 +398,26 @@
       }
       const actions = document.createElement("div");
       actions.className = "actions";
+      if (state.teamSetup.state === "publication_pending") {
+        addText(section, "p", "Merge the reviewed pull request in GitHub, then refresh to verify and finish local setup.");
+        actions.append(actionButton("Refresh publication merge status", inspectTeamSetup));
+      }
+      if (state.teamSetup.state === "publication_recovery_required") {
+        addText(section, "p", "A GitHub publication write may have occurred. Preview and authorize an exact recovery retry; setup cannot be cancelled until provider state is reconciled.");
+      }
+      if (state.teamSetup.state === "publication_restart_required") {
+        addText(section, "p", "The exact publication pull request was closed without merging. Preview and authorize a fresh exact pull request; setup cannot be cancelled until provider state is reconciled.");
+      }
       if (state.teamSetup.state === "setup_required") {
         actions.append(actionButton("Inspect GitHub identity and repository", inspectTeamSetup));
       }
       if (state.teamSetup.state === "identity_verified") {
         actions.append(actionButton("Enroll this device with WebAuthn", enrollProductionTeam));
       }
-      if (state.teamSetup.state === "enrolled" || state.teamSetup.state === "protection_configured") {
+      if (["enrolled", "default_branch_prerequisite", "code_changes_staged", "protection_configured"].includes(state.teamSetup.state)) {
         actions.append(actionButton("Preview branch protection changes", previewTeamProtection));
       }
-      if (state.teamSetup.state === "protection_configured" || state.teamSetup.state === "publication_draft") {
+      if (["protection_configured", "publication_draft", "publication_recovery_required", "publication_restart_required"].includes(state.teamSetup.state)) {
         actions.append(
           actionButton("Preview encrypted team-state publication", previewTeamPublication)
         );
@@ -415,8 +425,15 @@
       if (state.teamSetupPreview && state.teamSetupPreview.payload) {
         const action = state.teamSetupPreview.payload.action;
         if (action === "approve_external_write") {
+          const phase = state.teamSetupPreview.preview && state.teamSetupPreview.preview.phase;
           actions.append(
-            actionButton("Authorize branch protection with WebAuthn", authorizeTeamSetup, "danger")
+            actionButton(
+              phase === "code_changes"
+                ? "Authorize code suggestion staging with WebAuthn"
+                : "Authorize branch protection with WebAuthn",
+              authorizeTeamSetup,
+              "danger"
+            )
           );
         } else if (action === "publish_state") {
           actions.append(
@@ -424,7 +441,14 @@
           );
         }
       }
-      if (!["cancelled", "unconfigured", "published"].includes(state.teamSetup.state)) {
+      if (![
+        "cancelled",
+        "unconfigured",
+        "published",
+        "publication_pending",
+        "publication_recovery_required",
+        "publication_restart_required",
+      ].includes(state.teamSetup.state)) {
         actions.append(actionButton("Cancel team setup", cancelTeamSetup));
       }
       section.append(actions);
@@ -621,10 +645,13 @@
 
   async function refreshTeamEnrollment(quiet = false) {
     void fetchJson(api.teamSetup)
-      .then((setup) => {
+      .then(async (setup) => {
         state.teamSetup = setup;
         if (state.view === "team_state") {
           render();
+        }
+        if (setup.state === "publication_pending") {
+          await inspectTeamSetup();
         }
       })
       .catch(() => {
@@ -699,9 +726,15 @@
 
   async function loadTeamSetupPreview(path, successMessage) {
     try {
-      state.teamSetupPreview = await fetchJson(path, { method: "POST", body: "{}" });
+      const result = await fetchJson(path, { method: "POST", body: "{}" });
+      if (result.state && !result.payload) {
+        state.teamSetup = { ...state.teamSetup, ...result };
+        state.teamSetupPreview = null;
+      } else {
+        state.teamSetupPreview = result;
+      }
       render();
-      announce(successMessage);
+      announce(result.guidance || successMessage);
     } catch (_error) {
       state.teamSetupPreview = null;
       render();
@@ -751,6 +784,10 @@
       announce(
         result.state === "published"
           ? "Encrypted team state published through the reviewed pull request."
+          : result.state === "publication_pending"
+          ? "Publication pull request opened. Merge it in GitHub, then refresh publication status."
+          : result.state === "code_changes_staged"
+          ? "Code suggestions staged. Commit and merge the exact files to the protected default branch, then preview protection again."
           : "Branch protection configured after WebAuthn authorization."
       );
     } catch (error) {
@@ -777,7 +814,7 @@
       render();
       announce("Team setup cancelled. No pending authority remains.");
     } catch (_error) {
-      announce("Team setup cancellation failed; pending authority will expire.");
+      announce("Team setup cancellation was refused. Recovery state was retained; inspect or retry the reviewed operation before restarting setup.");
     }
   }
 

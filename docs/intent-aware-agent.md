@@ -309,35 +309,65 @@ Configure these prerequisites before expecting the check to pass:
    `seal_state_payload` envelope and independently pinned Ed25519 signing keys. Automatic team
    enrollment, publication PR creation and WebAuthn-bound publication are not provided by this
    workflow. The offline tests' fixed keys are fixtures and must never be used for deployment.
-3. First promote the reviewed launcher, adapter, hash lock, base digest and workflow to the
-   protected default branch through a trusted bootstrap review. A PR cannot bootstrap its own
-   trusted tooling. Protect these paths with independent code-owner review, stale-approval
-   dismissal, no direct/force pushes and no ordinary bypass. Create a GitHub environment named
+3. Before team setup can even stage suggestions, the default branch must already enforce
+   admins, required PR approval, stale-review dismissal, no review bypass, and disabled
+   force pushes/deletions. First promote the reviewed launcher, adapter, hash lock, base digest
+   and workflow through that trusted default-branch review. A PR cannot bootstrap its own
+   trusted tooling. After merge, team setup verifies exact remote workflow/CODEOWNERS bytes
+   and code-owner enforcement before a separate WebAuthn protection decision. Protect these
+   paths with independent code-owner review and no ordinary bypass. Create a GitHub environment named
    `intent-ci`, with required reviewers and deployment rules allowing only that protected default
-   branch. Do not make its secret available to PR refs or alternate workflows. Store
-   `INTENT_CI_SHARED_STATE_TRUST` as an environment secret.
-   Its strict JSON object has `schema_version: 1`, `project_id`,
-   `repository_id: "github.com/owner/repository"`, `recipient_key_id`,
-   `recipient_private_key_base64`, and `signing_keys`, an array of
-   `{ "signature_id": "...", "public_key_base64": "..." }` records sorted by signature ID.
-   Keys use unpadded URL-safe base64 for exactly 32 bytes; all configured signers must match the
-   release. Provision the recipient private key and trusted signing public keys through an
-   independent secure channel. Do not copy keys from a PR or commit them to Git.
+   branch. Do not store recipient private keys in GitHub environment secrets.
+   The production shared-state setup uses an independently provisioned self-hosted
+   runner keyring and reviewed public `INTENT_CI_TRUST_PATH` configuration; follow
+   [dedicated CI recipient setup](ci-recipient.md). The older environment-JSON
+   adapter remains a compatibility/test API, not a supported hosted-key deployment.
+   The existing code-check workflow's migration to that runner trust lifecycle is
+   separate from the generated required state-validation workflow.
+   Production team setup currently requires an organization-owned repository and a
+   classic setup token with `repo` and `admin:org`, plus repository admin/read/write
+   permission. Its organization runner group `intent-state` must have selected-repository
+   visibility and permit only the exact
+   `<owner>/<repository>/.github/workflows/intent-state.yml@refs/heads/<default-branch>`
+   workflow. The CI descriptor's runner ID must match the registered runner name in
+   that group, with labels `self-hosted` and `intent-state`; labels alone are not an
+   isolation boundary. The generated workflow selects both the group and labels.
 4. Environment approval authorizes only protected tooling to handle the trust secret. Proposed
    code, including fork code, executes solely in its secret-free, network-disabled container.
    Never add a head checkout, PR-authored action, package install, build hook or arbitrary PR
    command to this host job. `pull_request_target` is safe here only with that separation and the
    protected workflow source; merely selecting the event or naming an environment is insufficient.
    [GitHub documents the event's protected/default-branch context and risks](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#pull_request_target).
-5. Require this exact protected workflow through an active organization/enterprise workflow
-   ruleset targeting the protected default branch. An ordinary status-name requirement alone is
-   insufficient: PR-authored Actions can emit the same name. Require current-head checks and
-   independent review, and restrict ruleset bypass. GitHub supports `pull_request_target` for
-   required-workflow rules. If that enforcement is unavailable, use an independently pinned
-   external required-workflow service; do not claim a name-only check is this enforcement boundary.
+5. Keep the two required-workflow boundaries distinct. The code-check workflow described
+   above governs proposed code updates to the default branch. The generated
+   `Intent Engineering / state` validator instead requires an active, no-bypass
+   workflow ruleset targeting **`refs/heads/intent-state`** and sourcing exactly this
+   repository's `.github/workflows/intent-state.yml` from
+   **`refs/heads/<default-branch>`**. Set `do_not_enforce_on_create: true` so the exact
+   WebAuthn-authorized empty orphan can be created; every later state update remains
+   governed. An optional source SHA must match the reviewed default-branch commit.
+   Setup checks the effective state-branch rule and its active source ruleset.
+   A rule targeting only the default branch does not protect state publications.
+   An ordinary status-name requirement is insufficient: PR-authored Actions can
+   emit the same name. GitHub Actions app ID `15368` is supplementary, not a replacement
+   for the exact workflow-source rule, no-bypass policy, and restricted runner group.
+   Require current-head checks and independent human approval. GitHub supports
+   `pull_request_target` for required-workflow rules. If that enforcement or runner
+   isolation is unavailable, production team setup fails closed; an external
+   required-workflow/key-broker deployment is not implemented by this setup path.
    [GitHub required-workflow rules](https://docs.github.com/en/enterprise-cloud@latest/repositories/configuring-branches-and-merges-in-your-repository/managing-rulesets/available-rules-for-rulesets#require-workflows-to-pass-before-merging).
-   Do not apply this code rule to the separate state-only branch. These repository files do not
-   configure rulesets, reviewers, environments, secrets or merges.
+   Default-branch CODEOWNERS protects the tooling, not the artifact-only state branch.
+   State protection uses generic human approval, linear history, strict required checks,
+   enforced admins, and disabled force pushes/deletions. The state branch retains only
+   its three release artifacts. These repository files do not provision organization
+   runner groups, required-workflow rulesets, reviewers, environments or merges for you.
+
+An interrupted setup preserves its exact bootstrap/publication receipt. Cancel cannot
+erase authority needed to reconcile a possibly successful provider write. Retry the
+reviewed operation, or merge the pending publication PR in GitHub and refresh its
+status; local trust is installed only after the merged artifacts and sole reviewed
+parent have been verified. A linear-history merge may rewrite the commit SHA but
+must preserve those exact bytes.
 
 Only `.intent-trusted/.intent-ci/test-results.json` is uploaded by the PR job, with seven-day retention.
 It contains commit/project/test identifiers and ACL metadata, not decrypted canonical state or

@@ -18,7 +18,9 @@ import typer
 from pydantic import ConfigDict, Field
 
 from intent_engineering.cli.output import OutputFormat, emit
-from intent_engineering.cli.runtime import github_repository_scope, load_runtime
+from intent_engineering.cli.runtime import Runtime, github_repository_scope, load_runtime
+from intent_engineering.cli.team_ci import ci_app
+from intent_engineering.cli.writes import policy_actor_aliases
 from intent_engineering.control_plane.models import HumanDecisionPayload
 from intent_engineering.control_plane.webauthn_service import VerifiedHumanDecision
 from intent_engineering.core.models._base import StrictModel
@@ -27,7 +29,11 @@ from intent_engineering.team_state.github import (
     GitHubTeamStateStatus,
     PublicationPullRequest,
 )
-from intent_engineering.team_state.models import PreparedPublication, RecipientRecord
+from intent_engineering.team_state.models import (
+    CiRecipientRecord,
+    PreparedPublication,
+    RecipientRecord,
+)
 from intent_engineering.team_state.publication import PublicationPreview
 from intent_engineering.team_state.suggestions import (
     CodeSuggestionPreview,
@@ -37,6 +43,26 @@ from intent_engineering.team_state.suggestions import (
 team_app = typer.Typer(help="Configure and inspect shared intent state.")
 team_enable_app = typer.Typer(help="Enable one reviewed team-state provider.")
 team_app.add_typer(team_enable_app, name="enable")
+team_app.add_typer(ci_app, name="ci")
+
+_GITHUB_LOGIN = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,37}[a-z0-9])?\Z")
+
+
+class GitHubCodeOwnerError(ValueError):
+    """Fixed actionable failure when no exact writable GitHub user is configured."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            "GitHub code owner unavailable; configure exactly one github:<login> alias "
+            "for the local actor"
+        )
+
+
+class MissingCiRecipientError(ValueError):
+    def __init__(self) -> None:
+        super().__init__(
+            "CI recipient required; provision a self-hosted runner with intent team ci provision, then import its public descriptor with --ci-recipient"
+        )
 
 
 class GitHubEnablePreview(StrictModel):
@@ -46,6 +72,7 @@ class GitHubEnablePreview(StrictModel):
     project_id: str
     repository_id: str
     actor: str
+    code_owner: Annotated[str, Field(pattern=r"^@[a-z0-9](?:[a-z0-9-]{0,37}[a-z0-9])?$")]
     codeowners_path: Literal[".github/CODEOWNERS"] = ".github/CODEOWNERS"
     workflow_path: Literal[".github/workflows/intent-state.yml"] = (
         ".github/workflows/intent-state.yml"
@@ -53,6 +80,7 @@ class GitHubEnablePreview(StrictModel):
     codeowners_suggestion: str
     workflow_suggestion: str
     code_suggestions: CodeSuggestionPreview | None = None
+    ci_recipient: CiRecipientRecord | None = None
     preview_digest: str
 
 
@@ -148,6 +176,8 @@ class GitHubEnablementWorkflow:
             status = await self._services.github.inspect(repository)
             if status.repository_id != preview.repository_id:
                 raise ValueError("GitHub team enablement preview changed")
+            if preview.code_owner != f"@{status.login}":
+                raise GitHubCodeOwnerError()
             protection = self._services.github.protection_preview()
             if protection.repository_id != preview.repository_id:
                 raise ValueError("GitHub team enablement preview changed")
@@ -230,15 +260,34 @@ def _digest(payload: dict[str, object]) -> str:
     return f"sha256:{hashlib.sha256(content).hexdigest()}"
 
 
-def build_github_enable_preview(project: Path, repository: str) -> GitHubEnablePreview:
+def _configured_code_owner(runtime: Runtime) -> str:
+    aliases = policy_actor_aliases(runtime)
+    candidates = tuple(
+        sorted(alias.removeprefix("github:") for alias in aliases if alias.startswith("github:"))
+    )
+    if (
+        len(candidates) != 1
+        or _GITHUB_LOGIN.fullmatch(candidates[0]) is None
+        or "--" in candidates[0]
+    ):
+        raise GitHubCodeOwnerError()
+    return f"@{candidates[0]}"
+
+
+def build_github_enable_preview(
+    project: Path, repository: str, *, ci_recipient: CiRecipientRecord | None = None
+) -> GitHubEnablePreview:
     """Return the stable, network-free provider setup proposal."""
     repository = github_repository_scope({"GITHUB_REPOSITORY": repository})
     runtime = load_runtime(project)
     try:
         repository_id = f"github.com/{repository}"
-        login = repository.split("/", 1)[0]
+        code_owner = _configured_code_owner(runtime)
         codeowners_suggestion = (
-            f"/.intent/ @{login}\n/.github/workflows/intent-state.yml @{login}\n"
+            f"/.intent/ {code_owner}\n"
+            f"/.github/workflows/ {code_owner}\n"
+            f"/ci/launch.py {code_owner}\n"
+            f"/src/intent_engineering/ {code_owner}\n"
         )
         workflow_suggestion = (
             "# Protected default-branch tooling only; candidate commits are inert Git objects.\n"
@@ -251,7 +300,9 @@ def build_github_enable_preview(project: Path, repository: str) -> GitHubEnableP
             "jobs:\n"
             "  state:\n"
             "    name: Intent Engineering / state\n"
-            "    runs-on: ubuntu-24.04\n"
+            "    runs-on:\n"
+            "      group: intent-state\n"
+            "      labels: [self-hosted, intent-state]\n"
             "    environment: intent-ci\n"
             "    timeout-minutes: 10\n"
             "    steps:\n"
@@ -275,15 +326,23 @@ def build_github_enable_preview(project: Path, repository: str) -> GitHubEnableP
             "        run: python -I .intent-trusted/ci/launch.py validate-state\n"
             "        env:\n"
             "          INTENT_CI_TOOLING_SHA: ${{ github.workflow_sha }}\n"
-            "          INTENT_CI_SHARED_STATE_TRUST: ${{ secrets.INTENT_CI_SHARED_STATE_TRUST }}\n"
         )
         suggestions = (
             preview_code_suggestions(project, codeowners_suggestion, workflow_suggestion)
             if (project / ".git").exists()
             else None
         )
+        if ci_recipient is not None:
+            ci_recipient = CiRecipientRecord.model_validate(ci_recipient.model_dump(mode="python"))
+            if (
+                ci_recipient.project_id != runtime.config.project_id
+                or ci_recipient.repository_id != repository_id
+            ):
+                raise ValueError("CI recipient scope changed")
         payload: dict[str, object] = {
+            "ci_recipient": ci_recipient.model_dump(mode="json") if ci_recipient else None,
             "actor": runtime.config.local_actor,
+            "code_owner": code_owner,
             "codeowners_path": ".github/CODEOWNERS",
             "codeowners_suggestion": codeowners_suggestion,
             "project_id": runtime.config.project_id,
@@ -298,9 +357,11 @@ def build_github_enable_preview(project: Path, repository: str) -> GitHubEnableP
             project_id=runtime.config.project_id,
             repository_id=repository_id,
             actor=runtime.config.local_actor,
+            code_owner=code_owner,
             codeowners_suggestion=codeowners_suggestion,
             workflow_suggestion=workflow_suggestion,
             code_suggestions=suggestions,
+            ci_recipient=ci_recipient,
             preview_digest=_digest(payload),
         )
     finally:
@@ -314,9 +375,10 @@ async def run_confirmed_github_enablement(
     preview_confirmation: str,
     protection_confirmation: str | None,
     workflow: GitHubEnablementWorkflow | None = None,
+    ci_recipient: CiRecipientRecord | None = None,
 ) -> GitHubEnableResult:
     """Enter the WebAuthn-backed setup boundary after an exact local preview."""
-    preview = build_github_enable_preview(project, repository)
+    preview = build_github_enable_preview(project, repository, ci_recipient=ci_recipient)
     if preview_confirmation != preview.preview_digest:
         raise ValueError("GitHub team enablement preview changed")
     if workflow is not None:
@@ -326,6 +388,9 @@ async def run_confirmed_github_enablement(
             protection_confirmation=protection_confirmation,
         )
     from intent_engineering.team_state.setup import save_setup_request
+
+    if preview.ci_recipient is None:
+        raise MissingCiRecipientError()
 
     runtime = load_runtime(project)
     try:
@@ -344,14 +409,21 @@ async def run_confirmed_github_enablement(
 def enable_github_command(
     project: Annotated[Path, typer.Option("--project")] = Path("."),
     repository: Annotated[str | None, typer.Option("--repository")] = None,
+    ci_recipient: Annotated[Path | None, typer.Option("--ci-recipient")] = None,
     confirm_preview: Annotated[str | None, typer.Option("--confirm-preview")] = None,
     confirm_protection: Annotated[str | None, typer.Option("--confirm-protection")] = None,
     output_format: Annotated[OutputFormat, typer.Option("--format")] = OutputFormat.TEXT,
 ) -> None:
     """Preview GitHub team setup before any credential or network access."""
     try:
+        from intent_engineering.team_state.ci import read_ci_recipient
+
+        recipient = read_ci_recipient(ci_recipient) if ci_recipient is not None else None
         repository = discover_github_repository(project, repository)
-        preview = build_github_enable_preview(project, repository)
+        preview = build_github_enable_preview(project, repository, ci_recipient=recipient)
+    except GitHubCodeOwnerError as error:
+        typer.echo(f"intent error: {error}", err=True)
+        raise typer.Exit(1) from None
     except Exception:  # noqa: BLE001 - never print local/provider configuration details
         typer.echo("intent error: GitHub configuration unavailable", err=True)
         raise typer.Exit(1) from None
@@ -368,10 +440,14 @@ def enable_github_command(
             repository,
             preview_confirmation=confirm_preview,
             protection_confirmation=confirm_protection,
+            ci_recipient=recipient,
         )
 
     try:
         result = anyio.run(run)
+    except MissingCiRecipientError as error:
+        typer.echo(f"intent error: {error}", err=True)
+        raise typer.Exit(1) from None
     except Exception:  # noqa: BLE001 - fixed CLI boundary; cancellation stays observable
         typer.echo("intent error: GitHub configuration unavailable", err=True)
         raise typer.Exit(1) from None
@@ -421,12 +497,15 @@ def validate_state_command(
 ) -> None:
     """Read-only CI validation of inert state objects using explicitly supplied CI trust."""
     from intent_engineering.team_state.candidate import validate_candidate
-    from intent_engineering.team_state.restore import EnvironmentTrustProvider
+    from intent_engineering.team_state.ci import CiTrustError, ci_trust_from_environment
 
     try:
         validate_candidate(
-            project, EnvironmentTrustProvider(), base=base, head=head, at=datetime.now(UTC)
+            project, ci_trust_from_environment(project), base=base, head=head, at=datetime.now(UTC)
         )
+    except CiTrustError as error:
+        typer.echo(f"intent error: {error}", err=True)
+        raise typer.Exit(1) from None
     except Exception:  # noqa: BLE001 - fixed CI boundary never emits decrypted state
         typer.echo("intent error: state candidate unavailable", err=True)
         raise typer.Exit(1) from None
@@ -434,6 +513,7 @@ def validate_state_command(
 
 
 __all__ = [
+    "GitHubCodeOwnerError",
     "GitHubEnablePreview",
     "GitHubEnableResult",
     "GitHubEnablementServices",
