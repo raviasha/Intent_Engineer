@@ -7,6 +7,7 @@ import json
 import os
 import re
 from collections.abc import Mapping
+from datetime import UTC, datetime, timedelta
 from typing import Annotated, Final, Literal, Never
 
 from cryptography.exceptions import InvalidTag
@@ -40,6 +41,9 @@ MAX_RECIPIENTS: Final = 64
 _NONCE_BYTES: Final = 12
 _KEY_BYTES: Final = 32
 _KEY_ID = re.compile(r"^[a-z][a-z0-9._:-]{0,127}$")
+_PROJECT_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+_REPOSITORY_ID = re.compile(r"^[a-z0-9.-]+/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+_SHA256 = re.compile(r"^sha256:[0-9a-f]{64}$")
 
 
 def _canonical_json(value: object) -> bytes:
@@ -108,6 +112,84 @@ class WrappedContentKey(_EnvelopeModel):
         # A wrapped 256-bit AES key carries the 16-byte GCM tag.
         _b64decode(self.ciphertext, expected_size=_KEY_BYTES + 16)
         return self
+
+
+class AuthenticatedBundleContext(_EnvelopeModel):
+    """Exact canonical authority carried as AEAD additional authenticated data."""
+
+    schema_version: Literal[1] = 1
+    project_id: Annotated[str, Field(pattern=_PROJECT_ID.pattern)]
+    repository_id: Annotated[str, Field(pattern=_REPOSITORY_ID.pattern)]
+    graph_version: Annotated[int, Field(ge=1)]
+    parent_bundle_digest: Annotated[str, Field(pattern=_SHA256.pattern)] | None = None
+    encryption_algorithm: Literal["x25519-hkdf-sha256-aes256gcm-v1"] = ALGORITHM
+    recipient_key_ids: Annotated[tuple[str, ...], Field(min_length=1, max_length=MAX_RECIPIENTS)]
+    required_signature_ids: Annotated[
+        tuple[str, ...], Field(min_length=1, max_length=MAX_RECIPIENTS)
+    ]
+    created_at: datetime
+
+    @field_validator("graph_version", mode="before")
+    @classmethod
+    def require_integer(cls, value: object) -> object:
+        if type(value) is not int:
+            raise ValueError("invalid authenticated bundle graph version")
+        return value
+
+    @field_validator("recipient_key_ids", "required_signature_ids", mode="before")
+    @classmethod
+    def require_identifier_tuples(cls, value: object, info: ValidationInfo) -> object:
+        return _json_tuple(value, info)
+
+    @field_validator("recipient_key_ids", "required_signature_ids")
+    @classmethod
+    def require_sorted_unique_ids(cls, values: tuple[str, ...]) -> tuple[str, ...]:
+        if (
+            values != tuple(sorted(values))
+            or len(values) != len(set(values))
+            or any(_KEY_ID.fullmatch(value) is None for value in values)
+        ):
+            raise ValueError("authenticated bundle identifiers must be sorted and unique")
+        return values
+
+    @field_validator("created_at")
+    @classmethod
+    def require_utc(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() != timedelta(0):
+            raise ValueError("authenticated bundle time must be UTC")
+        return value.astimezone(UTC)
+
+    @field_validator("repository_id")
+    @classmethod
+    def require_canonical_repository_id(cls, value: str) -> str:
+        _host, owner, repository = value.split("/")
+        if owner in {".", ".."} or repository in {".", ".."} or repository.endswith(".git"):
+            raise ValueError("invalid authenticated bundle repository identity")
+        return value
+
+
+def canonical_authenticated_context_bytes(context: AuthenticatedBundleContext) -> bytes:
+    """Return the only AAD encoding accepted by public encryption boundaries."""
+    if not isinstance(context, AuthenticatedBundleContext):
+        raise TypeError("context must be an AuthenticatedBundleContext")
+    validated = AuthenticatedBundleContext.model_validate(context.model_dump(mode="python"))
+    content = _canonical_json(validated.model_dump(mode="json"))
+    if not content or len(content) > MAX_MANIFEST_BYTES:
+        raise ValueError("invalid encrypted bundle AAD")
+    return content
+
+
+def _parse_authenticated_context(aad: bytes) -> AuthenticatedBundleContext:
+    if type(aad) is not bytes or not aad or len(aad) > MAX_MANIFEST_BYTES:
+        raise ValueError("invalid encrypted bundle AAD")
+    try:
+        loads_strict_object(aad.decode("utf-8"))
+        context = AuthenticatedBundleContext.model_validate_json(aad)
+    except (TypeError, UnicodeError, ValueError, ValidationError) as error:
+        raise ValueError("invalid encrypted bundle AAD") from error
+    if canonical_authenticated_context_bytes(context) != aad:
+        raise ValueError("invalid noncanonical encrypted bundle AAD")
+    return context
 
 
 class EncryptedBundle(_EnvelopeModel):
@@ -222,11 +304,17 @@ class _InvalidRecipients(ValueError):
     pass
 
 
-def _validate_inputs(plaintext: bytes, aad: bytes) -> None:
+class _InvalidAuthenticatedContext(ValueError):
+    pass
+
+
+def _validate_inputs(plaintext: bytes, aad: bytes) -> AuthenticatedBundleContext:
     if type(plaintext) is not bytes or len(plaintext) > MAX_BUNDLE_BYTES - 16:
         raise ValueError("invalid encrypted bundle plaintext")
-    if type(aad) is not bytes or not aad or len(aad) > MAX_MANIFEST_BYTES:
-        raise ValueError("invalid encrypted bundle AAD")
+    try:
+        return _parse_authenticated_context(aad)
+    except ValueError as error:
+        raise _InvalidAuthenticatedContext("invalid encrypted bundle AAD") from error
 
 
 def _encrypt_bundle_for_public_keys(
@@ -234,7 +322,7 @@ def _encrypt_bundle_for_public_keys(
     recipient_public_keys: Mapping[str, bytes],
     aad: bytes,
 ) -> EncryptedBundle:
-    _validate_inputs(plaintext, aad)
+    context = _validate_inputs(plaintext, aad)
     if type(recipient_public_keys) is not dict:
         raise _InvalidRecipients("invalid recipient set")
     recipient_ids = tuple(recipient_public_keys)
@@ -244,6 +332,7 @@ def _encrypt_bundle_for_public_keys(
         or recipient_ids != tuple(sorted(recipient_ids))
         or len(recipient_ids) != len(set(recipient_ids))
         or any(_KEY_ID.fullmatch(item) is None for item in recipient_ids)
+        or recipient_ids != context.recipient_key_ids
     ):
         raise _InvalidRecipients("invalid recipient set")
 
@@ -286,12 +375,15 @@ def _raise_safely(
     *,
     operation: str,
     invalid_recipients: bool = False,
+    invalid_aad: bool = False,
 ) -> Never:
     pending.__traceback__ = None
     if not isinstance(pending, Exception):
         raise pending.with_traceback(None)
     if invalid_recipients:
         raise ValueError("invalid encrypted bundle recipient set")
+    if invalid_aad:
+        raise ValueError("invalid encrypted bundle AAD or recipient authority")
     raise ValueError(f"unable to {operation} encrypted bundle")
 
 
@@ -303,6 +395,7 @@ def encrypt_bundle(
     """Encrypt exact plaintext once and wrap its random key for every recipient."""
     pending: BaseException | None = None
     invalid_recipients = False
+    invalid_aad = False
     try:
         if type(recipients) is not tuple or not recipients:
             raise _InvalidRecipients("invalid recipient set")
@@ -314,7 +407,17 @@ def encrypt_bundle(
         )
         ids = tuple(item.key_id for item in validated)
         authorities = {(item.project_id, item.repository_id) for item in validated}
-        if ids != tuple(sorted(ids)) or len(ids) != len(set(ids)) or len(authorities) != 1:
+        try:
+            context = _parse_authenticated_context(aad)
+        except ValueError as error:
+            raise _InvalidAuthenticatedContext from error
+        if (
+            ids != tuple(sorted(ids))
+            or len(ids) != len(set(ids))
+            or len(authorities) != 1
+            or authorities != {(context.project_id, context.repository_id)}
+            or ids != context.recipient_key_ids
+        ):
             raise _InvalidRecipients("invalid recipient set")
         public_keys = {
             item.key_id: _b64decode(item.public_key, expected_size=_KEY_BYTES) for item in validated
@@ -324,6 +427,7 @@ def encrypt_bundle(
         error.__traceback__ = None
         pending = error
         invalid_recipients = isinstance(error, (_InvalidRecipients, ValidationError))
+        invalid_aad = isinstance(error, _InvalidAuthenticatedContext)
     finally:
         # Remove caller-owned plaintext from any public-wrapper traceback frame.
         del plaintext
@@ -332,6 +436,7 @@ def encrypt_bundle(
         pending,
         operation="encrypt",
         invalid_recipients=invalid_recipients,
+        invalid_aad=invalid_aad,
     )
 
 
@@ -342,10 +447,12 @@ def _decrypt_for_recipient(
     recipient_key_id: str,
 ) -> bytes:
     value = EncryptedBundle.model_validate(bundle.model_dump(mode="python"))
-    _validate_inputs(b"", aad)
+    context = _validate_inputs(b"", aad)
     if type(private_key) is not bytes or len(private_key) != _KEY_BYTES:
         raise ValueError("invalid recipient private key")
     wrapped = {item.recipient_key_id: item for item in value.wrapped_keys}
+    if tuple(wrapped) != context.recipient_key_ids:
+        raise InvalidTag
     selected = wrapped.get(recipient_key_id)
     if selected is None:
         raise InvalidTag
@@ -388,9 +495,11 @@ def decrypt_bundle_for_recipient(
 
 def _decrypt_any_recipient(bundle: EncryptedBundle, private_key: bytes, aad: bytes) -> bytes:
     value = EncryptedBundle.model_validate(bundle.model_dump(mode="python"))
-    _validate_inputs(b"", aad)
+    context = _validate_inputs(b"", aad)
     if type(private_key) is not bytes or len(private_key) != _KEY_BYTES:
         raise ValueError("invalid recipient private key")
+    if tuple(item.recipient_key_id for item in value.wrapped_keys) != context.recipient_key_ids:
+        raise InvalidTag
     for item in value.wrapped_keys:
         try:
             return _decrypt_for_recipient(value, private_key, aad, item.recipient_key_id)
@@ -416,9 +525,11 @@ def decrypt_bundle(bundle: EncryptedBundle, private_key: bytes, aad: bytes) -> b
 
 __all__ = [
     "ALGORITHM",
+    "AuthenticatedBundleContext",
     "EncryptedBundle",
     "EncryptedStateBundle",
     "WrappedContentKey",
+    "canonical_authenticated_context_bytes",
     "canonical_encrypted_bundle_bytes",
     "decrypt_bundle",
     "decrypt_bundle_for_recipient",

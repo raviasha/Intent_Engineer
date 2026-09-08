@@ -501,7 +501,7 @@ def _parse_payload(
     return files
 
 
-def seal_state_payload(
+def _seal_state_payload_impl(
     plaintext: bytes,
     *,
     project_id: str,
@@ -581,6 +581,45 @@ def seal_state_payload(
         bundle_path=f"bundles/{name}.intent",
         signature_path=f"signatures/{name}.json",
     )
+
+
+def seal_state_payload(
+    plaintext: bytes,
+    *,
+    project_id: str,
+    repository_id: str,
+    graph_version: int,
+    parent_bundle_digest: str | None,
+    created_at: datetime,
+    recipient_public_keys: Mapping[str, bytes],
+    signing_private_keys: Mapping[str, bytes],
+    schema_version: int = 1,
+) -> SharedStateArtifacts:
+    """Create secret-safe signed/encrypted bytes without performing publication."""
+    pending: BaseException | None = None
+    try:
+        return _seal_state_payload_impl(
+            plaintext,
+            project_id=project_id,
+            repository_id=repository_id,
+            graph_version=graph_version,
+            parent_bundle_digest=parent_bundle_digest,
+            created_at=created_at,
+            recipient_public_keys=recipient_public_keys,
+            signing_private_keys=signing_private_keys,
+            schema_version=schema_version,
+        )
+    except BaseException as error:  # noqa: BLE001 - scrub and preserve cancellation
+        error.__traceback__ = None
+        pending = error
+    finally:
+        del plaintext
+        del signing_private_keys
+    assert pending is not None
+    pending.__traceback__ = None
+    if not isinstance(pending, Exception):
+        raise pending.with_traceback(None)
+    raise ValueError("unable to seal shared state")
 
 
 class _Unavailable(ValueError):

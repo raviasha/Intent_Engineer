@@ -24,7 +24,32 @@ from intent_engineering.team_state.models import RecipientRecord
 
 NOW = datetime(2026, 9, 8, 12, tzinfo=UTC)
 REPOSITORY = "github.com/acme/project"
-AAD = b'{"manifest":"exact"}'
+
+
+def _aad(
+    *,
+    project_id: str = "project",
+    repository_id: str = REPOSITORY,
+    recipient_ids: tuple[str, ...] = ("recipient:alice", "recipient:bob"),
+) -> bytes:
+    return json.dumps(
+        {
+            "created_at": "2026-09-08T12:00:00Z",
+            "encryption_algorithm": "x25519-hkdf-sha256-aes256gcm-v1",
+            "graph_version": 7,
+            "parent_bundle_digest": None,
+            "project_id": project_id,
+            "recipient_key_ids": list(recipient_ids),
+            "repository_id": repository_id,
+            "required_signature_ids": ["signer:release"],
+            "schema_version": 1,
+        },
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode()
+
+
+AAD = _aad()
 
 
 def _b64(content: bytes) -> str:
@@ -65,13 +90,17 @@ def _mutate(value: str) -> str:
     return value[:-1] + replacement
 
 
-def _traceback_contains_bytes(error: BaseException, secret: bytes) -> bool:
+def _traceback_contains_bytes(
+    error: BaseException,
+    secret: bytes,
+    modules: frozenset[str] = frozenset({"intent_engineering.team_state.crypto"}),
+) -> bool:
     current: BaseException | None = error
     seen: set[int] = set()
     while current is not None and id(current) not in seen:
         seen.add(id(current))
         for frame, _lineno in traceback.walk_tb(current.__traceback__):
-            if frame.f_globals.get("__name__") != "intent_engineering.team_state.crypto":
+            if frame.f_globals.get("__name__") not in modules:
                 continue
             if any(value is secret or value == secret for value in frame.f_locals.values()):
                 return True
@@ -217,9 +246,30 @@ def test_recipient_substitution_wrong_key_and_wrong_aad_fail_closed() -> None:
         (substituted, alice.private_bytes_raw(), AAD),
         (bundle, outsider.private_bytes_raw(), AAD),
         (bundle, alice.private_bytes_raw(), AAD + b"x"),
+        (bundle, alice.private_bytes_raw(), _aad(project_id="other-project")),
+        (bundle, alice.private_bytes_raw(), _aad(repository_id="github.com/acme/other")),
     ):
         with pytest.raises(ValueError, match="unable to decrypt"):
             decrypt_bundle(candidate, key, aad)
+
+
+def test_decryption_rejects_removed_or_substituted_recipient_inventory() -> None:
+    """Catches a valid remaining wrap bypassing the complete AAD recipient authority."""
+    alice, _bob = _keys()
+    bundle = encrypt_bundle(b"state", _recipients(), AAD)
+    removed = bundle.model_copy(update={"wrapped_keys": (bundle.wrapped_keys[0],)})
+    substituted = bundle.model_copy(
+        update={
+            "wrapped_keys": (
+                bundle.wrapped_keys[0],
+                bundle.wrapped_keys[1].model_copy(update={"recipient_key_id": "recipient:carol"}),
+            )
+        }
+    )
+
+    for forged in (removed, substituted):
+        with pytest.raises(ValueError, match="unable to decrypt"):
+            decrypt_bundle(forged, alice.private_bytes_raw(), AAD)
 
 
 @pytest.mark.parametrize(
@@ -250,6 +300,36 @@ def test_encryption_rejects_mixed_recipient_authority(change: dict[str, str]) ->
         encrypt_bundle(b"state", mixed, AAD)
 
 
+@pytest.mark.parametrize(
+    ("change", "aad"),
+    [
+        ({"project_id": "other-project"}, AAD),
+        ({"repository_id": "github.com/acme/other"}, AAD),
+        ({}, _aad(project_id="other-project")),
+        ({}, _aad(repository_id="github.com/acme/other")),
+    ],
+)
+def test_encryption_binds_every_recipient_to_exact_aad_authority(
+    change: dict[str, str], aad: bytes
+) -> None:
+    """Catches uniformly wrong recipient authority or an AAD authority substitution."""
+    recipients = tuple(item.model_copy(update=change) for item in _recipients())
+
+    with pytest.raises(ValueError, match="recipient"):
+        encrypt_bundle(b"state", recipients, aad)
+
+
+def test_encryption_rejects_noncanonical_or_incomplete_authenticated_context() -> None:
+    """Catches treating arbitrary opaque bytes as publication authority."""
+    for aad in (
+        b'{"manifest":"opaque"}',
+        AAD + b"\n",
+        _aad(recipient_ids=("recipient:alice",)),
+    ):
+        with pytest.raises(ValueError, match="AAD|recipient"):
+            encrypt_bundle(b"state", _recipients(), aad)
+
+
 def test_cancellation_propagates_without_plaintext_retained_in_traceback(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -277,3 +357,55 @@ def test_decryption_error_does_not_retain_private_key_in_traceback() -> None:
     assert caught.value.__cause__ is None
     assert caught.value.__context__ is None
     assert not _traceback_contains_bytes(caught.value, private_key)
+
+
+@pytest.mark.parametrize("cancel", [False, True])
+def test_legacy_seal_scrubs_plaintext_on_crypto_failure_and_cancellation(
+    monkeypatch: pytest.MonkeyPatch,
+    cancel: bool,
+) -> None:
+    """Catches the exported compatibility sealer retaining plaintext in failure frames."""
+    plaintext = b"seal-plaintext-secret-" + bytes(range(64))
+
+    if cancel:
+
+        def fail(_size: int) -> bytes:
+            raise asyncio.CancelledError
+
+        monkeypatch.setattr(crypto, "_random_bytes", fail)
+        expected: type[BaseException] = asyncio.CancelledError
+    else:
+
+        def fail(*, bit_length: int) -> bytes:
+            del bit_length
+            raise RuntimeError("crypto failed")
+
+        monkeypatch.setattr(crypto.AESGCM, "generate_key", staticmethod(fail))
+        expected = ValueError
+
+    with pytest.raises(expected) as caught:
+        restore.seal_state_payload(
+            plaintext,
+            project_id="project",
+            repository_id=REPOSITORY,
+            graph_version=7,
+            parent_bundle_digest=None,
+            created_at=NOW,
+            recipient_public_keys={"recipient:alice": _keys()[0].public_key().public_bytes_raw()},
+            signing_private_keys={
+                "signer:release": Ed25519PrivateKey.from_private_bytes(
+                    b"s" * 32
+                ).private_bytes_raw()
+            },
+        )
+
+    assert not _traceback_contains_bytes(
+        caught.value,
+        plaintext,
+        frozenset(
+            {
+                "intent_engineering.team_state.crypto",
+                "intent_engineering.team_state.restore",
+            }
+        ),
+    )
