@@ -41,6 +41,7 @@ from intent_engineering.cli.runtime import (
     run_selected_sync,
     validate_github_environment,
 )
+from intent_engineering.cli.team import team_app
 from intent_engineering.cli.writes import policy_actor_aliases, write_app
 from intent_engineering.context import ContextProvider
 from intent_engineering.core.models import (
@@ -112,6 +113,7 @@ app.add_typer(connectors_app, name="connectors")
 app.add_typer(write_app, name="write")
 app.add_typer(sources_app, name="sources")
 app.add_typer(proposals_app, name="proposals")
+app.add_typer(team_app, name="team")
 app.command("bootstrap")(bootstrap_command)
 app.command("onboard")(onboard_command)
 app.command("dev")(dev_command)

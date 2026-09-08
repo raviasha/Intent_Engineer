@@ -6,7 +6,7 @@ import re
 from collections.abc import Awaitable, Callable, Mapping
 from datetime import UTC, datetime, timedelta
 from email.utils import parsedate_to_datetime
-from typing import Any, Self
+from typing import TYPE_CHECKING, Any, Self
 
 import anyio
 import httpx
@@ -29,6 +29,9 @@ from intent_engineering.capture.github.errors import (
 )
 from intent_engineering.capture.github.models import GitHubRepositoryStatus, PageResult
 from intent_engineering.core.models._base import StrictModel
+
+if TYPE_CHECKING:
+    from intent_engineering.team_state.github import GitHubJsonResponse
 
 GITHUB_API_BASE_URL = httpx.URL("https://api.github.com")
 GITHUB_ACCEPT = "application/vnd.github+json"
@@ -534,6 +537,95 @@ class GitHubClient:
             rate_reset_at=reset_at,
             rate_resource=resource,
         )
+
+    async def request_json_object(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: Mapping[str, str] | None = None,
+        payload: Mapping[str, object] | None = None,
+        allowed_statuses: frozenset[int] = frozenset({200}),
+    ) -> GitHubJsonResponse:
+        """Issue one bounded object request; mutating requests are never retried."""
+        if (
+            method not in {"GET", "POST", "PUT"}
+            or type(allowed_statuses) is not frozenset
+            or not allowed_statuses
+            or any(
+                type(status) is not int
+                or (
+                    not 200 <= status <= 299
+                    and not (method == "GET" and status == 404)
+                    and not (method == "POST" and status == 422)
+                )
+                for status in allowed_statuses
+            )
+            or (method == "GET" and payload is not None)
+        ):
+            raise GitHubProtocolError("/")
+        current = self._absolute_url(path, pagination=False)
+        if current is None:
+            raise GitHubProtocolError("/")
+        endpoint = self._safe_endpoint(current.path)
+        response: httpx.Response | None = None
+        try:
+            if method == "GET":
+                response = await self._request_page(
+                    current,
+                    params=params,
+                    etag=None,
+                    endpoint=endpoint,
+                )
+            else:
+                headers = (
+                    self._request_headers.copy()
+                    if self._request_headers is not None
+                    else httpx.Headers()
+                )
+                request = httpx.Request(
+                    method,
+                    current.copy_merge_params(params) if params else current,
+                    headers=headers or None,
+                    json=None if payload is None else dict(payload),
+                    extensions={"timeout": GITHUB_TIMEOUT.as_dict()},
+                )
+                try:
+                    response = await self._client.send(
+                        request,
+                        auth=None,
+                        follow_redirects=False,
+                    )
+                except httpx.TransportError:
+                    raise GitHubTransientError(endpoint, attempt_count=1) from None
+            if response.status_code not in allowed_statuses:
+                raise self._status_error(response, endpoint)
+            content = response.content
+            malformed = len(content) > 1024 * 1024
+            parsed: Any = None
+            if not malformed:
+                try:
+                    parsed = response.json()
+                except (UnicodeError, ValueError):
+                    malformed = True
+            oauth_scopes = response.headers.get("X-OAuth-Scopes")
+            if (
+                malformed
+                or type(parsed) is not dict
+                or (oauth_scopes is not None and len(oauth_scopes.encode("utf-8")) > 4096)
+                or self._provider_material_overlaps_credential((parsed, oauth_scopes))
+            ):
+                raise GitHubProtocolError(endpoint)
+            from intent_engineering.team_state.github import GitHubJsonResponse
+
+            return GitHubJsonResponse(
+                status_code=response.status_code,
+                payload=dict(parsed),
+                headers={} if oauth_scopes is None else {"X-OAuth-Scopes": oauth_scopes},
+            )
+        finally:
+            if response is not None:
+                await response.aclose()
 
     async def get_pages(
         self,

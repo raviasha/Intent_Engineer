@@ -168,6 +168,64 @@ def test_preview_is_stable_for_one_snapshot_and_prepare_requires_its_exact_decis
         runtime.close()
 
 
+def test_genesis_publication_binds_an_orphan_state_branch_anchor_and_rejects_drift(
+    tmp_path: Path,
+) -> None:
+    """Catches a bootstrap anchor being copied from code or changed after WebAuthn review."""
+    root = tmp_path / "project"
+    root.mkdir()
+    ready_project(root)
+    anchor = "a" * 40
+    current = PublicationAuthority(
+        recipients=(_recipient(X25519PrivateKey.generate()),),
+        signing_private_keys={"signer:release": Ed25519PrivateKey.generate().private_bytes_raw()},
+        remote_state=None,
+        publication_base_commit=anchor,
+    )
+
+    class AnchorPublisher:
+        def __init__(self) -> None:
+            self.base_commit: str | None = None
+
+        def publish(self, publication: PreparedPublication, *, base_commit: str | None) -> None:
+            assert publication.manifest.parent_bundle_digest is None
+            self.base_commit = base_commit
+
+    publisher = AnchorPublisher()
+    runtime = load_runtime(root)
+    service = PublicationService(
+        runtime,
+        repository_id=REPOSITORY_ID,
+        decision_repository_id=LOCAL_REPOSITORY_ID,
+        authority=lambda: current,
+        publisher=publisher,
+        challenge_source=lambda: b"p" * 32,
+    )
+    try:
+        preview = service.preview(now=NOW)
+        decision = VerifiedHumanDecision(preview.payload, _credential(), NOW)
+        current = PublicationAuthority(
+            recipients=current.recipients,
+            signing_private_keys=current.signing_private_keys,
+            remote_state=None,
+            publication_base_commit="b" * 40,
+        )
+        with pytest.raises(ValueError, match="publication state changed"):
+            service.prepare(decision, now=NOW)
+
+        current = current.__class__(
+            recipients=current.recipients,
+            signing_private_keys=current.signing_private_keys,
+            remote_state=None,
+            publication_base_commit=anchor,
+        )
+        preview = service.preview(now=NOW)
+        service.prepare(VerifiedHumanDecision(preview.payload, _credential(), NOW), now=NOW)
+        assert publisher.base_commit == anchor
+    finally:
+        runtime.close()
+
+
 def test_equal_plaintext_has_a_stable_snapshot_digest_but_fresh_ciphertext(tmp_path: Path) -> None:
     """Catches randomized encryption contaminating the deterministic reviewed state identity."""
     root = tmp_path / "project"

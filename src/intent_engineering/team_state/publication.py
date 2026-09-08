@@ -68,6 +68,7 @@ _EXTRA_PATHS = {
 }
 _MAX_GIT_OUTPUT_BYTES = 64 * 1024
 _GIT_TIMEOUT_SECONDS = 10.0
+_COMMIT = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?\Z")
 _GIT_EXECUTABLE = Path("/usr/bin/git")
 _GIT_SUPERVISOR = (
     "import os,subprocess,sys,time;"
@@ -85,6 +86,7 @@ class PublicationAuthority:
     recipients: tuple[RecipientRecord, ...]
     signing_private_keys: Mapping[str, bytes]
     remote_state: RemoteStateSnapshot | None
+    publication_base_commit: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -474,6 +476,7 @@ class PublicationService:
         self._authority = authority
         self._publisher = publisher
         self._challenge_source = challenge_source
+        self._publication_base_commit: str | None = None
         self._pending: (
             tuple[
                 PublicationPreview,
@@ -484,6 +487,32 @@ class PublicationService:
             ]
             | None
         ) = None
+
+    def bind_publication_base_commit(self, commit: str) -> None:
+        """Bind the next reviewed release to the exact state-branch anchor."""
+        if (
+            self._pending is not None
+            or type(commit) is not str
+            or _COMMIT.fullmatch(commit) is None
+        ):
+            raise ValueError("publication parent binding changed")
+        self._publication_base_commit = commit
+
+    def _current_authority(self) -> PublicationAuthority:
+        authority = self._authority()
+        if self._publication_base_commit is None:
+            return authority
+        if (
+            authority.publication_base_commit is not None
+            and authority.publication_base_commit != self._publication_base_commit
+        ):
+            raise ValueError("publication parent binding changed")
+        return PublicationAuthority(
+            recipients=authority.recipients,
+            signing_private_keys=authority.signing_private_keys,
+            remote_state=authority.remote_state,
+            publication_base_commit=self._publication_base_commit,
+        )
 
     @staticmethod
     def _digest(content: bytes) -> str:
@@ -581,6 +610,12 @@ class PublicationService:
             for key, value in signing.items()
         }
         remote = authority.remote_state
+        publication_base_commit = authority.publication_base_commit
+        if (
+            publication_base_commit is not None
+            and _COMMIT.fullmatch(publication_base_commit) is None
+        ):
+            raise ValueError("publication parent binding changed")
         if remote is not None:
             remote = RemoteStateSnapshot.model_validate(remote.model_dump(mode="python"))
             if (
@@ -589,6 +624,9 @@ class PublicationService:
                 or remote.manifest.repository_id != repository_id
             ):
                 raise ValueError("publication parent binding changed")
+            if publication_base_commit is not None and publication_base_commit != remote.commit:
+                raise ValueError("publication parent binding changed")
+            publication_base_commit = remote.commit
         canonical = json.dumps(
             {
                 "recipients": [item.model_dump(mode="json") for item in recipients],
@@ -597,6 +635,7 @@ class PublicationService:
                     for key, value in sorted(signer_public.items())
                 },
                 "remote": None if remote is None else remote.model_dump(mode="json"),
+                "publication_base_commit": publication_base_commit,
             },
             ensure_ascii=False,
             allow_nan=False,
@@ -607,7 +646,7 @@ class PublicationService:
             recipients,
             signing,
             None if remote is None else remote.manifest.bundle_digest,
-            None if remote is None else remote.commit,
+            publication_base_commit,
             canonical,
         )
 
@@ -617,7 +656,7 @@ class PublicationService:
         snapshot, archive = self._capture()
         recipients, signing, parent_digest, parent_commit, authority_bytes = (
             self._authority_material(
-                self._authority(),
+                self._current_authority(),
                 project_id=snapshot.project_id,
                 repository_id=snapshot.repository_id,
             )
@@ -712,7 +751,7 @@ class PublicationService:
         snapshot, archive = self._capture()
         recipients, _signing, current_parent, current_commit, authority_bytes = (
             self._authority_material(
-                self._authority(),
+                self._current_authority(),
                 project_id=snapshot.project_id,
                 repository_id=snapshot.repository_id,
             )
@@ -740,4 +779,5 @@ class PublicationService:
             raise ValueError("publication state changed")
         self._publisher.publish(prepared, base_commit=parent_commit)
         self._pending = None
+        self._publication_base_commit = None
         return prepared
