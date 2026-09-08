@@ -512,3 +512,48 @@ def test_corrupt_or_untrusted_journal_is_rejected_without_target_mutation(
         name: path.read_bytes() if path.exists() else None for name, path in paths.items()
     } == before
     assert journal.exists()
+
+
+@pytest.mark.parametrize("operation", ("snapshot", "read_transaction"))
+def test_no_recovery_reads_reject_journal_presence_without_reading_its_payload(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+) -> None:
+    """Catches no-recovery paths parsing or byte-reading an unrecovered journal."""
+    coordinator, paths, journal = _coordinator(tmp_path)
+    _seed(paths)
+    journal.write_bytes(b"PRIVATE malformed recovery material")
+    original = SecureFile.read_optional_nonblocking
+
+    def reject_journal_read(
+        self: SecureFile,
+        *,
+        max_bytes: int | None = None,
+    ) -> bytes | None:
+        if self.name == journal.name:
+            raise AssertionError("journal payload was read")
+        return original(self, max_bytes=max_bytes)
+
+    monkeypatch.setattr(SecureFile, "read_optional_nonblocking", reject_journal_read)
+
+    with pytest.raises(TransactionRecoveryError, match="^local transaction recovery failed$"):
+        if operation == "snapshot":
+            coordinator.snapshot_without_recovery()
+        else:
+            with coordinator.read_transaction_without_recovery():
+                raise AssertionError("unrecovered state became visible")
+
+    assert journal.read_bytes() == b"PRIVATE malformed recovery material"
+
+
+def test_no_recovery_snapshot_maps_unsafe_journal_entries_to_recovery_error(
+    tmp_path: Path,
+) -> None:
+    """Catches journal metadata failures escaping instead of one fail-closed signal."""
+    coordinator, paths, journal = _coordinator(tmp_path)
+    _seed(paths)
+    journal.symlink_to(paths["graph"])
+
+    with pytest.raises(TransactionRecoveryError, match="^local transaction recovery failed$"):
+        coordinator.snapshot_without_recovery()

@@ -365,7 +365,12 @@ def test_scheduled_workflow_is_read_only_and_orders_capture_before_assurance() -
     assert commands[4] == "intent sync --project . --sources markdown,git,github"
     assert commands[5] == "intent validate --project ."
     assert commands[6] == ("intent drift --project . --format markdown --output intent-drift.md")
-    assert commands[8] == "intent check --require-review"
+    assessment_index = commands.index(
+        "intent assess --project . --format json > intent-assessment.json"
+    )
+    review_index = commands.index("intent check --require-review")
+    assert assessment_index < review_index
+    assert steps[review_index - 1]["name"] == "Gate assessment against exact comparison base"
     assert steps[4]["env"] == {
         "GH_TOKEN": "${{ secrets.GITHUB_TOKEN }}",
         "GITHUB_REPOSITORY": "${{ github.repository }}",
