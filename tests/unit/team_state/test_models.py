@@ -31,6 +31,9 @@ DIGEST_A = "sha256:" + "a" * 64
 DIGEST_B = "sha256:" + "b" * 64
 REPOSITORY = "github.com/acme/project"
 COMMIT = "c" * 40
+X25519_PUBLIC_KEY = "YWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXowMTIzNDU"
+WEBAUTHN_CREDENTIAL_ID = "Y3JlZGVudGlhbC1pZC0x"
+WEBAUTHN_PUBLIC_KEY = "Y3JlZGVudGlhbC1wdWJsaWMta2V5LTE"
 
 
 def manifest_values(**changes: object) -> dict[str, object]:
@@ -59,6 +62,30 @@ def canonical_files() -> tuple[CanonicalStateFile, ...]:
     return tuple(
         CanonicalStateFile(path=path, content=path.encode()) for path in CANONICAL_STATE_PATHS
     )
+
+
+def recipient_values(**changes: object) -> dict[str, object]:
+    values: dict[str, object] = {
+        "schema_version": 1,
+        "key_id": "recipient:alice",
+        "project_id": "project",
+        "repository_id": REPOSITORY,
+        "actor": "github:1234",
+        "github_account_id": "1234",
+        "github_login": "alice-dev",
+        "public_key": X25519_PUBLIC_KEY,
+        "webauthn_credential_id": WEBAUTHN_CREDENTIAL_ID,
+        "webauthn_credential_public_key": WEBAUTHN_PUBLIC_KEY,
+        "encryption_algorithm": "x25519-hkdf-sha256-aes256gcm-v1",
+        "decision_algorithm": "webauthn-decision-v1",
+        "enrolled_at": NOW,
+    }
+    values.update(changes)
+    return values
+
+
+def recipient(**changes: object) -> RecipientRecord:
+    return RecipientRecord(**recipient_values(**changes))
 
 
 def test_manifest_emits_one_bounded_canonical_wire_representation() -> None:
@@ -178,6 +205,24 @@ def test_manifest_parser_rejects_typed_noncanonical_and_duplicate_json(mutation:
         TeamStateManifest.model_validate_json(changed)
 
 
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"recipient_key_ids": ()},
+        {"repository_id": "github.com/../project"},
+        {"created_at": NOW.replace(tzinfo=None)},
+    ],
+)
+def test_canonical_manifest_bytes_revalidates_model_copy_updates(
+    changes: dict[str, object],
+) -> None:
+    """Catches unvalidated Pydantic copies crossing the signed canonical-byte boundary."""
+    forged = manifest().model_copy(update=changes)
+
+    with pytest.raises(ValidationError):
+        canonical_manifest_bytes(forged)
+
+
 @pytest.mark.parametrize("path", ["/graph.yaml", "../graph.yaml", "a\\graph.yaml", "graph//x"])
 def test_snapshot_rejects_unsafe_or_noncanonical_paths(path: str) -> None:
     """Catches archive construction receiving a path that could escape the restore root."""
@@ -246,21 +291,70 @@ def test_snapshot_inventory_binds_every_path_size_digest_and_total() -> None:
 
 def test_recipient_is_project_actor_and_webauthn_bound_without_private_material() -> None:
     """Catches a public recipient key being reusable across a project or decision policy."""
-    recipient = RecipientRecord(
-        key_id="recipient:alice",
-        project_id="project",
-        actor="github:1234",
-        public_key="YWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXowMTIzNDU",
-        encryption_algorithm="x25519-hkdf-sha256-aes256gcm-v1",
-        decision_algorithm="webauthn-decision-v1",
-        enrolled_at=NOW,
-    )
+    value = recipient()
 
-    assert "private" not in json.dumps(recipient.model_dump(mode="json"))
+    assert value.repository_id == REPOSITORY
+    assert value.github_account_id == "1234"
+    assert value.github_login == "alice-dev"
+    assert value.webauthn_credential_id == WEBAUTHN_CREDENTIAL_ID
+    assert "private" not in json.dumps(value.model_dump(mode="json"))
     with pytest.raises(ValidationError):
-        RecipientRecord(**{**recipient.model_dump(), "public_key": "not-base64"})
+        recipient(public_key="not-base64")
     with pytest.raises(ValidationError):
-        RecipientRecord(**{**recipient.model_dump(), "decision_algorithm": "agent-approval-v1"})
+        recipient(decision_algorithm="agent-approval-v1")
+
+
+@pytest.mark.parametrize(
+    ("field", "bad"),
+    [
+        ("repository_id", "GitHub.com/acme/project"),
+        ("actor", "GitHub:1234"),
+        ("actor", "github:álîce"),
+        ("github_account_id", "01234"),
+        ("github_account_id", "12a34"),
+        ("github_account_id", 1234),
+        ("github_login", "Alice-Dev"),
+        ("github_login", "álîce"),
+        ("github_login", "alice--dev"),
+        ("public_key", X25519_PUBLIC_KEY + "="),
+        ("public_key", "YQ"),
+        ("webauthn_credential_id", ""),
+        ("webauthn_credential_id", WEBAUTHN_CREDENTIAL_ID + "="),
+        ("webauthn_credential_id", "💥"),
+        ("webauthn_credential_id", "YQ" * 700),
+        ("webauthn_credential_public_key", ""),
+        ("webauthn_credential_public_key", WEBAUTHN_PUBLIC_KEY + "="),
+        ("webauthn_credential_public_key", "YQ" * 2800),
+    ],
+)
+def test_recipient_rejects_noncanonical_or_unbounded_identity_and_key_material(
+    field: str, bad: object
+) -> None:
+    """Catches ambiguous GitHub/WebAuthn/X25519 identities entering reviewed team state."""
+    with pytest.raises(ValidationError):
+        recipient(**{field: bad})
+
+
+def test_recipient_requires_every_team_identity_binding() -> None:
+    """Catches a key-store result that cannot prove repository, GitHub, or WebAuthn ownership."""
+    for field in (
+        "repository_id",
+        "github_account_id",
+        "github_login",
+        "webauthn_credential_id",
+        "webauthn_credential_public_key",
+    ):
+        values = recipient_values()
+        del values[field]
+        with pytest.raises(ValidationError):
+            RecipientRecord(**values)
+
+
+def test_recipient_preserves_the_exact_case_sensitive_repository_path() -> None:
+    """Catches canonicalization corrupting the repository name returned by GitHub and Git."""
+    value = recipient(repository_id="github.com/raviasha/Intent_Engineer")
+
+    assert value.repository_id == "github.com/raviasha/Intent_Engineer"
 
 
 def test_publication_lineage_distinguishes_genesis_from_descendants() -> None:
@@ -335,3 +429,58 @@ def test_remote_snapshot_and_prepared_publication_bind_exact_manifest_and_artifa
         PreparedPublication(**{**prepared.model_dump(), "bundle": bundle + b"x"})
     with pytest.raises(ValidationError):
         PreparedPublication(**{**prepared.model_dump(), "bundle_path": "../bundle.intent"})
+
+
+def test_containers_revalidate_nested_model_copy_updates() -> None:
+    """Catches trusted containers accepting nested model instances that bypassed validation."""
+    files = canonical_files()
+    valid_inventory = CanonicalStateSnapshot(
+        project_id="project",
+        repository_id=REPOSITORY,
+        graph_version=3,
+        files=files,
+    ).inventory()
+    invalid_entry = valid_inventory.entries[0].model_copy(update={"sha256": "not-a-digest"})
+    with pytest.raises(ValidationError):
+        BundleInventory(
+            entries=(invalid_entry, *valid_inventory.entries[1:]),
+            total_size=valid_inventory.total_size,
+        )
+
+    invalid_file = files[0].model_copy(update={"path": "../config.yaml"})
+    with pytest.raises(ValidationError):
+        CanonicalStateSnapshot(
+            project_id="project",
+            repository_id=REPOSITORY,
+            graph_version=3,
+            files=(invalid_file, *files[1:]),
+        )
+
+    bundle = b"encrypted-bundle"
+    valid_manifest = manifest(
+        bundle_size=len(bundle),
+        bundle_digest="sha256:" + hashlib.sha256(bundle).hexdigest(),
+    )
+    valid_bytes = canonical_manifest_bytes(valid_manifest)
+    invalid_manifest = valid_manifest.model_copy(update={"recipient_key_ids": ()})
+    with pytest.raises(ValidationError):
+        RemoteStateSnapshot(
+            repository_id=REPOSITORY,
+            ref="refs/remotes/origin/intent-state",
+            commit=COMMIT,
+            manifest=invalid_manifest,
+            manifest_bytes=valid_bytes,
+        )
+    digest_hex = valid_manifest.bundle_digest.removeprefix("sha256:")
+    with pytest.raises(ValidationError):
+        PreparedPublication(
+            repository_id=REPOSITORY,
+            branch=f"intent-publication/{digest_hex}",
+            manifest=invalid_manifest,
+            manifest_bytes=valid_bytes,
+            bundle=bundle,
+            signatures=b'{"signatures":[]}',
+            bundle_path=f"bundles/3-{digest_hex}.intent",
+            signature_path=f"signatures/3-{digest_hex}.json",
+            decision_algorithm="webauthn-decision-v1",
+        )

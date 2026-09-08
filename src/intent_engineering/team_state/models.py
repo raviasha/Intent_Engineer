@@ -44,10 +44,21 @@ _PROJECT_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _REPOSITORY_ID = re.compile(r"^[a-z0-9.-]+/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 _GIT_COMMIT = re.compile(r"^[0-9a-f]{40}(?:[0-9a-f]{24})?$")
 _PUBLICATION_BRANCH = re.compile(r"^intent-publication/[0-9a-f]{64}$")
+_GITHUB_ACCOUNT_ID = re.compile(r"^[1-9][0-9]{0,19}$")
+_GITHUB_LOGIN = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,37}[a-z0-9])?$")
+_BASE64URL = re.compile(r"^[A-Za-z0-9_-]+$")
+_MAX_WEBAUTHN_CREDENTIAL_ID = 1024
+_MAX_WEBAUTHN_PUBLIC_KEY = 4096
 
 
 class _TeamStateModel(StrictModel):
-    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+    model_config = ConfigDict(
+        extra="forbid",
+        frozen=True,
+        revalidate_instances="always",
+        strict=True,
+        validate_default=True,
+    )
 
     @field_validator("repository_id", check_fields=False)
     @classmethod
@@ -96,16 +107,27 @@ def _require_utc(value: datetime) -> datetime:
     return value.astimezone(UTC)
 
 
-def _decode_public_key(value: str) -> bytes:
-    if not value or len(value) > 64:
-        raise ValueError("invalid recipient public key")
+def _decode_base64url(
+    value: str,
+    *,
+    label: str,
+    maximum_encoded: int,
+    exact_decoded: int | None = None,
+    minimum_decoded: int = 1,
+) -> bytes:
+    if not value or len(value) > maximum_encoded or _BASE64URL.fullmatch(value) is None:
+        raise ValueError(f"invalid {label}")
     try:
         decoded = base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
     except (UnicodeError, ValueError) as error:
-        raise ValueError("invalid recipient public key") from error
+        raise ValueError(f"invalid {label}") from error
     encoded = base64.urlsafe_b64encode(decoded).rstrip(b"=").decode("ascii")
-    if encoded != value or len(decoded) != 32:
-        raise ValueError("invalid recipient public key")
+    if (
+        encoded != value
+        or len(decoded) < minimum_decoded
+        or (exact_decoded is not None and len(decoded) != exact_decoded)
+    ):
+        raise ValueError(f"invalid {label}")
     return decoded
 
 
@@ -199,7 +221,8 @@ def canonical_manifest_bytes(manifest: TeamStateManifest) -> bytes:
     """Return the sole canonical UTF-8 JSON encoding used for signing and AAD."""
     if type(manifest) is not TeamStateManifest:
         raise TypeError("manifest must be a TeamStateManifest")
-    content = _canonical_json(manifest.model_dump(mode="json"))
+    validated = TeamStateManifest.model_validate(manifest.model_dump(mode="python"))
+    content = _canonical_json(validated.model_dump(mode="json"))
     if not content or len(content) > MAX_MANIFEST_BYTES:
         raise ValueError("team-state manifest is oversized")
     return content
@@ -305,13 +328,14 @@ class CanonicalStateSnapshot(_TeamStateModel):
         return self
 
     def inventory(self) -> BundleInventory:
+        validated = CanonicalStateSnapshot.model_validate(self.model_dump(mode="python"))
         entries = tuple(
             BundleInventoryEntry(
                 path=item.path,
                 size=len(item.content),
                 sha256=_digest(item.content),
             )
-            for item in self.files
+            for item in validated.files
         )
         return BundleInventory(entries=entries, total_size=sum(item.size for item in entries))
 
@@ -322,8 +346,13 @@ class RecipientRecord(_TeamStateModel):
     schema_version: Literal[1] = 1
     key_id: Annotated[str, Field(pattern=_KEY_ID.pattern)]
     project_id: Annotated[str, Field(pattern=_PROJECT_ID.pattern)]
+    repository_id: Annotated[str, Field(pattern=_REPOSITORY_ID.pattern)]
     actor: Annotated[str, Field(pattern=_KEY_ID.pattern)]
+    github_account_id: Annotated[str, Field(pattern=_GITHUB_ACCOUNT_ID.pattern)]
+    github_login: Annotated[str, Field(pattern=_GITHUB_LOGIN.pattern)]
     public_key: str
+    webauthn_credential_id: str
+    webauthn_credential_public_key: str
     encryption_algorithm: Literal["x25519-hkdf-sha256-aes256gcm-v1"] = ENCRYPTION_ALGORITHM
     decision_algorithm: Literal["webauthn-decision-v1"] = DECISION_ALGORITHM
     enrolled_at: datetime
@@ -331,7 +360,40 @@ class RecipientRecord(_TeamStateModel):
     @field_validator("public_key")
     @classmethod
     def require_x25519_public_key(cls, value: str) -> str:
-        _decode_public_key(value)
+        _decode_base64url(
+            value,
+            label="recipient public key",
+            maximum_encoded=64,
+            exact_decoded=32,
+        )
+        return value
+
+    @field_validator("webauthn_credential_id")
+    @classmethod
+    def require_webauthn_credential_id(cls, value: str) -> str:
+        _decode_base64url(
+            value,
+            label="WebAuthn credential ID",
+            maximum_encoded=_MAX_WEBAUTHN_CREDENTIAL_ID,
+        )
+        return value
+
+    @field_validator("webauthn_credential_public_key")
+    @classmethod
+    def require_webauthn_public_key(cls, value: str) -> str:
+        _decode_base64url(
+            value,
+            label="WebAuthn credential public key",
+            maximum_encoded=_MAX_WEBAUTHN_PUBLIC_KEY,
+            minimum_decoded=16,
+        )
+        return value
+
+    @field_validator("github_login")
+    @classmethod
+    def require_canonical_github_login(cls, value: str) -> str:
+        if "--" in value:
+            raise ValueError("invalid canonical GitHub login")
         return value
 
     @field_validator("enrolled_at")
