@@ -7,6 +7,7 @@ import json
 import os
 import shlex
 import signal
+import socket
 import subprocess
 import time
 from pathlib import Path
@@ -76,6 +77,17 @@ def _action():
     path = Path(__file__).parents[2] / "src/intent_engineering/integrations/github_action.py"
     assert path.is_file(), "reviewed GitHub check runner is missing"
     return importlib.import_module("intent_engineering.integrations.github_action")
+
+
+def _require_local_listener() -> None:
+    """Skip only when host policy forbids the listener exercised by direct dev."""
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        listener.bind(("127.0.0.1", 0))
+    except PermissionError:
+        pytest.skip("host policy forbids the loopback listener required by direct dev")
+    finally:
+        listener.close()
 
 
 def _clone(
@@ -454,6 +466,7 @@ def test_direct_dev_restores_team_state_before_starting_the_control_plane(
     offline: bool,
 ) -> None:
     """Catches the primary CLI retaining a hidden manual restore prerequisite."""
+    _require_local_listener()
     repo, trust = _clone(tmp_path)
     monkeypatch.setenv("INTENT_CI_SHARED_STATE_TRUST", trust_environment(trust))
     refreshes: list[str] = []
@@ -488,6 +501,7 @@ def test_direct_offline_dev_preserves_missing_trust_as_offline_stale_team_state(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Catches direct dev downgrading a previously governed checkout to local-only."""
+    _require_local_listener()
     repo, trust = _clone(tmp_path)
     assert (
         GitSharedStateRestorer(StaticTrustProvider(trust))

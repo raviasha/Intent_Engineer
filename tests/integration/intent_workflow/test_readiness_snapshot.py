@@ -13,6 +13,7 @@ import pytest
 import structlog
 from typer.testing import CliRunner
 
+import intent_engineering.cli.dev as dev_cli
 import intent_engineering.cli.runtime as runtime_module
 from intent_engineering.cli.app import app
 from intent_engineering.cli.runtime import load_readiness_runtime
@@ -44,8 +45,23 @@ INPUT_PATHS = (
 
 
 @pytest.fixture(autouse=True)
-def _reset_cli_logging(request: pytest.FixtureRequest) -> None:
+def _reset_cli_logging(
+    request: pytest.FixtureRequest,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Do not retain a CLI capture stream in later library tests' logging configuration."""
+    monkeypatch.setattr(
+        dev_cli,
+        "_shared_restore",
+        lambda _root: dev_cli.SharedStateRestoreResult(
+            status=dev_cli.SharedStateRestoreStatus.NOT_REQUIRED
+        ),
+    )
+    monkeypatch.setattr(
+        dev_cli,
+        "_start_or_reuse_background_service",
+        lambda _root, _status: True,
+    )
     structlog.reset_defaults()
     request.addfinalizer(structlog.reset_defaults)
 
