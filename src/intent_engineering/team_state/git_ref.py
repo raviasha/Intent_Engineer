@@ -28,14 +28,19 @@ class GitRefReader:
         self._root = Path(os.path.abspath(root))
         self._reader = _GitRefReader(self._root)
         self._snapshot: RemoteStateSnapshot | None = None
+        self._closed = False
 
     def close(self) -> None:
         """Release any transport resources owned by the underlying reader."""
         self._snapshot = None
+        self._closed = True
         self._reader.close()
 
     def fetch_manifest(self, remote: str, ref: str) -> RemoteStateSnapshot:
         """Return the canonical manifest at the one supported remote-tracking ref."""
+        if self._closed:
+            raise ValueError("shared-state ref unavailable")
+        self._snapshot = None
         if (
             type(remote) is not str
             or remote != "origin"
@@ -66,7 +71,7 @@ class GitRefReader:
     def read_blob(self, ref: str, path: str) -> bytes:
         """Read a regular blob from the commit pinned by :meth:`fetch_manifest`."""
         snapshot = self._snapshot
-        if type(ref) is not str or ref != STATE_REF or snapshot is None:
+        if self._closed or type(ref) is not str or ref != STATE_REF or snapshot is None:
             raise ValueError("shared-state ref unavailable")
         try:
             return self._reader.blob(snapshot.commit, path, MAX_BUNDLE_BYTES)

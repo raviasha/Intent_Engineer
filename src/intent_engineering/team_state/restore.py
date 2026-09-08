@@ -88,6 +88,8 @@ SIGNATURE_ALGORITHM: Final = "ed25519-v1"
 TRUST_ENVIRONMENT_VARIABLE = "INTENT_CI_SHARED_STATE_TRUST"
 MAX_TRUST_BYTES = 32 * 1024
 MAX_GIT_TEXT_BYTES = 4096
+MAX_GIT_PATH_CHARACTERS = 1024
+MAX_GIT_PATH_BYTES = 4096
 MAX_FETCH_OUTPUT_BYTES = 64 * 1024
 MAX_GIT_EXECUTABLE_BYTES = 16 * 1024 * 1024
 _FETCH_TIMEOUT_SECONDS = 10.0
@@ -992,9 +994,16 @@ class _GitRefReader:
         return parents
 
     def blob(self, commit: str, path: str, maximum: int) -> bytes:
+        if type(path) is not str:
+            raise ValueError("invalid shared-state Git path")
+        try:
+            encoded_path = path.encode("utf-8")
+        except UnicodeError as error:
+            raise ValueError("invalid shared-state Git path") from error
         if (
-            type(path) is not str
-            or not path
+            not path
+            or len(path) > MAX_GIT_PATH_CHARACTERS
+            or len(encoded_path) > MAX_GIT_PATH_BYTES
             or path.startswith("/")
             or "\\" in path
             or any(part in {"", ".", ".."} for part in path.split("/"))
@@ -2347,8 +2356,15 @@ class GitSharedStateRestorer:
                 reader.close()
 
 
-class _RootRuntime(Protocol):
+@dataclass(frozen=True, slots=True)
+class TeamStateRestoreRuntime:
+    """Unopened repository handle accepted by the atomic restore façade."""
+
     root: Path
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.root, Path):
+            raise TypeError("invalid team-state restore runtime")
 
 
 class TeamStateRestorer:
@@ -2365,13 +2381,15 @@ class TeamStateRestorer:
 
     def ensure(
         self,
-        runtime: _RootRuntime,
+        runtime: TeamStateRestoreRuntime,
         remote_state: RemoteStateSnapshot,
         now: datetime,
     ) -> SharedStateRestoreResult:
         try:
+            if type(runtime) is not TeamStateRestoreRuntime:
+                raise ValueError("invalid team-state restore input")
             root = runtime.root
-            if not isinstance(root, Path) or type(remote_state) is not RemoteStateSnapshot:
+            if type(remote_state) is not RemoteStateSnapshot:
                 raise ValueError("invalid team-state restore input")
             expected = RemoteStateSnapshot.model_validate(remote_state.model_dump(mode="python"))
         except (AttributeError, TypeError, ValueError):
@@ -2397,6 +2415,7 @@ __all__ = [
     "SharedStateManifest",
     "SharedStateTrust",
     "StaticTrustProvider",
+    "TeamStateRestoreRuntime",
     "TeamStateRestorer",
     "TrustedSigningKey",
     "build_state_payload",
