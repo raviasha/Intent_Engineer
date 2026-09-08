@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -11,6 +12,43 @@ import yaml  # type: ignore[import-untyped]
 from typer.testing import CliRunner
 
 from intent_engineering.cli.app import app
+
+# Resolved from the official actions repositories on 2026-09-08; changes require review.
+_REVIEWED_ACTION_REFS = {
+    "actions/checkout@11d5960a326750d5838078e36cf38b85af677262",  # v4.4.0
+    "actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065",  # v5.6.0
+    "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02",  # v4.6.2
+}
+
+
+def _workflow_action_refs() -> list[tuple[str, str, str]]:
+    """Cover every workflow, including future reusable jobs and adjacent action steps."""
+    references = []
+    directory = Path(__file__).parents[2] / ".github/workflows"
+    for path in sorted(directory.iterdir()):
+        if path.suffix not in {".yml", ".yaml"}:
+            continue
+        workflow = yaml.load(path.read_text(encoding="utf-8"), Loader=yaml.BaseLoader)
+        for name, job in workflow["jobs"].items():
+            if "uses" in job:
+                references.append((path.name, name, job["uses"]))
+            for index, step in enumerate(job.get("steps", [])):
+                if "uses" in step:
+                    references.append((path.name, f"{name}.steps[{index}]", step["uses"]))
+    return references
+
+
+@pytest.mark.parametrize(("workflow", "location", "reference"), _workflow_action_refs())
+def test_every_workflow_action_uses_a_reviewed_full_commit_sha(
+    workflow: str, location: str, reference: str
+) -> None:
+    """A movable tag or an unreviewed action cannot supply executable CI tooling."""
+    assert re.fullmatch(r"[^@\s]+@[0-9a-f]{40}", reference), (
+        f"{workflow}:{location} must use a full immutable commit SHA, got {reference}"
+    )
+    assert reference in _REVIEWED_ACTION_REFS, (
+        f"{workflow}:{location} uses an unreviewed action commit: {reference}"
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -38,7 +76,7 @@ def test_intent_sync_workflow_is_nightly_manual_read_only_and_ordered() -> None:
     assert steps[0]["uses"].startswith("actions/checkout@")
     assert steps[0]["with"] == {"fetch-depth": "0", "persist-credentials": "false"}
     assert steps[1] == {
-        "uses": "actions/setup-python@v5",
+        "uses": "actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065",
         "with": {"python-version": "3.12"},
     }
     assert steps[2]["run"] == "python -m pip install ."
@@ -53,7 +91,7 @@ def test_intent_sync_workflow_is_nightly_manual_read_only_and_ordered() -> None:
         "intent drift --project . --format markdown --output intent-drift.md"
     )
     assert steps[7] == {
-        "uses": "actions/upload-artifact@v4",
+        "uses": "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02",
         "with": {
             "name": "intent-drift",
             "path": "intent-drift.md",

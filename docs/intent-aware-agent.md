@@ -127,6 +127,18 @@ revision. Protected tooling fetches the PR head as Git objects and verifies the 
 it does not check out, install, build, or import the proposed package on the host. Requests for
 an unprotected/non-default base or execution ref fail closed instead of being skipped.
 
+Action code is part of this trusted bootstrap. Every action reference in `ci.yml`,
+`intent-check.yml` and `intent-sync.yml` uses a reviewed full commit SHA, not a movable version
+tag. The pins resolve to official [checkout v4.4.0](https://github.com/actions/checkout/commit/11d5960a326750d5838078e36cf38b85af677262),
+[setup-python v5.6.0](https://github.com/actions/setup-python/commit/a26af69be951a213d495a4c3e4e4022e16d87065)
+and [upload-artifact v4.6.2](https://github.com/actions/upload-artifact/commit/ea165f8d65b6e75b540449e92b4886f43607fa02),
+verified from their official repositories on 2026-09-08. The offline workflow guard discovers
+all `.yml`/`.yaml` workflows and checks every step action and reusable-workflow job against an
+exact reviewed allowlist. Updating an action requires verifying its official full commit and
+reviewing the upstream changes, then changing the workflow pins and allowlist together in a
+protected-tooling review. Pins prevent silent tag movement; they do not automatically receive
+future security fixes or replace the trusted runner and environment controls described below.
+
 After installing the protected exact-version/hash wheel lock, a separate read-only-auth fetch
 step acquires the proposed commit. Only the protected launcher check step receives the state
 decryption trust bundle:

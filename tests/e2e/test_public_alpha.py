@@ -336,11 +336,11 @@ def test_scheduled_workflow_is_read_only_and_orders_capture_before_assurance() -
     }
     steps = job["steps"]
     assert steps[0] == {
-        "uses": "actions/checkout@v4",
+        "uses": "actions/checkout@11d5960a326750d5838078e36cf38b85af677262",
         "with": {"fetch-depth": 0, "persist-credentials": False},
     }
     assert steps[1] == {
-        "uses": "actions/setup-python@v5",
+        "uses": "actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065",
         "with": {"python-version": "3.12"},
     }
     assert [step["name"] for step in steps[2:7]] == [
@@ -351,7 +351,7 @@ def test_scheduled_workflow_is_read_only_and_orders_capture_before_assurance() -
         "Render drift and assurance report",
     ]
     assert steps[7] == {
-        "uses": "actions/upload-artifact@v4",
+        "uses": "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02",
         "with": {
             "name": "intent-drift",
             "path": "intent-drift.md",
@@ -426,11 +426,11 @@ def test_guided_adoption_docs_and_plugin_independent_assurance_are_ordered() -> 
     assert set(workflow["on"]) == {"schedule", "workflow_dispatch"}
     steps = workflow["jobs"]["drift"]["steps"]
     assert steps[0] == {
-        "uses": "actions/checkout@v4",
+        "uses": "actions/checkout@11d5960a326750d5838078e36cf38b85af677262",
         "with": {"fetch-depth": 0, "persist-credentials": False},
     }
     assert steps[1] == {
-        "uses": "actions/setup-python@v5",
+        "uses": "actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065",
         "with": {"python-version": "3.12"},
     }
     assert [step.get("run") for step in steps[2:7]] == [
