@@ -22,6 +22,8 @@ from intent_engineering.team_state.models import (
     RecipientRecord,
     RemoteStateSnapshot,
     TeamStateManifest,
+    TeamStateManifestV2,
+    V1MigrationBinding,
     canonical_manifest_bytes,
 )
 from intent_engineering.team_state.restore import SharedStateManifest
@@ -34,6 +36,8 @@ COMMIT = "c" * 40
 X25519_PUBLIC_KEY = "YWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXowMTIzNDU"
 WEBAUTHN_CREDENTIAL_ID = "Y3JlZGVudGlhbC1pZC0x"
 WEBAUTHN_PUBLIC_KEY = "Y3JlZGVudGlhbC1wdWJsaWMta2V5LTE"
+V2_CI_RECIPIENT_ID = "recipient:ci:sha256:" + "1" * 64
+V2_HUMAN_RECIPIENT_ID = "recipient:sha256:" + "2" * 64
 
 
 def manifest_values(**changes: object) -> dict[str, object]:
@@ -104,6 +108,76 @@ def test_manifest_emits_one_bounded_canonical_wire_representation() -> None:
         b'"required_signature_ids":["signer:alice"],"schema_version":1}'
     )
     assert TeamStateManifest.model_validate_json(encoded) == value
+
+
+def test_v2_manifest_is_strict_canonical_and_migration_bound() -> None:
+    """Catches a v2 release omitting its stable-root and legacy bridge authority."""
+    value = TeamStateManifestV2(
+        project_id="project",
+        repository_id=REPOSITORY,
+        graph_version=4,
+        parent_bundle_digest=DIGEST_A,
+        bundle_digest=DIGEST_B,
+        bundle_size=17,
+        recipient_key_ids=(V2_CI_RECIPIENT_ID, V2_HUMAN_RECIPIENT_ID),
+        authority_digest="sha256:" + "d" * 64,
+        authority_epoch=1,
+        root_key_id="root:sha256:" + "e" * 64,
+        created_at=NOW,
+        migration=V1MigrationBinding(
+            prior_manifest_digest="sha256:" + "f" * 64,
+            legacy_signature_ids=("signer:alice",),
+        ),
+    )
+
+    encoded = canonical_manifest_bytes(value)
+
+    assert b'"archive_version":2' in encoded
+    assert TeamStateManifestV2.model_validate_json(encoded) == value
+    with pytest.raises(ValidationError):
+        TeamStateManifestV2(**{**value.model_dump(), "recipient_key_ids": ["a", "b"]})
+    with pytest.raises(ValidationError):
+        TeamStateManifestV2(
+            **{
+                **value.model_dump(),
+                "recipient_key_ids": tuple(f"recipient:{index:02d}" for index in range(65)),
+            }
+        )
+
+
+@pytest.mark.parametrize(
+    "recipient_ids",
+    [
+        ("recipient:ci", "recipient:human"),
+        ("recipient:sha256:" + "1" * 64, "recipient:sha256:" + "2" * 64),
+        (
+            "recipient:ci:sha256:" + "1" * 64,
+            "recipient:ci:sha256:" + "2" * 64,
+            "recipient:sha256:" + "3" * 64,
+        ),
+        ("recipient:ci:sha256:" + "1" * 64, "recipient:other:" + "2" * 64),
+    ],
+)
+def test_v2_manifest_requires_exactly_one_ci_and_at_least_one_human_recipient(
+    recipient_ids: tuple[str, ...],
+) -> None:
+    """Catches malformed or authority-free recipient sets entering signed v2 metadata."""
+    value = TeamStateManifestV2(
+        project_id="project",
+        repository_id=REPOSITORY,
+        graph_version=4,
+        parent_bundle_digest=DIGEST_A,
+        bundle_digest=DIGEST_B,
+        bundle_size=17,
+        recipient_key_ids=(V2_CI_RECIPIENT_ID, V2_HUMAN_RECIPIENT_ID),
+        authority_digest="sha256:" + "d" * 64,
+        authority_epoch=1,
+        root_key_id="root:sha256:" + "e" * 64,
+        created_at=NOW,
+    )
+
+    with pytest.raises(ValidationError):
+        TeamStateManifestV2(**{**value.model_dump(), "recipient_key_ids": recipient_ids})
 
 
 def test_restore_uses_the_same_manifest_type_and_canonical_bytes() -> None:

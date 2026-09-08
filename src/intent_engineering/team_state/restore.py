@@ -38,7 +38,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import (
     Ed25519PublicKey,
 )
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
-from pydantic import ConfigDict, Field, ValidationInfo, field_validator, model_validator
+from pydantic import ConfigDict, Field, ValidationInfo, field_validator
 
 from intent_engineering.capture.mcp.profile_loader import load_strict_yaml_mapping_bytes
 from intent_engineering.cli.writes import MutationPolicy
@@ -79,7 +79,13 @@ from intent_engineering.team_state.models import (
     MAX_STATE_FILES,
     STATE_REF,
     RemoteStateSnapshot,
+    SignatureEnvelope,
+    StateSignature,
+    StateSignatureEnvelope,
+    StateSignatureEnvelopeV2,
+    TeamManifest,
     TeamStateManifest,
+    TeamStateManifestV2,
     canonical_manifest_bytes,
 )
 from intent_engineering.validation import validate_canonical_snapshot
@@ -229,31 +235,6 @@ def _b64decode(
 
 
 SharedStateManifest = TeamStateManifest
-
-
-class StateSignature(_RestoreModel):
-    signature_id: Annotated[str, Field(pattern=_KEY_ID.pattern)]
-    algorithm: Literal["ed25519-v1"] = SIGNATURE_ALGORITHM
-    signature: str
-
-
-class StateSignatureEnvelope(_RestoreModel):
-    schema_version: Literal[1] = 1
-    manifest_digest: Annotated[str, Field(pattern=_SHA256.pattern)]
-    bundle_digest: Annotated[str, Field(pattern=_SHA256.pattern)]
-    signatures: Annotated[tuple[StateSignature, ...], Field(min_length=1, max_length=64)]
-
-    @field_validator("signatures", mode="before")
-    @classmethod
-    def require_signature_list(cls, value: object, info: ValidationInfo) -> object:
-        return _json_tuple(value, info)
-
-    @model_validator(mode="after")
-    def require_sorted_signatures(self) -> StateSignatureEnvelope:
-        _unique_sorted(tuple(item.signature_id for item in self.signatures))
-        for item in self.signatures:
-            _b64decode(item.signature, expected_size=64)
-        return self
 
 
 class StatePayloadEntry(_RestoreModel):
@@ -684,6 +665,35 @@ def _parse_canonical_model(content: bytes, model: type[StrictModel], maximum: in
     if content != _canonical_json(parsed.model_dump(mode="json")):
         raise ValueError("noncanonical shared-state object")
     return parsed
+
+
+def _schema_version(content: bytes, maximum: int) -> int:
+    if not content or len(content) > maximum:
+        raise ValueError("invalid shared-state object")
+    try:
+        loaded = loads_strict_object(content.decode("utf-8"))
+    except (TypeError, UnicodeError, ValueError) as error:
+        raise ValueError("invalid shared-state object") from error
+    version = loaded.get("schema_version")
+    if type(version) is not int or version not in {1, 2}:
+        raise ValueError("unsupported shared-state schema")
+    return version
+
+
+def parse_team_manifest(content: bytes) -> TeamManifest:
+    """Parse exactly one canonical v1 or v2 manifest based on its integer version."""
+    version = _schema_version(content, MAX_MANIFEST_BYTES)
+    if version == 1:
+        return TeamStateManifest.model_validate_json(content)
+    return TeamStateManifestV2.model_validate_json(content)
+
+
+def parse_signature_envelope(content: bytes) -> SignatureEnvelope:
+    """Parse exactly one canonical v1 or v2 signature envelope."""
+    version = _schema_version(content, MAX_SIGNATURE_BYTES)
+    if version == 1:
+        return StateSignatureEnvelope.model_validate_json(content)
+    return StateSignatureEnvelopeV2.model_validate_json(content)
 
 
 def _run_git(repo: Path, arguments: tuple[str, ...], *, maximum: int) -> bytes:
