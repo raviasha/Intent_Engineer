@@ -1,5 +1,15 @@
 """Signed and encrypted approved team-state restoration."""
 
+from intent_engineering.team_state.archive import (
+    RestoredSnapshot,
+    build_archive,
+    validate_archive,
+)
+from intent_engineering.team_state.crypto import (
+    EncryptedBundle,
+    decrypt_bundle,
+    encrypt_bundle,
+)
 from intent_engineering.team_state.models import (
     BundleInventory,
     BundleInventoryEntry,
@@ -30,18 +40,24 @@ __all__ = [
     "BundleInventoryEntry",
     "CanonicalStateFile",
     "CanonicalStateSnapshot",
+    "EncryptedBundle",
     "EnvironmentTrustProvider",
     "GitSharedStateRestorer",
     "PreparedPublication",
     "PublicationLineage",
     "RecipientRecord",
     "RemoteStateSnapshot",
+    "RestoredSnapshot",
     "SharedStateArtifacts",
     "SharedStateTrust",
     "StaticTrustProvider",
     "TeamStateManifest",
     "TrustedSigningKey",
+    "build_archive",
     "build_state_payload",
     "canonical_manifest_bytes",
+    "decrypt_bundle",
+    "encrypt_bundle",
     "seal_state_payload",
+    "validate_archive",
 ]

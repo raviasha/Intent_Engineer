@@ -33,17 +33,11 @@ from urllib.parse import urlparse
 
 import yaml  # type: ignore[import-untyped]
 from cryptography.exceptions import InvalidSignature, InvalidTag
-from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric.ed25519 import (
     Ed25519PrivateKey,
     Ed25519PublicKey,
 )
-from cryptography.hazmat.primitives.asymmetric.x25519 import (
-    X25519PrivateKey,
-    X25519PublicKey,
-)
-from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
 from pydantic import ConfigDict, Field, ValidationInfo, field_validator, model_validator
 
 from intent_engineering.capture.mcp.profile_loader import load_strict_yaml_mapping_bytes
@@ -65,6 +59,15 @@ from intent_engineering.storage.secure import (
 )
 from intent_engineering.storage.transaction import LocalTransactionCoordinator
 from intent_engineering.storage.yaml.graph_store import parse_graph
+from intent_engineering.team_state.archive import ARCHIVE_MAGIC, validate_archive
+from intent_engineering.team_state.crypto import (
+    ALGORITHM,
+    EncryptedBundle,
+    EncryptedStateBundle,
+    _encrypt_bundle_for_public_keys,
+    canonical_encrypted_bundle_bytes,
+    decrypt_bundle_for_recipient,
+)
 from intent_engineering.team_state.models import (
     CANONICAL_STATE_PATHS,
     MAX_BUNDLE_BYTES,
@@ -79,7 +82,6 @@ from intent_engineering.team_state.models import (
 )
 from intent_engineering.validation import validate_canonical_snapshot
 
-ALGORITHM: Final = "x25519-hkdf-sha256-aes256gcm-v1"
 SIGNATURE_ALGORITHM: Final = "ed25519-v1"
 TRUST_ENVIRONMENT_VARIABLE = "INTENT_CI_SHARED_STATE_TRUST"
 MAX_TRUST_BYTES = 32 * 1024
@@ -223,38 +225,6 @@ def _b64decode(
 
 
 SharedStateManifest = TeamStateManifest
-
-
-class WrappedContentKey(_RestoreModel):
-    recipient_key_id: Annotated[str, Field(pattern=_KEY_ID.pattern)]
-    nonce: str
-    ciphertext: str
-
-
-class EncryptedStateBundle(_RestoreModel):
-    schema_version: Literal[1] = 1
-    algorithm: Literal["x25519-hkdf-sha256-aes256gcm-v1"] = ALGORITHM
-    ephemeral_public_key: str
-    nonce: str
-    ciphertext: str
-    wrapped_keys: Annotated[tuple[WrappedContentKey, ...], Field(min_length=1, max_length=64)]
-
-    @field_validator("wrapped_keys", mode="before")
-    @classmethod
-    def require_wrapped_list(cls, value: object, info: ValidationInfo) -> object:
-        return _json_tuple(value, info)
-
-    @model_validator(mode="after")
-    def require_sorted_wrapped_keys(self) -> EncryptedStateBundle:
-        ids = tuple(item.recipient_key_id for item in self.wrapped_keys)
-        _unique_sorted(ids)
-        _b64decode(self.ephemeral_public_key, expected_size=32)
-        _b64decode(self.nonce, expected_size=12)
-        _b64decode(self.ciphertext)
-        for item in self.wrapped_keys:
-            _b64decode(item.nonce, expected_size=12)
-            _b64decode(item.ciphertext)
-        return self
 
 
 class StateSignature(_RestoreModel):
@@ -487,9 +457,21 @@ def build_state_payload(files: Mapping[str, bytes]) -> bytes:
     )
 
 
-def _parse_payload(content: bytes) -> dict[str, bytes]:
+def _parse_payload(
+    content: bytes,
+    manifest: TeamStateManifest | None = None,
+) -> dict[str, bytes]:
     if not content or len(content) > MAX_BUNDLE_BYTES:
         raise ValueError("invalid shared-state payload")
+    if content.startswith(ARCHIVE_MAGIC):
+        snapshot = validate_archive(content)
+        if manifest is not None and (
+            snapshot.project_id != manifest.project_id
+            or snapshot.repository_id != manifest.repository_id
+            or snapshot.graph_version != manifest.graph_version
+        ):
+            raise ValueError("shared-state archive identity mismatch")
+        return {item.path: item.content for item in snapshot.files}
     loads_strict_object(content.decode("utf-8"))
     payload = StatePayload.model_validate_json(content)
     if content != _canonical_json(payload.model_dump(mode="json")):
@@ -517,15 +499,6 @@ def _parse_payload(content: bytes) -> dict[str, bytes]:
     if payload.state_digest != _entries_digest(entries_for_digest):
         raise ValueError("invalid shared-state digest")
     return files
-
-
-def _derive_wrapping_key(shared_secret: bytes, aad: bytes, recipient_id: str) -> bytes:
-    return HKDF(
-        algorithm=hashes.SHA256(),
-        length=32,
-        salt=None,
-        info=b"intent.shared-state.wrap.v1\0" + aad + b"\0" + recipient_id.encode(),
-    ).derive(shared_secret)
 
 
 def seal_state_payload(
@@ -556,37 +529,12 @@ def seal_state_payload(
         recipient_key_ids=recipient_ids,
         required_signature_ids=signer_ids,
     )
-    content_key = AESGCM.generate_key(bit_length=256)
-    payload_nonce = os.urandom(12)
-    ephemeral = X25519PrivateKey.generate()
-    wrapped: list[WrappedContentKey] = []
-    for recipient_id in recipient_ids:
-        public_bytes = recipient_public_keys[recipient_id]
-        if type(public_bytes) is not bytes or len(public_bytes) != 32:
-            raise ValueError("invalid recipient public key")
-        shared = ephemeral.exchange(X25519PublicKey.from_public_bytes(public_bytes))
-        wrapping_key = _derive_wrapping_key(shared, aad, recipient_id)
-        nonce = os.urandom(12)
-        wrapped.append(
-            WrappedContentKey(
-                recipient_key_id=recipient_id,
-                nonce=_b64encode(nonce),
-                ciphertext=_b64encode(
-                    AESGCM(wrapping_key).encrypt(
-                        nonce,
-                        content_key,
-                        aad + b"\0" + recipient_id.encode(),
-                    )
-                ),
-            )
-        )
-    bundle_model = EncryptedStateBundle(
-        ephemeral_public_key=_b64encode(ephemeral.public_key().public_bytes_raw()),
-        nonce=_b64encode(payload_nonce),
-        ciphertext=_b64encode(AESGCM(content_key).encrypt(payload_nonce, plaintext, aad)),
-        wrapped_keys=tuple(wrapped),
+    bundle_model = _encrypt_bundle_for_public_keys(
+        plaintext,
+        {recipient_id: recipient_public_keys[recipient_id] for recipient_id in recipient_ids},
+        aad,
     )
-    bundle = _canonical_json(bundle_model.model_dump(mode="json"))
+    bundle = canonical_encrypted_bundle_bytes(bundle_model)
     manifest_model = SharedStateManifest(
         project_id=project_id,
         repository_id=repository_id,
@@ -1205,8 +1153,8 @@ def _decrypt_release_payload(
     )
     if len(bundle) != manifest.bundle_size or _digest(bundle) != manifest.bundle_digest:
         raise ValueError("shared-state bundle mismatch")
-    bundle_model = _parse_canonical_model(bundle, EncryptedStateBundle, MAX_BUNDLE_BYTES)
-    assert isinstance(bundle_model, EncryptedStateBundle)
+    bundle_model = _parse_canonical_model(bundle, EncryptedBundle, MAX_BUNDLE_BYTES)
+    assert isinstance(bundle_model, EncryptedBundle)
     wrapped = {item.recipient_key_id: item for item in bundle_model.wrapped_keys}
     if (
         tuple(sorted(wrapped)) != manifest.recipient_key_ids
@@ -1222,25 +1170,13 @@ def _decrypt_release_payload(
         recipient_key_ids=manifest.recipient_key_ids,
         required_signature_ids=manifest.required_signature_ids,
     )
-    private = X25519PrivateKey.from_private_bytes(trust.recipient_private_key)
-    shared = private.exchange(
-        X25519PublicKey.from_public_bytes(
-            _b64decode(bundle_model.ephemeral_public_key, expected_size=32)
-        )
-    )
-    selected = wrapped[trust.recipient_key_id]
-    wrapping_key = _derive_wrapping_key(shared, aad, trust.recipient_key_id)
-    content_key = AESGCM(wrapping_key).decrypt(
-        _b64decode(selected.nonce, expected_size=12),
-        _b64decode(selected.ciphertext),
-        aad + b"\0" + trust.recipient_key_id.encode(),
-    )
-    plaintext = AESGCM(content_key).decrypt(
-        _b64decode(bundle_model.nonce, expected_size=12),
-        _b64decode(bundle_model.ciphertext),
+    plaintext = decrypt_bundle_for_recipient(
+        bundle_model,
+        trust.recipient_private_key,
         aad,
+        trust.recipient_key_id,
     )
-    return _parse_payload(plaintext)
+    return _parse_payload(plaintext, manifest)
 
 
 def _same_semantic_baseline(current: Mapping[str, bytes], baseline: Mapping[str, bytes]) -> bool:
@@ -2329,6 +2265,7 @@ __all__ = [
     "CANONICAL_STATE_PATHS",
     "MAX_BUNDLE_BYTES",
     "TRUST_ENVIRONMENT_VARIABLE",
+    "EncryptedStateBundle",
     "EnvironmentTrustProvider",
     "GitSharedStateRestorer",
     "SharedStateArtifacts",
