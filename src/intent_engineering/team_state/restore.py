@@ -68,6 +68,7 @@ from intent_engineering.team_state.crypto import (
     canonical_encrypted_bundle_bytes,
     decrypt_bundle_for_recipient,
 )
+from intent_engineering.team_state.keys import RecipientKeyStore, RecipientKeyStoreError
 from intent_engineering.team_state.models import (
     CANONICAL_STATE_PATHS,
     MAX_BUNDLE_BYTES,
@@ -77,6 +78,7 @@ from intent_engineering.team_state.models import (
     MAX_STATE_BYTES,
     MAX_STATE_FILES,
     STATE_REF,
+    RemoteStateSnapshot,
     TeamStateManifest,
     canonical_manifest_bytes,
 )
@@ -374,6 +376,37 @@ class EnvironmentTrustProvider:
                 for item in parsed.signing_keys
             ),
         )
+
+
+@dataclass(frozen=True)
+class RecipientKeyStoreTrustProvider:
+    """Combine reviewed public trust with one enrolled OS-keyring recipient key."""
+
+    project_id: str
+    repository_id: str
+    recipient_key_id: str
+    signing_keys: tuple[TrustedSigningKey, ...]
+    key_store: RecipientKeyStore
+
+    def load(self) -> SharedStateTrust | None:
+        private_key = b""
+        try:
+            private_key = self.key_store.private_key(self.recipient_key_id)
+        except RecipientKeyStoreError:
+            return None
+        try:
+            return SharedStateTrust(
+                project_id=self.project_id,
+                repository_id=self.repository_id,
+                recipient_key_id=self.recipient_key_id,
+                recipient_private_key=private_key,
+                signing_keys=self.signing_keys,
+            )
+        except (TypeError, ValueError) as error:
+            error.__traceback__ = None
+            raise ValueError("shared-state trust unavailable") from None
+        finally:
+            private_key = b""
 
 
 @dataclass(frozen=True)
@@ -2172,6 +2205,7 @@ class GitSharedStateRestorer:
         fault_hook: Callable[[str], None] | None = None,
         refresh_remote: bool = False,
         prior_marker: Mapping[str, object] | None = None,
+        expected_remote_state: RemoteStateSnapshot | None = None,
     ) -> None:
         if type(refresh_remote) is not bool:
             raise ValueError("invalid shared-state refresh mode")
@@ -2180,6 +2214,11 @@ class GitSharedStateRestorer:
         self._fault_hook = fault_hook or (lambda _stage: None)
         self._refresh_remote = refresh_remote
         self._prior_marker = _validate_prior_marker(prior_marker)
+        self._expected_remote_state = (
+            None
+            if expected_remote_state is None
+            else RemoteStateSnapshot.model_validate(expected_remote_state.model_dump(mode="python"))
+        )
 
     def verify_and_restore_approved_baseline(self, root: Path) -> SharedStateRestoreResult:
         project: SecureDirectory | None = None
@@ -2222,6 +2261,15 @@ class GitSharedStateRestorer:
                 raise ValueError("local shared-state marker mismatch")
             lineage = _verify_release_lineage(reader, commit, trust, now, marker)
             manifest = lineage.tip.manifest
+            expected = self._expected_remote_state
+            if expected is not None and (
+                expected.repository_id != trust.repository_id
+                or expected.ref != STATE_REF
+                or expected.commit != commit
+                or expected.manifest != manifest
+                or expected.manifest_bytes != canonical_manifest_bytes(manifest)
+            ):
+                raise ValueError("shared-state snapshot changed")
             files = _decrypt_release_payload(reader, lineage.tip, trust)
             _validate_authenticated_state(files, manifest, trust)
             baseline_files = (
@@ -2299,6 +2347,43 @@ class GitSharedStateRestorer:
                 reader.close()
 
 
+class _RootRuntime(Protocol):
+    root: Path
+
+
+class TeamStateRestorer:
+    """Compatibility façade for an exact pre-fetched shared-state snapshot."""
+
+    def __init__(
+        self,
+        trust_provider: TrustProvider,
+        *,
+        fault_hook: Callable[[str], None] | None = None,
+    ) -> None:
+        self._trust_provider = trust_provider
+        self._fault_hook = fault_hook
+
+    def ensure(
+        self,
+        runtime: _RootRuntime,
+        remote_state: RemoteStateSnapshot,
+        now: datetime,
+    ) -> SharedStateRestoreResult:
+        try:
+            root = runtime.root
+            if not isinstance(root, Path) or type(remote_state) is not RemoteStateSnapshot:
+                raise ValueError("invalid team-state restore input")
+            expected = RemoteStateSnapshot.model_validate(remote_state.model_dump(mode="python"))
+        except (AttributeError, TypeError, ValueError):
+            return SharedStateRestoreResult(status=SharedStateRestoreStatus.INVALID)
+        return GitSharedStateRestorer(
+            self._trust_provider,
+            clock=lambda: now,
+            fault_hook=self._fault_hook,
+            expected_remote_state=expected,
+        ).verify_and_restore_approved_baseline(root)
+
+
 __all__ = [
     "ALGORITHM",
     "CANONICAL_STATE_PATHS",
@@ -2307,10 +2392,12 @@ __all__ = [
     "EncryptedStateBundle",
     "EnvironmentTrustProvider",
     "GitSharedStateRestorer",
+    "RecipientKeyStoreTrustProvider",
     "SharedStateArtifacts",
     "SharedStateManifest",
     "SharedStateTrust",
     "StaticTrustProvider",
+    "TeamStateRestorer",
     "TrustedSigningKey",
     "build_state_payload",
     "read_approved_baseline",

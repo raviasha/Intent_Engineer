@@ -10,6 +10,7 @@ from intent_engineering.team_state.crypto import (
     decrypt_bundle,
     encrypt_bundle,
 )
+from intent_engineering.team_state.git_ref import GitRefReader
 from intent_engineering.team_state.keys import (
     GitHubIdentity,
     GitHubIdentityVerifier,
@@ -35,9 +36,11 @@ from intent_engineering.team_state.restore import (
     CANONICAL_STATE_PATHS,
     EnvironmentTrustProvider,
     GitSharedStateRestorer,
+    RecipientKeyStoreTrustProvider,
     SharedStateArtifacts,
     SharedStateTrust,
     StaticTrustProvider,
+    TeamStateRestorer,
     TrustedSigningKey,
     build_state_payload,
     seal_state_payload,
@@ -53,6 +56,7 @@ __all__ = [
     "EnvironmentTrustProvider",
     "GitHubIdentity",
     "GitHubIdentityVerifier",
+    "GitRefReader",
     "GitSharedStateRestorer",
     "InMemoryRecipientKeyStore",
     "KeyringRecipientKeyStore",
@@ -61,6 +65,7 @@ __all__ = [
     "RecipientEnrollmentBinding",
     "RecipientKeyStore",
     "RecipientKeyStoreError",
+    "RecipientKeyStoreTrustProvider",
     "RecipientRecord",
     "RemoteStateSnapshot",
     "RestoredSnapshot",
@@ -68,6 +73,7 @@ __all__ = [
     "SharedStateTrust",
     "StaticTrustProvider",
     "TeamStateManifest",
+    "TeamStateRestorer",
     "TrustedSigningKey",
     "build_archive",
     "build_state_payload",
