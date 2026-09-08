@@ -74,6 +74,7 @@ _STATIC_METHODS = {
     "/api/v1/team/enrollment/options": "POST",
     "/api/v1/team/enrollment/verify": "POST",
     "/api/v1/team/enrollment/cancel": "POST",
+    "/api/v1/team/publication/preview": "GET",
     "/api/v1/decisions/options": "POST",
     "/api/v1/decisions/verify": "POST",
 }
@@ -856,6 +857,24 @@ def _make_handlers(
             result = None
         return _end_handler(request, signal, response)
 
+    async def team_publication_preview_endpoint(request: Request) -> Response:
+        response: Response | None = None
+        signal: BaseException | None = None
+        result: dict[str, object] | None = None
+        try:
+            result = service.team_publication_preview()
+            response = _json_response(result)
+        except Exception:  # noqa: BLE001 - fixed browser boundary
+            response = _fixed_response(503)
+        except BaseException as caught:  # noqa: BLE001 - preserve cancellation identity
+            caught.__traceback__ = None
+            caught.__cause__ = None
+            caught.__context__ = None
+            signal = caught
+        finally:
+            result = None
+        return _end_handler(request, signal, response)
+
     async def team_enrollment_options_endpoint(request: Request) -> Response:
         response: Response | None = None
         signal: BaseException | None = None
@@ -1001,6 +1020,7 @@ def _make_handlers(
         "team_enrollment_options": team_enrollment_options_endpoint,
         "team_enrollment_verify": team_enrollment_verify_endpoint,
         "team_enrollment_cancel": team_enrollment_cancel_endpoint,
+        "team_publication_preview": team_publication_preview_endpoint,
         "decision_options": decision_options_endpoint,
         "decision_verify": decision_verify_endpoint,
     }
@@ -1084,6 +1104,11 @@ def build_control_plane_app(
                 "/api/v1/team/enrollment/cancel",
                 handlers["team_enrollment_cancel"],
                 methods=["POST"],
+            ),
+            Route(
+                "/api/v1/team/publication/preview",
+                handlers["team_publication_preview"],
+                methods=["GET"],
             ),
             Route(
                 "/api/v1/decisions/options",

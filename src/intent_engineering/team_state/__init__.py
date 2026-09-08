@@ -32,6 +32,14 @@ from intent_engineering.team_state.models import (
     TeamStateManifest,
     canonical_manifest_bytes,
 )
+from intent_engineering.team_state.publication import (
+    PublicationAuthority,
+    PublicationCleanupError,
+    PublicationPreview,
+    PublicationPublisher,
+    PublicationService,
+    TemporaryWorktreePublisher,
+)
 from intent_engineering.team_state.restore import (
     CANONICAL_STATE_PATHS,
     EnvironmentTrustProvider,
@@ -62,7 +70,12 @@ __all__ = [
     "InMemoryRecipientKeyStore",
     "KeyringRecipientKeyStore",
     "PreparedPublication",
+    "PublicationAuthority",
+    "PublicationCleanupError",
     "PublicationLineage",
+    "PublicationPreview",
+    "PublicationPublisher",
+    "PublicationService",
     "RecipientEnrollmentBinding",
     "RecipientKeyStore",
     "RecipientKeyStoreError",
@@ -76,6 +89,7 @@ __all__ = [
     "TeamStateManifest",
     "TeamStateRestoreRuntime",
     "TeamStateRestorer",
+    "TemporaryWorktreePublisher",
     "TrustedSigningKey",
     "build_archive",
     "build_state_payload",

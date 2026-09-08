@@ -13,6 +13,7 @@
     teamEnrollmentOptions: "/api/v1/team/enrollment/options",
     teamEnrollmentVerify: "/api/v1/team/enrollment/verify",
     teamEnrollmentCancel: "/api/v1/team/enrollment/cancel",
+    teamPublicationPreview: "/api/v1/team/publication/preview",
     decisionOptions: "/api/v1/decisions/options",
     decisionVerify: "/api/v1/decisions/verify",
     developmentObservation: "/api/v1/development/observation",
@@ -33,6 +34,7 @@
     proposalGeneration: 0,
     developmentObservation: null,
     teamEnrollment: null,
+    teamPublication: null,
   };
   let csrfToken = readCsrfBootstrap();
 
@@ -375,6 +377,10 @@
       addText(section, "h3", "Recipient enrollment");
       addProjection(section, state.teamEnrollment);
     }
+    if (state.teamPublication) {
+      addText(section, "h3", "Pending publication preview");
+      addProjection(section, state.teamPublication.preview);
+    }
     const proofLabel = document.createElement("label");
     proofLabel.textContent = "GitHub device authorization proof";
     const proof = document.createElement("input");
@@ -385,6 +391,7 @@
     section.append(
       proofLabel,
       actionButton("Verify GitHub identity and enroll this device", () => enrollTeamRecipient(proof)),
+      actionButton("Preview reviewed team-state publication", loadTeamPublicationPreview),
       actionButton("Refresh team-state readiness", refreshTeamEnrollment)
     );
     return section;
@@ -566,6 +573,19 @@
       }
     } catch (_error) {
       announce("Team recipient status is unavailable.");
+    }
+  }
+
+  async function loadTeamPublicationPreview() {
+    try {
+      state.teamPublication = await fetchJson(api.teamPublicationPreview);
+      if (state.view === "team_state") {
+        render();
+      }
+      announce("Exact team-state publication preview loaded for review.");
+    } catch (_error) {
+      state.teamPublication = null;
+      announce("Team-state publication is unavailable. Nothing was published.");
     }
   }
 

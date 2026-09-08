@@ -157,6 +157,23 @@ class _Service:
         self._fail()
         return b'{"publicKey":{"userVerification":"required"}}'
 
+    def team_publication_preview(self) -> dict[str, object]:
+        self.calls.append(("team_publication_preview", None))
+        self._fail()
+        return {
+            "schema_version": 1,
+            "preview": {
+                "snapshot_digest": "sha256:" + "1" * 64,
+                "bundle_digest": "sha256:" + "2" * 64,
+                "bundle_size": 123,
+                "branch": "intent-publication/" + "2" * 64,
+                "parent_bundle_digest": None,
+                "recipient_key_ids": ["recipient:alice"],
+                "created_at": "2026-08-30T12:00:00Z",
+            },
+            "payload": {**_payload(), "action": "publish_state"},
+        }
+
     def apply_decision(self, response: bytes, payload: HumanDecisionPayload) -> dict[str, object]:
         self.calls.append(("apply_decision", (response, payload)))
         self._fail()
@@ -394,6 +411,21 @@ def test_starlette_lifespan_starts_without_bypassing_the_http_boundary() -> None
 
     assert response.status_code == 200
     assert response.json() == service.status_result
+
+
+def test_team_publication_preview_route_returns_only_the_service_projection() -> None:
+    """Catches the Team state browser view constructing or exposing publication artifacts."""
+    service = _Service()
+
+    response = TestClient(_app(service), base_url=ORIGIN).get("/api/v1/team/publication/preview")
+
+    assert response.status_code == 200
+    assert response.json() == service.team_publication_preview()
+    assert "bundle" not in response.json()["preview"]
+    assert service.calls == [
+        ("team_publication_preview", None),
+        ("team_publication_preview", None),
+    ]
 
 
 @pytest.mark.parametrize(

@@ -88,6 +88,7 @@ from intent_engineering.team_state.keys import (
     restore_recipient,
 )
 from intent_engineering.team_state.models import RecipientRecord as TeamRecipientRecord
+from intent_engineering.team_state.publication import PublicationService
 
 _MAX_AUTHORITY_FILE_BYTES = 1_048_576
 _MAX_AUTHORITY_TOTAL_BYTES = 8_388_608
@@ -246,6 +247,7 @@ class ControlPlaneService:
         team_repository_id: str | None = None,
         github_identity_verifier: GitHubIdentityVerifier | None = None,
         recipient_key_store_factory: RecipientKeyStoreFactory = keyring_recipient_store,
+        publication_service: PublicationService | None = None,
     ) -> None:
         if type(runtime) is not Runtime:
             raise ValueError("invalid control plane runtime")
@@ -272,6 +274,9 @@ class ControlPlaneService:
         self._team_repository_id = team_repository_id
         self._github_identity_verifier = github_identity_verifier
         self._recipient_key_store_factory = recipient_key_store_factory
+        if publication_service is not None and type(publication_service) is not PublicationService:
+            raise TypeError("invalid publication service")
+        self._publication_service = publication_service
         self._team_enrollment_guard = threading.RLock()
         self._team_enrollment_blocked = False
         self._pending_team_enrollment: _PendingTeamEnrollment | None = None
@@ -433,6 +438,31 @@ class ControlPlaneService:
                     "github_login": validated.github_login,
                 }
         except Exception:  # noqa: BLE001 - fixed browser projection boundary
+            raise ControlPlaneError() from None
+
+    def team_publication_preview(self) -> dict[str, object]:
+        """Return a secret-free projection of the exact pending team publication."""
+        publication = self._publication_service
+        if publication is None:
+            raise ControlPlaneError() from None
+        try:
+            preview = publication.preview(now=self._now())
+            return {
+                "schema_version": 1,
+                "preview": {
+                    "snapshot_digest": preview.snapshot_digest,
+                    "bundle_digest": preview.manifest.bundle_digest,
+                    "bundle_size": preview.manifest.bundle_size,
+                    "branch": preview.branch,
+                    "parent_bundle_digest": preview.manifest.parent_bundle_digest,
+                    "recipient_key_ids": list(preview.recipient_key_ids),
+                    "created_at": preview.manifest.model_dump(mode="json")["created_at"],
+                },
+                "payload": preview.payload.model_dump(mode="json"),
+            }
+        except ControlPlaneError:
+            raise
+        except Exception:  # noqa: BLE001 - fixed local-browser boundary
             raise ControlPlaneError() from None
 
     def _team_identity(self, proof: bytes, authority: _Authority) -> GitHubIdentity:
