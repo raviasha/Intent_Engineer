@@ -194,7 +194,7 @@ class GitHubApiPublisher:
         publication: PreparedPublication,
         *,
         base_commit: str | None,
-    ) -> None:
+    ) -> str:
         """Create an exact publication branch; never update the protected state ref."""
         if type(publication) is not PreparedPublication or base_commit is None:
             raise GitHubPublicationError()
@@ -275,13 +275,14 @@ class GitHubApiPublisher:
             )
             if ref_response.status_code == 201:
                 self._validate_ref(ref_response.payload, ref, commit_sha)
-                return
+                return commit_sha
             await self._require_live(base_commit)
             existing = await self._api.request_json_object(
                 "GET",
                 f"/repos/{self._repository}/git/ref/heads/{publication.branch}",
             )
             self._validate_ref(existing.payload, ref, commit_sha)
+            return commit_sha
         except cancelled_class:
             raise
         except GitHubPublicationError:

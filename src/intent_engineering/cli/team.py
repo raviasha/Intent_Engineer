@@ -5,9 +5,11 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
+import subprocess
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Annotated, Literal, Protocol
 
@@ -230,6 +232,7 @@ def _digest(payload: dict[str, object]) -> str:
 
 def build_github_enable_preview(project: Path, repository: str) -> GitHubEnablePreview:
     """Return the stable, network-free provider setup proposal."""
+    repository = github_repository_scope({"GITHUB_REPOSITORY": repository})
     runtime = load_runtime(project)
     try:
         repository_id = f"github.com/{repository}"
@@ -238,17 +241,41 @@ def build_github_enable_preview(project: Path, repository: str) -> GitHubEnableP
             f"/.intent/ @{login}\n/.github/workflows/intent-state.yml @{login}\n"
         )
         workflow_suggestion = (
-            "name: Intent state\n"
-            "on:\n"
-            "  pull_request:\n"
+            "# Protected default-branch tooling only; candidate commits are inert Git objects.\n"
+            "name: Intent Engineering\n"
+            '"on":\n'
+            "  pull_request_target:\n"
             "    branches: [intent-state]\n"
             "permissions:\n"
             "  contents: read\n"
             "jobs:\n"
-            "  validate:\n"
-            "    runs-on: ubuntu-latest\n"
+            "  state:\n"
+            "    name: Intent Engineering / state\n"
+            "    runs-on: ubuntu-24.04\n"
+            "    environment: intent-ci\n"
+            "    timeout-minutes: 10\n"
             "    steps:\n"
-            "      - run: intent check --shared-state\n"
+            "      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262\n"
+            "        with:\n"
+            "          ref: ${{ github.workflow_sha }}\n"
+            "          path: .intent-trusted\n"
+            "          fetch-depth: 0\n"
+            "          persist-credentials: false\n"
+            "      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065\n"
+            "        with:\n"
+            '          python-version: "3.12"\n'
+            "      - name: Install protected hash-locked tooling dependencies\n"
+            '        run: "python -I -m pip install --require-hashes --only-binary=:all: -r .intent-trusted/src/intent_engineering/integrations/ci-runtime.lock"\n'
+            "      - name: Fetch state objects without checking out candidate code\n"
+            "        run: python -I .intent-trusted/ci/launch.py fetch-state\n"
+            "        env:\n"
+            "          INTENT_CI_TOOLING_SHA: ${{ github.workflow_sha }}\n"
+            "          GH_TOKEN: ${{ github.token }}\n"
+            "      - name: Verify exact signed state candidate\n"
+            "        run: python -I .intent-trusted/ci/launch.py validate-state\n"
+            "        env:\n"
+            "          INTENT_CI_TOOLING_SHA: ${{ github.workflow_sha }}\n"
+            "          INTENT_CI_SHARED_STATE_TRUST: ${{ secrets.INTENT_CI_SHARED_STATE_TRUST }}\n"
         )
         suggestions = (
             preview_code_suggestions(project, codeowners_suggestion, workflow_suggestion)
@@ -316,13 +343,18 @@ async def run_confirmed_github_enablement(
 @team_enable_app.command("github")
 def enable_github_command(
     project: Annotated[Path, typer.Option("--project")] = Path("."),
+    repository: Annotated[str | None, typer.Option("--repository")] = None,
     confirm_preview: Annotated[str | None, typer.Option("--confirm-preview")] = None,
     confirm_protection: Annotated[str | None, typer.Option("--confirm-protection")] = None,
     output_format: Annotated[OutputFormat, typer.Option("--format")] = OutputFormat.TEXT,
 ) -> None:
     """Preview GitHub team setup before any credential or network access."""
-    repository = github_repository_scope(os.environ)
-    preview = build_github_enable_preview(project, repository)
+    try:
+        repository = discover_github_repository(project, repository)
+        preview = build_github_enable_preview(project, repository)
+    except Exception:  # noqa: BLE001 - never print local/provider configuration details
+        typer.echo("intent error: GitHub configuration unavailable", err=True)
+        raise typer.Exit(1) from None
     if confirm_preview is None:
         emit(preview, output_format)
         raise typer.Exit(4)
@@ -338,7 +370,11 @@ def enable_github_command(
             protection_confirmation=confirm_protection,
         )
 
-    result = anyio.run(run)
+    try:
+        result = anyio.run(run)
+    except Exception:  # noqa: BLE001 - fixed CLI boundary; cancellation stays observable
+        typer.echo("intent error: GitHub configuration unavailable", err=True)
+        raise typer.Exit(1) from None
     emit(result, output_format)
     if result.state == "webauthn_confirmation_required":
         from intent_engineering.cli.dev import dev_command
@@ -346,6 +382,55 @@ def enable_github_command(
         dev_command(project=project, prd=None, no_open=False, offline=False, status=False)
     if result.state != "published":
         raise typer.Exit(4)
+
+
+def discover_github_repository(project: Path, explicit: str | None = None) -> str:
+    """Resolve strict local origin identity; never use a credential-bearing URL."""
+    from intent_engineering.team_state.restore import _run_git
+
+    if explicit is not None:
+        return github_repository_scope({"GITHUB_REPOSITORY": explicit})
+    raw = b""
+    if (project / ".git").exists():
+        try:
+            raw = _run_git(
+                project,
+                ("config", "--local", "--no-includes", "--get", "remote.origin.url"),
+                maximum=512,
+            )
+        except subprocess.CalledProcessError as error:
+            if error.returncode != 1:
+                raise ValueError("GitHub configuration unavailable") from None
+    if not raw:
+        return github_repository_scope(os.environ)
+    value = raw.decode("ascii").removesuffix("\n")
+    matched = re.fullmatch(
+        r"(?:https://github\.com/|git@github\.com:|ssh://git@github\.com/)([A-Za-z0-9._/-]+?)(?:\.git)?",
+        value,
+    )
+    if matched is None:
+        raise ValueError("GitHub configuration unavailable")
+    return github_repository_scope({"GITHUB_REPOSITORY": matched.group(1)})
+
+
+@team_app.command("validate-state")
+def validate_state_command(
+    base: Annotated[str, typer.Option("--base")],
+    head: Annotated[str, typer.Option("--head")],
+    project: Annotated[Path, typer.Option("--project")] = Path("."),
+) -> None:
+    """Read-only CI validation of inert state objects using explicitly supplied CI trust."""
+    from intent_engineering.team_state.candidate import validate_candidate
+    from intent_engineering.team_state.restore import EnvironmentTrustProvider
+
+    try:
+        validate_candidate(
+            project, EnvironmentTrustProvider(), base=base, head=head, at=datetime.now(UTC)
+        )
+    except Exception:  # noqa: BLE001 - fixed CI boundary never emits decrypted state
+        typer.echo("intent error: state candidate unavailable", err=True)
+        raise typer.Exit(1) from None
+    typer.echo("Intent state candidate verified")
 
 
 __all__ = [

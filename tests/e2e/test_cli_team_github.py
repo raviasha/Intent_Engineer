@@ -26,12 +26,14 @@ from intent_engineering.control_plane.models import HumanDecisionPayload
 from intent_engineering.control_plane.webauthn_service import VerifiedHumanDecision
 from intent_engineering.core.policy import initialize_project
 from intent_engineering.team_state.github import (
+    GitHubProtectionPolicy,
     GitHubProtectionPreview,
     GitHubTeamStateStatus,
     PublicationPullRequest,
 )
 from intent_engineering.team_state.models import PreparedPublication, RecipientRecord
 from intent_engineering.team_state.publication import PublicationPreview
+from tests.helpers.shared_state import git
 
 
 def _project(tmp_path: Path) -> Path:
@@ -39,6 +41,65 @@ def _project(tmp_path: Path) -> Path:
     root.mkdir()
     initialize_project(root)
     return root
+
+
+@pytest.mark.parametrize(
+    "remote",
+    [
+        "git@github.com:acme/project.git",
+        "https://github.com/acme/project.git",
+        "ssh://git@github.com/acme/project.git",
+    ],
+)
+def test_cli_discovers_origin_before_environment(tmp_path, remote):
+    project = _project(tmp_path)
+    git(project, "init", "--initial-branch=main")
+    git(project, "add", ".intent/config.yaml", "-f")
+    git(project, "commit", "-m", "Code")
+    git(project, "remote", "add", "origin", remote)
+    result = CliRunner().invoke(
+        app,
+        ["team", "enable", "github", "--project", str(project), "--format", "json"],
+        env={"GITHUB_REPOSITORY": "wrong/project"},
+    )
+    assert result.exit_code == 4, result.exception
+    assert json.loads(result.stdout)["repository_id"] == "github.com/acme/project"
+
+
+def test_cli_explicit_repository_and_fixed_configuration_failure(tmp_path):
+    project = _project(tmp_path)
+    result = CliRunner().invoke(
+        app,
+        [
+            "team",
+            "enable",
+            "github",
+            "--project",
+            str(project),
+            "--repository",
+            "acme/project",
+            "--format",
+            "json",
+        ],
+    )
+    assert result.exit_code == 4, result.exception
+    assert json.loads(result.stdout)["repository_id"] == "github.com/acme/project"
+    failed = CliRunner().invoke(
+        app,
+        [
+            "team",
+            "enable",
+            "github",
+            "--project",
+            str(project),
+            "--repository",
+            "https://secret-token@evil.test/acme/project",
+        ],
+    )
+    assert failed.exit_code == 1
+    assert "configuration unavailable" in failed.output
+    assert "secret-token" not in failed.output
+    assert isinstance(failed.exception, SystemExit)
 
 
 def test_team_enable_github_is_a_no_network_preview_before_confirmation(
@@ -69,7 +130,15 @@ def test_team_enable_github_is_a_no_network_preview_before_confirmation(
     assert payload["codeowners_suggestion"] == (
         "/.intent/ @acme\n/.github/workflows/intent-state.yml @acme\n"
     )
-    assert "intent check --shared-state" in payload["workflow_suggestion"]
+    import yaml
+
+    workflow = yaml.safe_load(payload["workflow_suggestion"])
+    assert workflow["on"]["pull_request_target"]["branches"] == ["intent-state"]
+    state_job = workflow["jobs"]["state"]
+    assert state_job["name"] == "Intent Engineering / state"
+    assert state_job["steps"][0]["with"]["ref"] == "${{ github.workflow_sha }}"
+    assert state_job["steps"][0]["with"]["persist-credentials"] is False
+    assert state_job["steps"][-1]["run"] == "python -I .intent-trusted/ci/launch.py validate-state"
     assert payload["preview_digest"].startswith("sha256:")
     assert called is False
 
@@ -207,6 +276,19 @@ async def test_confirmed_enablement_runs_real_reviewed_orchestration_without_sid
     events: list[str] = []
     protection_digest = "sha256:" + "2" * 64
     verified_protection_digest = "sha256:" + "0" * 64
+    configured_policy = GitHubProtectionPolicy(
+        snapshot_digest="sha256:" + "3" * 64,
+        enforce_admins=True,
+        allow_deletions=False,
+        allow_force_pushes=False,
+        required_linear_history=True,
+        dismiss_stale_reviews=True,
+        require_code_owner_reviews=False,
+        required_approving_review_count=1,
+        required_status_checks_strict=True,
+        required_status_check_contexts=("Intent Engineering / state",),
+        restrictions_digest=None,
+    )
 
     class GitHub:
         async def inspect(self, repository: str) -> GitHubTeamStateStatus:
@@ -220,8 +302,9 @@ async def test_confirmed_enablement_runs_real_reviewed_orchestration_without_sid
                 scopes=("repo",),
                 private=True,
                 default_branch="main",
-                branch_commit="a" * 40,
-                branch_present=True,
+                default_branch_commit="b" * 40,
+                branch_commit=None,
+                branch_present=False,
                 protection_compatible=False,
                 codeowners_present=True,
             )
@@ -230,8 +313,10 @@ async def test_confirmed_enablement_runs_real_reviewed_orchestration_without_sid
             events.append("protection_preview")
             return GitHubProtectionPreview(
                 repository_id="github.com/acme/project",
-                branch_creation_required=False,
+                branch_creation_required=True,
                 requires_change=True,
+                before_policy=None,
+                after_policy=configured_policy,
                 digest=protection_digest,
             )
 
@@ -249,6 +334,7 @@ async def test_confirmed_enablement_runs_real_reviewed_orchestration_without_sid
                 branch_commit="a" * 40,
                 branch_present=True,
                 protection_compatible=True,
+                protection_policy=configured_policy,
                 codeowners_present=True,
             )
 

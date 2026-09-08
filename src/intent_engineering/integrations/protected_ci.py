@@ -34,6 +34,7 @@ class ProtectedRequest:
     revision: str
     repository: str
     number: int | None
+    base: str | None = None
 
 
 def _mapping(value: object) -> Mapping[str, object]:
@@ -53,7 +54,9 @@ def _text(value: object) -> str:
     return value
 
 
-def load_request(root: Path, event: object, environment: Mapping[str, str]) -> ProtectedRequest:
+def load_request(
+    root: Path, event: object, environment: Mapping[str, str], *, state: bool = False
+) -> ProtectedRequest:
     """Verify the protected checkout and bounded event fields before using PR data."""
     try:
         payload = _mapping(event)
@@ -70,7 +73,7 @@ def load_request(root: Path, event: object, environment: Mapping[str, str]) -> P
             or _git(root, ("rev-parse", "--verify", "HEAD"), 256).decode().strip() != tooling
         ):
             raise ValueError("unprotected tooling")
-        if environment["GITHUB_EVENT_NAME"] == "workflow_dispatch":
+        if environment["GITHUB_EVENT_NAME"] == "workflow_dispatch" and not state:
             return ProtectedRequest(tooling, name, None)
         if environment["GITHUB_EVENT_NAME"] != "pull_request_target":
             raise ValueError("unprotected event")
@@ -81,12 +84,15 @@ def load_request(root: Path, event: object, environment: Mapping[str, str]) -> P
         if (
             type(number) is not int
             or not 1 <= number <= 2**31 - 1
-            or _text(base["ref"]) != branch
+            or _text(base["ref"]) != ("intent-state" if state else branch)
             or _text(_mapping(base["repo"])["full_name"]) != name
             or _REVISION.fullmatch(revision) is None
         ):
             raise ValueError("unprotected proposal")
-        return ProtectedRequest(revision, name, number)
+        base_sha = _text(base["sha"]) if state else None
+        if base_sha is not None and _REVISION.fullmatch(base_sha) is None:
+            raise ValueError("unprotected state base")
+        return ProtectedRequest(revision, name, number, base_sha)
     except (KeyError, TypeError, ValueError, OSError):
         raise ValueError("protected CI unavailable") from None
 
@@ -123,10 +129,15 @@ def fetch_proposed_revision(root: Path, request: ProtectedRequest, token: str) -
             "fetch.unpackLimit=1",
             "fetch",
             "--no-tags",
-            "--depth=1",
+            "--depth=64" if request.base is not None else "--depth=1",
             "--no-write-fetch-head",
             "https://github.com/" + request.repository,
             f"+refs/pull/{request.number}/head:refs/intent-ci/proposed",
+            *(
+                ["+refs/heads/intent-state:refs/remotes/origin/intent-state"]
+                if request.base is not None
+                else []
+            ),
         ],
         cwd=root,
         env={
@@ -153,6 +164,14 @@ def fetch_proposed_revision(root: Path, request: ProtectedRequest, token: str) -
         != request.revision
     ):
         raise ValueError("protected CI unavailable")
+    if (
+        request.base is not None
+        and _git(root, ("rev-parse", "--verify", "refs/remotes/origin/intent-state"), 256)
+        .decode()
+        .strip()
+        != request.base
+    ):
+        raise ValueError("protected CI unavailable")
 
 
 def main(root: Path) -> int:
@@ -166,9 +185,24 @@ def main(root: Path) -> int:
             )
         finally:
             os.close(descriptor)
-        request = load_request(root, event, os.environ)
-        if sys.argv[1:] == ["fetch"]:
+        request = load_request(
+            root, event, os.environ, state=sys.argv[1:] in (["fetch-state"], ["validate-state"])
+        )
+        if sys.argv[1:] in (["fetch"], ["fetch-state"]):
             fetch_proposed_revision(root, request, os.environ.get("GH_TOKEN", ""))
+        elif sys.argv[1:] == ["validate-state"]:
+            from intent_engineering.team_state.candidate import validate_candidate
+            from intent_engineering.team_state.restore import EnvironmentTrustProvider
+
+            if request.base is None:
+                raise ValueError("protected CI unavailable")
+            validate_candidate(
+                root,
+                EnvironmentTrustProvider(),
+                base=request.base,
+                head=request.revision,
+                at=datetime.now(UTC),
+            )
         elif sys.argv[1:] == ["check"]:
             if (
                 request.number is not None

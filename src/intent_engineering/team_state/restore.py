@@ -993,6 +993,12 @@ class _GitRefReader:
             raise ValueError("shared-state merges are unsupported")
         return parents
 
+    def is_empty_orphan(self, commit: str) -> bool:
+        """Only the reviewed bootstrap shape may precede a semantic genesis."""
+        return not self.parents(commit) and not _run_git(
+            self._root, ("ls-tree", "-z", "--full-tree", commit), maximum=MAX_GIT_TEXT_BYTES
+        )
+
     def blob(self, commit: str, path: str, maximum: int) -> bytes:
         if type(path) is not str:
             raise ValueError("invalid shared-state Git path")
@@ -1165,6 +1171,10 @@ def _verify_release_lineage(
                 raise _Stale("local shared-state lineage diverged")
             return _VerifiedLineage(tip, baseline)
         if release.manifest.parent_bundle_digest is None:
+            if reader.is_empty_orphan(parents[0]):
+                if marker is not None and baseline is None:
+                    raise _Stale("local shared-state lineage diverged")
+                return _VerifiedLineage(tip, baseline)
             raise _Stale("invalid shared-state parent")
         expected_digest = release.manifest.parent_bundle_digest
         commit = parents[0]

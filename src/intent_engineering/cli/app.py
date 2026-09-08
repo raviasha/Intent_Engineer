@@ -21,7 +21,12 @@ from intent_engineering.cli.connectors import (
     connector_catalog,
     connectors_app,
 )
-from intent_engineering.cli.dev import _developer_readiness, dev_command, ensure_command
+from intent_engineering.cli.dev import (
+    _developer_readiness,
+    _shared_restore,
+    dev_command,
+    ensure_command,
+)
 from intent_engineering.cli.github import GitHubDoctorResult, check_github
 from intent_engineering.cli.intent_workflow import (
     bootstrap_command,
@@ -80,6 +85,7 @@ from intent_engineering.intent_workflow.check import (
     CheckResult,
     CheckService,
     CheckStatus,
+    SharedStateRestoreResult,
 )
 from intent_engineering.intent_workflow.onboarding import (
     OnboardingRuntime,
@@ -468,6 +474,15 @@ def sync_command(
     _sync_command(_runtime(project), sources, output_format)
 
 
+class _CliCheckRuntimeAdapter(CheckRuntimeAdapter):
+    """Keep local team verification inside CheckService's ordered readiness gate."""
+
+    def restore(self, *, require_shared: bool) -> SharedStateRestoreResult:
+        if require_shared or not os.path.lexists(self._root / ".intent/team-trust.json"):
+            return super().restore(require_shared=require_shared)
+        return _shared_restore(self._root)
+
+
 @app.command("check")
 def check_command(
     project: Path = typer.Option(Path("."), "--project"),
@@ -479,7 +494,7 @@ def check_command(
     output_format: OutputFormat = typer.Option(OutputFormat.JSON, "--format"),
 ) -> None:
     """Run readiness, capture, validation, assurance, and bounded drift reporting."""
-    adapter = CheckRuntimeAdapter(
+    adapter = _CliCheckRuntimeAdapter(
         project,
         principal_resolver=_authorized_principals,
         mcp_connector_resolver=lambda runtime: connector_catalog(runtime).read_connectors(),

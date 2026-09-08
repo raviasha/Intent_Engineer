@@ -192,16 +192,18 @@ class _PublicationTransport:
         from intent_engineering.team_state.github_publication import GitHubApiPublisher
 
         self.publisher: GitHubApiPublisher | None = None
+        self.published_commit: str | None = None
 
     def publish(self, publication: PreparedPublication, *, base_commit: str | None) -> None:
         publisher = self.publisher
         if publisher is None:
             raise ValueError("GitHub publication transport unavailable")
 
-        async def run() -> None:
-            await publisher.publish(publication, base_commit=base_commit)
+        async def run() -> str:
+            return await publisher.publish(publication, base_commit=base_commit)
 
-        anyio.from_thread.run(run)
+        self.published_commit = None
+        self.published_commit = anyio.from_thread.run(run)
 
 
 class _GuardedApi:
@@ -266,6 +268,25 @@ class GitHubSetupBridge:
         service._team_repository_id = request.preview.repository_id
         service._restore_team_recipient()
 
+    def status(self) -> str:
+        """Advisory local progress; each next action reinspects live provider authority."""
+        if self.service._team_recipient is None:
+            return "setup_required"
+        draft = _draft(self.service._runtime)
+        if draft is not None:
+            if draft.manifest.repository_id != self.request.preview.repository_id:
+                raise ValueError("GitHub publication draft changed")
+            return "publication_draft"
+        try:
+            SigningKeyStore(
+                self.service._runtime.config.project_id,
+                self.request.preview.repository_id,
+                self.service._runtime.config.local_actor,
+            ).public_keys()
+        except ValueError:
+            return "enrolled"
+        return "protection_configured"
+
     def _authority(self) -> str:
         from intent_engineering.control_plane.service import _parent_digest
 
@@ -277,7 +298,7 @@ class GitHubSetupBridge:
         finally:
             authority.close()
 
-    def _recipient(self, status: GitHubTeamStateStatus) -> None:
+    def _recipient(self, status: GitHubTeamStateStatus) -> RecipientRecord:
         self.service._restore_team_recipient()
         recipient = self.service._team_recipient
         if (
@@ -289,6 +310,7 @@ class GitHubSetupBridge:
             or (self.recipient_snapshot is not None and recipient != self.recipient_snapshot)
         ):
             raise ValueError("GitHub enrollment changed")
+        return recipient
 
     def _publication_authority(self) -> PublicationAuthority:
         reviewed = self.reviewed
@@ -371,6 +393,18 @@ class GitHubSetupBridge:
             self.publication = None
             self.transport.publisher = None
             service.cancel_team_enrollment()
+            draft = _draft(service._runtime)
+            if draft is not None:
+                if draft.manifest.repository_id != self.request.preview.repository_id:
+                    raise ValueError("GitHub publication draft changed")
+                _draft(
+                    service._runtime,
+                    prepared=draft.publication(),
+                    anchor=draft.anchor,
+                    discard=True,
+                )
+            _complete_setup_request(service._runtime, self.request)
+            service._github_setup_bridge = None
             return {"state": "cancelled"}
         api: GitHubTeamStateApi | None = None
         client: GitHubTeamStateClient | None = None
@@ -402,6 +436,11 @@ class GitHubSetupBridge:
             ):
                 raise ValueError("GitHub code suggestions changed")
             await self._anchor(api, reviewed)
+            if (
+                self._authority() != self.authority_digest
+                or load_setup_request(service._runtime) != self.request
+            ):
+                raise ValueError("GitHub local authority changed")
 
         try:
             api = _GuardedApi(github_api(), require_write_authority)
@@ -420,7 +459,9 @@ class GitHubSetupBridge:
                 raise ValueError("GitHub repository changed")
             if action == "inspect":
                 return {
-                    "state": "identity_verified",
+                    "state": "identity_verified"
+                    if service._team_recipient is None
+                    else self.status(),
                     "repository_id": status.repository_id,
                     "github_account_id": status.account_id,
                     "github_login": status.login,
@@ -610,7 +651,23 @@ class GitHubSetupBridge:
                 finally:
                     self.transport.publisher = None
                 self.publication = None
-                pr = await client.open_publication_pr(prepared)
+                if self.transport.published_commit is None:
+                    raise ValueError("GitHub publication commit unavailable")
+                pr = await client.open_publication_pr(
+                    prepared, expected_head_commit=self.transport.published_commit
+                )
+                from intent_engineering.team_state.local_trust import save_local_trust
+
+                await require_write_authority()
+                save_local_trust(
+                    service._runtime,
+                    self._recipient(status),
+                    SigningKeyStore(
+                        service._runtime.config.project_id,
+                        status.repository_id,
+                        service._runtime.config.local_actor,
+                    ).public_keys(),
+                )
                 _draft(
                     service._runtime,
                     prepared=prepared,
@@ -626,7 +683,14 @@ class GitHubSetupBridge:
                 }
             updated = await client.configure_protection(cast(str, self.protection_digest))
             await self._anchor(api, updated)
+            await require_write_authority()
             stage_code_suggestions(service._runtime.root, suggestions)
+            self.suggestions = preview_code_suggestions(
+                service._runtime.root,
+                self.request.preview.codeowners_suggestion,
+                self.request.preview.workflow_suggestion,
+            )
+            await require_write_authority()
             SigningKeyStore(
                 service._runtime.config.project_id,
                 status.repository_id,

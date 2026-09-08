@@ -27,6 +27,8 @@ from intent_engineering.team_state.models import (
 )
 
 NOW = datetime(2026, 9, 8, 12, tzinfo=UTC)
+PUBLICATION_COMMIT = "f" * 40
+STATE_COMMIT = "a" * 40
 
 
 class QueueApi:
@@ -82,6 +84,13 @@ def _inspection(*, protection_contexts: list[str] | None = None) -> list[GitHubJ
                 "full_name": "acme/project",
                 "private": True,
                 "default_branch": "main",
+                "permissions": {
+                    "admin": True,
+                    "maintain": True,
+                    "pull": True,
+                    "push": True,
+                    "triage": True,
+                },
             },
         ),
         _response(200, {"id": 123, "login": "alice"}),
@@ -97,16 +106,36 @@ def _inspection(*, protection_contexts: list[str] | None = None) -> list[GitHubJ
             200,
             {
                 "enforce_admins": {"enabled": True},
+                "allow_deletions": {"enabled": False},
+                "allow_force_pushes": {"enabled": False},
+                "required_linear_history": {"enabled": True},
                 "required_pull_request_reviews": {
                     "dismiss_stale_reviews": True,
                     "required_approving_review_count": 1,
-                    "require_code_owner_reviews": True,
+                    "require_code_owner_reviews": False,
                 },
                 "required_status_checks": {"strict": True, "contexts": contexts},
             },
         ),
         _response(200, {"path": ".github/CODEOWNERS", "type": "file"}),
     ]
+
+
+def _created_branch_inspection(commit: str) -> list[GitHubJsonResponse]:
+    responses = _inspection()
+    responses[2:] = [
+        _response(
+            200,
+            {
+                "name": "intent-state",
+                "protected": False,
+                "commit": {"sha": commit},
+            },
+        ),
+        _response(404, {}),
+        _response(404, {}),
+    ]
+    return responses
 
 
 def _publication() -> PreparedPublication:
@@ -134,6 +163,43 @@ def _publication() -> PreparedPublication:
         bundle_path=f"bundles/{suffix}.intent",
         signature_path=f"signatures/{suffix}.json",
     )
+
+
+def _publication_ref(
+    publication: PreparedPublication, *, commit: str = PUBLICATION_COMMIT
+) -> GitHubJsonResponse:
+    return _response(
+        200,
+        {
+            "ref": f"refs/heads/{publication.branch}",
+            "object": {"sha": commit, "type": "commit"},
+        },
+    )
+
+
+def _pull(
+    publication: PreparedPublication,
+    number: int,
+    *,
+    head_sha: str = PUBLICATION_COMMIT,
+    base_sha: str = STATE_COMMIT,
+    head_repository: str = "acme/project",
+    base_repository: str = "acme/project",
+) -> dict[str, object]:
+    return {
+        "number": number,
+        "html_url": f"https://github.com/acme/project/pull/{number}",
+        "head": {
+            "ref": publication.branch,
+            "sha": head_sha,
+            "repo": {"full_name": head_repository},
+        },
+        "base": {
+            "ref": "intent-state",
+            "sha": base_sha,
+            "repo": {"full_name": base_repository},
+        },
+    }
 
 
 @pytest.mark.anyio
@@ -173,7 +239,19 @@ async def test_inspect_rejects_identity_scope_public_policy_and_changed_protecti
     missing_scope = _inspection()
     missing_scope[0] = _response(
         200,
-        {"id": 77, "full_name": "acme/project", "private": True, "default_branch": "main"},
+        {
+            "id": 77,
+            "full_name": "acme/project",
+            "private": True,
+            "default_branch": "main",
+            "permissions": {
+                "admin": True,
+                "maintain": True,
+                "pull": True,
+                "push": True,
+                "triage": True,
+            },
+        },
         scopes="read:user",
     )
     with pytest.raises(GitHubTeamStateError):
@@ -192,7 +270,19 @@ async def test_inspect_rejects_identity_scope_public_policy_and_changed_protecti
     public = _inspection()
     public[0] = _response(
         200,
-        {"id": 77, "full_name": "acme/project", "private": False, "default_branch": "main"},
+        {
+            "id": 77,
+            "full_name": "acme/project",
+            "private": False,
+            "default_branch": "main",
+            "permissions": {
+                "admin": True,
+                "maintain": True,
+                "pull": True,
+                "push": True,
+                "triage": True,
+            },
+        },
         scopes="public_repo",
     )
     with pytest.raises(GitHubTeamStateError):
@@ -202,40 +292,285 @@ async def test_inspect_rejects_identity_scope_public_policy_and_changed_protecti
 
 
 @pytest.mark.anyio
-async def test_open_publication_pr_rechecks_status_and_reuses_one_exact_open_pr() -> None:
-    """Catches duplicate PR creation or stale repository/protection authorization."""
+@pytest.mark.parametrize(
+    ("permissions", "accepted"),
+    [
+        (
+            {"admin": False, "maintain": True, "pull": True, "push": True, "triage": True},
+            True,
+        ),
+        (
+            {"admin": True, "maintain": False, "pull": True, "push": True, "triage": True},
+            True,
+        ),
+        (
+            {"admin": False, "maintain": False, "pull": True, "push": True, "triage": True},
+            False,
+        ),
+        (
+            {"admin": True, "maintain": True, "pull": True, "push": False, "triage": True},
+            False,
+        ),
+        (
+            {"admin": True, "maintain": True, "pull": False, "push": True, "triage": True},
+            False,
+        ),
+        (
+            {"admin": True, "maintain": True, "pull": True, "push": "yes", "triage": True},
+            False,
+        ),
+        ({"admin": True, "maintain": True, "pull": True, "push": True}, False),
+    ],
+)
+async def test_inspect_requires_real_repository_level_write_and_pr_permissions(
+    permissions: Mapping[str, object], accepted: bool
+) -> None:
+    """Catches token scopes substituting for repository-level setup authority."""
+    responses = _inspection()
+    repository = dict(responses[0].payload)
+    repository["permissions"] = permissions
+    responses[0] = _response(200, repository)
+    client = GitHubTeamStateClient(
+        QueueApi(responses), expected_account_id="123", expected_login="alice"
+    )
+
+    if accepted:
+        status = await client.inspect("acme/project")
+        assert status.repository_id == "github.com/acme/project"
+    else:
+        with pytest.raises(GitHubTeamStateError):
+            await client.inspect("acme/project")
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("allow_deletions", {"enabled": True}),
+        ("allow_force_pushes", {"enabled": True}),
+        ("required_linear_history", {"enabled": False}),
+        ("required_linear_history", None),
+    ],
+)
+async def test_state_protection_requires_linear_history_and_disallows_destructive_pushes(
+    field: str, value: object
+) -> None:
+    """Catches a protected branch that can still be rewritten, deleted, or merge-committed."""
+    responses = _inspection()
+    protection = dict(responses[3].payload)
+    if value is None:
+        protection.pop(field)
+    else:
+        protection[field] = value
+    responses[3] = _response(200, protection)
+    client = GitHubTeamStateClient(
+        QueueApi(responses), expected_account_id="123", expected_login="alice"
+    )
+
+    status = await client.inspect("acme/project")
+
+    assert status.protection_compatible is False
+    assert client.protection_preview().requires_change is True
+
+
+@pytest.mark.anyio
+async def test_state_protection_uses_generic_approval_not_default_branch_codeowners() -> None:
+    """Catches state PRs requiring CODEOWNERS that exist only on the code branch."""
+    compatible = GitHubTeamStateClient(
+        QueueApi(_inspection()), expected_account_id="123", expected_login="alice"
+    )
+    assert (await compatible.inspect("acme/project")).codeowners_present is True
+    assert compatible.protection_preview().requires_change is False
+
+    responses = _inspection()
+    protection = dict(responses[3].payload)
+    reviews = dict(protection["required_pull_request_reviews"])  # type: ignore[arg-type]
+    reviews["require_code_owner_reviews"] = True
+    protection["required_pull_request_reviews"] = reviews
+    responses[3] = _response(200, protection)
+    incompatible = GitHubTeamStateClient(
+        QueueApi(responses), expected_account_id="123", expected_login="alice"
+    )
+
+    assert (await incompatible.inspect("acme/project")).protection_compatible is False
+
+
+@pytest.mark.anyio
+async def test_stronger_compatible_protection_is_never_replaced() -> None:
+    """Catches setup weakening approvals, extra checks, or repository restrictions."""
+    responses = _inspection(protection_contexts=["Intent Engineering / state", "security"])
+    protection = dict(responses[3].payload)
+    reviews = dict(protection["required_pull_request_reviews"])  # type: ignore[arg-type]
+    reviews["required_approving_review_count"] = 3
+    protection["required_pull_request_reviews"] = reviews
+    protection["restrictions"] = {"users": [], "teams": ["release"], "apps": []}
+    responses[3] = _response(200, protection)
+    api = QueueApi(responses)
+    client = GitHubTeamStateClient(api, expected_account_id="123", expected_login="alice")
+    status = await client.inspect("acme/project")
+
+    preview = client.protection_preview()
+    updated = await client.configure_protection(preview.digest)
+
+    assert preview.branch_creation_required is False
+    assert preview.requires_change is False
+    assert updated == status
+    assert all(call[0] != "PUT" for call in api.calls)
+
+    assert preview.before_policy is not None
+    assert preview.before_policy.required_approving_review_count == 3
+    assert preview.before_policy.required_status_check_contexts == (
+        "Intent Engineering / state",
+        "security",
+    )
+    assert preview.after_policy == preview.before_policy
+
+
+@pytest.mark.anyio
+async def test_preview_exposes_bounded_current_and_required_protection_policies() -> None:
+    """Catches a confirmation digest hiding the concrete before/after policy."""
+    client = GitHubTeamStateClient(
+        QueueApi(_inspection()), expected_account_id="123", expected_login="alice"
+    )
+    await client.inspect("acme/project")
+
+    preview = client.protection_preview()
+
+    assert preview.before_policy is not None
+    assert preview.before_policy.snapshot_digest.startswith("sha256:")
+    assert preview.before_policy.required_linear_history is True
+    assert preview.before_policy.allow_force_pushes is False
+    assert preview.before_policy.allow_deletions is False
+    assert preview.after_policy == preview.before_policy
+
+
+@pytest.mark.anyio
+async def test_protection_snapshot_rejects_unbounded_provider_content_secret_safely() -> None:
+    """Catches exact drift binding retaining arbitrary or credential-like provider data."""
+    secret = "ghp_snapshot_secret_" + "x" * 4096
+    responses = _inspection()
+    protection = dict(responses[3].payload)
+    protection["unexpected"] = secret
+    responses[3] = _response(200, protection)
+    client = GitHubTeamStateClient(
+        QueueApi(responses), expected_account_id="123", expected_login="alice"
+    )
+
+    with pytest.raises(GitHubTeamStateError) as caught:
+        await client.inspect("acme/project")
+
+    assert secret not in str(caught.value)
+    assert secret not in repr(caught.value)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("drift", ["approval_count", "contexts", "restrictions"])
+async def test_compatible_protection_drift_is_rejected_before_pr_reuse(drift: str) -> None:
+    """Catches stronger policy details drifting while the compatible boolean stays true."""
     publication = _publication()
-    existing = {
-        "number": 42,
-        "html_url": "https://github.com/acme/project/pull/42",
-        "head": {"ref": publication.branch, "repo": {"full_name": "acme/project"}},
-        "base": {"ref": "intent-state", "repo": {"full_name": "acme/project"}},
-    }
-    api = QueueApi(_inspection() + _inspection(), PageResult(items=(existing,), etag=None))
+    initial = _inspection(protection_contexts=["Intent Engineering / state", "security"])
+    initial_policy = dict(initial[3].payload)
+    initial_reviews = dict(initial_policy["required_pull_request_reviews"])  # type: ignore[arg-type]
+    initial_reviews["required_approving_review_count"] = 2
+    initial_policy["required_pull_request_reviews"] = initial_reviews
+    initial_policy["restrictions"] = {"users": [], "teams": ["release"], "apps": []}
+    initial[3] = _response(200, initial_policy)
+    changed = _inspection(protection_contexts=["Intent Engineering / state", "security"])
+    changed_policy = dict(changed[3].payload)
+    changed_reviews = dict(changed_policy["required_pull_request_reviews"])  # type: ignore[arg-type]
+    changed_reviews["required_approving_review_count"] = 2
+    changed_policy["required_pull_request_reviews"] = changed_reviews
+    changed_policy["restrictions"] = {"users": [], "teams": ["release"], "apps": []}
+    if drift == "approval_count":
+        changed_reviews["required_approving_review_count"] = 3
+    elif drift == "contexts":
+        changed_policy["required_status_checks"] = {
+            "strict": True,
+            "contexts": ["Intent Engineering / state", "security", "audit"],
+        }
+    else:
+        changed_policy["restrictions"] = {
+            "users": [],
+            "teams": ["release", "operations"],
+            "apps": [],
+        }
+    changed[3] = _response(200, changed_policy)
+    api = QueueApi(
+        initial + changed + [_publication_ref(publication)],
+        PageResult(items=(_pull(publication, 42),), etag=None),
+    )
     client = GitHubTeamStateClient(api, expected_account_id="123", expected_login="alice")
     await client.inspect("acme/project")
 
-    pull_request = await client.open_publication_pr(publication)
+    with pytest.raises(GitHubTeamStateError):
+        await client.open_publication_pr(publication, expected_head_commit=PUBLICATION_COMMIT)
+
+    assert all(call[0] not in {"GET-PAGES", "POST"} for call in api.calls)
+
+
+@pytest.mark.anyio
+async def test_existing_incompatible_protection_fails_closed_without_put() -> None:
+    """Catches setup replacing unknown existing policy with a weaker guessed policy."""
+    incompatible = _inspection(protection_contexts=["another-check"])
+    configured = _response(200, _inspection()[3].payload)
+    api = QueueApi(incompatible + incompatible + [configured])
+    client = GitHubTeamStateClient(api, expected_account_id="123", expected_login="alice")
+    await client.inspect("acme/project")
+    preview = client.protection_preview()
+
+    with pytest.raises(GitHubTeamStateError):
+        await client.configure_protection(preview.digest)
+
+    assert preview.branch_creation_required is False
+    assert preview.requires_change is True
+    assert all(call[0] != "PUT" for call in api.calls)
+
+
+@pytest.mark.anyio
+async def test_open_publication_pr_rechecks_status_and_reuses_one_exact_open_pr() -> None:
+    """Catches duplicate PR creation or stale repository/protection authorization."""
+    publication = _publication()
+    existing = _pull(publication, 42)
+    api = QueueApi(
+        _inspection()
+        + _inspection()
+        + [_publication_ref(publication)]
+        + _inspection()
+        + [_publication_ref(publication)],
+        PageResult(items=(existing,), etag=None),
+    )
+    client = GitHubTeamStateClient(api, expected_account_id="123", expected_login="alice")
+    await client.inspect("acme/project")
+
+    pull_request = await client.open_publication_pr(
+        publication, expected_head_commit=PUBLICATION_COMMIT
+    )
 
     assert pull_request.number == 42
     assert pull_request.created is False
     assert pull_request.url == "https://github.com/acme/project/pull/42"
     assert all(call[0] != "POST" for call in api.calls)
+    assert sum(call[1].endswith(publication.branch) for call in api.calls) == 2
 
 
 @pytest.mark.anyio
 async def test_open_publication_pr_posts_one_exact_payload_and_closes_on_cancellation() -> None:
     """Catches an unbound PR target or cancellation leaking the owned provider client."""
     publication = _publication()
-    created = _response(
-        201,
-        {"number": 43, "html_url": "https://github.com/acme/project/pull/43"},
+    created = _response(201, _pull(publication, 43))
+    api = QueueApi(
+        _inspection()
+        + _inspection()
+        + [_publication_ref(publication)]
+        + _inspection()
+        + [_publication_ref(publication), created]
     )
-    api = QueueApi(_inspection() + _inspection() + [created])
     client = GitHubTeamStateClient(api, expected_account_id="123", expected_login="alice")
     await client.inspect("acme/project")
 
-    pull_request = await client.open_publication_pr(publication)
+    pull_request = await client.open_publication_pr(
+        publication, expected_head_commit=PUBLICATION_COMMIT
+    )
 
     assert pull_request.created is True
     assert api.calls[-1] == (
@@ -262,23 +597,102 @@ async def test_open_publication_pr_rejects_status_changed_since_review() -> None
     await client.inspect("acme/project")
 
     with pytest.raises(GitHubTeamStateError):
-        await client.open_publication_pr(_publication())
+        await client.open_publication_pr(_publication(), expected_head_commit=PUBLICATION_COMMIT)
 
     assert all(call[0] != "POST" for call in api.calls)
 
 
 @pytest.mark.anyio
+async def test_open_publication_pr_rejects_a_live_head_other_than_the_published_commit() -> None:
+    """Catches a publication branch being moved between Git Data publication and PR creation."""
+    publication = _publication()
+    api = QueueApi(_inspection() + _inspection() + [_publication_ref(publication, commit="9" * 40)])
+    client = GitHubTeamStateClient(api, expected_account_id="123", expected_login="alice")
+    await client.inspect("acme/project")
+
+    with pytest.raises(GitHubTeamStateError):
+        await client.open_publication_pr(publication, expected_head_commit=PUBLICATION_COMMIT)
+
+    assert all(call[0] not in {"GET-PAGES", "POST"} for call in api.calls)
+
+
+@pytest.mark.anyio
+async def test_open_publication_pr_rechecks_the_exact_base_immediately_before_create() -> None:
+    """Catches state advancing after the first live check but before PR creation."""
+    publication = _publication()
+    changed = _inspection()
+    changed_branch = dict(changed[2].payload)
+    changed_branch["commit"] = {"sha": "9" * 40}
+    changed[2] = _response(200, changed_branch)
+    api = QueueApi(_inspection() + _inspection() + [_publication_ref(publication)] + changed)
+    client = GitHubTeamStateClient(api, expected_account_id="123", expected_login="alice")
+    await client.inspect("acme/project")
+
+    with pytest.raises(GitHubTeamStateError):
+        await client.open_publication_pr(publication, expected_head_commit=PUBLICATION_COMMIT)
+
+    assert sum(call[0] == "GET-PAGES" for call in api.calls) == 1
+    assert all(call[0] != "POST" for call in api.calls)
+
+
+@pytest.mark.anyio
+async def test_open_publication_pr_verifies_created_pr_shas_refs_and_repositories() -> None:
+    """Catches GitHub returning a PR that is not bound to the reviewed head and live base."""
+    publication = _publication()
+    malformed = []
+    for section, field, value in (
+        ("head", "sha", "9" * 40),
+        ("base", "sha", "9" * 40),
+        ("head", "ref", "other-head"),
+        ("base", "ref", "main"),
+    ):
+        candidate = _pull(publication, 43)
+        projected = dict(candidate[section])  # type: ignore[arg-type]
+        projected[field] = value
+        candidate[section] = projected
+        malformed.append(candidate)
+    for section in ("head", "base"):
+        candidate = _pull(publication, 43)
+        projected = dict(candidate[section])  # type: ignore[arg-type]
+        projected["repo"] = {"full_name": "acme/other"}
+        candidate[section] = projected
+        malformed.append(candidate)
+
+    for payload in malformed:
+        api = QueueApi(
+            _inspection()
+            + _inspection()
+            + [_publication_ref(publication)]
+            + _inspection()
+            + [_publication_ref(publication), _response(201, payload)]
+        )
+        client = GitHubTeamStateClient(api, expected_account_id="123", expected_login="alice")
+        await client.inspect("acme/project")
+
+        with pytest.raises(GitHubTeamStateError):
+            await client.open_publication_pr(publication, expected_head_commit=PUBLICATION_COMMIT)
+
+
+@pytest.mark.anyio
 async def test_branch_protection_requires_its_exact_second_preview_digest() -> None:
     """Catches branch protection mutation under stale or single-stage consent."""
-    missing = _inspection(protection_contexts=["another-check"])
+    missing = _inspection()
+    missing[2:] = [
+        _response(404, {}),
+        _response(200, {"name": "main", "commit": {"sha": "b" * 40}}),
+        _response(404, {}),
+    ]
     configured = _response(
         200,
         {
             "enforce_admins": {"enabled": True},
+            "allow_deletions": {"enabled": False},
+            "allow_force_pushes": {"enabled": False},
+            "required_linear_history": {"enabled": True},
             "required_pull_request_reviews": {
                 "dismiss_stale_reviews": True,
                 "required_approving_review_count": 1,
-                "require_code_owner_reviews": True,
+                "require_code_owner_reviews": False,
             },
             "required_status_checks": {
                 "strict": True,
@@ -286,7 +700,20 @@ async def test_branch_protection_requires_its_exact_second_preview_digest() -> N
             },
         },
     )
-    api = QueueApi(missing + missing + [configured])
+    tree_sha = "c" * 40
+    anchor_sha = "d" * 40
+    api = QueueApi(
+        missing
+        + missing
+        + [
+            _response(201, {"sha": tree_sha}),
+            _response(201, {"sha": anchor_sha, "tree": {"sha": tree_sha}, "parents": []}),
+            _response(201, {"ref": "refs/heads/intent-state", "object": {"sha": anchor_sha}}),
+            _response(200, {"name": "intent-state", "commit": {"sha": anchor_sha}}),
+        ]
+        + _created_branch_inspection(anchor_sha)
+        + [configured]
+    )
     client = GitHubTeamStateClient(api, expected_account_id="123", expected_login="alice")
     status = await client.inspect("acme/project")
     assert status.protection_compatible is False
@@ -304,9 +731,12 @@ async def test_branch_protection_requires_its_exact_second_preview_digest() -> N
         "/repos/acme/project/branches/intent-state/protection",
         {
             "enforce_admins": True,
+            "allow_deletions": False,
+            "allow_force_pushes": False,
+            "required_linear_history": True,
             "required_pull_request_reviews": {
                 "dismiss_stale_reviews": True,
-                "require_code_owner_reviews": True,
+                "require_code_owner_reviews": False,
                 "required_approving_review_count": 1,
             },
             "required_status_checks": {
@@ -356,10 +786,13 @@ async def test_confirmed_bootstrap_creates_an_empty_orphan_anchor_never_copies_m
         200,
         {
             "enforce_admins": {"enabled": True},
+            "allow_deletions": {"enabled": False},
+            "allow_force_pushes": {"enabled": False},
+            "required_linear_history": {"enabled": True},
             "required_pull_request_reviews": {
                 "dismiss_stale_reviews": True,
                 "required_approving_review_count": 1,
-                "require_code_owner_reviews": True,
+                "require_code_owner_reviews": False,
             },
             "required_status_checks": {
                 "strict": True,
@@ -383,8 +816,9 @@ async def test_confirmed_bootstrap_creates_an_empty_orphan_anchor_never_copies_m
                 200,
                 {"name": "intent-state", "commit": {"sha": anchor_sha}},
             ),
-            configured,
         ]
+        + _created_branch_inspection(anchor_sha)
+        + [configured]
     )
     client = GitHubTeamStateClient(api, expected_account_id="123", expected_login="alice")
     await client.inspect("acme/project")
@@ -406,15 +840,7 @@ async def test_confirmed_bootstrap_creates_an_empty_orphan_anchor_never_copies_m
 async def test_pull_request_create_race_relists_and_reuses_only_the_exact_repository_pr() -> None:
     """Catches list-then-create races or a fork PR being accepted as the publication."""
     publication = _publication()
-    exact = {
-        "number": 44,
-        "html_url": "https://github.com/acme/project/pull/44",
-        "head": {
-            "ref": publication.branch,
-            "repo": {"full_name": "acme/project"},
-        },
-        "base": {"ref": "intent-state", "repo": {"full_name": "acme/project"}},
-    }
+    exact = _pull(publication, 44)
 
     class RaceApi(QueueApi):
         async def get_pages(
@@ -425,11 +851,21 @@ async def test_pull_request_create_race_relists_and_reuses_only_the_exact_reposi
                 return PageResult(items=(), etag=None)
             return PageResult(items=(exact,), etag=None)
 
-    api = RaceApi(_inspection() + _inspection() + [_response(422, {"message": "exists"})])
+    api = RaceApi(
+        _inspection()
+        + _inspection()
+        + [_publication_ref(publication)]
+        + _inspection()
+        + [_publication_ref(publication), _response(422, {"message": "exists"})]
+        + _inspection()
+        + [_publication_ref(publication)]
+    )
     client = GitHubTeamStateClient(api, expected_account_id="123", expected_login="alice")
     await client.inspect("acme/project")
 
-    pull_request = await client.open_publication_pr(publication)
+    pull_request = await client.open_publication_pr(
+        publication, expected_head_commit=PUBLICATION_COMMIT
+    )
 
     assert pull_request.number == 44
     assert pull_request.created is False

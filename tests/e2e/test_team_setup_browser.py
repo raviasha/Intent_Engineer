@@ -123,3 +123,23 @@ process.stdout.write(JSON.stringify({setupText,app:app.textContent,cancelBody:ca
     assert "GitHub device authorization proof" not in result["setupText"]
     assert result["cancelBody"] == "{}"
     assert "Team setup cancelled" in result["app"] or "setup_required" in result["app"]
+
+
+@pytest.mark.parametrize(
+    "progress", ["enrolled", "protection_configured", "publication_draft", "cancelled"]
+)
+def test_refresh_routes_to_recoverable_next_action_without_reenrollment(progress):
+    result = _run(
+        r"""
+respond(take("/api/v1/status"),projection); await settle(); nav.find((item)=>item.dataset.view==="team_state").click(); await settle();
+respond(take("/api/v1/team/setup"),{state:PROGRESS,repository_id:"github.com/acme/alpha"}); await settle();
+process.stdout.write(JSON.stringify({buttons:walk(app).filter((node)=>node.tagName==="button").map((node)=>node.textContent),app:app.textContent}));
+""".replace("PROGRESS", json.dumps(progress))
+    )
+    assert "Enroll this device with WebAuthn" not in result["buttons"]
+    if progress == "enrolled":
+        assert "Preview branch protection changes" in result["buttons"]
+    elif progress in {"protection_configured", "publication_draft"}:
+        assert "Preview encrypted team-state publication" in result["buttons"]
+    else:
+        assert "Cancel team setup" not in result["buttons"]

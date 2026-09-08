@@ -20,7 +20,7 @@ import sys
 import threading
 import time
 import webbrowser
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -77,6 +77,7 @@ from intent_engineering.team_state.governance import (
     GovernanceRegistry,
     default_governance_registry_root,
 )
+from intent_engineering.team_state.local_trust import local_or_environment_trust
 from intent_engineering.team_state.restore import (
     TRUST_ENVIRONMENT_VARIABLE,
     EnvironmentTrustProvider,
@@ -1412,16 +1413,19 @@ def _remember_verified_governance(root: Path, context: _GovernanceContext, proje
             project.close()
 
 
-def _shared_restore(root: Path, *, refresh_remote: bool = True) -> SharedStateRestoreResult:
+def _shared_restore(
+    root: Path,
+    *,
+    refresh_remote: bool = True,
+    environment: Mapping[str, str] | None = None,
+) -> SharedStateRestoreResult:
     marker_status = _untrusted_shared_marker_status(root)
     if marker_status is SharedStateRestoreStatus.INVALID:
         return SharedStateRestoreResult(status=SharedStateRestoreStatus.INVALID)
-    if TRUST_ENVIRONMENT_VARIABLE not in os.environ:
-        return SharedStateRestoreResult(status=marker_status)
     trust = None
     try:
         try:
-            trust = EnvironmentTrustProvider().load()
+            trust = local_or_environment_trust(root, environment).load()
         except Exception as error:  # noqa: BLE001 - fixed secret-free trust failure boundary
             error.__traceback__ = None
             error.__cause__ = None
@@ -1434,7 +1438,13 @@ def _shared_restore(root: Path, *, refresh_remote: bool = True) -> SharedStateRe
                 )
             )
         if trust is None:
-            return SharedStateRestoreResult(status=marker_status)
+            return SharedStateRestoreResult(
+                status=(
+                    SharedStateRestoreStatus.UNAVAILABLE
+                    if os.path.lexists(root / ".intent/team-trust.json")
+                    else marker_status
+                )
+            )
         context = _governance_context(root)
         if context.repository_id != trust.repository_id or (
             context.record is not None
@@ -1605,7 +1615,7 @@ def _automatic_shared_restore(root: Path) -> SharedStateRestoreResult:
     try:
         kind, payload = _consume_background_provenance()
         if kind == _PROVENANCE_LOCAL:
-            result = SharedStateRestoreResult(status=_untrusted_shared_marker_status(root))
+            result = _shared_restore(root, environment={})
         elif kind == _PROVENANCE_INVALID:
             result = SharedStateRestoreResult(status=SharedStateRestoreStatus.INVALID)
         else:

@@ -407,7 +407,7 @@
       if (state.teamSetup.state === "enrolled" || state.teamSetup.state === "protection_configured") {
         actions.append(actionButton("Preview branch protection changes", previewTeamProtection));
       }
-      if (state.teamSetup.state === "protection_configured") {
+      if (state.teamSetup.state === "protection_configured" || state.teamSetup.state === "publication_draft") {
         actions.append(
           actionButton("Preview encrypted team-state publication", previewTeamPublication)
         );
@@ -424,7 +424,9 @@
           );
         }
       }
-      actions.append(actionButton("Cancel team setup", cancelTeamSetup));
+      if (!["cancelled", "unconfigured", "published"].includes(state.teamSetup.state)) {
+        actions.append(actionButton("Cancel team setup", cancelTeamSetup));
+      }
       section.append(actions);
       return section;
     }

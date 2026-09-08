@@ -7,7 +7,7 @@ import json
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Literal, Protocol
+from typing import Annotated, Literal, Protocol
 
 import anyio
 from pydantic import ConfigDict, Field
@@ -19,6 +19,12 @@ from intent_engineering.team_state.models import PreparedPublication
 _REPOSITORY = re.compile(r"(?!-)(?!.*--)[a-z0-9-]{1,39}(?<!-)/[a-z0-9][a-z0-9._-]{0,99}\Z")
 _COMMIT = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?\Z")
 _REQUIRED_CHECK = "Intent Engineering / state"
+_MAX_PROTECTION_SNAPSHOT_BYTES = 64 * 1024
+_MAX_PROTECTION_COLLECTION_ITEMS = 256
+_MAX_PROTECTION_DEPTH = 8
+_MAX_PROTECTION_STRING_LENGTH = 4096
+
+ProtectionContext = Annotated[str, Field(min_length=1, max_length=255)]
 
 
 class GitHubTeamStateError(ValueError):
@@ -56,6 +62,24 @@ class GitHubTeamStateApi(Protocol):
     async def aclose(self) -> None: ...
 
 
+class GitHubProtectionPolicy(StrictModel):
+    """Bounded, secret-safe projection plus exact digest of one provider policy."""
+
+    model_config = ConfigDict(frozen=True, strict=True)
+
+    snapshot_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    enforce_admins: bool | None
+    allow_deletions: bool | None
+    allow_force_pushes: bool | None
+    required_linear_history: bool | None
+    dismiss_stale_reviews: bool | None
+    require_code_owner_reviews: bool | None
+    required_approving_review_count: int | None = Field(default=None, ge=0, le=6)
+    required_status_checks_strict: bool | None
+    required_status_check_contexts: tuple[ProtectionContext, ...] = Field(max_length=100)
+    restrictions_digest: str | None = Field(default=None, pattern=r"^sha256:[0-9a-f]{64}$")
+
+
 class GitHubTeamStateStatus(StrictModel):
     model_config = ConfigDict(frozen=True, strict=True)
 
@@ -71,6 +95,7 @@ class GitHubTeamStateStatus(StrictModel):
     branch_commit: str | None = None
     branch_present: bool
     protection_compatible: bool
+    protection_policy: GitHubProtectionPolicy | None = None
     codeowners_present: bool
 
 
@@ -90,6 +115,8 @@ class GitHubProtectionPreview(StrictModel):
     branch: Literal["intent-state"] = "intent-state"
     branch_creation_required: bool
     requires_change: bool
+    before_policy: GitHubProtectionPolicy | None
+    after_policy: GitHubProtectionPolicy
     digest: str
 
 
@@ -109,6 +136,109 @@ def _scopes(headers: Mapping[str, str]) -> tuple[str, ...]:
     if not values or len(values) != len(set(values)):
         raise GitHubTeamStateError()
     return values
+
+
+def _permissions(payload: object) -> tuple[str, ...]:
+    names = ("admin", "maintain", "pull", "push", "triage")
+    if not isinstance(payload, Mapping) or any(
+        type(payload.get(name)) is not bool for name in names
+    ):
+        raise GitHubTeamStateError()
+    granted = tuple(name for name in names if payload[name] is True)
+    if not ({"admin", "maintain"} & set(granted)) or "push" not in granted or "pull" not in granted:
+        raise GitHubTeamStateError()
+    return granted
+
+
+def _bounded_json(value: object, *, depth: int = 0) -> object:
+    if depth > _MAX_PROTECTION_DEPTH:
+        raise GitHubTeamStateError()
+    if value is None or type(value) in {bool, int}:
+        return value
+    if type(value) is str:
+        if not value or len(value) > _MAX_PROTECTION_STRING_LENGTH:
+            raise GitHubTeamStateError()
+        return value
+    if type(value) is list:
+        if len(value) > _MAX_PROTECTION_COLLECTION_ITEMS:
+            raise GitHubTeamStateError()
+        return [_bounded_json(item, depth=depth + 1) for item in value]
+    if type(value) is dict:
+        if len(value) > _MAX_PROTECTION_COLLECTION_ITEMS:
+            raise GitHubTeamStateError()
+        normalized: dict[str, object] = {}
+        for key, item in value.items():
+            if type(key) is not str or not key or len(key) > 255:
+                raise GitHubTeamStateError()
+            normalized[key] = _bounded_json(item, depth=depth + 1)
+        return normalized
+    raise GitHubTeamStateError()
+
+
+def _json_digest(value: object) -> str:
+    canonical = json.dumps(
+        _bounded_json(value),
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    if len(canonical) > _MAX_PROTECTION_SNAPSHOT_BYTES:
+        raise GitHubTeamStateError()
+    return f"sha256:{hashlib.sha256(canonical).hexdigest()}"
+
+
+def _enabled(value: object) -> bool | None:
+    if type(value) is not dict:
+        return None
+    enabled = value.get("enabled")
+    if type(enabled) is not bool:
+        return None
+    return enabled
+
+
+def _protection_policy(payload: Mapping[str, object]) -> GitHubProtectionPolicy:
+    reviews = payload.get("required_pull_request_reviews")
+    checks = payload.get("required_status_checks")
+    review_mapping = reviews if type(reviews) is dict else {}
+    check_mapping = checks if type(checks) is dict else {}
+    count = review_mapping.get("required_approving_review_count")
+    if type(count) is not int or not 0 <= count <= 6:
+        count = None
+    contexts = check_mapping.get("contexts")
+    if (
+        type(contexts) is not list
+        or len(contexts) > 100
+        or any(type(item) is not str or not item or len(item) > 255 for item in contexts)
+        or len(contexts) != len(set(contexts))
+    ):
+        contexts = []
+    restrictions_digest = (
+        _json_digest(payload["restrictions"]) if "restrictions" in payload else None
+    )
+    return GitHubProtectionPolicy(
+        snapshot_digest=_json_digest(dict(payload)),
+        enforce_admins=_enabled(payload.get("enforce_admins")),
+        allow_deletions=_enabled(payload.get("allow_deletions")),
+        allow_force_pushes=_enabled(payload.get("allow_force_pushes")),
+        required_linear_history=_enabled(payload.get("required_linear_history")),
+        dismiss_stale_reviews=(
+            review_mapping.get("dismiss_stale_reviews")
+            if type(review_mapping.get("dismiss_stale_reviews")) is bool
+            else None
+        ),
+        require_code_owner_reviews=(
+            review_mapping.get("require_code_owner_reviews")
+            if type(review_mapping.get("require_code_owner_reviews")) is bool
+            else None
+        ),
+        required_approving_review_count=count,
+        required_status_checks_strict=(
+            check_mapping.get("strict") if type(check_mapping.get("strict")) is bool else None
+        ),
+        required_status_check_contexts=tuple(contexts),
+        restrictions_digest=restrictions_digest,
+    )
 
 
 class GitHubTeamStateClient:
@@ -145,6 +275,7 @@ class GitHubTeamStateClient:
         private = repo.payload.get("private")
         default_branch = _string(repo.payload.get("default_branch"))
         scopes = _scopes(repo.headers)
+        _permissions(repo.payload.get("permissions"))
         if (
             repo.status_code != 200
             or repo_id is None
@@ -170,6 +301,7 @@ class GitHubTeamStateClient:
         branch_commit: str | None = None
         default_branch_commit: str | None = None
         protection_compatible = False
+        protection_policy: GitHubProtectionPolicy | None = None
         if branch.status_code == 200:
             commit = branch.payload.get("commit")
             branch_commit = _string(commit.get("sha")) if type(commit) is dict else None
@@ -185,9 +317,10 @@ class GitHubTeamStateClient:
                 allowed_statuses=frozenset({200, 404}),
             )
             if protection.status_code == 200:
+                protection_policy = _protection_policy(protection.payload)
                 protection_compatible = branch.payload.get(
                     "protected"
-                ) is True and self._compatible_protection(protection.payload)
+                ) is True and self._compatible_protection(protection_policy)
         elif branch.status_code != 404:
             raise GitHubTeamStateError()
         else:
@@ -232,35 +365,35 @@ class GitHubTeamStateClient:
             branch_commit=branch_commit,
             branch_present=branch.status_code == 200,
             protection_compatible=protection_compatible,
+            protection_policy=protection_policy,
             codeowners_present=codeowners_present,
         )
 
     @staticmethod
-    def _compatible_protection(payload: Mapping[str, object]) -> bool:
-        admins = payload.get("enforce_admins")
-        reviews = payload.get("required_pull_request_reviews")
-        checks = payload.get("required_status_checks")
-        if type(admins) is not dict or type(reviews) is not dict or type(checks) is not dict:
-            return False
-        contexts = checks.get("contexts")
+    def _compatible_protection(policy: GitHubProtectionPolicy) -> bool:
         return (
-            admins.get("enabled") is True
-            and reviews.get("dismiss_stale_reviews") is True
-            and reviews.get("require_code_owner_reviews") is True
-            and type(reviews.get("required_approving_review_count")) is int
-            and reviews["required_approving_review_count"] >= 1
-            and checks.get("strict") is True
-            and type(contexts) is list
-            and _REQUIRED_CHECK in contexts
+            policy.enforce_admins is True
+            and policy.allow_deletions is False
+            and policy.allow_force_pushes is False
+            and policy.required_linear_history is True
+            and policy.dismiss_stale_reviews is True
+            and policy.require_code_owner_reviews is False
+            and policy.required_approving_review_count is not None
+            and policy.required_approving_review_count >= 1
+            and policy.required_status_checks_strict is True
+            and _REQUIRED_CHECK in policy.required_status_check_contexts
         )
 
     @staticmethod
     def _protection_payload() -> dict[str, object]:
         return {
             "enforce_admins": True,
+            "allow_deletions": False,
+            "allow_force_pushes": False,
+            "required_linear_history": True,
             "required_pull_request_reviews": {
                 "dismiss_stale_reviews": True,
-                "require_code_owner_reviews": True,
+                "require_code_owner_reviews": False,
                 "required_approving_review_count": 1,
             },
             "required_status_checks": {
@@ -270,12 +403,43 @@ class GitHubTeamStateClient:
             "restrictions": None,
         }
 
+    @staticmethod
+    def _required_policy() -> GitHubProtectionPolicy:
+        return _protection_policy(
+            {
+                "enforce_admins": {"enabled": True},
+                "allow_deletions": {"enabled": False},
+                "allow_force_pushes": {"enabled": False},
+                "required_linear_history": {"enabled": True},
+                "required_pull_request_reviews": {
+                    "dismiss_stale_reviews": True,
+                    "require_code_owner_reviews": False,
+                    "required_approving_review_count": 1,
+                },
+                "required_status_checks": {
+                    "contexts": [_REQUIRED_CHECK],
+                    "strict": True,
+                },
+                "restrictions": None,
+            }
+        )
+
     def protection_preview(self) -> GitHubProtectionPreview:
         reviewed = self._reviewed
         if reviewed is None:
             raise GitHubTeamStateError()
+        before_policy = reviewed.protection_policy
+        after_policy = (
+            before_policy
+            if reviewed.protection_compatible and before_policy is not None
+            else self._required_policy()
+        )
         content = json.dumps(
             {
+                "after_policy": after_policy.model_dump(mode="json"),
+                "before_policy": (
+                    None if before_policy is None else before_policy.model_dump(mode="json")
+                ),
                 "branch_commit": reviewed.branch_commit,
                 "default_branch_commit": reviewed.default_branch_commit,
                 "protection": self._protection_payload(),
@@ -291,6 +455,8 @@ class GitHubTeamStateClient:
             repository_id=reviewed.repository_id,
             branch_creation_required=not reviewed.branch_present,
             requires_change=not reviewed.protection_compatible,
+            before_policy=before_policy,
+            after_policy=after_policy,
             digest=f"sha256:{hashlib.sha256(content).hexdigest()}",
         )
 
@@ -303,6 +469,8 @@ class GitHubTeamStateClient:
             raise GitHubTeamStateError()
         if not preview.requires_change:
             return reviewed
+        if reviewed.branch_present:
+            raise GitHubTeamStateError()
         repository = reviewed.repository_id.removeprefix("github.com/")
         cancelled_class = anyio.get_cancelled_exc_class()
         try:
@@ -378,14 +546,23 @@ class GitHubTeamStateClient:
                     }
                 )
                 self._reviewed = reviewed
+                live_created = await self._inspect(repository)
+                if live_created != reviewed:
+                    raise GitHubTeamStateError()
             response = await self._api.request_json_object(
                 "PUT",
                 f"/repos/{repository}/branches/intent-state/protection",
                 payload=self._protection_payload(),
             )
-            if not self._compatible_protection(response.payload):
+            response_policy = _protection_policy(response.payload)
+            if not self._compatible_protection(response_policy):
                 raise GitHubTeamStateError()
-            updated = reviewed.model_copy(update={"protection_compatible": True})
+            updated = reviewed.model_copy(
+                update={
+                    "protection_compatible": True,
+                    "protection_policy": response_policy,
+                }
+            )
             self._reviewed = updated
             return updated
         except cancelled_class:
@@ -414,19 +591,51 @@ class GitHubTeamStateClient:
         self._reviewed = reviewed
         return reviewed
 
-    async def open_publication_pr(self, publication: PreparedPublication) -> PublicationPullRequest:
+    async def _require_live_publication(
+        self,
+        repository: str,
+        publication: PreparedPublication,
+        expected_head_commit: str,
+        expected_base_commit: str,
+    ) -> None:
+        current = await self._inspect(repository)
+        if (
+            current != self._reviewed
+            or current.branch_commit != expected_base_commit
+            or not current.protection_compatible
+        ):
+            raise GitHubTeamStateError()
+        response = await self._api.request_json_object(
+            "GET",
+            f"/repos/{repository}/git/ref/heads/{publication.branch}",
+        )
+        self._validate_publication_ref(response.payload, publication.branch, expected_head_commit)
+
+    async def open_publication_pr(
+        self,
+        publication: PreparedPublication,
+        *,
+        expected_head_commit: str,
+    ) -> PublicationPullRequest:
         reviewed = self._reviewed
         if reviewed is None or type(publication) is not PreparedPublication:
             raise GitHubTeamStateError()
         publication = PreparedPublication.model_validate(publication.model_dump(mode="python"))
         repository = reviewed.repository_id.removeprefix("github.com/")
-        if publication.repository_id != reviewed.repository_id:
+        expected_base_commit = reviewed.branch_commit
+        if (
+            publication.repository_id != reviewed.repository_id
+            or type(expected_head_commit) is not str
+            or _COMMIT.fullmatch(expected_head_commit) is None
+            or expected_base_commit is None
+            or _COMMIT.fullmatch(expected_base_commit) is None
+        ):
             raise GitHubTeamStateError()
         cancelled_class = anyio.get_cancelled_exc_class()
         try:
-            current = await self._inspect(repository)
-            if current != reviewed or not current.protection_compatible:
-                raise GitHubTeamStateError()
+            await self._require_live_publication(
+                repository, publication, expected_head_commit, expected_base_commit
+            )
             pages = await self._api.get_pages(
                 f"/repos/{repository}/pulls",
                 {
@@ -439,12 +648,28 @@ class GitHubTeamStateClient:
             matches = tuple(
                 item
                 for item in pages.items
-                if self._matches_publication_pr(item, publication.branch, repository)
+                if self._matches_publication_pr(
+                    item,
+                    publication.branch,
+                    repository,
+                    expected_head_commit,
+                    expected_base_commit,
+                )
             )
             if len(matches) > 1:
                 raise GitHubTeamStateError()
             if matches:
-                return self._pull_request(reviewed.repository_id, matches[0], created=False)
+                await self._require_live_publication(
+                    repository, publication, expected_head_commit, expected_base_commit
+                )
+                return self._pull_request(
+                    reviewed.repository_id,
+                    matches[0],
+                    publication.branch,
+                    expected_head_commit,
+                    expected_base_commit,
+                    created=False,
+                )
             body = {
                 "base": "intent-state",
                 "body": f"Encrypted intent state `{publication.manifest.bundle_digest}`.",
@@ -452,6 +677,9 @@ class GitHubTeamStateClient:
                 "head": publication.branch,
                 "title": f"Publish intent state v{publication.manifest.graph_version}",
             }
+            await self._require_live_publication(
+                repository, publication, expected_head_commit, expected_base_commit
+            )
             response = await self._api.request_json_object(
                 "POST",
                 f"/repos/{repository}/pulls",
@@ -471,12 +699,35 @@ class GitHubTeamStateClient:
                 matches = tuple(
                     item
                     for item in repeated.items
-                    if self._matches_publication_pr(item, publication.branch, repository)
+                    if self._matches_publication_pr(
+                        item,
+                        publication.branch,
+                        repository,
+                        expected_head_commit,
+                        expected_base_commit,
+                    )
                 )
                 if len(matches) != 1:
                     raise GitHubTeamStateError()
-                return self._pull_request(reviewed.repository_id, matches[0], created=False)
-            return self._pull_request(reviewed.repository_id, response.payload, created=True)
+                await self._require_live_publication(
+                    repository, publication, expected_head_commit, expected_base_commit
+                )
+                return self._pull_request(
+                    reviewed.repository_id,
+                    matches[0],
+                    publication.branch,
+                    expected_head_commit,
+                    expected_base_commit,
+                    created=False,
+                )
+            return self._pull_request(
+                reviewed.repository_id,
+                response.payload,
+                publication.branch,
+                expected_head_commit,
+                expected_base_commit,
+                created=True,
+            )
         except cancelled_class:
             with anyio.CancelScope(shield=True):
                 await self._api.aclose()
@@ -488,7 +739,26 @@ class GitHubTeamStateClient:
             raise GitHubTeamStateError() from None
 
     @staticmethod
-    def _matches_publication_pr(item: Mapping[str, object], branch: str, repository: str) -> bool:
+    def _validate_publication_ref(
+        payload: Mapping[str, object], branch: str, expected_head_commit: str
+    ) -> None:
+        target = payload.get("object")
+        if (
+            payload.get("ref") != f"refs/heads/{branch}"
+            or not isinstance(target, Mapping)
+            or target.get("type") != "commit"
+            or target.get("sha") != expected_head_commit
+        ):
+            raise GitHubTeamStateError()
+
+    @staticmethod
+    def _matches_publication_pr(
+        item: Mapping[str, object],
+        branch: str,
+        repository: str,
+        expected_head_commit: str,
+        expected_base_commit: str,
+    ) -> bool:
         head = item.get("head")
         base = item.get("base")
         head_repo = head.get("repo") if isinstance(head, Mapping) else None
@@ -496,17 +766,25 @@ class GitHubTeamStateClient:
         return (
             isinstance(head, Mapping)
             and head.get("ref") == branch
+            and head.get("sha") == expected_head_commit
             and isinstance(head_repo, Mapping)
             and head_repo.get("full_name") == repository
             and isinstance(base, Mapping)
             and base.get("ref") == "intent-state"
+            and base.get("sha") == expected_base_commit
             and isinstance(base_repo, Mapping)
             and base_repo.get("full_name") == repository
         )
 
     @staticmethod
     def _pull_request(
-        repository_id: str, payload: Mapping[str, object], *, created: bool
+        repository_id: str,
+        payload: Mapping[str, object],
+        branch: str,
+        expected_head_commit: str,
+        expected_base_commit: str,
+        *,
+        created: bool,
     ) -> PublicationPullRequest:
         number = _integer(payload.get("number"))
         url = _string(payload.get("html_url"))
@@ -515,6 +793,13 @@ class GitHubTeamStateClient:
             or url is None
             or url
             != f"https://github.com/{repository_id.removeprefix('github.com/')}/pull/{number}"
+            or not GitHubTeamStateClient._matches_publication_pr(
+                payload,
+                branch,
+                repository_id.removeprefix("github.com/"),
+                expected_head_commit,
+                expected_base_commit,
+            )
         ):
             raise GitHubTeamStateError()
         return PublicationPullRequest(
@@ -530,6 +815,7 @@ class GitHubTeamStateClient:
 
 __all__ = [
     "GitHubJsonResponse",
+    "GitHubProtectionPolicy",
     "GitHubProtectionPreview",
     "GitHubTeamStateClient",
     "GitHubTeamStateError",

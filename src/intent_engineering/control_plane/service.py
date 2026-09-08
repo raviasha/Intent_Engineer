@@ -272,6 +272,12 @@ class ControlPlaneService:
         self._plans_file = self._approvals_directory.file("plans.jsonl")
         self._pending_answers: dict[str, _PendingAnswer] = {}
         self._team_repository_id = team_repository_id
+        if self._team_repository_id is None:
+            from intent_engineering.team_state.local_trust import load_local_trust
+
+            local_trust = load_local_trust(runtime.root)
+            if local_trust is not None:
+                self._team_repository_id = local_trust.repository_id
         self._github_identity_verifier = github_identity_verifier
         self._recipient_key_store_factory = recipient_key_store_factory
         if publication_service is not None and type(publication_service) is not PublicationService:
@@ -469,13 +475,15 @@ class ControlPlaneService:
 
     def github_setup_status(self) -> dict[str, object]:
         """Read the bounded CLI request without acquiring provider credentials."""
-        from intent_engineering.team_state.setup import load_setup_request
+        from intent_engineering.team_state.setup import GitHubSetupBridge, load_setup_request
 
         request = load_setup_request(self._runtime)
         if request is None:
             return {"state": "unconfigured"}
+        if self._github_setup_bridge is None:
+            self._github_setup_bridge = GitHubSetupBridge(self)
         return {
-            "state": "setup_required",
+            "state": cast(GitHubSetupBridge, self._github_setup_bridge).status(),
             "repository_id": request.preview.repository_id,
             "preview_digest": request.preview.preview_digest,
         }

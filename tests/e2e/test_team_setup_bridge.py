@@ -22,9 +22,12 @@ from tests.integration.control_plane.test_service import (
 )
 
 
-def test_confirmed_cli_transfers_exact_nonsecret_setup_into_production_service(tmp_path) -> None:
+def test_confirmed_cli_transfers_exact_nonsecret_setup_into_production_service(
+    tmp_path, monkeypatch
+) -> None:
     """Catches the production command returning a route without a runnable setup request."""
     harness = _harness(tmp_path, aliases=("github:alice",))
+    monkeypatch.setenv("GH_TOKEN", "never-persist-this-credential")
     git(harness.project, "init", "--initial-branch=main")
     git(harness.project, "add", "docs/prd.md")
     git(harness.project, "commit", "-m", "Code")
@@ -47,11 +50,14 @@ def test_confirmed_cli_transfers_exact_nonsecret_setup_into_production_service(t
         request = json.loads(request_file.read_bytes())
         assert request["preview"]["preview_digest"] == preview.preview_digest
         assert request["preview"]["repository_id"] == "github.com/acme/project"
-        assert "token" not in request_file.read_text().lower()
+        assert "never-persist-this-credential" not in request_file.read_text()
         assert result.control_plane_path == "/"
         service = ControlPlaneService(harness.runtime, origin=ORIGIN, clock=lambda: NOW)
         try:
             assert service.github_setup_status()["repository_id"] == "github.com/acme/project"
+            anyio.run(service.github_setup_action, "cancel")
+            assert service.github_setup_status()["state"] == "unconfigured"
+            assert not request_file.exists()
         finally:
             service.close()
     finally:
@@ -232,8 +238,6 @@ class _GitHubTransport:
     async def request_json_object(
         self, method, path, *, payload=None, params=None, allowed_statuses=frozenset({200})
     ):
-        from intent_engineering.team_state.github import GitHubTeamStateClient
-
         code = 200
         if method != "GET":
             self.writes.append((method, path, payload))
@@ -247,6 +251,13 @@ class _GitHubTransport:
                 "full_name": "acme/project",
                 "private": True,
                 "default_branch": "main",
+                "permissions": {
+                    "admin": True,
+                    "maintain": True,
+                    "pull": True,
+                    "push": True,
+                    "triage": True,
+                },
             }
         elif path.endswith("/branches/main"):
             data = {"name": "main", "commit": {"sha": "a" * 40}}
@@ -265,9 +276,26 @@ class _GitHubTransport:
             if method == "PUT":
                 self.protected = True
             code = 200 if self.protected else 404
-            data = GitHubTeamStateClient._protection_payload() if self.protected else {}
-            if self.protected:
-                data["enforce_admins"] = {"enabled": True}
+            data = (
+                {
+                    "enforce_admins": {"enabled": True},
+                    "required_status_checks": {
+                        "strict": True,
+                        "contexts": ["Intent Engineering / state"],
+                    },
+                    "required_pull_request_reviews": {
+                        "dismiss_stale_reviews": True,
+                        "require_code_owner_reviews": False,
+                        "required_approving_review_count": 1,
+                    },
+                    "restrictions": None,
+                    "allow_force_pushes": {"enabled": False},
+                    "allow_deletions": {"enabled": False},
+                    "required_linear_history": {"enabled": True},
+                }
+                if self.protected
+                else {}
+            )
         elif path.endswith("/contents/.github/CODEOWNERS"):
             code, data = 404, {}
         elif path.endswith("/git/blobs"):
@@ -350,9 +378,14 @@ class _GitHubTransport:
                 "html_url": "https://github.com/acme/project/pull/1",
                 "head": {
                     "ref": self.publication_ref["ref"].removeprefix("refs/heads/"),
+                    "sha": self.publication_ref["sha"],
                     "repo": {"full_name": "acme/project"},
                 },
-                "base": {"ref": "intent-state", "repo": {"full_name": "acme/project"}},
+                "base": {
+                    "ref": "intent-state",
+                    "sha": self.branch,
+                    "repo": {"full_name": "acme/project"},
+                },
             }
             code, data = 201, self.pr
             if self.lose_pr_response:
@@ -396,7 +429,9 @@ class _SetupVerifier(_TeamVerifier):
 
 
 @pytest.mark.anyio
-@pytest.mark.parametrize("failure", ["file-conflict", "anchor-race"])
+@pytest.mark.parametrize(
+    "failure", ["file-conflict", "anchor-race", "before-suggestions", "before-signing"]
+)
 async def test_protection_rejects_conflicts_and_branch_changes_at_write_boundaries(
     tmp_path, monkeypatch, failure
 ):
@@ -431,13 +466,43 @@ async def test_protection_rejects_conflicts_and_branch_changes_at_write_boundari
             preview = await service.github_setup_action("protection-preview")
             payload = HumanDecisionPayload.model_validate_json(json.dumps(preview["payload"]))
             await service.github_setup_action("options", payload=payload)
-            transport.after_tree = lambda: setattr(transport, "branch", "9" * 40)
+            if failure == "anchor-race":
+                transport.after_tree = lambda: setattr(transport, "branch", "9" * 40)
+            elif failure == "before-suggestions":
+                bridge = service._github_setup_bridge
+                original = bridge._anchor
+
+                async def changed_anchor(api, status):
+                    await original(api, status)
+                    if transport.protected:
+                        path = harness.project / ".intent/config.yaml"
+                        path.write_bytes(path.read_bytes() + b"\n# authority changed\n")
+
+                monkeypatch.setattr(bridge, "_anchor", changed_anchor)
+            else:
+                from intent_engineering.team_state import suggestions
+
+                original_stage = suggestions.stage_code_suggestions
+
+                def changed_stage(*args):
+                    original_stage(*args)
+                    path = harness.project / ".intent/config.yaml"
+                    path.write_bytes(path.read_bytes() + b"\n# authority changed\n")
+
+                monkeypatch.setattr(suggestions, "stage_code_suggestions", changed_stage)
             with pytest.raises(ValueError):
                 await service.github_setup_action(
                     "verify", payload=payload, response=b"signed-assertion"
                 )
-            assert transport.branch == "9" * 40
-            assert not any(path.endswith("/git/commits") for _, path, _ in transport.writes)
+            if failure == "anchor-race":
+                assert transport.branch == "9" * 40
+                assert not any(path.endswith("/git/commits") for _, path, _ in transport.writes)
+            else:
+                assert not any(
+                    name.startswith("intent-engineering-signing/") for name, _ in backend.values
+                )
+                if failure == "before-suggestions":
+                    assert not (harness.project / ".github/CODEOWNERS").exists()
     finally:
         service.close()
         harness.service.close()
@@ -445,7 +510,7 @@ async def test_protection_rejects_conflicts_and_branch_changes_at_write_boundari
 
 
 @pytest.mark.anyio
-@pytest.mark.parametrize("lost_pr_response", [False, True])
+@pytest.mark.parametrize("lost_pr_response", [False, True, "cancel"])
 async def test_production_ui_requires_exact_enrolled_protection_decision(
     tmp_path, monkeypatch, lost_pr_response
 ):
@@ -558,10 +623,21 @@ async def test_production_ui_requires_exact_enrolled_protection_decision(
         assert publication_payload.action.value == "publish_state"
         assert publication_payload.parent_bundle_digest == "sha256:" + "0" * 64
         assert transport.publication_ref is None
+        if lost_pr_response == "cancel":
+            result = await service.github_setup_action("cancel")
+            assert result["state"] == "cancelled"
+            assert not (harness.project / ".intent/team-publication.json").exists()
+            assert not (harness.project / ".intent/team-setup.json").exists()
+            service.close()
+            service = ControlPlaneService(harness.runtime, origin=ORIGIN, clock=lambda: NOW)
+            assert service.github_setup_status()["state"] == "unconfigured"
+            assert transport.publication_ref is None
+            return
         service.close()
         service = ControlPlaneService(
             harness.runtime, origin=ORIGIN, clock=lambda: NOW, webauthn_verifier=verifier
         )
+        assert service.github_setup_status()["state"] == "publication_draft"
         recovered = await service.github_setup_action("publication-preview")
         assert recovered["preview"]["bundle_digest"] == publication["preview"]["bundle_digest"]
         with pytest.raises(ValueError):
@@ -595,6 +671,18 @@ async def test_production_ui_requires_exact_enrolled_protection_decision(
         assert not (harness.project / ".intent/team-publication.json").exists()
         assert not (harness.project / ".intent/team-setup.json").exists()
         assert service._github_setup_bridge is None
+        trust_path = harness.project / ".intent/team-trust.json"
+        assert trust_path.exists()
+        assert "private" not in trust_path.read_text()
+        from intent_engineering.team_state.local_trust import LocalTrustProvider
+
+        trust = LocalTrustProvider(harness.project).load()
+        assert trust is not None and trust.repository_id == "github.com/acme/project"
+        restarted = ControlPlaneService(harness.runtime, origin=ORIGIN, clock=lambda: NOW)
+        try:
+            assert restarted.team_enrollment_status()["status"] == "enrolled"
+        finally:
+            restarted.close()
         assert transport.branch == "c" * 40
         assert transport.commit["parents"] == ["c" * 40]
         assert transport.publication_ref["ref"].startswith("refs/heads/intent-publication/")

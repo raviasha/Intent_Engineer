@@ -201,11 +201,12 @@ async def test_publisher_creates_only_exact_encrypted_publication_objects_and_re
     )
     inspector = InspectClient([_status()] * 6)
 
-    await GitHubApiPublisher(api, inspector, _status()).publish(
+    commit_sha = await GitHubApiPublisher(api, inspector, _status()).publish(
         publication,
         base_commit=ANCHOR,
     )
 
+    assert commit_sha == "f" * 40
     assert inspector.calls == 6
     assert [call[:2] for call in api.calls] == [
         ("POST", "/repos/acme/project/git/blobs"),
@@ -306,11 +307,12 @@ async def test_publisher_recovers_only_the_exact_ref_after_a_creation_race() -> 
     )
     api = RecordingApi(responses)
 
-    await GitHubApiPublisher(api, InspectClient([_status()] * 7), _status()).publish(
+    commit_sha = await GitHubApiPublisher(api, InspectClient([_status()] * 7), _status()).publish(
         publication,
         base_commit=ANCHOR,
     )
 
+    assert commit_sha == "f" * 40
     assert api.calls[-1][:2] == (
         "GET",
         f"/repos/acme/project/git/ref/heads/{publication.branch}",

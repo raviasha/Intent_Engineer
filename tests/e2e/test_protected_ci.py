@@ -33,6 +33,22 @@ def _request(trust, base, proposed):
     return event, environment
 
 
+def test_state_validator_uses_default_tooling_but_exact_state_target(tmp_path, monkeypatch):
+    from intent_engineering.integrations.protected_ci import load_request
+
+    repo, trust = _restored(tmp_path, monkeypatch)
+    tooling = git(repo, "rev-parse", "HEAD").decode().strip()
+    event, environment = _request(trust, tooling, "a" * 40)
+    event["pull_request"]["base"].update({"ref": "intent-state", "sha": "b" * 40})
+    request = load_request(repo, event, environment, state=True)
+    assert request.revision == "a" * 40
+    assert request.base == "b" * 40
+    assert git(repo, "rev-parse", "HEAD").decode().strip() == tooling
+    event["pull_request"]["base"]["ref"] = "main"
+    with pytest.raises(ValueError):
+        load_request(repo, event, environment, state=True)
+
+
 def test_proposed_backend_and_package_are_only_git_data(tmp_path, monkeypatch):
     from intent_engineering.integrations.immutable_ci import build_context
     from intent_engineering.integrations.protected_ci import load_request
