@@ -90,26 +90,37 @@ class GitHubApiPublisher:
             if name in top and top[name] != candidate:
                 raise GitHubPublicationError()
             top[name] = candidate
-        if type(entries) is not list or len(entries) != len(top):
+        leaves = {path: ("blob", blob_sha) for path, blob_sha in expected}
+        if type(entries) is not list:
             raise GitHubPublicationError()
-        seen: set[str] = set()
+        observed: dict[str, tuple[str, str, str]] = {}
         for entry in entries:
-            if not isinstance(entry, Mapping) or type(entry.get("path")) is not str:
-                raise GitHubPublicationError()
-            path = entry["path"]
-            expected_entry = top.get(path)
-            if expected_entry is None or path in seen:
-                raise GitHubPublicationError()
-            kind, expected_sha = expected_entry
             if (
-                entry.get("type") != kind
-                or entry.get("mode") != ("040000" if kind == "tree" else "100644")
-                or _sha(entry.get("sha"))
-                != (entry.get("sha") if expected_sha is None else expected_sha)
+                not isinstance(entry, Mapping)
+                or type(entry.get("path")) is not str
+                or type(entry.get("type")) is not str
+                or type(entry.get("mode")) is not str
             ):
                 raise GitHubPublicationError()
-            seen.add(path)
-        if seen != set(top) or payload.get("truncated") is not False:
+            path = entry["path"]
+            if path in observed:
+                raise GitHubPublicationError()
+            observed[path] = (entry["type"], entry["mode"], _sha(entry.get("sha")))
+
+        def matches(specification: Mapping[str, tuple[str, str | None]]) -> bool:
+            if set(observed) != set(specification):
+                return False
+            for path, (kind, expected_sha) in specification.items():
+                actual_kind, actual_mode, actual_sha = observed[path]
+                if (
+                    actual_kind != kind
+                    or actual_mode != ("040000" if kind == "tree" else "100644")
+                    or (expected_sha is not None and actual_sha != expected_sha)
+                ):
+                    return False
+            return True
+
+        if not (matches(top) or matches(leaves)) or payload.get("truncated") is not False:
             raise GitHubPublicationError()
         return tree_sha
 

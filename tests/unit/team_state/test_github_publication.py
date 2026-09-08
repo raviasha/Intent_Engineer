@@ -115,30 +115,40 @@ def _response(status: int, payload: Mapping[str, object]) -> GitHubJsonResponse:
     return GitHubJsonResponse(status_code=status, payload=payload, headers={})
 
 
-def _success_responses(publication: PreparedPublication) -> list[GitHubJsonResponse]:
+def _success_responses(
+    publication: PreparedPublication, *, created_tree_recursive: bool = False
+) -> list[GitHubJsonResponse]:
     paths = ("manifest.json", publication.bundle_path, publication.signature_path)
     blobs = ("b" * 40, "c" * 40, "d" * 40)
+    created_tree = (
+        [
+            {"path": path, "mode": "100644", "type": "blob", "sha": sha}
+            for path, sha in zip(paths, blobs, strict=True)
+        ]
+        if created_tree_recursive
+        else [
+            {"path": "bundles", "mode": "040000", "type": "tree", "sha": "1" * 40},
+            {
+                "path": "manifest.json",
+                "mode": "100644",
+                "type": "blob",
+                "sha": blobs[0],
+            },
+            {
+                "path": "signatures",
+                "mode": "040000",
+                "type": "tree",
+                "sha": "2" * 40,
+            },
+        ]
+    )
     return [
         *(_response(201, {"sha": sha}) for sha in blobs),
         _response(
             201,
             {
                 "sha": "e" * 40,
-                "tree": [
-                    {"path": "bundles", "mode": "040000", "type": "tree", "sha": "1" * 40},
-                    {
-                        "path": "manifest.json",
-                        "mode": "100644",
-                        "type": "blob",
-                        "sha": blobs[0],
-                    },
-                    {
-                        "path": "signatures",
-                        "mode": "040000",
-                        "type": "tree",
-                        "sha": "2" * 40,
-                    },
-                ],
+                "tree": created_tree,
                 "truncated": False,
             },
         ),
@@ -180,10 +190,15 @@ def _success_responses(publication: PreparedPublication) -> list[GitHubJsonRespo
 
 
 @pytest.mark.anyio
-async def test_publisher_creates_only_exact_encrypted_publication_objects_and_ref() -> None:
+@pytest.mark.parametrize("created_tree_recursive", [False, True])
+async def test_publisher_creates_only_exact_encrypted_publication_objects_and_ref(
+    created_tree_recursive: bool,
+) -> None:
     """Catches code/plaintext paths, state-ref updates, or writes without live reinspection."""
     publication = _publication()
-    api = RecordingApi(_success_responses(publication))
+    api = RecordingApi(
+        _success_responses(publication, created_tree_recursive=created_tree_recursive)
+    )
     inspector = InspectClient([_status()] * 6)
 
     await GitHubApiPublisher(api, inspector, _status()).publish(
