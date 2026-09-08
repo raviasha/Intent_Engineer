@@ -11,7 +11,6 @@ import subprocess
 import time
 from pathlib import Path
 from unittest.mock import patch
-from urllib.request import Request, urlopen
 
 import anyio
 import pytest
@@ -46,18 +45,30 @@ from tests.helpers.shared_state import (
     RECIPIENT_ID,
     REPOSITORY_ID,
     SIGNER_ID,
+    artifacts,
     canonical_files,
     git,
     init_repository,
     install_state_ref,
+    keys,
     ready_project,
     trust_environment,
 )
 
 
 @pytest.fixture(autouse=True)
-def _reset_cli_logging(request: pytest.FixtureRequest) -> None:
+def _reset_cli_logging(
+    request: pytest.FixtureRequest,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """CLI capture streams must not remain installed for later library test modules."""
+    monkeypatch.setattr(
+        dev_cli,
+        "_governance_registry_root",
+        lambda: tmp_path / "user-governance",
+        raising=False,
+    )
     request.addfinalizer(structlog.reset_defaults)
 
 
@@ -244,6 +255,12 @@ def test_fresh_onboarded_clone_first_prompt_and_plugin_disabled_ci_backstop(
             else (_ for _ in ()).throw(AssertionError("wrong trusted repository"))
         ),
     )
+    started_statuses: list[dev_cli.SharedStateRestoreStatus] = []
+    monkeypatch.setattr(
+        dev_cli,
+        "_start_or_reuse_background_service",
+        lambda _root, status: started_statuses.append(status) is None,
+    )
     original_head = git(repo, "rev-parse", "HEAD")
     monkeypatch.chdir(repo)
     first_prompt = CliRunner().invoke(
@@ -266,23 +283,7 @@ def test_fresh_onboarded_clone_first_prompt_and_plugin_disabled_ci_backstop(
     context = json.loads(first_prompt.stdout)["hookSpecificOutput"]["additionalContext"]
     assert "intent_advisory_preflight" in context
     assert "onboarding" not in context.lower()
-    metadata = json.loads((repo / ".intent/cache/control-plane.json").read_bytes())
-    assert metadata["pid"] != os.getpid()
-    assert metadata["shared_state_status"] == "verified"
-    with urlopen(
-        Request(
-            metadata["origin"] + dev_cli._INSTANCE_PATH,
-            headers={
-                "Host": metadata["origin"].removeprefix("http://"),
-                "Origin": metadata["origin"],
-            },
-        ),
-        timeout=3,
-    ) as response:
-        assert json.loads(response.read())["shared_state_status"] == "verified"
-    status = CliRunner().invoke(app, ["dev", "--project", str(repo), "--status"])
-    assert status.exit_code == 0, (status.stdout, status.stderr, repr(status.exception))
-    assert status.stdout == f"intent dev: running at {metadata['origin']}\n"
+    assert started_statuses == [dev_cli.SharedStateRestoreStatus.VERIFIED]
     assert git(repo, "rev-parse", "HEAD") == original_head
     # The GitHub path has no plugin invocation and restores from the signed ref again.
     anyio.run(action.run_tests, repo, NOW)
@@ -298,14 +299,13 @@ def test_fresh_onboarded_clone_first_prompt_and_plugin_disabled_ci_backstop(
     assert git(repo, "rev-parse", "HEAD") == original_head
 
 
-def test_automatic_child_reauthenticates_when_refreshed_objects_were_temporary(
+def test_automatic_child_uses_clean_remote_before_a_valid_mutable_local_ref(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Catches a child trusting parent status when refreshed Git objects were not retained."""
+    """Catches a child granting verified health from caller-controlled tracking state."""
     repo, trust = _clone(tmp_path)
     source = tmp_path / "source" / "project"
-    git(repo, "update-ref", "-d", "refs/remotes/origin/intent-state")
     monkeypatch.setenv("INTENT_CI_SHARED_STATE_TRUST", trust_environment(trust))
     packet = dev_cli._background_provenance_bytes()
     read_descriptor, write_descriptor = os.pipe()
@@ -327,12 +327,124 @@ def test_automatic_child_reauthenticates_when_refreshed_objects_were_temporary(
         return restore_module._GitRefReader(source)
 
     monkeypatch.setattr(restore_module, "_refresh_state_ref", refresh)
+    observed: list[tuple[str, dev_cli.SharedStateRestoreStatus]] = []
 
-    result = dev_cli._automatic_shared_restore(repo)
+    def capture_service_boundary(
+        _root: Path,
+        _project_directory: object,
+        *,
+        launch_mode: str,
+        prevalidated_restore: dev_cli.SharedStateRestoreResult,
+        **_kwargs: object,
+    ) -> None:
+        observed.append((launch_mode, prevalidated_restore.status))
 
-    assert result.status is dev_cli.SharedStateRestoreStatus.VERIFIED
+    monkeypatch.setattr(dev_cli, "_run_with_repository_lease", capture_service_boundary)
+
+    result = dev_cli._automatic_child_entrypoint(repo)
+
+    assert result == 0
     assert refreshes == [trust.repository_id]
+    assert observed == [("automatic", dev_cli.SharedStateRestoreStatus.VERIFIED)]
     assert (repo / ".intent/cache/shared-state.json").is_file()
+
+
+def test_fabricated_trust_and_local_ref_cannot_create_verified_service_metadata(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catches a self-signed tracking ref minting verified automatic service health."""
+    repo, _legitimate_trust = _clone(tmp_path)
+    source = tmp_path / "source" / "project"
+    attacker_recipient, attacker_signer, attacker_trust = keys()
+    install_state_ref(
+        repo,
+        artifacts(canonical_files(source), attacker_recipient, attacker_signer),
+    )
+    monkeypatch.setenv("INTENT_CI_SHARED_STATE_TRUST", trust_environment(attacker_trust))
+    packet = dev_cli._background_provenance_bytes()
+    read_descriptor, write_descriptor = os.pipe()
+    try:
+        os.write(write_descriptor, packet)
+    finally:
+        packet[:] = b"\x00" * len(packet)
+        packet.clear()
+        os.close(write_descriptor)
+    monkeypatch.setattr(
+        dev_cli,
+        "_inherited_provenance_descriptors",
+        lambda: (read_descriptor,),
+    )
+    refreshes: list[str] = []
+
+    def clean_remote(repository_id: str):
+        refreshes.append(repository_id)
+        return restore_module._GitRefReader(source)
+
+    monkeypatch.setattr(restore_module, "_refresh_state_ref", clean_remote)
+    observed: list[tuple[str, dev_cli.SharedStateRestoreStatus]] = []
+
+    def capture_service_boundary(
+        _root: Path,
+        _project_directory: object,
+        *,
+        launch_mode: str,
+        prevalidated_restore: dev_cli.SharedStateRestoreResult,
+        **_kwargs: object,
+    ) -> None:
+        observed.append((launch_mode, prevalidated_restore.status))
+
+    monkeypatch.setattr(dev_cli, "_run_with_repository_lease", capture_service_boundary)
+
+    result = dev_cli._automatic_child_entrypoint(repo)
+
+    assert result == 0
+    assert refreshes == [attacker_trust.repository_id]
+    assert observed == [("automatic", dev_cli.SharedStateRestoreStatus.INVALID)]
+
+
+def test_deleted_cache_marker_cannot_downgrade_a_registered_governed_checkout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catches deletion of repository-local cache evidence erasing team governance."""
+    repo, trust = _clone(tmp_path)
+    source = tmp_path / "source" / "project"
+    monkeypatch.setenv("INTENT_CI_SHARED_STATE_TRUST", trust_environment(trust))
+    monkeypatch.setattr(
+        restore_module,
+        "_refresh_state_ref",
+        lambda repository_id: (
+            restore_module._GitRefReader(source)
+            if repository_id == trust.repository_id
+            else (_ for _ in ()).throw(AssertionError("wrong trusted repository"))
+        ),
+    )
+
+    first = dev_cli._shared_restore(repo)
+    assert first.status is dev_cli.SharedStateRestoreStatus.VERIFIED
+    (repo / ".intent/cache/shared-state.json").unlink()
+    monkeypatch.delenv("INTENT_CI_SHARED_STATE_TRUST")
+
+    missing_trust = dev_cli._shared_restore(repo)
+
+    assert missing_trust.status is dev_cli.SharedStateRestoreStatus.UNAVAILABLE
+    monkeypatch.setenv("INTENT_CI_SHARED_STATE_TRUST", "{")
+    unusable_trust = dev_cli._shared_restore(repo)
+    assert unusable_trust.status is dev_cli.SharedStateRestoreStatus.UNAVAILABLE
+
+
+def test_offline_authenticated_local_ref_is_projected_as_stale(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catches offline verification presenting mutable cached Git state as fresh."""
+    repo, trust = _clone(tmp_path)
+    monkeypatch.setenv("INTENT_CI_SHARED_STATE_TRUST", trust_environment(trust))
+
+    result = dev_cli._shared_restore(repo, refresh_remote=False)
+
+    assert result.status is dev_cli.SharedStateRestoreStatus.STALE
 
 
 @pytest.mark.parametrize("offline", [False, True], ids=("refreshed", "offline-cached"))
@@ -367,7 +479,7 @@ def test_direct_dev_restores_team_state_before_starting_the_control_plane(
 
     assert result.exit_code == 0, (result.stdout, result.stderr, repr(result.exception))
     assert (repo / ".intent/cache/shared-state.json").is_file()
-    assert observed[0]["status"] == "ready"
+    assert observed[0]["status"] == ("offline_stale" if offline else "ready")
     assert refreshes == ([] if offline else [trust.repository_id])
 
 

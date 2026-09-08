@@ -92,7 +92,12 @@ The bundle first runs the same non-authoritative readiness check as
 configured, that operation performs a bounded fetch of only `origin/intent-state`, verifies and
 restores the signed baseline, then starts or reuses the repository-bound local service before
 returning. A missing or offline protected ref reports fixed unavailable/stale guidance rather than
-silently using an older tracking ref. A fresh repository with no approved shared baseline still
+silently using an older tracking ref. A successful online restore also records bounded, non-secret
+repository/project and release-digest metadata in the current OS account's owner-only
+`.intent-engineering` governance registry. Deleting the ignored repository cache cannot opt that
+checkout out of team governance; missing trust remains unavailable/offline-stale. Explicit offline
+verification of a cached tracking ref is likewise stale, never fresh verified state. A fresh
+repository with no approved shared baseline still
 receives the unchanged onboarding offer and no state is created. If an approved graph has pending
 proposal review, an open reconciliation case, or unanswered clarification, it stops before
 capturing or classifying the prompt and directs the developer to the already-running local review

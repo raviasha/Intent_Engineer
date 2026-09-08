@@ -72,11 +72,17 @@ from intent_engineering.intent_workflow.readiness import (
 )
 from intent_engineering.storage._atomic import same_path_lock
 from intent_engineering.storage.secure import SecureDirectory, SecureFile, UnsafePathError
+from intent_engineering.team_state.governance import (
+    GovernanceRecord,
+    GovernanceRegistry,
+    default_governance_registry_root,
+)
 from intent_engineering.team_state.restore import (
     TRUST_ENVIRONMENT_VARIABLE,
     EnvironmentTrustProvider,
     GitSharedStateRestorer,
     StaticTrustProvider,
+    _origin_repository,
     _read_local_marker,
 )
 
@@ -115,6 +121,19 @@ _PROVENANCE_LOCAL = b"L"
 _PROVENANCE_TRUST = b"T"
 _PROVENANCE_INVALID = b"I"
 _LaunchMode = Literal["automatic", "manual_headless", "interactive", "legacy"]
+
+
+def _governance_registry_root() -> Path:
+    """Return the fixed account registry path; tests replace only this path factory."""
+    return default_governance_registry_root()
+
+
+@dataclass(frozen=True, slots=True)
+class _GovernanceContext:
+    registry: GovernanceRegistry
+    repository_id: str | None
+    directory_identity: tuple[int, int]
+    record: GovernanceRecord | None
 
 
 def _reset_repository_locks_after_fork() -> None:
@@ -1299,8 +1318,8 @@ def _readiness_result(
     )
 
 
-def _untrusted_shared_marker_status(root: Path) -> SharedStateRestoreStatus:
-    """Detect prior governed state through bounded descriptor-safe marker validation."""
+def _repository_marker_status(root: Path) -> SharedStateRestoreStatus:
+    """Inspect only the bounded repository-local marker."""
     project: SecureDirectory | None = None
     workspace: SecureDirectory | None = None
     try:
@@ -1329,8 +1348,74 @@ def _untrusted_shared_marker_status(root: Path) -> SharedStateRestoreStatus:
             project.close()
 
 
+def _governance_context(root: Path) -> _GovernanceContext:
+    """Bind durable governance evidence to the canonical remote or exact checkout."""
+    project = SecureDirectory.open(root)
+    try:
+        repository_id: str | None = None
+        try:
+            repository_id = _origin_repository(root)
+        except (OSError, subprocess.SubprocessError, UnicodeError, ValueError):
+            pass
+        registry = GovernanceRegistry(_governance_registry_root())
+        record = registry.lookup(repository_id, project.identity).record
+        if (
+            record is not None
+            and repository_id is not None
+            and record.repository_id != repository_id
+        ):
+            raise UnsafePathError()
+        return _GovernanceContext(registry, repository_id, project.identity, record)
+    finally:
+        project.close()
+
+
+def _untrusted_shared_marker_status(root: Path) -> SharedStateRestoreStatus:
+    """Detect governed state from repository cache or durable owner-only evidence."""
+    marker_status = _repository_marker_status(root)
+    if marker_status is SharedStateRestoreStatus.INVALID:
+        return marker_status
+    try:
+        context = _governance_context(root)
+    except (OSError, UnicodeError, ValueError, UnsafePathError):
+        initialized = os.path.lexists(root / ".intent")
+        return (
+            SharedStateRestoreStatus.INVALID
+            if marker_status is SharedStateRestoreStatus.UNAVAILABLE or initialized
+            else marker_status
+        )
+    return SharedStateRestoreStatus.UNAVAILABLE if context.record is not None else marker_status
+
+
+def _remember_verified_governance(root: Path, context: _GovernanceContext, project_id: str) -> None:
+    """Persist only post-verification, non-secret lineage metadata."""
+    if context.repository_id is None:
+        raise UnsafePathError()
+    project: SecureDirectory | None = None
+    workspace: SecureDirectory | None = None
+    try:
+        project = SecureDirectory.open(root)
+        workspace = project.subdirectory(".intent")
+        marker = _read_local_marker(workspace)
+        if marker is None:
+            raise UnsafePathError()
+        context.registry.remember(
+            repository_id=context.repository_id,
+            project_id=project_id,
+            directory_identity=context.directory_identity,
+            marker=marker,
+        )
+    finally:
+        if workspace is not None:
+            workspace.close()
+        if project is not None:
+            project.close()
+
+
 def _shared_restore(root: Path, *, refresh_remote: bool = True) -> SharedStateRestoreResult:
     marker_status = _untrusted_shared_marker_status(root)
+    if marker_status is SharedStateRestoreStatus.INVALID:
+        return SharedStateRestoreResult(status=SharedStateRestoreStatus.INVALID)
     if TRUST_ENVIRONMENT_VARIABLE not in os.environ:
         return SharedStateRestoreResult(status=marker_status)
     trust = None
@@ -1350,11 +1435,25 @@ def _shared_restore(root: Path, *, refresh_remote: bool = True) -> SharedStateRe
             )
         if trust is None:
             return SharedStateRestoreResult(status=marker_status)
+        context = _governance_context(root)
+        if context.repository_id != trust.repository_id or (
+            context.record is not None
+            and (
+                context.record.repository_id != trust.repository_id
+                or context.record.project_id != trust.project_id
+            )
+        ):
+            return SharedStateRestoreResult(status=SharedStateRestoreStatus.INVALID)
         result = GitSharedStateRestorer(
             StaticTrustProvider(trust),
             refresh_remote=refresh_remote,
+            prior_marker=context.record.marker() if context.record is not None else None,
         ).verify_and_restore_approved_baseline(root)
         if type(result) is SharedStateRestoreResult:
+            if result.status is SharedStateRestoreStatus.VERIFIED:
+                _remember_verified_governance(root, context, trust.project_id)
+                if not refresh_remote:
+                    return SharedStateRestoreResult(status=SharedStateRestoreStatus.STALE)
             return result
     except Exception as error:  # noqa: BLE001 - fixed secret-free restore boundary
         error.__traceback__ = None
@@ -1515,17 +1614,20 @@ def _automatic_shared_restore(root: Path) -> SharedStateRestoreResult:
             trust = EnvironmentTrustProvider(environment).load()
             if trust is None:
                 raise ValueError("shared-state trust unavailable")
+            context = _governance_context(root)
+            if context.repository_id != trust.repository_id or (
+                context.record is not None
+                and (
+                    context.record.repository_id != trust.repository_id
+                    or context.record.project_id != trust.project_id
+                )
+            ):
+                raise ValueError("shared-state governance mismatch")
             result = GitSharedStateRestorer(
-                StaticTrustProvider(trust), refresh_remote=False
+                StaticTrustProvider(trust),
+                refresh_remote=True,
+                prior_marker=context.record.marker() if context.record is not None else None,
             ).verify_and_restore_approved_baseline(root)
-            if result.status in {
-                SharedStateRestoreStatus.INVALID,
-                SharedStateRestoreStatus.STALE,
-                SharedStateRestoreStatus.UNAVAILABLE,
-            }:
-                result = GitSharedStateRestorer(
-                    StaticTrustProvider(trust), refresh_remote=True
-                ).verify_and_restore_approved_baseline(root)
     except _DevUnavailable:
         raise
     except (OSError, UnicodeError, ValueError):

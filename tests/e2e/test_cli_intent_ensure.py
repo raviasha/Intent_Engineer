@@ -28,8 +28,15 @@ NOW = datetime(2026, 9, 7, tzinfo=UTC)
 def _reuse_bounded_service(
     monkeypatch: pytest.MonkeyPatch,
     request: pytest.FixtureRequest,
+    tmp_path: Path,
 ) -> None:
     """The real process lifecycle is covered by the automation journey."""
+    monkeypatch.setattr(
+        dev_cli,
+        "_governance_registry_root",
+        lambda: tmp_path / "user-governance",
+        raising=False,
+    )
     if request.node.name in {
         "test_background_service_launch_is_argv_only_secret_free_and_bounded",
         "test_cancelled_background_exec_closes_both_pipe_ends_and_scrubs_trust",
@@ -195,6 +202,28 @@ def test_ensure_treats_unusable_trust_for_a_governed_checkout_as_offline_stale(
     assert result.exit_code == 0
     payload = json.loads(result.stdout)
     assert payload["status"] == "offline_stale"
+    assert payload["attention_route"] == "team_state"
+
+
+def test_ensure_fails_closed_when_the_owner_registry_is_unsafe(
+    tmp_path: Path,
+) -> None:
+    """Catches unsafe durable governance state silently degrading to local readiness."""
+    project = tmp_path / "governed-project"
+    project.mkdir()
+    _ready_project(project)
+    registry = tmp_path / "user-governance"
+    registry.mkdir(mode=0o700)
+    registry.chmod(0o755)
+
+    result = CliRunner().invoke(
+        app,
+        ["ensure", "--project", str(project), "--preset", "developer", "--format", "json"],
+    )
+
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["status"] == "shared_state_invalid"
     assert payload["attention_route"] == "team_state"
 
 

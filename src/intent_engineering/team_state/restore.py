@@ -1225,6 +1225,23 @@ def _read_local_marker(workspace: SecureDirectory | None) -> dict[str, object] |
         marker.close()
 
 
+def _validate_prior_marker(marker: Mapping[str, object] | None) -> dict[str, object] | None:
+    if marker is None:
+        return None
+    value = dict(marker)
+    if (
+        set(value) != {"schema_version", "bundle_digest", "graph_version", "ref_commit"}
+        or value["schema_version"] != 1
+        or type(value["bundle_digest"]) is not str
+        or _SHA256.fullmatch(value["bundle_digest"]) is None
+        or type(value["graph_version"]) is not int
+        or type(value["ref_commit"]) is not str
+        or _GIT_COMMIT.fullmatch(value["ref_commit"]) is None
+    ):
+        raise ValueError("invalid prior shared-state marker")
+    return value
+
+
 def _decrypt_release_payload(
     reader: _GitRefReader, release: _VerifiedRelease, trust: SharedStateTrust
 ) -> dict[str, bytes]:
@@ -2225,6 +2242,7 @@ class GitSharedStateRestorer:
         clock: Callable[[], datetime] | None = None,
         fault_hook: Callable[[str], None] | None = None,
         refresh_remote: bool = False,
+        prior_marker: Mapping[str, object] | None = None,
     ) -> None:
         if type(refresh_remote) is not bool:
             raise ValueError("invalid shared-state refresh mode")
@@ -2232,6 +2250,7 @@ class GitSharedStateRestorer:
         self._clock = clock or (lambda: datetime.now(UTC))
         self._fault_hook = fault_hook or (lambda _stage: None)
         self._refresh_remote = refresh_remote
+        self._prior_marker = _validate_prior_marker(prior_marker)
 
     def verify_and_restore_approved_baseline(self, root: Path) -> SharedStateRestoreResult:
         project: SecureDirectory | None = None
@@ -2268,6 +2287,10 @@ class GitSharedStateRestorer:
             if now.tzinfo is None or now.utcoffset() != timedelta(0):
                 raise ValueError("invalid shared-state time")
             marker = _read_local_marker(workspace)
+            if marker is None:
+                marker = self._prior_marker
+            elif self._prior_marker is not None and marker != self._prior_marker:
+                raise ValueError("local shared-state marker mismatch")
             lineage = _verify_release_lineage(reader, commit, trust, now, marker)
             manifest = lineage.tip.manifest
             files = _decrypt_release_payload(reader, lineage.tip, trust)

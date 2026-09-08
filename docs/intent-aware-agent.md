@@ -355,7 +355,13 @@ configured, the same prompt path verifies and restores the signed baseline befor
 readiness, then starts or reuses the repository-bound `intent dev` service with no browser popup.
 Verification first performs a bounded, output-capped, credential-free fetch of the one fixed
 `origin/intent-state` ref; it never checks out or merges remote code, and an absent/offline ref does
-not silently certify an older remote-tracking tip.
+not silently certify an older remote-tracking tip. The automatic child also earns verified health
+from that clean trust-derived fetch; caller-provided trust and mutable local tracking refs cannot
+mint a verified service status. After a successful authenticated online restore, an owner-only
+per-account registry retains only canonical repository/project and release-digest metadata. It is
+independent of the ignored repository cache, so deleting `cache/shared-state.json` cannot silently
+downgrade a governed checkout. Cached-ref verification requested with `--offline` is reported as
+stale even when its signatures validate.
 A repository with neither local state nor an approved shared baseline still receives the
 non-mutating onboarding offer. The offline release proof covers a real fresh clone, automatic signed
 baseline restore, automatic service startup, the first prompt, an implementation/test commit,
