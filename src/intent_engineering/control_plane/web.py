@@ -567,14 +567,7 @@ def _visible_status(service: ControlPlaneService) -> dict[str, object]:
     try:
         raw = service.status()
         status = StatusResponse.model_validate(raw)
-        try:
-            inbox = InboxResponse.model_validate(service.inbox())
-        except Exception:  # noqa: BLE001 - unavailable authority reveals no identifiers
-            inbox = InboxResponse(
-                pending_proposal_ids=[],
-                open_case_ids=[],
-                clarification_sessions=[],
-            )
+        inbox = InboxResponse.model_validate(service.inbox())
         visible_proposals.extend(inbox.pending_proposal_ids)
         visible_cases.extend(inbox.open_case_ids)
         projected = status.model_dump(mode="json")

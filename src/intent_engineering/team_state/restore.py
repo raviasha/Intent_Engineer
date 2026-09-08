@@ -17,6 +17,7 @@ import os
 import re
 import secrets
 import selectors
+import signal
 import stat
 import subprocess
 import tempfile
@@ -77,6 +78,9 @@ MAX_FILE_BYTES = 8 * 1024 * 1024
 MAX_STATE_FILES = 32
 MAX_TRUST_BYTES = 32 * 1024
 MAX_GIT_TEXT_BYTES = 4096
+MAX_FETCH_OUTPUT_BYTES = 64 * 1024
+MAX_GIT_EXECUTABLE_BYTES = 16 * 1024 * 1024
+_FETCH_TIMEOUT_SECONDS = 10.0
 MAX_CLOCK_SKEW = timedelta(minutes=5)
 MAX_ANCESTRY_COMMITS = 64
 
@@ -97,6 +101,19 @@ _SHA256 = re.compile(r"^sha256:[0-9a-f]{64}$")
 _KEY_ID = re.compile(r"^[a-z][a-z0-9._:-]{0,127}$")
 _PROJECT_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _REPOSITORY_ID = re.compile(r"^[a-z0-9.-]+/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+_GIT_EXECUTABLE = Path("/usr/bin/git")
+_FETCH_ENVIRONMENT: Mapping[str, str] = {
+    "GIT_ASKPASS": "/usr/bin/false",
+    "GIT_CONFIG_GLOBAL": "/dev/null",
+    "GIT_CONFIG_NOSYSTEM": "1",
+    "GIT_NO_REPLACE_OBJECTS": "1",
+    "GIT_OPTIONAL_LOCKS": "0",
+    "GIT_TERMINAL_PROMPT": "0",
+    "LANG": "C.UTF-8",
+    "LC_ALL": "C.UTF-8",
+    "PATH": "/usr/bin:/bin",
+    "SSH_ASKPASS": "/usr/bin/false",
+}
 _GIT_COMMIT = re.compile(r"^[0-9a-f]{40}(?:[0-9a-f]{24})?$")
 
 
@@ -679,6 +696,147 @@ def _run_git(repo: Path, arguments: tuple[str, ...], *, maximum: int) -> bytes:
         if process.poll() is None:
             process.kill()
             process.wait()
+
+
+def _git_executable_token() -> tuple[int, int, int, int, str]:
+    descriptor = os.open(
+        _GIT_EXECUTABLE,
+        os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0),
+    )
+    content = bytearray()
+    try:
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != 0
+            or metadata.st_mode & 0o022
+            or metadata.st_size > MAX_GIT_EXECUTABLE_BYTES
+        ):
+            raise ValueError("Git executable unavailable")
+        while chunk := os.read(descriptor, 64 * 1024):
+            content.extend(chunk)
+            if len(content) > MAX_GIT_EXECUTABLE_BYTES:
+                raise ValueError("Git executable unavailable")
+        return (
+            metadata.st_dev,
+            metadata.st_ino,
+            metadata.st_mtime_ns,
+            metadata.st_size,
+            hashlib.sha256(content).hexdigest(),
+        )
+    finally:
+        content.clear()
+        os.close(descriptor)
+
+
+def _stop_fetch_process(process: subprocess.Popen[bytes]) -> None:
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except (PermissionError, ProcessLookupError):
+        try:
+            process.kill()
+        except ProcessLookupError:
+            pass
+    try:
+        process.wait(timeout=1)
+    except subprocess.TimeoutExpired:
+        pass
+
+
+def _refresh_state_ref(root: Path) -> None:
+    """Fetch only the protected state branch through one opaque bounded Git boundary."""
+    process: subprocess.Popen[bytes] | None = None
+    selector = selectors.DefaultSelector()
+    git_token: tuple[int, int, int, int, str] | None = None
+    try:
+        git_token = _git_executable_token()
+        argv = (
+            str(_GIT_EXECUTABLE),
+            "--no-pager",
+            "--no-replace-objects",
+            "-c",
+            "core.askPass=",
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "credential.helper=",
+            "-c",
+            "credential.interactive=never",
+            "-c",
+            "fetch.fsckObjects=true",
+            "-c",
+            "gc.auto=0",
+            "-c",
+            "protocol.ext.allow=never",
+            "-c",
+            "submodule.recurse=false",
+            "-C",
+            str(root),
+            "fetch",
+            "--force",
+            "--no-tags",
+            "--no-recurse-submodules",
+            "--no-write-fetch-head",
+            "--quiet",
+            "origin",
+            "refs/heads/intent-state:refs/remotes/origin/intent-state",
+        )
+        process = subprocess.Popen(
+            argv,
+            cwd="/",
+            env=dict(_FETCH_ENVIRONMENT),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            close_fds=True,
+            start_new_session=True,
+            shell=False,
+            bufsize=0,
+        )
+        assert process.stdout is not None
+        assert process.stderr is not None
+        selector.register(process.stdout, selectors.EVENT_READ)
+        selector.register(process.stderr, selectors.EVENT_READ)
+        total = 0
+        deadline = time.monotonic() + _FETCH_TIMEOUT_SECONDS
+        while selector.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("shared-state fetch unavailable")
+            events = selector.select(remaining)
+            if not events:
+                raise TimeoutError("shared-state fetch unavailable")
+            for key, _mask in events:
+                file_object = key.fileobj
+                descriptor = file_object if isinstance(file_object, int) else file_object.fileno()
+                chunk = os.read(descriptor, 64 * 1024)
+                if not chunk:
+                    selector.unregister(key.fileobj)
+                    continue
+                total += len(chunk)
+                if total > MAX_FETCH_OUTPUT_BYTES:
+                    raise ValueError("shared-state fetch unavailable")
+        remaining = deadline - time.monotonic()
+        if remaining <= 0 or process.wait(timeout=remaining) != 0:
+            raise ValueError("shared-state fetch unavailable")
+        if _git_executable_token() != git_token:
+            raise ValueError("shared-state fetch unavailable")
+    except (OSError, subprocess.SubprocessError, TimeoutError, ValueError) as error:
+        error.__traceback__ = None
+        raise _Unavailable("shared-state ref unavailable") from None
+    finally:
+        selector.close()
+        if process is not None:
+            if process.stdout is not None:
+                process.stdout.close()
+            if process.stderr is not None:
+                process.stderr.close()
+            if process.poll() is None:
+                _stop_fetch_process(process)
+        process = None
+        git_token = None
 
 
 def _origin_repository(repo: Path) -> str:
@@ -1935,10 +2093,14 @@ class GitSharedStateRestorer:
         *,
         clock: Callable[[], datetime] | None = None,
         fault_hook: Callable[[str], None] | None = None,
+        refresh_remote: bool = False,
     ) -> None:
+        if type(refresh_remote) is not bool:
+            raise ValueError("invalid shared-state refresh mode")
         self._trust_provider = trust_provider
         self._clock = clock or (lambda: datetime.now(UTC))
         self._fault_hook = fault_hook or (lambda _stage: None)
+        self._refresh_remote = refresh_remote
 
     def verify_and_restore_approved_baseline(self, root: Path) -> SharedStateRestoreResult:
         project: SecureDirectory | None = None
@@ -1965,6 +2127,8 @@ class GitSharedStateRestorer:
                 workspace = project.subdirectory(".intent")
             if _origin_repository(root) != trust.repository_id:
                 raise ValueError("repository identity mismatch")
+            if self._refresh_remote:
+                _refresh_state_ref(root)
             reader = _GitRefReader(root)
             commit = reader.commit()
             now = self._clock()

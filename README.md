@@ -89,15 +89,18 @@ working directory; it must not assume `.` refers to the user's checkout.
 
 The bundle first runs the same non-authoritative readiness check as
 `intent ensure --project . --preset developer --format json`. When approved shared-state trust is
-configured, that operation verifies and restores the signed baseline, then starts or reuses the
-repository-bound local service before returning. A fresh repository with no approved shared
-baseline still receives the unchanged onboarding offer and no state is created. If an approved graph has pending proposal review, an open
-reconciliation case, or unanswered clarification, it stops before capturing or classifying the
-prompt and directs the developer to the already-running local review view. Otherwise, it persists the exact stdin prompt
-as untrusted `agent:codex` context, supplies only opaque conversation and evidence references, and
-routes the agent's bounded classification draft through token-free `intent_advisory_preflight`. The
-hook boundary is callable by the coding agent, so it never claims local-human attribution or
-approval. Raw prompt text never crosses that MCP wire boundary.
+configured, that operation performs a bounded fetch of only `origin/intent-state`, verifies and
+restores the signed baseline, then starts or reuses the repository-bound local service before
+returning. A missing or offline protected ref reports fixed unavailable/stale guidance rather than
+silently using an older tracking ref. A fresh repository with no approved shared baseline still
+receives the unchanged onboarding offer and no state is created. If an approved graph has pending
+proposal review, an open reconciliation case, or unanswered clarification, it stops before
+capturing or classifying the prompt and directs the developer to the already-running local review
+view. Otherwise, it persists the exact stdin prompt as untrusted `agent:codex` context, supplies
+only opaque conversation and evidence references, and routes the agent's bounded classification
+draft through token-free `intent_advisory_preflight`. The hook boundary is callable by the coding
+agent, so it never claims local-human attribution or approval. Raw prompt text never crosses that
+MCP wire boundary.
 
 The advisory classifications are `no_semantic_impact`, `aligned`, `new_or_ambiguous`, and
 `conflicting`. Continue normal work for the first two. The plugin never receives a mutation
@@ -116,6 +119,10 @@ without waiting for a browser request. The Home view shows the latest detached o
 offers an explicit **Run reviewed tests** action for command IDs from reviewed project
 configuration. The write uses the same-origin/CSRF boundary; it supplies an identifier, never a
 shell command, and neither polling nor test execution asserts implementation completion.
+The automatic prompt-time service intentionally opens no browser and never persists its CSRF
+bootstrap. Running ordinary `intent dev` later securely replaces that attested headless owner,
+opens a browser with a new in-memory bootstrap, and keeps the protected write actions usable;
+`intent dev --status` and `intent dev --no-open` continue to reuse the existing process.
 
 ### Required GitHub check
 

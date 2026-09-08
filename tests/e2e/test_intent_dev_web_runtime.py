@@ -541,6 +541,8 @@ def _launched_site(service: _LaunchedJourneyService) -> Iterator[str]:
         origin=origin,
         csrf_secret=csrf,
         instance_id="instance:" + "8" * 64,
+        project_id="project",
+        repository_id="repo:sha256:" + "4" * 64,
     )
     server = uvicorn.Server(
         uvicorn.Config(

@@ -7,6 +7,8 @@ import hashlib
 import json
 import os
 import shutil
+import subprocess
+import time
 from dataclasses import replace
 from pathlib import Path
 
@@ -63,6 +65,122 @@ def test_restores_a_verified_repository_bound_state_ref_without_checkout(tmp_pat
         source / ".intent/config.yaml"
     ).read_bytes()
     assert (target / ".git/HEAD").read_bytes() == head_before
+
+
+def test_opted_in_restore_refreshes_the_fixed_remote_ref_before_verification(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catches prompt readiness accepting an older cached origin/intent-state tip."""
+    source = _approved_source(tmp_path)
+    target = init_repository(tmp_path / "target" / "project")
+    recipient, signer, trust = keys()
+    first = artifacts(canonical_files(source), recipient, signer)
+    first_commit = install_state_ref(target, first)
+    first_digest = json.loads(first.manifest)["bundle_digest"]
+    second = artifacts(
+        canonical_files(source),
+        recipient,
+        signer,
+        parent_bundle_digest=first_digest,
+    )
+    second_commit = install_state_ref(target, second, parent=first_commit)
+    git(target, "update-ref", restore_module.STATE_REF, first_commit)
+    refreshed: list[Path] = []
+
+    def refresh(root: Path) -> None:
+        refreshed.append(root)
+        git(root, "update-ref", restore_module.STATE_REF, second_commit)
+
+    monkeypatch.setattr(restore_module, "_refresh_state_ref", refresh, raising=False)
+
+    result = GitSharedStateRestorer(
+        StaticTrustProvider(trust),
+        refresh_remote=True,
+    ).verify_and_restore_approved_baseline(target)
+
+    assert result.status is SharedStateRestoreStatus.VERIFIED
+    assert refreshed == [target]
+    marker = json.loads((target / ".intent/cache/shared-state.json").read_bytes())
+    assert marker["graph_version"] == 1
+    assert marker["ref_commit"] == second_commit
+
+
+def test_opted_in_restore_maps_offline_or_absent_fixed_ref_to_unavailable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catches a failed refresh silently falling back to an untrusted stale tracking ref."""
+    target = init_repository(tmp_path / "target" / "project")
+    _recipient, _signer, trust = keys()
+    marker = "PRIVATE-FETCH-FAILURE-8197"
+
+    def unavailable(_root: Path) -> None:
+        raise restore_module._Unavailable(marker)
+
+    monkeypatch.setattr(restore_module, "_refresh_state_ref", unavailable, raising=False)
+
+    result = GitSharedStateRestorer(
+        StaticTrustProvider(trust),
+        refresh_remote=True,
+    ).verify_and_restore_approved_baseline(target)
+
+    assert result.status is SharedStateRestoreStatus.UNAVAILABLE
+    assert not (target / ".intent").exists()
+
+
+@pytest.mark.parametrize(
+    ("program", "timeout"),
+    [
+        ("import time; time.sleep(5)", 0.05),
+        ("import sys; sys.stderr.buffer.write(b'x' * 70000)", 1.0),
+    ],
+    ids=("time-bound", "combined-output-bound"),
+)
+def test_fixed_ref_fetch_is_argv_only_bounded_and_credential_free(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    program: str,
+    timeout: float,
+) -> None:
+    """Catches prompt-time fetch using shell/config credentials or unbounded child work."""
+    target = init_repository(tmp_path / "target" / "project")
+    original_popen = subprocess.Popen
+    calls: dict[str, object] = {}
+    marker = "PRIVATE-FETCH-CREDENTIAL-8197"
+    monkeypatch.setenv("GITHUB_TOKEN", marker)
+    monkeypatch.setenv("GIT_ASKPASS", marker)
+    monkeypatch.setenv("SSH_AUTH_SOCK", marker)
+    monkeypatch.setattr(restore_module, "_FETCH_TIMEOUT_SECONDS", timeout, raising=False)
+
+    def popen(argv, **kwargs):
+        calls["argv"] = argv
+        calls["kwargs"] = kwargs
+        return original_popen(
+            ["/usr/bin/python3", "-I", "-c", program],
+            **kwargs,
+        )
+
+    monkeypatch.setattr(restore_module.subprocess, "Popen", popen)
+    started = time.monotonic()
+
+    with pytest.raises(restore_module._Unavailable):
+        restore_module._refresh_state_ref(target)
+
+    assert time.monotonic() - started < 1
+    argv = calls["argv"]
+    kwargs = calls["kwargs"]
+    assert type(argv) is tuple
+    assert type(kwargs) is dict
+    assert argv[0] == "/usr/bin/git"
+    assert argv[-2:] == (
+        "origin",
+        "refs/heads/intent-state:refs/remotes/origin/intent-state",
+    )
+    assert kwargs["shell"] is False
+    assert kwargs["start_new_session"] is True
+    assert kwargs["stdin"] is subprocess.DEVNULL
+    assert marker not in repr(argv) + repr(kwargs)
 
 
 def _canonical(value: object) -> bytes:

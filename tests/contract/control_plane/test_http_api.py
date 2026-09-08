@@ -740,6 +740,28 @@ def test_invalid_service_output_and_service_errors_have_one_fixed_secret_free_re
     assert "PRIVATE" not in invalid_output.text + service_error.text
 
 
+def test_status_fails_closed_when_acl_filtered_inbox_projection_is_unavailable() -> None:
+    """Catches authority or storage failure being rewritten as an empty ready Home view."""
+
+    class InboxUnavailable(_Service):
+        def inbox(self) -> dict[str, object]:
+            self.calls.append(("inbox", None))
+            raise ValueError("PRIVATE-INBOX-STORAGE-FAILURE")
+
+    service = InboxUnavailable()
+    service.status_result["status"] = "human_attention_required"
+    service.status_result["attention_route"] = "inbox"
+    service.status_result["pending_proposal_ids"] = ["proposal:hidden"]
+    client = TestClient(_app(service), base_url=ORIGIN)
+
+    response = client.get("/api/v1/status", headers={"Origin": ORIGIN})
+
+    assert response.status_code == 503
+    assert response.json() == FIXED_ERROR
+    assert "PRIVATE" not in response.text
+    assert service.calls == [("status", None), ("inbox", None)]
+
+
 def _repository_traceback_locals(error: BaseException) -> str:
     repository_locals: list[str] = []
     traceback = error.__traceback__

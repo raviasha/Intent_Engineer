@@ -353,6 +353,9 @@ For an onboarded local checkout, the first ordinary prompt checks readiness auto
 developer does not need to type an Intent command per task. When approved shared-state trust is
 configured, the same prompt path verifies and restores the signed baseline before immutable
 readiness, then starts or reuses the repository-bound `intent dev` service with no browser popup.
+Verification first performs a bounded, output-capped, credential-free fetch of the one fixed
+`origin/intent-state` ref; it never checks out or merges remote code, and an absent/offline ref does
+not silently certify an older remote-tracking tip.
 A repository with neither local state nor an approved shared baseline still receives the
 non-mutating onboarding offer. The offline release proof covers a real fresh clone, automatic signed
 baseline restore, automatic service startup, the first prompt, an implementation/test commit,
@@ -366,6 +369,12 @@ when no browser page is open. Home reads only its latest detached projection. A 
 run one reviewed test command through the protected loopback API; the request contains the reviewed
 command ID and is subject to exact origin, CSRF, JSON, timeout, output, repository, and executable
 bindings. Background polling never executes tests, mutates the graph, or records completion.
+Because the headless service cannot share its in-memory CSRF bootstrap, a later ordinary
+`intent dev` invocation re-attests and stops that exact owner, acquires the same repository lease,
+and opens a replacement using a new ephemeral fragment. Status and explicit `--no-open` calls
+still reuse the owner. Bootstrap bytes remain absent from metadata, argv, environment and logs.
+If the ACL-filtered Inbox cannot be projected, status returns the fixed unavailable response; it
+does not rewrite storage or authority failures as an empty ready Home view.
 
 ## 4. Clarification and review
 

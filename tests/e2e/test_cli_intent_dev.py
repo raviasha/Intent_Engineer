@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 import pytest
@@ -186,7 +187,12 @@ def _fake_process_server(
                 }
                 status = 200
             elif self.path == "/_intent/dev/instance" and instance_id is not None:
-                payload = {"schema_version": 1, "instance_id": instance_id}
+                payload = {
+                    "schema_version": 1,
+                    "instance_id": instance_id,
+                    "project_id": project_id,
+                    "repository_id": repository_id,
+                }
                 status = 200
             else:
                 payload = {"schema_version": 1, "status": "unavailable"}
@@ -328,7 +334,7 @@ def test_fresh_repository_starts_reuses_serves_assets_and_cleans_up(tmp_path: Pa
     assert not (project / ".intent/cache/control-plane.json").exists()
 
 
-def test_reuse_does_not_open_a_browser_without_the_in_memory_bootstrap(
+def test_ordinary_dev_replaces_automatic_owner_and_opens_with_ephemeral_bootstrap(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     project = _project(tmp_path)
@@ -345,17 +351,62 @@ def test_reuse_does_not_open_a_browser_without_the_in_memory_bootstrap(
         "open",
         lambda url, **_kwargs: opened.append(url) or True,
     )
+    authenticated_results: list[tuple[int, str]] = []
+
+    def exercise_authenticated_browser(_started: object) -> None:
+        opened_url = opened[0]
+        origin, _separator, bootstrap = opened_url.partition("/#csrf=")
+        host = origin.removeprefix("http://")
+        with urlopen(Request(origin, headers={"Host": host}), timeout=3) as response:
+            cookie = response.headers["Set-Cookie"].partition(";")[0]
+        request = Request(
+            origin + "/api/v1/development/tests/run",
+            data=json.dumps({"command_id": "test:sha256:" + "f" * 64}).encode(),
+            headers={
+                "Content-Type": "application/json",
+                "Cookie": cookie,
+                "Host": host,
+                "Origin": origin,
+                "X-Intent-CSRF": bootstrap,
+            },
+            method="POST",
+        )
+        try:
+            with urlopen(request, timeout=3) as response:
+                authenticated_results.append(
+                    (response.status, json.loads(response.read())["status"])
+                )
+        except HTTPError as error:
+            authenticated_results.append((error.code, "http_error"))
+
+    monkeypatch.setattr(dev_cli, "_wait_for_exit", exercise_authenticated_browser)
     try:
-        metadata = ControlPlaneProcessMetadata.model_validate(_wait_for_metadata(project, owner))
+        automatic = ControlPlaneProcessMetadata.model_validate(_wait_for_metadata(project, owner))
 
         result = CliRunner().invoke(app, ["dev", "--project", str(project)])
 
         assert result.exit_code == 0, repr(result.exception)
-        assert result.stdout == f"intent dev: already running at {metadata.origin}\n"
+        assert result.stdout.startswith("intent dev: ready at http://localhost:")
         assert result.stderr == ""
-        assert opened == []
+        assert len(opened) == 1
+        assert opened[0].startswith("http://localhost:")
+        assert "/#csrf=" in opened[0]
+        assert automatic.origin not in opened[0]
+        # This project has no reviewed command, so behavior is unavailable only
+        # after the authenticated write boundary accepts the ephemeral token.
+        assert authenticated_results == [(503, "http_error")]
+        owner_stdout, owner_stderr = owner.communicate(timeout=10)
+        assert owner_stdout == f"intent dev: ready at {automatic.origin}\n"
+        assert owner_stderr == ""
+        persisted = b"".join(
+            path.read_bytes()
+            for path in (project / ".intent").rglob("*")
+            if path.is_file() and not path.name.startswith(".control-plane.json.lock")
+        )
+        assert opened[0].partition("#csrf=")[2].encode() not in persisted
     finally:
-        _stop(owner)
+        if owner.poll() is None:
+            _stop(owner)
 
 
 def test_stale_and_foreign_pid_metadata_is_not_reused(tmp_path: Path) -> None:

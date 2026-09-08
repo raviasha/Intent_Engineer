@@ -30,6 +30,7 @@ from intent_engineering.core.models import (
 )
 from intent_engineering.intent_workflow.check import CheckService
 from intent_engineering.storage.executor import LocalChangeSetExecutor
+from intent_engineering.team_state import restore as restore_module
 from intent_engineering.team_state.restore import (
     SharedStateTrust,
     TrustedSigningKey,
@@ -230,6 +231,13 @@ def test_fresh_onboarded_clone_first_prompt_and_plugin_disabled_ci_backstop(
     repo, trust = _clone(tmp_path)
     request.addfinalizer(lambda: _stop_background_dev(repo))
     monkeypatch.setenv("INTENT_CI_SHARED_STATE_TRUST", trust_environment(trust))
+    monkeypatch.setattr(restore_module, "_origin_repository", lambda _root: trust.repository_id)
+    git(
+        repo,
+        "config",
+        f"url.file://{tmp_path / 'source' / 'project'}.insteadOf",
+        "https://github.com/acme/project.git",
+    )
     original_head = git(repo, "rev-parse", "HEAD")
     monkeypatch.chdir(repo)
     first_prompt = CliRunner().invoke(

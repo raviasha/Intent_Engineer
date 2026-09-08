@@ -11,6 +11,7 @@ import json
 import os
 import re
 import secrets
+import signal
 import socket
 import subprocess
 import sys
@@ -394,16 +395,13 @@ def _probe(metadata: ControlPlaneProcessMetadata, expected_repository_id: str) -
         or not _listener_owned_by_process(metadata.pid, port)
     ):
         return False
-    instance = _probe_json(metadata, _INSTANCE_PATH, 512)
-    if instance != {"schema_version": 1, "instance_id": metadata.instance_id}:
-        return False
-    status = _probe_json(metadata, "/api/v1/status", 65_536)
-    return bool(
-        type(status) is dict
-        and status.get("schema_version") == 1
-        and status.get("project_id") == metadata.project_id
-        and status.get("repository_id") == expected_repository_id
-    )
+    instance = _probe_json(metadata, _INSTANCE_PATH, 1024)
+    return instance == {
+        "schema_version": 1,
+        "instance_id": metadata.instance_id,
+        "project_id": metadata.project_id,
+        "repository_id": expected_repository_id,
+    }
 
 
 def _remove_exact_metadata(target: SecureFile, expected: bytes) -> None:
@@ -538,13 +536,20 @@ class _ControlPlaneSite:
         origin: str,
         csrf_secret: str,
         instance_id: str,
+        project_id: str,
+        repository_id: str,
     ) -> None:
         self._api = cast(Any, api)
         self._origin = origin
         self._host = origin.removeprefix("http://").encode("ascii")
         self._csrf = csrf_secret
         self._instance = json.dumps(
-            {"schema_version": 1, "instance_id": instance_id},
+            {
+                "schema_version": 1,
+                "instance_id": instance_id,
+                "project_id": project_id,
+                "repository_id": repository_id,
+            },
             allow_nan=False,
             ensure_ascii=False,
             separators=(",", ":"),
@@ -702,6 +707,8 @@ def _start(
         origin=origin,
         csrf_secret=started.bootstrap,
         instance_id=instance_id,
+        project_id=runtime.config.project_id,
+        repository_id=repository_id,
     )
     configuration = uvicorn.Config(
         started.site,
@@ -844,6 +851,24 @@ def _live_repository_process(
             workspace.close()
 
 
+def _request_interactive_takeover(
+    metadata: ControlPlaneProcessMetadata,
+    expected_repository_id: str,
+) -> bool:
+    """Ask one freshly re-attested owner to release its repository lifecycle lease."""
+    if metadata.pid == os.getpid():
+        return False
+    if not _probe(metadata, expected_repository_id):
+        return True
+    try:
+        os.kill(metadata.pid, signal.SIGINT)
+    except ProcessLookupError:
+        return True
+    except (OSError, ValueError):
+        return False
+    return True
+
+
 def _run_with_repository_lease(
     root: Path,
     project_directory: SecureDirectory,
@@ -951,6 +976,7 @@ def _shared_restore(root: Path) -> SharedStateRestoreResult:
     try:
         result = GitSharedStateRestorer(
             EnvironmentTrustProvider(),
+            refresh_remote=True,
         ).verify_and_restore_approved_baseline(root)
         if type(result) is SharedStateRestoreResult:
             return result
@@ -1102,6 +1128,7 @@ def dev_command(
     prd_value = prd.as_posix() if prd is not None else None
     project_directory: SecureDirectory | None = None
     signal_error: BaseException | None = None
+    takeover_requested: set[tuple[int, str, str]] = set()
     try:
         if status and not (root / ".intent").exists():
             _fixed_error("not running")
@@ -1112,9 +1139,15 @@ def dev_command(
             if current is not None:
                 if status:
                     typer.echo(f"intent dev: running at {current.origin}")
-                else:
+                    return
+                if no_open:
                     typer.echo(f"intent dev: already running at {current.origin}")
-                return
+                    return
+                owner = (current.pid, current.process_start_id, current.instance_id)
+                if owner not in takeover_requested:
+                    if not _request_interactive_takeover(current, current.repository_id):
+                        raise _DevUnavailable()
+                    takeover_requested.add(owner)
             with _try_repository_lifecycle_lock(project_directory) as acquired:
                 if acquired:
                     _run_with_repository_lease(
@@ -1153,6 +1186,7 @@ def dev_command(
             project_directory.close()
         project_directory = None
         root = Path()
+        takeover_requested.clear()
     if signal_error is not None:
         caught = signal_error
         signal_error = None
