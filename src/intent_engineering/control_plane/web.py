@@ -75,6 +75,19 @@ _STATIC_METHODS = {
     "/api/v1/team/enrollment/verify": "POST",
     "/api/v1/team/enrollment/cancel": "POST",
     "/api/v1/team/publication/preview": "GET",
+    "/api/v1/team/setup": "GET",
+    **{
+        f"/api/v1/team/setup/{action}": "POST"
+        for action in (
+            "inspect",
+            "enroll",
+            "protection-preview",
+            "publication-preview",
+            "options",
+            "verify",
+            "cancel",
+        )
+    },
     "/api/v1/decisions/options": "POST",
     "/api/v1/decisions/verify": "POST",
 }
@@ -839,6 +852,51 @@ def _make_handlers(
                 detached = cast(CredentialRecord, None)
         return _end_handler(request, signal, response)
 
+    async def github_setup_endpoint(request: Request) -> Response:
+        response: Response | None = None
+        signal: BaseException | None = None
+        encoded = b""
+        model: (
+            RegistrationOptionsRequest | DecisionOptionsRequest | DecisionVerifyRequest | None
+        ) = None
+        result: dict[str, object] | None = None
+        try:
+            if request.url.path == "/api/v1/team/setup":
+                result = service.github_setup_status()
+            else:
+                action = request.url.path.rsplit("/", 1)[-1]
+                if action == "options":
+                    model = cast(
+                        DecisionOptionsRequest, _parse_body(request, DecisionOptionsRequest)
+                    )
+                    result = await service.github_setup_action(action, payload=model.payload)
+                elif action == "verify":
+                    model = cast(DecisionVerifyRequest, _parse_body(request, DecisionVerifyRequest))
+                    encoded = canonical_json_object(model.response)
+                    result = await service.github_setup_action(
+                        action, payload=model.payload, response=encoded
+                    )
+                else:
+                    model = cast(
+                        RegistrationOptionsRequest, _parse_body(request, RegistrationOptionsRequest)
+                    )
+                    result = await service.github_setup_action(action)
+            response = _json_response(result)
+        except _HandlerRequestError:
+            response = _fixed_response(400)
+        except Exception:  # noqa: BLE001 - fixed browser boundary
+            response = _fixed_response(503)
+        except BaseException as caught:  # noqa: BLE001 - preserve scrubbed cancellation
+            caught.__traceback__ = None
+            caught.__cause__ = None
+            caught.__context__ = None
+            signal = caught
+        finally:
+            encoded = b""
+            model = None
+            result = None
+        return _end_handler(request, signal, response)
+
     async def team_enrollment_status_endpoint(request: Request) -> Response:
         response: Response | None = None
         signal: BaseException | None = None
@@ -1017,6 +1075,7 @@ def _make_handlers(
         "registration_options": registration_options_endpoint,
         "registration_verify": registration_verify_endpoint,
         "team_enrollment_status": team_enrollment_status_endpoint,
+        "github_setup": github_setup_endpoint,
         "team_enrollment_options": team_enrollment_options_endpoint,
         "team_enrollment_verify": team_enrollment_verify_endpoint,
         "team_enrollment_cancel": team_enrollment_cancel_endpoint,
@@ -1048,6 +1107,19 @@ def build_control_plane_app(
     app = Starlette(
         debug=False,
         routes=[
+            Route("/api/v1/team/setup", handlers["github_setup"], methods=["GET"]),
+            *[
+                Route(f"/api/v1/team/setup/{action}", handlers["github_setup"], methods=["POST"])
+                for action in (
+                    "inspect",
+                    "enroll",
+                    "protection-preview",
+                    "publication-preview",
+                    "options",
+                    "verify",
+                    "cancel",
+                )
+            ],
             Route("/api/v1/status", handlers["status"], methods=["GET"]),
             Route("/api/v1/inbox", handlers["inbox"], methods=["GET"]),
             Route(

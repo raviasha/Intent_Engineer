@@ -14,6 +14,14 @@
     teamEnrollmentVerify: "/api/v1/team/enrollment/verify",
     teamEnrollmentCancel: "/api/v1/team/enrollment/cancel",
     teamPublicationPreview: "/api/v1/team/publication/preview",
+    teamSetup: "/api/v1/team/setup",
+    teamSetupInspect: "/api/v1/team/setup/inspect",
+    teamSetupEnroll: "/api/v1/team/setup/enroll",
+    teamSetupProtectionPreview: "/api/v1/team/setup/protection-preview",
+    teamSetupPublicationPreview: "/api/v1/team/setup/publication-preview",
+    teamSetupOptions: "/api/v1/team/setup/options",
+    teamSetupVerify: "/api/v1/team/setup/verify",
+    teamSetupCancel: "/api/v1/team/setup/cancel",
     decisionOptions: "/api/v1/decisions/options",
     decisionVerify: "/api/v1/decisions/verify",
     developmentObservation: "/api/v1/development/observation",
@@ -35,6 +43,9 @@
     developmentObservation: null,
     teamEnrollment: null,
     teamPublication: null,
+    teamSetup: null,
+    teamSetupPreview: null,
+    teamSetupResult: null,
   };
   let csrfToken = readCsrfBootstrap();
 
@@ -373,6 +384,50 @@
     if (state.status) {
       addProjection(section, state.status);
     }
+    if (state.teamSetup) {
+      addText(section, "h3", "GitHub team setup");
+      addProjection(section, state.teamSetup);
+      if (state.teamSetupPreview) {
+        addText(section, "h3", "Exact setup preview");
+        addProjection(section, state.teamSetupPreview.preview);
+        addText(section, "h3", "Decision binding");
+        addProjection(section, state.teamSetupPreview.payload);
+      }
+      if (state.teamSetupResult && state.teamSetupResult.pull_request_url) {
+        addText(section, "p", state.teamSetupResult.pull_request_url);
+      }
+      const actions = document.createElement("div");
+      actions.className = "actions";
+      if (state.teamSetup.state === "setup_required") {
+        actions.append(actionButton("Inspect GitHub identity and repository", inspectTeamSetup));
+      }
+      if (state.teamSetup.state === "identity_verified") {
+        actions.append(actionButton("Enroll this device with WebAuthn", enrollProductionTeam));
+      }
+      if (state.teamSetup.state === "enrolled" || state.teamSetup.state === "protection_configured") {
+        actions.append(actionButton("Preview branch protection changes", previewTeamProtection));
+      }
+      if (state.teamSetup.state === "protection_configured") {
+        actions.append(
+          actionButton("Preview encrypted team-state publication", previewTeamPublication)
+        );
+      }
+      if (state.teamSetupPreview && state.teamSetupPreview.payload) {
+        const action = state.teamSetupPreview.payload.action;
+        if (action === "approve_external_write") {
+          actions.append(
+            actionButton("Authorize branch protection with WebAuthn", authorizeTeamSetup, "danger")
+          );
+        } else if (action === "publish_state") {
+          actions.append(
+            actionButton("Authorize publication with WebAuthn", authorizeTeamSetup, "danger")
+          );
+        }
+      }
+      actions.append(actionButton("Cancel team setup", cancelTeamSetup));
+      section.append(actions);
+      return section;
+    }
     if (state.teamEnrollment) {
       addText(section, "h3", "Recipient enrollment");
       addProjection(section, state.teamEnrollment);
@@ -563,6 +618,16 @@
   }
 
   async function refreshTeamEnrollment(quiet = false) {
+    void fetchJson(api.teamSetup)
+      .then((setup) => {
+        state.teamSetup = setup;
+        if (state.view === "team_state") {
+          render();
+        }
+      })
+      .catch(() => {
+        // Older injected enrollment services intentionally use the manual compatibility UI.
+      });
     try {
       state.teamEnrollment = await fetchJson(api.teamEnrollment);
       if (state.view === "team_state") {
@@ -586,6 +651,131 @@
     } catch (_error) {
       state.teamPublication = null;
       announce("Team-state publication is unavailable. Nothing was published.");
+    }
+  }
+
+  async function inspectTeamSetup() {
+    try {
+      state.teamSetup = await fetchJson(api.teamSetupInspect, { method: "POST", body: "{}" });
+      state.teamSetupPreview = null;
+      render();
+      announce("GitHub identity and repository inspected for team setup.");
+    } catch (_error) {
+      announce("GitHub identity inspection failed. Team setup was not changed.");
+    }
+  }
+
+  async function enrollProductionTeam() {
+    let options = null;
+    let credential = null;
+    let response = null;
+    try {
+      options = await fetchJson(api.teamSetupEnroll, { method: "POST", body: "{}" });
+      credential = await navigator.credentials.create({ publicKey: creationOptions(options).publicKey });
+      response = serializeCredential(credential);
+      await fetchJson(api.teamEnrollmentVerify, {
+        method: "POST",
+        body: JSON.stringify({ response }),
+      });
+      state.teamSetup = { ...state.teamSetup, state: "enrolled", enrollment: "enrolled" };
+      render();
+      announce("Team recipient enrolled with the inspected GitHub identity.");
+    } catch (error) {
+      announce(
+        cancellation(error)
+          ? "Team enrollment cancelled. No recipient key was created."
+          : "Team enrollment could not complete. The project remains local-only."
+      );
+    } finally {
+      clearOptionBuffers(options);
+      clearSerializedCredential(response);
+      response = null;
+      credential = null;
+      options = null;
+    }
+  }
+
+  async function loadTeamSetupPreview(path, successMessage) {
+    try {
+      state.teamSetupPreview = await fetchJson(path, { method: "POST", body: "{}" });
+      render();
+      announce(successMessage);
+    } catch (_error) {
+      state.teamSetupPreview = null;
+      render();
+      announce("Team setup preview is unavailable. Nothing was changed.");
+    }
+  }
+
+  function previewTeamProtection() {
+    return loadTeamSetupPreview(
+      api.teamSetupProtectionPreview,
+      "Exact branch protection preview loaded for review."
+    );
+  }
+
+  function previewTeamPublication() {
+    return loadTeamSetupPreview(
+      api.teamSetupPublicationPreview,
+      "Exact encrypted publication preview loaded for review."
+    );
+  }
+
+  async function authorizeTeamSetup() {
+    const preview = state.teamSetupPreview;
+    if (!preview || !preview.payload) {
+      announce("Review the exact setup preview before authorizing it.");
+      return;
+    }
+    let payload = preview.payload;
+    let options = null;
+    let credential = null;
+    let response = null;
+    try {
+      options = await fetchJson(api.teamSetupOptions, {
+        method: "POST",
+        body: JSON.stringify({ payload }),
+      });
+      credential = await navigator.credentials.get({ publicKey: requestOptions(options).publicKey });
+      response = serializeCredential(credential);
+      const result = await fetchJson(api.teamSetupVerify, {
+        method: "POST",
+        body: JSON.stringify({ payload, response }),
+      });
+      state.teamSetupResult = result;
+      state.teamSetup = { ...state.teamSetup, ...result };
+      state.teamSetupPreview = null;
+      render();
+      announce(
+        result.state === "published"
+          ? "Encrypted team state published through the reviewed pull request."
+          : "Branch protection configured after WebAuthn authorization."
+      );
+    } catch (error) {
+      announce(
+        cancellation(error)
+          ? "Team setup authorization cancelled. Nothing was changed."
+          : "Team setup authorization failed. Review the exact preview again."
+      );
+    } finally {
+      clearOptionBuffers(options);
+      clearSerializedCredential(response);
+      payload = null;
+      response = null;
+      credential = null;
+      options = null;
+    }
+  }
+
+  async function cancelTeamSetup() {
+    try {
+      state.teamSetup = await fetchJson(api.teamSetupCancel, { method: "POST", body: "{}" });
+      state.teamSetupPreview = null;
+      state.teamSetupResult = null;
+      render();
+      announce("Team setup cancelled. No pending authority remains.");
+    } catch (_error) {
+      announce("Team setup cancellation failed; pending authority will expire.");
     }
   }
 

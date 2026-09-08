@@ -282,6 +282,7 @@ class ControlPlaneService:
         self._pending_team_enrollment: _PendingTeamEnrollment | None = None
         self._team_recipient: TeamRecipientRecord | None = None
         self._team_key_store: RecipientKeyStore | None = None
+        self._github_setup_bridge: object | None = None
         self._dev_observer: DevObserver | None = None
         self._observation_guard = threading.Lock()
         self._observation_state_guard = threading.Lock()
@@ -445,6 +446,7 @@ class ControlPlaneService:
         publication = self._publication_service
         if publication is None:
             raise ControlPlaneError() from None
+
         try:
             preview = publication.preview(now=self._now())
             return {
@@ -464,6 +466,29 @@ class ControlPlaneService:
             raise
         except Exception:  # noqa: BLE001 - fixed local-browser boundary
             raise ControlPlaneError() from None
+
+    def github_setup_status(self) -> dict[str, object]:
+        """Read the bounded CLI request without acquiring provider credentials."""
+        from intent_engineering.team_state.setup import load_setup_request
+
+        request = load_setup_request(self._runtime)
+        if request is None:
+            return {"state": "unconfigured"}
+        return {
+            "state": "setup_required",
+            "repository_id": request.preview.repository_id,
+            "preview_digest": request.preview.preview_digest,
+        }
+
+    async def github_setup_action(
+        self, action: str, *, payload: HumanDecisionPayload | None = None, response: bytes = b""
+    ) -> dict[str, object]:
+        from intent_engineering.team_state.setup import GitHubSetupBridge
+
+        if self._github_setup_bridge is None:
+            self._github_setup_bridge = GitHubSetupBridge(self)
+        bridge = cast(GitHubSetupBridge, self._github_setup_bridge)
+        return await bridge.action(action, payload=payload, response=response)
 
     def _team_identity(self, proof: bytes, authority: _Authority) -> GitHubIdentity:
         verifier = self._github_identity_verifier
@@ -2087,6 +2112,7 @@ class ControlPlaneService:
         self._pending_team_enrollment = None
         self._team_recipient = None
         self._team_key_store = None
+        self._github_setup_bridge = None
         self._shared_state_status = SharedStateRestoreStatus.NOT_REQUIRED
 
 

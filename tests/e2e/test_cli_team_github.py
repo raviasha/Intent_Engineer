@@ -156,8 +156,11 @@ def test_team_enable_github_requires_exact_preview_and_second_protection_confirm
     assert calls == [(preview_digest, None), (preview_digest, protection_digest)]
 
 
-def test_confirmed_cli_routes_to_control_plane_for_platform_webauthn(tmp_path: Path) -> None:
+def test_confirmed_cli_routes_to_control_plane_for_platform_webauthn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Catches the default CLI replacing required platform WebAuthn with a fixed failure."""
+    monkeypatch.setattr("intent_engineering.cli.dev.dev_command", lambda **_: None)
     project = _project(tmp_path)
     runner = CliRunner()
     env = {"GITHUB_REPOSITORY": "acme/project"}
@@ -187,7 +190,7 @@ def test_confirmed_cli_routes_to_control_plane_for_platform_webauthn(tmp_path: P
     assert result.exit_code == 4, repr(result.exception)
     payload = json.loads(result.stdout)
     assert payload["state"] == "webauthn_confirmation_required"
-    assert payload["control_plane_path"] == "/team-state"
+    assert payload["control_plane_path"] == "/"
 
 
 @pytest.mark.anyio

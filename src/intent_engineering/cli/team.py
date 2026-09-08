@@ -27,6 +27,10 @@ from intent_engineering.team_state.github import (
 )
 from intent_engineering.team_state.models import PreparedPublication, RecipientRecord
 from intent_engineering.team_state.publication import PublicationPreview
+from intent_engineering.team_state.suggestions import (
+    CodeSuggestionPreview,
+    preview_code_suggestions,
+)
 
 team_app = typer.Typer(help="Configure and inspect shared intent state.")
 team_enable_app = typer.Typer(help="Enable one reviewed team-state provider.")
@@ -46,6 +50,7 @@ class GitHubEnablePreview(StrictModel):
     )
     codeowners_suggestion: str
     workflow_suggestion: str
+    code_suggestions: CodeSuggestionPreview | None = None
     preview_digest: str
 
 
@@ -245,6 +250,11 @@ def build_github_enable_preview(project: Path, repository: str) -> GitHubEnableP
             "    steps:\n"
             "      - run: intent check --shared-state\n"
         )
+        suggestions = (
+            preview_code_suggestions(project, codeowners_suggestion, workflow_suggestion)
+            if (project / ".git").exists()
+            else None
+        )
         payload: dict[str, object] = {
             "actor": runtime.config.local_actor,
             "codeowners_path": ".github/CODEOWNERS",
@@ -253,6 +263,9 @@ def build_github_enable_preview(project: Path, repository: str) -> GitHubEnableP
             "repository_id": repository_id,
             "workflow_path": ".github/workflows/intent-state.yml",
             "workflow_suggestion": workflow_suggestion,
+            "code_suggestions": None
+            if suggestions is None
+            else suggestions.model_dump(mode="json"),
         }
         return GitHubEnablePreview(
             project_id=runtime.config.project_id,
@@ -260,6 +273,7 @@ def build_github_enable_preview(project: Path, repository: str) -> GitHubEnableP
             actor=runtime.config.local_actor,
             codeowners_suggestion=codeowners_suggestion,
             workflow_suggestion=workflow_suggestion,
+            code_suggestions=suggestions,
             preview_digest=_digest(payload),
         )
     finally:
@@ -284,11 +298,18 @@ async def run_confirmed_github_enablement(
             preview_confirmation=preview_confirmation,
             protection_confirmation=protection_confirmation,
         )
+    from intent_engineering.team_state.setup import save_setup_request
+
+    runtime = load_runtime(project)
+    try:
+        save_setup_request(runtime, preview)
+    finally:
+        runtime.close()
     return GitHubEnableResult(
         state="webauthn_confirmation_required",
         repository_id=preview.repository_id,
         preview_digest=preview.preview_digest,
-        control_plane_path="/team-state",
+        control_plane_path="/",
     )
 
 
@@ -319,6 +340,10 @@ def enable_github_command(
 
     result = anyio.run(run)
     emit(result, output_format)
+    if result.state == "webauthn_confirmation_required":
+        from intent_engineering.cli.dev import dev_command
+
+        dev_command(project=project, prd=None, no_open=False, offline=False, status=False)
     if result.state != "published":
         raise typer.Exit(4)
 

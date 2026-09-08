@@ -38,6 +38,7 @@ from intent_engineering.mutations.models import ApprovalRecord, WritePlan
 from intent_engineering.storage.jsonl.approval_store import parse_immutable_records
 from intent_engineering.storage.secure import SecureFile, configured_graph_relative
 from intent_engineering.team_state.archive import build_archive
+from intent_engineering.team_state.crypto import EncryptedBundle, decrypt_bundle
 from intent_engineering.team_state.models import (
     CANONICAL_STATE_PATHS,
     CanonicalStateFile,
@@ -47,7 +48,12 @@ from intent_engineering.team_state.models import (
     RemoteStateSnapshot,
     TeamStateManifest,
 )
-from intent_engineering.team_state.restore import _git_executable_token, seal_state_payload
+from intent_engineering.team_state.restore import (
+    StateSignatureEnvelope,
+    _git_executable_token,
+    _manifest_aad,
+    seal_state_payload,
+)
 from intent_engineering.validation import validate_canonical_snapshot
 
 _GENESIS_PARENT = "sha256:" + "0" * 64
@@ -548,8 +554,8 @@ class PublicationService:
             )
             if not validation.valid or validation.graph_version is None:
                 raise ValueError("canonical publication state is invalid")
-            config = ProjectConfig.model_validate(
-                load_strict_yaml_mapping_bytes(files["config.yaml"])
+            config = ProjectConfig.model_validate_json(
+                json.dumps(load_strict_yaml_mapping_bytes(files["config.yaml"]))
             )
             if (
                 config != self._runtime.config
@@ -724,6 +730,106 @@ class PublicationService:
         )
         self._pending = (preview, prepared, archive, authority_bytes, parent_commit)
         return preview
+
+    def pending_publication(self) -> PreparedPublication:
+        """Return only the encrypted draft; it carries no human authority."""
+        if self._pending is None:
+            raise ValueError("publication draft unavailable")
+        return self._pending[1]
+
+    def recover_preview(
+        self,
+        prepared: PreparedPublication,
+        *,
+        recipient_private_key: bytes,
+        now: datetime,
+    ) -> PublicationPreview:
+        """Reauthenticate an encrypted draft against current state and issue fresh authority."""
+        plaintext = b""
+        signing: dict[str, bytes] = {}
+        try:
+            prepared = PreparedPublication.model_validate(prepared.model_dump(mode="python"))
+            current = self.preview(now=now)
+            pending = self._pending
+            assert pending is not None
+            _, _, archive, authority_bytes, parent_commit = pending
+            manifest = prepared.manifest
+            if (
+                manifest.project_id != current.manifest.project_id
+                or manifest.repository_id != current.manifest.repository_id
+                or manifest.graph_version != current.manifest.graph_version
+                or manifest.parent_bundle_digest != current.manifest.parent_bundle_digest
+                or manifest.recipient_key_ids != current.manifest.recipient_key_ids
+                or manifest.required_signature_ids != current.manifest.required_signature_ids
+                or manifest.created_at > now
+            ):
+                raise ValueError("publication draft changed")
+            envelope = StateSignatureEnvelope.model_validate_json(prepared.signatures)
+            signed = json.dumps(
+                {
+                    "schema_version": 1,
+                    "manifest_digest": self._digest(prepared.manifest_bytes),
+                    "bundle_digest": manifest.bundle_digest,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+            if (
+                envelope.manifest_digest != self._digest(prepared.manifest_bytes)
+                or envelope.bundle_digest != manifest.bundle_digest
+                or tuple(item.signature_id for item in envelope.signatures)
+                != manifest.required_signature_ids
+            ):
+                raise ValueError("publication draft signatures changed")
+            _, signing, _, _, _ = self._authority_material(
+                self._current_authority(),
+                project_id=manifest.project_id,
+                repository_id=manifest.repository_id,
+            )
+            for signature in envelope.signatures:
+                Ed25519PrivateKey.from_private_bytes(
+                    signing[signature.signature_id]
+                ).public_key().verify(
+                    base64.urlsafe_b64decode(
+                        signature.signature + "=" * (-len(signature.signature) % 4)
+                    ),
+                    signed,
+                )
+            aad = _manifest_aad(
+                project_id=manifest.project_id,
+                repository_id=manifest.repository_id,
+                graph_version=manifest.graph_version,
+                parent_bundle_digest=manifest.parent_bundle_digest,
+                created_at=manifest.created_at,
+                recipient_key_ids=manifest.recipient_key_ids,
+                required_signature_ids=manifest.required_signature_ids,
+            )
+            plaintext = decrypt_bundle(
+                EncryptedBundle.model_validate_json(prepared.bundle), recipient_private_key, aad
+            )
+            if plaintext != archive:
+                raise ValueError("publication draft snapshot changed")
+            payload = HumanDecisionPayload.model_validate_json(
+                current.payload.model_copy(
+                    update={"result_digest": manifest.bundle_digest}
+                ).model_dump_json()
+            )
+            preview = PublicationPreview(
+                payload=payload,
+                manifest=manifest,
+                snapshot_digest=current.snapshot_digest,
+                recipient_key_ids=manifest.recipient_key_ids,
+                branch=prepared.branch,
+            )
+            self._pending = (preview, prepared, archive, authority_bytes, parent_commit)
+            return preview
+        except BaseException:
+            self._pending = None
+            raise
+        finally:
+            plaintext = b""
+            recipient_private_key = b""
+            signing.clear()
 
     def prepare(
         self,
