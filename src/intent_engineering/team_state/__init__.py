@@ -10,6 +10,15 @@ from intent_engineering.team_state.crypto import (
     decrypt_bundle,
     encrypt_bundle,
 )
+from intent_engineering.team_state.keys import (
+    GitHubIdentity,
+    GitHubIdentityVerifier,
+    InMemoryRecipientKeyStore,
+    KeyringRecipientKeyStore,
+    RecipientEnrollmentBinding,
+    RecipientKeyStore,
+    RecipientKeyStoreError,
+)
 from intent_engineering.team_state.models import (
     BundleInventory,
     BundleInventoryEntry,
@@ -42,9 +51,16 @@ __all__ = [
     "CanonicalStateSnapshot",
     "EncryptedBundle",
     "EnvironmentTrustProvider",
+    "GitHubIdentity",
+    "GitHubIdentityVerifier",
     "GitSharedStateRestorer",
+    "InMemoryRecipientKeyStore",
+    "KeyringRecipientKeyStore",
     "PreparedPublication",
     "PublicationLineage",
+    "RecipientEnrollmentBinding",
+    "RecipientKeyStore",
+    "RecipientKeyStoreError",
     "RecipientRecord",
     "RemoteStateSnapshot",
     "RestoredSnapshot",

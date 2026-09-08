@@ -140,6 +140,29 @@ class RegistrationVerifyRequest(HttpRequestModel):
     response: dict[str, object]
 
 
+class TeamEnrollmentOptionsRequest(HttpRequestModel):
+    """One bounded opaque proof consumed only by the GitHub identity verifier."""
+
+    identity_proof: str = Field(min_length=1, max_length=16 * 1024)
+
+    @field_validator("identity_proof", mode="before")
+    @classmethod
+    def require_exact_proof(cls, value: object) -> str:
+        if type(value) is not str or len(value.encode("utf-8")) > 16 * 1024:
+            raise ValueError("invalid team enrollment request")
+        return value
+
+
+class TeamEnrollmentVerifyRequest(HttpRequestModel):
+    """The WebAuthn registration response for a server-held GitHub identity."""
+
+    response: dict[str, object]
+
+
+class TeamEnrollmentCancelRequest(HttpRequestModel):
+    """An intentionally empty cancellation request."""
+
+
 class DecisionOptionsRequest(HttpRequestModel):
     """One canonical decision payload for WebAuthn option issuance."""
 
@@ -473,6 +496,9 @@ __all__ = [
     "RegistrationOptionsRequest",
     "RegistrationVerifyRequest",
     "StatusResponse",
+    "TeamEnrollmentCancelRequest",
+    "TeamEnrollmentOptionsRequest",
+    "TeamEnrollmentVerifyRequest",
     "canonical_json_object",
     "detach_response_mapping",
     "parse_request_bytes",

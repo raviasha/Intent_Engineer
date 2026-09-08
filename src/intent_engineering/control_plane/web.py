@@ -29,6 +29,9 @@ from intent_engineering.control_plane.http_models import (
     RegistrationVerifyRequest,
     ReviewedTestRunRequest,
     StatusResponse,
+    TeamEnrollmentCancelRequest,
+    TeamEnrollmentOptionsRequest,
+    TeamEnrollmentVerifyRequest,
     canonical_json_object,
     detach_response_mapping,
     parse_request_bytes,
@@ -36,6 +39,7 @@ from intent_engineering.control_plane.http_models import (
 )
 from intent_engineering.control_plane.models import CredentialRecord
 from intent_engineering.control_plane.service import ControlPlaneService
+from intent_engineering.team_state.models import RecipientRecord as TeamRecipientRecord
 
 _BODY_STATE_KEY = "intent.control-plane.raw-body"
 _CSRF_COOKIE = "intent_csrf"
@@ -66,6 +70,10 @@ _STATIC_METHODS = {
     "/api/v1/clarifications/answers/discard": "POST",
     "/api/v1/webauthn/register/options": "POST",
     "/api/v1/webauthn/register/verify": "POST",
+    "/api/v1/team/enrollment": "GET",
+    "/api/v1/team/enrollment/options": "POST",
+    "/api/v1/team/enrollment/verify": "POST",
+    "/api/v1/team/enrollment/cancel": "POST",
     "/api/v1/decisions/options": "POST",
     "/api/v1/decisions/verify": "POST",
 }
@@ -830,6 +838,106 @@ def _make_handlers(
                 detached = cast(CredentialRecord, None)
         return _end_handler(request, signal, response)
 
+    async def team_enrollment_status_endpoint(request: Request) -> Response:
+        response: Response | None = None
+        signal: BaseException | None = None
+        result: dict[str, object] | None = None
+        try:
+            result = service.team_enrollment_status()
+            response = _json_response(result)
+        except Exception:  # noqa: BLE001 - fixed browser boundary
+            response = _fixed_response(503)
+        except BaseException as caught:  # noqa: BLE001 - scrub exact cancellation path
+            caught.__traceback__ = None
+            caught.__cause__ = None
+            caught.__context__ = None
+            signal = caught
+        finally:
+            result = None
+        return _end_handler(request, signal, response)
+
+    async def team_enrollment_options_endpoint(request: Request) -> Response:
+        response: Response | None = None
+        signal: BaseException | None = None
+        model: TeamEnrollmentOptionsRequest | None = None
+        proof = b""
+        options = b""
+        try:
+            model = cast(
+                TeamEnrollmentOptionsRequest,
+                _parse_body(request, TeamEnrollmentOptionsRequest),
+            )
+            proof = model.identity_proof.encode("utf-8")
+            options = service.team_enrollment_options(proof)
+            response = _json_response(parse_response_bytes(options))
+        except _HandlerRequestError:
+            response = _fixed_response(400)
+        except Exception:  # noqa: BLE001 - fixed browser boundary
+            response = _fixed_response(503)
+        except BaseException as caught:  # noqa: BLE001 - scrub exact cancellation path
+            caught.__traceback__ = None
+            caught.__cause__ = None
+            caught.__context__ = None
+            signal = caught
+        finally:
+            model = None
+            proof = b""
+            options = b""
+        return _end_handler(request, signal, response)
+
+    async def team_enrollment_verify_endpoint(request: Request) -> Response:
+        response: Response | None = None
+        signal: BaseException | None = None
+        model: TeamEnrollmentVerifyRequest | None = None
+        encoded_response = b""
+        recipient: TeamRecipientRecord | None = None
+        try:
+            model = cast(
+                TeamEnrollmentVerifyRequest,
+                _parse_body(request, TeamEnrollmentVerifyRequest),
+            )
+            encoded_response = canonical_json_object(model.response)
+            enrolled = service.complete_team_enrollment(encoded_response)
+            recipient = TeamRecipientRecord.model_validate(enrolled.model_dump(mode="python"))
+            response = _json_response(recipient.model_dump(mode="json"))
+        except _HandlerRequestError:
+            response = _fixed_response(400)
+        except Exception:  # noqa: BLE001 - fixed browser boundary
+            response = _fixed_response(503)
+        except BaseException as caught:  # noqa: BLE001 - scrub exact cancellation path
+            caught.__traceback__ = None
+            caught.__cause__ = None
+            caught.__context__ = None
+            signal = caught
+        finally:
+            model = None
+            encoded_response = b""
+            recipient = None
+            if "enrolled" in locals():
+                enrolled = cast(TeamRecipientRecord, None)
+        return _end_handler(request, signal, response)
+
+    async def team_enrollment_cancel_endpoint(request: Request) -> Response:
+        response: Response | None = None
+        signal: BaseException | None = None
+        result: dict[str, object] | None = None
+        try:
+            _parse_body(request, TeamEnrollmentCancelRequest)
+            result = service.cancel_team_enrollment()
+            response = _json_response(result)
+        except _HandlerRequestError:
+            response = _fixed_response(400)
+        except Exception:  # noqa: BLE001 - fixed browser boundary
+            response = _fixed_response(503)
+        except BaseException as caught:  # noqa: BLE001 - scrub exact cancellation path
+            caught.__traceback__ = None
+            caught.__cause__ = None
+            caught.__context__ = None
+            signal = caught
+        finally:
+            result = None
+        return _end_handler(request, signal, response)
+
     async def decision_options_endpoint(request: Request) -> Response:
         response: Response | None = None
         signal: BaseException | None = None
@@ -889,6 +997,10 @@ def _make_handlers(
         "clarification_answer_discard": clarification_answer_discard_endpoint,
         "registration_options": registration_options_endpoint,
         "registration_verify": registration_verify_endpoint,
+        "team_enrollment_status": team_enrollment_status_endpoint,
+        "team_enrollment_options": team_enrollment_options_endpoint,
+        "team_enrollment_verify": team_enrollment_verify_endpoint,
+        "team_enrollment_cancel": team_enrollment_cancel_endpoint,
         "decision_options": decision_options_endpoint,
         "decision_verify": decision_verify_endpoint,
     }
@@ -951,6 +1063,26 @@ def build_control_plane_app(
             Route(
                 "/api/v1/webauthn/register/verify",
                 handlers["registration_verify"],
+                methods=["POST"],
+            ),
+            Route(
+                "/api/v1/team/enrollment",
+                handlers["team_enrollment_status"],
+                methods=["GET"],
+            ),
+            Route(
+                "/api/v1/team/enrollment/options",
+                handlers["team_enrollment_options"],
+                methods=["POST"],
+            ),
+            Route(
+                "/api/v1/team/enrollment/verify",
+                handlers["team_enrollment_verify"],
+                methods=["POST"],
+            ),
+            Route(
+                "/api/v1/team/enrollment/cancel",
+                handlers["team_enrollment_cancel"],
                 methods=["POST"],
             ),
             Route(

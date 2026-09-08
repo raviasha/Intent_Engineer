@@ -9,6 +9,10 @@
     clarificationAnswerDiscard: "/api/v1/clarifications/answers/discard",
     registrationOptions: "/api/v1/webauthn/register/options",
     registrationVerify: "/api/v1/webauthn/register/verify",
+    teamEnrollment: "/api/v1/team/enrollment",
+    teamEnrollmentOptions: "/api/v1/team/enrollment/options",
+    teamEnrollmentVerify: "/api/v1/team/enrollment/verify",
+    teamEnrollmentCancel: "/api/v1/team/enrollment/cancel",
     decisionOptions: "/api/v1/decisions/options",
     decisionVerify: "/api/v1/decisions/verify",
     developmentObservation: "/api/v1/development/observation",
@@ -28,6 +32,7 @@
     selectedNodeIds: [],
     proposalGeneration: 0,
     developmentObservation: null,
+    teamEnrollment: null,
   };
   let csrfToken = readCsrfBootstrap();
 
@@ -366,7 +371,22 @@
     if (state.status) {
       addProjection(section, state.status);
     }
-    section.append(actionButton("Refresh team-state readiness", refreshStatus));
+    if (state.teamEnrollment) {
+      addText(section, "h3", "Recipient enrollment");
+      addProjection(section, state.teamEnrollment);
+    }
+    const proofLabel = document.createElement("label");
+    proofLabel.textContent = "GitHub device authorization proof";
+    const proof = document.createElement("input");
+    proof.type = "password";
+    proof.autocomplete = "off";
+    proof.maxLength = 16384;
+    proofLabel.append(proof);
+    section.append(
+      proofLabel,
+      actionButton("Verify GitHub identity and enroll this device", () => enrollTeamRecipient(proof)),
+      actionButton("Refresh team-state readiness", refreshTeamEnrollment)
+    );
     return section;
   }
 
@@ -535,6 +555,20 @@
     }
   }
 
+  async function refreshTeamEnrollment(quiet = false) {
+    try {
+      state.teamEnrollment = await fetchJson(api.teamEnrollment);
+      if (state.view === "team_state") {
+        render();
+      }
+      if (!quiet) {
+        announce("Team recipient status updated.");
+      }
+    } catch (_error) {
+      announce("Team recipient status is unavailable.");
+    }
+  }
+
   async function loadInbox() {
     try {
       state.inbox = await fetchJson(api.inbox);
@@ -627,6 +661,8 @@
       await loadInbox();
     } else if (view === "proposal") {
       await loadPreview();
+    } else if (view === "team_state") {
+      await refreshTeamEnrollment();
     }
   }
 
@@ -772,6 +808,58 @@
           : "Device registration could not complete. No decision was applied."
       );
     } finally {
+      clearOptionBuffers(options);
+      clearSerializedCredential(response);
+      result = null;
+      response = null;
+      credential = null;
+      options = null;
+    }
+  }
+
+  async function enrollTeamRecipient(field) {
+    let identityProof = typeof field.value === "string" ? field.value : "";
+    let options = null;
+    let credential = null;
+    let response = null;
+    let result = null;
+    let completed = false;
+    if (!identityProof) {
+      announce("Complete GitHub device authorization before team enrollment.");
+      return;
+    }
+    try {
+      options = await fetchJson(api.teamEnrollmentOptions, {
+        method: "POST",
+        body: JSON.stringify({ identity_proof: identityProof }),
+      });
+      field.value = "";
+      identityProof = "";
+      credential = await navigator.credentials.create({ publicKey: creationOptions(options).publicKey });
+      response = serializeCredential(credential);
+      result = await fetchJson(api.teamEnrollmentVerify, {
+        method: "POST",
+        body: JSON.stringify({ response }),
+      });
+      completed = true;
+      announce("Team recipient enrolled after GitHub identity and WebAuthn verification.");
+      await refreshTeamEnrollment(true);
+    } catch (error) {
+      if (!completed) {
+        try {
+          await fetchJson(api.teamEnrollmentCancel, { method: "POST", body: "{}" });
+        } catch (_cancelError) {
+          // The server also expires abandoned enrollment authority.
+        }
+      }
+      announce(
+        cancellation(error)
+          ? "Team enrollment cancelled. No recipient key was created."
+          : "Team enrollment could not complete. The project remains local-only."
+      );
+    } finally {
+      field.value = "";
+      identityProof = "";
       clearOptionBuffers(options);
       clearSerializedCredential(response);
       result = null;

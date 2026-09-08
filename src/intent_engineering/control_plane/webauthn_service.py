@@ -429,7 +429,14 @@ class WebAuthnService:
         return result
 
     def _register(
-        self, response: bytes, actor: str, origin: str, now: datetime
+        self,
+        response: bytes,
+        actor: str,
+        origin: str,
+        now: datetime,
+        *,
+        github_account_id: str | None = None,
+        github_login: str | None = None,
     ) -> CredentialRecord:
         challenge = b""
         request = None
@@ -475,6 +482,9 @@ class WebAuthnService:
                     public_key=_b64url(verified.public_key),
                     sign_count=verified.sign_count,
                     created_at=verified_now,
+                    local_only=github_account_id is None and github_login is None,
+                    github_account_id=github_account_id,
+                    github_login=github_login,
                 )
                 if not self._credentials.put(credential):
                     raise ValueError("credential collision")
@@ -484,16 +494,33 @@ class WebAuthnService:
             challenge = b""
             request = None
 
-    def register(self, response: bytes, actor: str, origin: str, now: datetime) -> CredentialRecord:
+    def register(
+        self,
+        response: bytes,
+        actor: str,
+        origin: str,
+        now: datetime,
+        *,
+        github_account_id: str | None = None,
+        github_login: str | None = None,
+    ) -> CredentialRecord:
         """Verify and persist one repository-bound credential enrollment."""
         result: CredentialRecord | None = None
         try:
-            result = self._register(response, actor, origin, now)
+            result = self._register(
+                response,
+                actor,
+                origin,
+                now,
+                github_account_id=github_account_id,
+                github_login=github_login,
+            )
         except Exception:  # noqa: BLE001 - fixed public authority boundary
             result = None
         finally:
             response = b""
             actor = origin = ""
+            github_account_id = github_login = None
             now = _REDACTED_TIME
         if result is None:
             raise HumanAuthorityError("human authority unavailable") from None
