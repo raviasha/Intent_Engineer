@@ -11,6 +11,12 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, field_validat
 
 from intent_engineering.assessment.models import AssessmentReport, NodeScorecard
 from intent_engineering.control_plane.models import HumanDecisionPayload
+from intent_engineering.intent_workflow.enrichment import EnrichmentQuestion
+from intent_engineering.intent_workflow.enrichment_models import EnrichmentSession
+from intent_engineering.intent_workflow.models import (
+    ClarificationIntentProposal,
+    ClarificationProposalSubmission,
+)
 
 MAX_HTTP_BODY_BYTES = 256 * 1024
 MAX_HTTP_RESPONSE_BYTES = 1024 * 1024
@@ -24,6 +30,9 @@ _PAGE_CURSOR_PATTERN = re.compile(r"^page:[0-9a-f]{64}:[1-9][0-9]{0,3}$")
 _MAX_ASSESSMENT_NODES = 2_000
 _MAX_ASSESSMENT_ROWS = 100
 _MAX_RUBRIC_CHECKS_PER_DIMENSION = 64
+_ENRICHMENT_SESSION_PATTERN = re.compile(r"^refine:[^\x00-\x20\x7f]{1,249}$")
+_CONTROL = re.compile(r"[\x00-\x1f\x7f]")
+_ANSWER_CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 
 
 def require_exact_json(value: object, *, maximum_bytes: int = MAX_HTTP_BODY_BYTES) -> None:
@@ -260,6 +269,106 @@ class ReviewedTestRunRequest(HttpRequestModel):
         return value
 
 
+class EnrichmentStartRequest(HttpRequestModel):
+    """Start one bounded voluntary improvement session."""
+
+    minutes: Literal[5, 15, 30] | None = None
+    focus: str | None = Field(default=None, min_length=1, max_length=256)
+
+    @field_validator("minutes", mode="before")
+    @classmethod
+    def require_exact_minutes(cls, value: object) -> int | None:
+        if value is not None and type(value) is not int:
+            raise ValueError("invalid enrichment request")
+        return value
+
+    @field_validator("focus", mode="before")
+    @classmethod
+    def require_exact_focus(cls, value: object) -> str | None:
+        if value is not None and (
+            type(value) is not str
+            or not value
+            or len(value.encode("utf-8")) > 256
+            or _CONTROL.search(value) is not None
+        ):
+            raise ValueError("invalid enrichment request")
+        return value
+
+    @model_validator(mode="after")
+    def require_scope(self) -> EnrichmentStartRequest:
+        if self.minutes is None and self.focus is None:
+            raise ValueError("invalid enrichment request")
+        return self
+
+
+class EnrichmentSessionRequest(HttpRequestModel):
+    """Select one durable enrichment session without placing it in a URL."""
+
+    session_id: str = Field(min_length=8, max_length=256)
+
+    @field_validator("session_id", mode="before")
+    @classmethod
+    def require_exact_session(cls, value: object) -> str:
+        if type(value) is not str or _ENRICHMENT_SESSION_PATTERN.fullmatch(value) is None:
+            raise ValueError("invalid enrichment request")
+        return value
+
+
+class EnrichmentGapRequest(EnrichmentSessionRequest):
+    """Select the exact current gap for a skip operation."""
+
+    gap_id: str = Field(min_length=1, max_length=256)
+
+    @field_validator("gap_id", mode="before")
+    @classmethod
+    def require_exact_gap(cls, value: object) -> str:
+        if (
+            type(value) is not str
+            or not value
+            or len(value.encode("utf-8")) > 256
+            or _CONTROL.search(value) is not None
+        ):
+            raise ValueError("invalid enrichment request")
+        return value
+
+
+class EnrichmentAnswerRequest(EnrichmentGapRequest):
+    """Carry one transient human answer to the evidence-capture boundary."""
+
+    answer: str = Field(min_length=1, max_length=_MAX_ANSWER_BYTES)
+
+    @field_validator("answer", mode="before")
+    @classmethod
+    def require_exact_answer(cls, value: object) -> str:
+        if (
+            type(value) is not str
+            or not value
+            or len(value.encode("utf-8")) > _MAX_ANSWER_BYTES
+            or _ANSWER_CONTROL.search(value) is not None
+        ):
+            raise ValueError("invalid enrichment request")
+        return value
+
+
+class EnrichmentProposalRequest(EnrichmentSessionRequest):
+    """Submit an exact governed proposal; it remains review-only."""
+
+    submission: ClarificationProposalSubmission
+
+    @field_validator("submission", mode="before")
+    @classmethod
+    def require_exact_submission(cls, value: object) -> ClarificationProposalSubmission:
+        encoded: bytes | None = None
+        try:
+            if type(value) is not dict:
+                raise ValueError("invalid enrichment request")
+            encoded = _canonical_json_bytes(value)
+            return ClarificationProposalSubmission.model_validate_json(encoded, strict=True)
+        finally:
+            value = None
+            encoded = None
+
+
 class _HttpResponseModel(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True, validate_default=True)
 
@@ -379,6 +488,67 @@ class ClarificationAnswerDiscardResponse(_HttpResponseModel):
     schema_version: Literal[1] = 1
     status: Literal["discarded"]
     answer_id: str = Field(pattern=_ANSWER_ID_PATTERN.pattern)
+
+
+class EnrichmentSessionResponse(_HttpResponseModel):
+    """One session status and, only while open, its single current question."""
+
+    schema_version: Literal[1] = 1
+    session: EnrichmentSession
+    question: EnrichmentQuestion | None = None
+
+    @field_validator("session", mode="before")
+    @classmethod
+    def require_exact_enrichment_session(cls, value: object) -> EnrichmentSession:
+        if type(value) is not dict:
+            raise ValueError("invalid enrichment response")
+        return EnrichmentSession.model_validate_json(_canonical_json_bytes(value), strict=True)
+
+    @field_validator("question", mode="before")
+    @classmethod
+    def require_exact_enrichment_question(cls, value: object) -> EnrichmentQuestion | None:
+        if value is None:
+            return None
+        if type(value) is not dict:
+            raise ValueError("invalid enrichment response")
+        return EnrichmentQuestion.model_validate_json(_canonical_json_bytes(value), strict=True)
+
+    @model_validator(mode="after")
+    def require_one_current_question(self) -> EnrichmentSessionResponse:
+        if self.session.status == "open":
+            if (
+                self.question is None
+                or self.session.current_gap_id is None
+                or self.question.gap_id != self.session.current_gap_id
+            ):
+                raise ValueError("invalid enrichment response")
+        elif self.question is not None:
+            raise ValueError("invalid enrichment response")
+        return self
+
+
+class EnrichmentProposalResponse(_HttpResponseModel):
+    """A governed proposal awaiting the existing review and approval path."""
+
+    schema_version: Literal[1] = 1
+    session_id: str = Field(min_length=8, max_length=256)
+    proposal: ClarificationIntentProposal
+
+    @field_validator("session_id", mode="before")
+    @classmethod
+    def require_exact_session_id(cls, value: object) -> str:
+        if type(value) is not str or _ENRICHMENT_SESSION_PATTERN.fullmatch(value) is None:
+            raise ValueError("invalid enrichment response")
+        return value
+
+    @field_validator("proposal", mode="before")
+    @classmethod
+    def require_exact_enrichment_proposal(cls, value: object) -> ClarificationIntentProposal:
+        if type(value) is not dict:
+            raise ValueError("invalid enrichment response")
+        return ClarificationIntentProposal.model_validate_json(
+            _canonical_json_bytes(value), strict=True
+        )
 
 
 def _canonical_json_bytes(value: object) -> bytes:

@@ -9,12 +9,13 @@ import os
 import re
 import secrets
 import threading
+import traceback
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import PurePosixPath
 from types import MappingProxyType
-from typing import cast
+from typing import Literal, cast
 
 from intent_engineering.assessment.models import AssessmentReport, AssessmentSnapshot, NodeScorecard
 from intent_engineering.assessment.service import GraphAssessmentService
@@ -41,6 +42,8 @@ from intent_engineering.control_plane.http_models import (
     MAX_HTTP_RESPONSE_BYTES,
     AssessmentNodeResponse,
     AssessmentResponse,
+    EnrichmentProposalResponse,
+    EnrichmentSessionResponse,
     require_exact_json,
 )
 from intent_engineering.control_plane.models import (
@@ -84,7 +87,13 @@ from intent_engineering.intent_workflow.dev_observer import (
     ObservationResult,
     TestRunResult,
 )
-from intent_engineering.intent_workflow.models import ClarificationIntentProposal, ProposalKind
+from intent_engineering.intent_workflow.enrichment import GraphEnrichmentService
+from intent_engineering.intent_workflow.enrichment_models import EnrichmentSession
+from intent_engineering.intent_workflow.models import (
+    ClarificationIntentProposal,
+    ClarificationProposalSubmission,
+    ProposalKind,
+)
 from intent_engineering.intent_workflow.onboarding import (
     OnboardingRuntime,
     OnboardingState,
@@ -360,6 +369,19 @@ class ControlPlaneService:
             raise TypeError("invalid publication service")
         self._publication_service = publication_service
         self._assessment_service = GraphAssessmentService(clock=self._clock)
+        enrichment_proposals = ClarificationCoordinator(
+            graph_store=runtime.graph_store,
+            evidence_store=runtime.evidence_store,
+            proposal_store=runtime.intent_proposals,
+            transactions=runtime.transactions,
+            config=runtime.config,
+        )
+        self._enrichment_service = GraphEnrichmentService(
+            runtime,
+            actor=runtime.config.local_actor,
+            clock=self._clock,
+            proposal_service=enrichment_proposals,
+        )
         self._assessment_cursor_key = bytearray(secrets.token_bytes(32))
         self._team_enrollment_guard = threading.RLock()
         self._team_enrollment_blocked = False
@@ -384,6 +406,19 @@ class ControlPlaneService:
             verifier=webauthn_verifier,
         )
         self._restore_team_recipient()
+
+    @staticmethod
+    def _scrub_enrichment_signal(error: BaseException) -> BaseException:
+        old_traceback = error.__traceback__
+        error.args = ()
+        error.__dict__.clear()
+        error.__traceback__ = None
+        error.__cause__ = None
+        error.__context__ = None
+        if old_traceback is not None:
+            traceback.clear_frames(old_traceback)
+        old_traceback = None
+        return error
 
     @staticmethod
     def _recipient_matches_binding(
@@ -1540,6 +1575,117 @@ class ControlPlaneService:
         if failed or result is None:
             raise ControlPlaneError() from None
         return result
+
+    def _enrichment_projection(self, session: EnrichmentSession) -> dict[str, object]:
+        if type(session) is not EnrichmentSession:
+            raise ValueError("invalid enrichment session")
+        question = (
+            self._enrichment_service.next_question(session.id) if session.status == "open" else None
+        )
+        return EnrichmentSessionResponse.model_validate(
+            {
+                "schema_version": 1,
+                "session": session.model_dump(mode="json"),
+                "question": None if question is None else question.model_dump(mode="json"),
+            }
+        ).model_dump(mode="json")
+
+    def _enrichment_boundary(
+        self,
+        operation: Callable[[], EnrichmentSession],
+    ) -> dict[str, object]:
+        result: dict[str, object] | None = None
+        signal: BaseException | None = None
+        failed = False
+        try:
+            result = self._enrichment_projection(operation())
+        except Exception as caught:  # noqa: BLE001 - fixed browser boundary
+            self._scrub_enrichment_signal(caught)
+            failed = True
+        except BaseException as caught:  # noqa: BLE001 - preserve cancellation identity
+            signal = self._scrub_enrichment_signal(caught)
+        finally:
+            operation = cast(Callable[[], EnrichmentSession], None)
+        if signal is not None:
+            detached = signal
+            signal = None
+            raise detached.with_traceback(None)
+        if failed or result is None:
+            raise ControlPlaneError() from None
+        return result
+
+    def enrichment_start(
+        self,
+        minutes: Literal[5, 15, 30] | None,
+        focus: str | None,
+    ) -> dict[str, object]:
+        """Start one voluntary session and return its single current question."""
+        return self._enrichment_boundary(lambda: self._enrichment_service.start(minutes, focus))
+
+    def enrichment_current(self, session_id: str) -> dict[str, object]:
+        """Refresh one durable session without exposing answers."""
+        return self._enrichment_boundary(lambda: self._enrichment_service.current(session_id))
+
+    def enrichment_answer(
+        self,
+        session_id: str,
+        gap_id: str,
+        answer: str,
+    ) -> dict[str, object]:
+        """Capture one human answer and immediately discard transient raw input."""
+        operation = lambda: self._enrichment_service.answer(session_id, gap_id, answer)
+        try:
+            return self._enrichment_boundary(operation)
+        finally:
+            operation = cast(Callable[[], EnrichmentSession], None)
+            answer = ""
+
+    def enrichment_skip(self, session_id: str, gap_id: str) -> dict[str, object]:
+        """Skip exactly the current gap."""
+        return self._enrichment_boundary(lambda: self._enrichment_service.skip(session_id, gap_id))
+
+    def enrichment_pause(self, session_id: str) -> dict[str, object]:
+        """Pause one open session while retaining only evidence references."""
+        return self._enrichment_boundary(lambda: self._enrichment_service.pause(session_id))
+
+    def enrichment_resume(self, session_id: str) -> dict[str, object]:
+        """Resume one paused session against a fresh authoritative snapshot."""
+        return self._enrichment_boundary(lambda: self._enrichment_service.resume(session_id))
+
+    def enrichment_propose(
+        self,
+        session_id: str,
+        submission: ClarificationProposalSubmission,
+    ) -> dict[str, object]:
+        """Create only a governed review proposal; never apply graph changes."""
+        proposal: ClarificationIntentProposal | None = None
+        signal: BaseException | None = None
+        failed = False
+        try:
+            proposal = self._enrichment_service.propose(session_id, submission)
+            return EnrichmentProposalResponse.model_validate(
+                {
+                    "schema_version": 1,
+                    "session_id": session_id,
+                    "proposal": proposal.model_dump(mode="json"),
+                }
+            ).model_dump(mode="json")
+        except Exception as caught:  # noqa: BLE001 - fixed browser boundary
+            self._scrub_enrichment_signal(caught)
+            failed = True
+        except BaseException as caught:  # noqa: BLE001 - preserve cancellation identity
+            signal = self._scrub_enrichment_signal(caught)
+        finally:
+            session_id = ""
+            submission = cast(ClarificationProposalSubmission, None)
+            proposal = None
+        if signal is not None:
+            detached = signal
+            signal = None
+            raise detached.with_traceback(None)
+        if failed:
+            raise ControlPlaneError() from None
+        raise ControlPlaneError() from None
 
     def assessment_node(self, node_id: str) -> dict[str, object]:
         """Return one visible node or the same fixed failure for hidden and unknown IDs."""

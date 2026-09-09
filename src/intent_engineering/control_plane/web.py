@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import re
 import secrets
+import traceback
 from collections.abc import Awaitable, Callable
 from typing import Any, cast
 from urllib.parse import quote, unquote_to_bytes, urlsplit
@@ -26,6 +27,13 @@ from intent_engineering.control_plane.http_models import (
     ClarificationAnswerPreviewResponse,
     DecisionOptionsRequest,
     DecisionVerifyRequest,
+    EnrichmentAnswerRequest,
+    EnrichmentGapRequest,
+    EnrichmentProposalRequest,
+    EnrichmentProposalResponse,
+    EnrichmentSessionRequest,
+    EnrichmentSessionResponse,
+    EnrichmentStartRequest,
     InboxResponse,
     RegistrationOptionsRequest,
     RegistrationVerifyRequest,
@@ -70,6 +78,13 @@ _STATIC_METHODS = {
     "/api/v1/inbox": "GET",
     "/api/v1/development/observation": "GET",
     "/api/v1/development/tests/run": "POST",
+    "/api/v1/enrichment/start": "POST",
+    "/api/v1/enrichment/current": "POST",
+    "/api/v1/enrichment/answer": "POST",
+    "/api/v1/enrichment/skip": "POST",
+    "/api/v1/enrichment/pause": "POST",
+    "/api/v1/enrichment/resume": "POST",
+    "/api/v1/enrichment/propose": "POST",
     "/api/v1/clarifications/answers/preview": "POST",
     "/api/v1/clarifications/answers/discard": "POST",
     "/api/v1/webauthn/register/options": "POST",
@@ -700,6 +715,19 @@ def _raise_signal(signal: BaseException | None) -> None:
         raise signal.with_traceback(None)
 
 
+def _scrub_enrichment_signal(error: BaseException) -> BaseException:
+    old_traceback = error.__traceback__
+    error.args = ()
+    error.__dict__.clear()
+    error.__traceback__ = None
+    error.__cause__ = None
+    error.__context__ = None
+    if old_traceback is not None:
+        traceback.clear_frames(old_traceback)
+    old_traceback = None
+    return error
+
+
 def _proposal_id(request: Request) -> str:
     value = request.path_params.get("proposal_id")
     if type(value) is not str or _PROPOSAL_PATH.fullmatch(f"/api/v1/proposals/{value}") is None:
@@ -803,6 +831,83 @@ def _make_handlers(
             signal = caught
         finally:
             node_id = ""
+            result = None
+            detached = None
+        return _end_handler(request, signal, response)
+
+    async def enrichment_endpoint(request: Request) -> Response:
+        response: Response | None = None
+        signal: BaseException | None = None
+        model: object = None
+        result: dict[str, object] | None = None
+        detached: object = None
+        action = request.url.path.rpartition("/")[2]
+        try:
+            if action == "start":
+                model = _parse_body(request, EnrichmentStartRequest)
+                start = cast(EnrichmentStartRequest, model)
+                result = service.enrichment_start(start.minutes, start.focus)
+                detached = EnrichmentSessionResponse.model_validate(result)
+            elif action == "current":
+                model = _parse_body(request, EnrichmentSessionRequest)
+                current = cast(EnrichmentSessionRequest, model)
+                result = service.enrichment_current(current.session_id)
+                detached = EnrichmentSessionResponse.model_validate(result)
+            elif action == "answer":
+                model = _parse_body(request, EnrichmentAnswerRequest)
+                answered = cast(EnrichmentAnswerRequest, model)
+                result = service.enrichment_answer(
+                    answered.session_id,
+                    answered.gap_id,
+                    answered.answer,
+                )
+                detached = EnrichmentSessionResponse.model_validate(result)
+            elif action == "skip":
+                model = _parse_body(request, EnrichmentGapRequest)
+                skipped = cast(EnrichmentGapRequest, model)
+                result = service.enrichment_skip(skipped.session_id, skipped.gap_id)
+                detached = EnrichmentSessionResponse.model_validate(result)
+            elif action == "pause":
+                model = _parse_body(request, EnrichmentSessionRequest)
+                paused = cast(EnrichmentSessionRequest, model)
+                result = service.enrichment_pause(paused.session_id)
+                detached = EnrichmentSessionResponse.model_validate(result)
+            elif action == "resume":
+                model = _parse_body(request, EnrichmentSessionRequest)
+                resumed = cast(EnrichmentSessionRequest, model)
+                result = service.enrichment_resume(resumed.session_id)
+                detached = EnrichmentSessionResponse.model_validate(result)
+            elif action == "propose":
+                model = _parse_body(request, EnrichmentProposalRequest)
+                proposed = cast(EnrichmentProposalRequest, model)
+                result = service.enrichment_propose(proposed.session_id, proposed.submission)
+                detached = EnrichmentProposalResponse.model_validate(result)
+            else:  # pragma: no cover - exact static routes only
+                raise _HandlerRequestError()
+            response = _json_response(cast(Any, detached).model_dump(mode="json"))
+        except _HandlerRequestError:
+            response = _fixed_response(400)
+        except Exception:  # noqa: BLE001 - fixed browser boundary
+            response = _fixed_response(503)
+        except BaseException as caught:  # noqa: BLE001 - preserve cancellation identity
+            signal = _scrub_enrichment_signal(caught)
+        finally:
+            action = ""
+            if "answered" in locals():
+                answered = cast(EnrichmentAnswerRequest, None)
+            if "start" in locals():
+                start = cast(EnrichmentStartRequest, None)
+            if "current" in locals():
+                current = cast(EnrichmentSessionRequest, None)
+            if "skipped" in locals():
+                skipped = cast(EnrichmentGapRequest, None)
+            if "paused" in locals():
+                paused = cast(EnrichmentSessionRequest, None)
+            if "resumed" in locals():
+                resumed = cast(EnrichmentSessionRequest, None)
+            if "proposed" in locals():
+                proposed = cast(EnrichmentProposalRequest, None)
+            model = None
             result = None
             detached = None
         return _end_handler(request, signal, response)
@@ -1217,6 +1322,7 @@ def _make_handlers(
     return {
         "assessment": assessment_endpoint,
         "assessment_node": assessment_node_endpoint,
+        "enrichment": enrichment_endpoint,
         "status": status_endpoint,
         "inbox": inbox_endpoint,
         "development_observation": development_observation_endpoint,
@@ -1265,6 +1371,14 @@ def build_control_plane_app(
                 handlers["assessment_node"],
                 methods=["GET"],
             ),
+            *[
+                Route(
+                    f"/api/v1/enrichment/{action}",
+                    handlers["enrichment"],
+                    methods=["POST"],
+                )
+                for action in ("start", "current", "answer", "skip", "pause", "resume", "propose")
+            ],
             Route("/api/v1/team/setup", handlers["github_setup"], methods=["GET"]),
             *[
                 Route(f"/api/v1/team/setup/{action}", handlers["github_setup"], methods=["POST"])

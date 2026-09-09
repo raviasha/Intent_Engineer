@@ -27,9 +27,16 @@
     developmentObservation: "/api/v1/development/observation",
     reviewedTests: "/api/v1/development/tests/run",
     assessment: "/api/v1/assessment",
+    enrichmentStart: "/api/v1/enrichment/start",
+    enrichmentCurrent: "/api/v1/enrichment/current",
+    enrichmentAnswer: "/api/v1/enrichment/answer",
+    enrichmentSkip: "/api/v1/enrichment/skip",
+    enrichmentPause: "/api/v1/enrichment/pause",
+    enrichmentResume: "/api/v1/enrichment/resume",
+    enrichmentPropose: "/api/v1/enrichment/propose",
     browserBootstrap: "/_intent/browser/bootstrap",
   });
-  const viewNames = new Set(["home", "onboarding", "inbox", "proposal", "team_state", "assessment"]);
+  const viewNames = new Set(["home", "onboarding", "inbox", "proposal", "enrichment", "team_state", "assessment"]);
   const MAX_ASSESSMENT_NODES = 2000;
   const MAX_ASSESSMENT_ROWS = 100;
   const MAX_ASSESSMENT_DIMENSIONS = 7;
@@ -67,6 +74,12 @@
     nextCursor: null,
     pageRows: [],
     overlay: "approved",
+    unavailable: false,
+    generation: 0,
+  });
+  const enrichmentState = Object.seal({
+    session: null,
+    question: null,
     unavailable: false,
     generation: 0,
   });
@@ -824,6 +837,378 @@
     return section;
   }
 
+  function exactObjectKeys(value, expected) {
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+      return false;
+    }
+    const actual = Object.keys(value).sort();
+    const wanted = Array.from(expected).sort();
+    return actual.length === wanted.length && actual.every((key, index) => key === wanted[index]);
+  }
+
+  function acceptEnrichmentResponse(payload) {
+    const sessionKeys = [
+      "schema_version", "id", "status", "focus_id", "budget_minutes",
+      "remaining_budget_seconds", "snapshot_digest", "current_gap_id",
+      "answered_gap_ids", "skipped_gap_ids", "answer_evidence_refs", "started_at", "updated_at",
+    ];
+    const questionKeys = [
+      "gap_id", "node_id", "dimension", "rule_id", "prompt", "reason",
+      "requested_fields", "evidence_scope",
+    ];
+    if (
+      !exactObjectKeys(payload, ["schema_version", "session", "question"]) ||
+      payload.schema_version !== 1 ||
+      !exactObjectKeys(payload.session, sessionKeys)
+    ) {
+      throw new Error("Invalid enrichment response.");
+    }
+    const session = payload.session;
+    if (
+      session.schema_version !== 1 ||
+      typeof session.id !== "string" ||
+      !/^refine:[^\s]{1,249}$/.test(session.id) ||
+      !["open", "paused", "complete", "cancelled"].includes(session.status) ||
+      ![null, 5, 15, 30].includes(session.budget_minutes) ||
+      !Number.isInteger(session.remaining_budget_seconds) ||
+      session.remaining_budget_seconds < 0 ||
+      session.remaining_budget_seconds > 1800 ||
+      typeof session.snapshot_digest !== "string" ||
+      !/^sha256:[0-9a-f]{64}$/.test(session.snapshot_digest)
+    ) {
+      throw new Error("Invalid enrichment session.");
+    }
+    for (const key of ["answered_gap_ids", "skipped_gap_ids", "answer_evidence_refs"]) {
+      const values = session[key];
+      if (!Array.isArray(values) || values.length > 10000 || values.some((item) => typeof item !== "string" || item.length > 256)) {
+        throw new Error("Invalid enrichment progress.");
+      }
+    }
+    const question = payload.question;
+    if (session.status === "open") {
+      if (
+        !exactObjectKeys(question, questionKeys) ||
+        typeof question.gap_id !== "string" ||
+        question.gap_id !== session.current_gap_id ||
+        typeof question.node_id !== "string" ||
+        typeof question.dimension !== "string" ||
+        typeof question.rule_id !== "string" ||
+        typeof question.prompt !== "string" ||
+        !question.prompt ||
+        question.prompt.length > 2048 ||
+        typeof question.reason !== "string" ||
+        !question.reason ||
+        question.reason.length > 2048 ||
+        !Array.isArray(question.requested_fields) ||
+        question.requested_fields.length > 16 ||
+        !Array.isArray(question.evidence_scope) ||
+        question.evidence_scope.length > 256
+      ) {
+        throw new Error("Invalid enrichment question.");
+      }
+    } else if (question !== null) {
+      throw new Error("Invalid inactive enrichment session.");
+    } else if (
+      session.status === "paused" &&
+      (typeof session.current_gap_id !== "string" || !session.current_gap_id)
+    ) {
+      throw new Error("Invalid paused enrichment session.");
+    } else if (
+      (session.status === "complete" || session.status === "cancelled") &&
+      session.current_gap_id !== null
+    ) {
+      throw new Error("Invalid terminal enrichment session.");
+    }
+    return { session, question };
+  }
+
+  function acceptEnrichmentProposalResponse(payload, expectedSession) {
+    const proposalKeys = [
+      "schema_version", "id", "kind", "proposed_by", "proposed_at",
+      "baseline_graph_version", "evidence_refs", "source_roles", "changeset",
+      "core_node_ids", "provisional_node_ids", "assumptions", "unanswered_questions",
+      "conflicting_authors", "destructive", "clarification_session_id", "task_id",
+    ];
+    if (
+      !expectedSession ||
+      !exactObjectKeys(payload, ["schema_version", "session_id", "proposal"]) ||
+      payload.schema_version !== 1 ||
+      payload.session_id !== expectedSession.id ||
+      !exactObjectKeys(payload.proposal, proposalKeys)
+    ) {
+      throw new Error("Invalid enrichment proposal response.");
+    }
+    const proposal = payload.proposal;
+    if (
+      proposal.schema_version !== 2 ||
+      typeof proposal.id !== "string" ||
+      !/^proposal:sha256:[0-9a-f]{64}$/.test(proposal.id) ||
+      !["bootstrap", "requirement"].includes(proposal.kind) ||
+      typeof proposal.proposed_by !== "string" ||
+      !proposal.proposed_by ||
+      !Number.isInteger(proposal.baseline_graph_version) ||
+      proposal.baseline_graph_version < 0 ||
+      typeof proposal.changeset !== "object" ||
+      proposal.changeset === null ||
+      Array.isArray(proposal.changeset) ||
+      typeof proposal.clarification_session_id !== "string" ||
+      !proposal.clarification_session_id ||
+      typeof proposal.task_id !== "string" ||
+      !proposal.task_id ||
+      typeof proposal.destructive !== "boolean"
+    ) {
+      throw new Error("Invalid enrichment proposal.");
+    }
+    for (const key of [
+      "evidence_refs", "source_roles", "core_node_ids", "provisional_node_ids",
+      "assumptions", "unanswered_questions", "conflicting_authors",
+    ]) {
+      if (!Array.isArray(proposal[key]) || proposal[key].length > 10000) {
+        throw new Error("Invalid enrichment proposal.");
+      }
+    }
+    if (
+      !Array.isArray(expectedSession.answer_evidence_refs) ||
+      expectedSession.answer_evidence_refs.length === 0 ||
+      expectedSession.answer_evidence_refs.some(
+        (reference) => !proposal.evidence_refs.includes(reference)
+      )
+    ) {
+      throw new Error("Enrichment proposal is not bound to this session.");
+    }
+    return proposal;
+  }
+
+  function focusEnrichmentAfterRender(session) {
+    const targetId = session && session.status === "open"
+      ? "enrichment-answer"
+      : session && session.status === "paused"
+      ? "enrichment-resume"
+      : "enrichment-start";
+    const target = document.getElementById(targetId);
+    if (target && target.id === targetId && typeof target.focus === "function") {
+      target.focus();
+    }
+  }
+
+  async function updateEnrichment(path, body) {
+    const generation = enrichmentState.generation + 1;
+    enrichmentState.generation = generation;
+    try {
+      const accepted = acceptEnrichmentResponse(await fetchJson(path, {
+        method: "POST",
+        body,
+      }));
+      if (generation !== enrichmentState.generation) {
+        return;
+      }
+      enrichmentState.session = accepted.session;
+      enrichmentState.question = accepted.question;
+      enrichmentState.unavailable = false;
+      if (state.view === "enrichment") {
+        render();
+        focusEnrichmentAfterRender(accepted.session);
+      }
+      announce("Graph improvement session updated. Approved graph state is unchanged.");
+    } catch (_error) {
+      if (generation !== enrichmentState.generation) {
+        return;
+      }
+      enrichmentState.session = null;
+      enrichmentState.question = null;
+      enrichmentState.unavailable = true;
+      if (state.view === "enrichment") {
+        render();
+        focusEnrichmentAfterRender(null);
+      }
+      announce("Graph improvement session is unavailable. Approved graph state is unchanged.");
+    }
+  }
+
+  function startEnrichment(minutesField, focusField) {
+    const selected = minutesField.value;
+    const minutes = selected === "" ? null : Number(selected);
+    const focus = typeof focusField.value === "string" && focusField.value ? focusField.value : null;
+    focusField.value = "";
+    if (![null, 5, 15, 30].includes(minutes) || (minutes === null && focus === null)) {
+      announce("Choose 5, 15, or 30 minutes, or provide a focus.");
+      return;
+    }
+    void updateEnrichment(api.enrichmentStart, JSON.stringify({ minutes, focus }));
+  }
+
+  function answerEnrichment(answerField) {
+    const session = enrichmentState.session;
+    const question = enrichmentState.question;
+    let answer = typeof answerField.value === "string" ? answerField.value : "";
+    let body = "";
+    answerField.value = "";
+    if (!answer || !session || !question) {
+      answer = "";
+      announce("Enter an answer to the current question.");
+      return;
+    }
+    body = JSON.stringify({ session_id: session.id, gap_id: question.gap_id, answer });
+    answer = "";
+    void updateEnrichment(api.enrichmentAnswer, body).finally(() => {
+      body = "";
+    });
+  }
+
+  function enrichmentSessionAction(path, includeGap = false) {
+    const session = enrichmentState.session;
+    const question = enrichmentState.question;
+    if (!session || (includeGap && !question)) {
+      return;
+    }
+    const body = includeGap
+      ? { session_id: session.id, gap_id: question.gap_id }
+      : { session_id: session.id };
+    void updateEnrichment(path, JSON.stringify(body));
+  }
+
+  async function proposeEnrichment(submissionField) {
+    const session = enrichmentState.session;
+    const generation = enrichmentState.generation;
+    let rawSubmission = typeof submissionField.value === "string" ? submissionField.value : "";
+    let submission = null;
+    let body = "";
+    submissionField.value = "";
+    try {
+      if (!session || session.answer_evidence_refs.length === 0 || !rawSubmission) {
+        throw new Error("Enrichment proposal submission is unavailable.");
+      }
+      submission = JSON.parse(rawSubmission);
+      rawSubmission = "";
+      if (!submission || typeof submission !== "object" || Array.isArray(submission)) {
+        throw new Error("Invalid enrichment proposal submission.");
+      }
+      body = JSON.stringify({ session_id: session.id, submission });
+      submission = null;
+      const proposal = acceptEnrichmentProposalResponse(
+        await fetchJson(api.enrichmentPropose, { method: "POST", body }),
+        session
+      );
+      body = "";
+      if (
+        enrichmentState.session !== session ||
+        enrichmentState.generation !== generation ||
+        state.view !== "enrichment"
+      ) {
+        throw new Error("Enrichment session changed before proposal review.");
+      }
+      selectProposal(proposal.id);
+      await showView("proposal");
+    } catch (_error) {
+      if (
+        enrichmentState.session === session &&
+        enrichmentState.generation === generation &&
+        state.view === "enrichment"
+      ) {
+        announce("Graph proposal is unavailable. No approved graph state changed.");
+      }
+    } finally {
+      submissionField.value = "";
+      rawSubmission = "";
+      submission = null;
+      body = "";
+    }
+  }
+
+  function renderEnrichment() {
+    const section = panel("Improve graph");
+    addText(
+      section,
+      "p",
+      "Answer one evidence-grounded question at a time. Answers are evidence; no graph change is applied without proposal review."
+    );
+    const start = document.createElement("fieldset");
+    addText(start, "legend", "Start an improvement session");
+    const minutesLabel = document.createElement("label");
+    minutesLabel.textContent = "Time budget";
+    const minutes = document.createElement("select");
+    minutes.id = "enrichment-minutes";
+    addOption(minutes, "", "Focus only");
+    addOption(minutes, "5", "5 minutes");
+    addOption(minutes, "15", "15 minutes");
+    addOption(minutes, "30", "30 minutes");
+    minutes.value = "5";
+    minutesLabel.append(minutes);
+    const focusLabel = document.createElement("label");
+    focusLabel.textContent = "Optional node or branch focus";
+    const focus = document.createElement("input");
+    focus.id = "enrichment-focus";
+    focus.type = "text";
+    focus.maxLength = 256;
+    focus.autocomplete = "off";
+    focusLabel.append(focus);
+    const startButton = actionButton(
+      "Start improvement session",
+      () => startEnrichment(minutes, focus)
+    );
+    startButton.id = "enrichment-start";
+    start.append(
+      minutesLabel,
+      focusLabel,
+      startButton
+    );
+    section.append(start);
+
+    if (enrichmentState.unavailable) {
+      addText(section, "p", "Improvement session unavailable. No approved graph state changed.");
+    }
+    const session = enrichmentState.session;
+    const question = enrichmentState.question;
+    if (session) {
+      addText(section, "p", `Session status: ${session.status}`);
+      if (question) {
+        const current = document.createElement("article");
+        current.className = "enrichment-question";
+        addText(current, "h3", question.prompt);
+        addText(current, "p", `Why this matters: ${question.reason}`);
+        addText(current, "p", `Score dimension: ${question.dimension}`);
+        const answerLabel = document.createElement("label");
+        answerLabel.textContent = "Your answer";
+        const answer = document.createElement("textarea");
+        answer.id = "enrichment-answer";
+        answer.maxLength = 16384;
+        answer.autocomplete = "off";
+        answerLabel.append(answer);
+        current.append(
+          answerLabel,
+          actionButton("Record answer as evidence", () => answerEnrichment(answer)),
+          actionButton("Skip current question", () => enrichmentSessionAction(api.enrichmentSkip, true)),
+          actionButton("Pause improvement session", () => enrichmentSessionAction(api.enrichmentPause))
+        );
+        section.append(current);
+      } else if (session.status === "paused") {
+        const resume = actionButton(
+          "Resume improvement session",
+          () => enrichmentSessionAction(api.enrichmentResume)
+        );
+        resume.id = "enrichment-resume";
+        section.append(resume);
+      }
+      const proposal = document.createElement("aside");
+      proposal.className = "proposal-review-action";
+      addText(proposal, "h3", "Proposal review");
+      addText(proposal, "p", "Graph changes remain separate and require the existing governed review flow.");
+      const submissionLabel = document.createElement("label");
+      submissionLabel.textContent = "Governed proposal submission";
+      const submission = document.createElement("textarea");
+      submission.id = "enrichment-proposal-submission";
+      submission.maxLength = 240000;
+      submission.autocomplete = "off";
+      submissionLabel.append(submission);
+      proposal.append(
+        submissionLabel,
+        actionButton("Review proposed graph changes", () => proposeEnrichment(submission))
+      );
+      section.append(proposal);
+    }
+    return section;
+  }
+
   function updateNavigation() {
     for (const button of navigation) {
       const selected = button.dataset.view === state.view;
@@ -856,6 +1241,7 @@
       actionButton("Refresh development evidence", () => refreshDevelopmentObservation(false))
     );
     section.append(actionButton("Open graph assessment", () => showView("assessment")));
+    section.append(actionButton("Improve graph", () => showView("enrichment")));
     return section;
   }
 
@@ -1135,6 +1521,8 @@
       next = renderTeamState();
     } else if (state.view === "assessment") {
       next = renderAssessment();
+    } else if (state.view === "enrichment") {
+      next = renderEnrichment();
     } else {
       next = renderHome();
     }
@@ -1641,6 +2029,11 @@
       await refreshTeamEnrollment();
     } else if (view === "assessment") {
       await loadAssessment(null);
+    } else if (view === "enrichment" && enrichmentState.session) {
+      await updateEnrichment(
+        api.enrichmentCurrent,
+        JSON.stringify({ session_id: enrichmentState.session.id })
+      );
     }
   }
 

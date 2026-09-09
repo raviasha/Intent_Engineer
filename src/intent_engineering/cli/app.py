@@ -38,6 +38,7 @@ from intent_engineering.cli.intent_workflow import (
     sources_app,
 )
 from intent_engineering.cli.output import OutputFormat, emit
+from intent_engineering.cli.refine import refine_command
 from intent_engineering.cli.runtime import (
     AssessmentRuntime,
     CheckRuntimeAdapter,
@@ -130,6 +131,7 @@ app.command("onboard")(onboard_command)
 app.command("dev")(dev_command)
 app.command("ensure")(ensure_command)
 app.command("assess")(assess_command)
+app.command("refine")(refine_command)
 app.command("assessment-gate", hidden=True)(assessment_gate_command)
 
 _MAX_PROMPT_HOOK_BYTES = 64 * 1024
