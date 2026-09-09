@@ -7,7 +7,7 @@ import re
 import secrets
 from collections.abc import Awaitable, Callable
 from typing import Any, cast
-from urllib.parse import quote, urlsplit
+from urllib.parse import quote, unquote_to_bytes, urlsplit
 
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
@@ -18,6 +18,8 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from intent_engineering.control_plane.http_models import (
     MAX_HTTP_BODY_BYTES,
+    AssessmentNodeResponse,
+    AssessmentResponse,
     ClarificationAnswerDiscardRequest,
     ClarificationAnswerDiscardResponse,
     ClarificationAnswerPreviewRequest,
@@ -42,6 +44,7 @@ from intent_engineering.control_plane.service import ControlPlaneService
 from intent_engineering.team_state.models import RecipientRecord as TeamRecipientRecord
 
 _BODY_STATE_KEY = "intent.control-plane.raw-body"
+_QUERY_STATE_KEY = "intent.control-plane.query"
 _CSRF_COOKIE = "intent_csrf"
 _CSRF_HEADER = b"x-intent-csrf"
 _FIXED_ERROR = {
@@ -62,6 +65,7 @@ _CSP = (
     "style-src 'self'; connect-src 'self'"
 )
 _STATIC_METHODS = {
+    "/api/v1/assessment": "GET",
     "/api/v1/status": "GET",
     "/api/v1/inbox": "GET",
     "/api/v1/development/observation": "GET",
@@ -93,6 +97,11 @@ _STATIC_METHODS = {
 }
 _PROPOSAL_PATH = re.compile(r"^/api/v1/proposals/([A-Za-z0-9:._-]{1,512})$")
 _PROPOSAL_PREFIX = "/api/v1/proposals/"
+_ASSESSMENT_NODE_PATH = re.compile(r"^/api/v1/assessment/nodes/([A-Za-z0-9:._-]{1,512})$")
+_ASSESSMENT_NODE_PREFIX = "/api/v1/assessment/nodes/"
+_ASSESSMENT_REFERENCE = re.compile(r"^[A-Za-z0-9:._-]{1,512}$")
+_ASSESSMENT_CURSOR = re.compile(r"^page:[0-9a-f]{64}:[1-9][0-9]{0,3}$")
+_MAX_RAW_TARGET_BYTES = 4_096
 _CSRF_VALUE = re.compile(r"^[A-Za-z0-9_-]{1,512}$")
 
 
@@ -204,18 +213,74 @@ def _expected_method(path: str) -> str:
         return method
     if _PROPOSAL_PATH.fullmatch(path) is not None:
         return "GET"
+    if _ASSESSMENT_NODE_PATH.fullmatch(path) is not None:
+        return "GET"
     raise _HttpBoundaryError(404)
 
 
 def _canonical_raw_path(path: str) -> bytes:
     proposal = _PROPOSAL_PATH.fullmatch(path)
-    if proposal is None:
+    assessment_node = _ASSESSMENT_NODE_PATH.fullmatch(path)
+    if proposal is None and assessment_node is None:
         try:
             return path.encode("ascii")
         except UnicodeError:
             raise _HttpBoundaryError(404) from None
-    identifier = proposal.group(1)
-    return f"{_PROPOSAL_PREFIX}{quote(identifier, safe='._-')}".encode("ascii")
+    if proposal is not None:
+        identifier = proposal.group(1)
+        prefix = _PROPOSAL_PREFIX
+    else:
+        if assessment_node is None:  # pragma: no cover - narrowed above
+            raise _HttpBoundaryError(404)
+        identifier = assessment_node.group(1)
+        prefix = _ASSESSMENT_NODE_PREFIX
+    return f"{prefix}{quote(identifier, safe='._-')}".encode("ascii")
+
+
+def _assessment_query(path: str, query: bytes) -> dict[str, str]:
+    if path != "/api/v1/assessment":
+        if query:
+            raise _HttpBoundaryError(400)
+        return {}
+    if not query:
+        return {}
+    if len(query) > _MAX_RAW_TARGET_BYTES:
+        raise _HttpBoundaryError(414)
+    result: dict[str, str] = {}
+    parts = query.split(b"&")
+    if len(parts) > 2:
+        raise _HttpBoundaryError(400)
+    for part in parts:
+        name, separator, raw_value = part.partition(b"=")
+        if separator != b"=" or name not in {b"focus", b"cursor"}:
+            raise _HttpBoundaryError(400)
+        key = name.decode("ascii")
+        if key in result or not raw_value:
+            raise _HttpBoundaryError(400)
+        try:
+            decoded_bytes = unquote_to_bytes(raw_value)
+            decoded = decoded_bytes.decode("ascii", errors="strict")
+        except (UnicodeError, ValueError):
+            raise _HttpBoundaryError(400) from None
+        if raw_value != quote(decoded, safe="._-").encode("ascii"):
+            raise _HttpBoundaryError(400)
+        if key == "focus":
+            if (
+                _ASSESSMENT_REFERENCE.fullmatch(decoded) is None
+                or len(decoded.encode("utf-8")) > 512
+            ):
+                raise _HttpBoundaryError(400)
+        elif _ASSESSMENT_CURSOR.fullmatch(decoded) is None:
+            raise _HttpBoundaryError(400)
+        result[key] = decoded
+    expected = b"&".join(
+        name.encode("ascii") + b"=" + quote(result[name], safe="._-").encode("ascii")
+        for name in ("focus", "cursor")
+        if name in result
+    )
+    if query != expected:
+        raise _HttpBoundaryError(400)
+    return result
 
 
 def _validate_scope_and_headers(
@@ -224,7 +289,7 @@ def _validate_scope_and_headers(
     expected_host: bytes,
     expected_origin: bytes,
     csrf_secret: bytes,
-) -> tuple[list[tuple[bytes, bytes]], int | None]:
+) -> tuple[list[tuple[bytes, bytes]], int | None, dict[str, str]]:
     headers: list[tuple[bytes, bytes]] = []
     try:
         if type(scope) is not dict or scope.get("type") != "http":
@@ -239,14 +304,16 @@ def _validate_scope_and_headers(
             or type(path) is not str
             or type(raw_path) is not bytes
             or type(query) is not bytes
-            or query
         ):
             raise _HttpBoundaryError(400)
+        if len(raw_path) + len(query) + (1 if query else 0) > _MAX_RAW_TARGET_BYTES:
+            raise _HttpBoundaryError(414)
         if type(scheme) is not str or scheme != "http":
             raise _HttpBoundaryError(403)
         required_method = _expected_method(path)
         if raw_path != _canonical_raw_path(path):
             raise _HttpBoundaryError(404)
+        query_values = _assessment_query(path, query)
         if method != required_method:
             raise _HttpBoundaryError(405)
         raw_headers = scope.get("headers")
@@ -292,7 +359,7 @@ def _validate_scope_and_headers(
                 raise _HttpBoundaryError(403)
         elif content_types or (length is not None and length != 0):
             raise _HttpBoundaryError(400)
-        return headers, length
+        return headers, length, query_values
     except _HttpBoundaryError:
         raise
     except (KeyError, TypeError, UnicodeError, ValueError):
@@ -458,7 +525,7 @@ class _StrictLoopbackMiddleware:
         signal: BaseException | None = None
         failure_status: int | None = None
         try:
-            headers, length = _validate_scope_and_headers(
+            headers, length, query_values = _validate_scope_and_headers(
                 scope,
                 expected_host=self._expected_host,
                 expected_origin=self._expected_origin,
@@ -475,9 +542,10 @@ class _StrictLoopbackMiddleware:
                 state = raw_state
             else:
                 raise _HttpBoundaryError(400)
-            if _BODY_STATE_KEY in state:
+            if _BODY_STATE_KEY in state or _QUERY_STATE_KEY in state:
                 raise _HttpBoundaryError(400)
             state[_BODY_STATE_KEY] = body
+            state[_QUERY_STATE_KEY] = query_values
             secured_send = _secure_sender(send, self._csrf_secret, set_cookie=False)
             await self._app(scope, _empty_receive, secured_send)
         except _HttpBoundaryError as error:
@@ -493,6 +561,7 @@ class _StrictLoopbackMiddleware:
             body.clear()
             if state is not None:
                 state.pop(_BODY_STATE_KEY, None)
+                state.pop(_QUERY_STATE_KEY, None)
             headers.clear()
             scope = {}
             receive = cast(Receive, None)
@@ -537,6 +606,18 @@ def _request_bytes(request: Request) -> bytes:
     return bytes(value)
 
 
+def _request_query(request: Request) -> dict[str, str]:
+    state = request.scope.get("state")
+    if type(state) is not dict:
+        raise _HandlerRequestError()
+    value = state.get(_QUERY_STATE_KEY)
+    if type(value) is not dict or any(
+        type(key) is not str or type(item) is not str for key, item in value.items()
+    ):
+        raise _HandlerRequestError()
+    return cast(dict[str, str], value)
+
+
 def _scrub_request(request: Request | None) -> None:
     if request is None:
         return
@@ -547,6 +628,9 @@ def _scrub_request(request: Request | None) -> None:
             if body:
                 body[:] = b"\x00" * len(body)
             body.clear()
+        query = state.pop(_QUERY_STATE_KEY, None)
+        if type(query) is dict:
+            query.clear()
     if hasattr(request, "_body"):
         request._body = b""
 
@@ -623,6 +707,17 @@ def _proposal_id(request: Request) -> str:
     return value
 
 
+def _assessment_node_id(request: Request) -> str:
+    value = request.path_params.get("node_id")
+    if (
+        type(value) is not str
+        or _ASSESSMENT_NODE_PATH.fullmatch(f"{_ASSESSMENT_NODE_PREFIX}{value}") is None
+        or len(value.encode("utf-8")) > 512
+    ):
+        raise _HandlerRequestError()
+    return value
+
+
 def _end_handler(
     request: Request | None,
     signal: BaseException | None,
@@ -655,6 +750,61 @@ def _make_handlers(
             signal = caught
         finally:
             result = None
+        return _end_handler(request, signal, response)
+
+    async def assessment_endpoint(request: Request) -> Response:
+        response: Response | None = None
+        signal: BaseException | None = None
+        result: dict[str, object] | None = None
+        detached: AssessmentResponse | None = None
+        query: dict[str, str] = {}
+        try:
+            query = _request_query(request)
+            result = service.assessment(
+                query.get("focus"),
+                page_cursor=query.get("cursor"),
+            )
+            detached = AssessmentResponse.model_validate(result)
+            response = _json_response(detached.model_dump(mode="json"))
+        except _HandlerRequestError:
+            response = _fixed_response(400)
+        except Exception:  # noqa: BLE001 - fixed browser boundary
+            response = _fixed_response(503)
+        except BaseException as caught:  # noqa: BLE001 - scrub exact cancellation path
+            caught.__traceback__ = None
+            caught.__cause__ = None
+            caught.__context__ = None
+            signal = caught
+        finally:
+            query.clear()
+            result = None
+            detached = None
+        return _end_handler(request, signal, response)
+
+    async def assessment_node_endpoint(request: Request) -> Response:
+        response: Response | None = None
+        signal: BaseException | None = None
+        result: dict[str, object] | None = None
+        detached: AssessmentNodeResponse | None = None
+        node_id = ""
+        try:
+            node_id = _assessment_node_id(request)
+            result = service.assessment_node(node_id)
+            detached = AssessmentNodeResponse.model_validate(result)
+            response = _json_response(detached.model_dump(mode="json"))
+        except (_HandlerRequestError, LookupError):
+            response = _fixed_response(404)
+        except Exception:  # noqa: BLE001 - fixed browser boundary
+            response = _fixed_response(503)
+        except BaseException as caught:  # noqa: BLE001 - scrub exact cancellation path
+            caught.__traceback__ = None
+            caught.__cause__ = None
+            caught.__context__ = None
+            signal = caught
+        finally:
+            node_id = ""
+            result = None
+            detached = None
         return _end_handler(request, signal, response)
 
     async def inbox_endpoint(request: Request) -> Response:
@@ -1065,6 +1215,8 @@ def _make_handlers(
         return _end_handler(request, signal, response)
 
     return {
+        "assessment": assessment_endpoint,
+        "assessment_node": assessment_node_endpoint,
         "status": status_endpoint,
         "inbox": inbox_endpoint,
         "development_observation": development_observation_endpoint,
@@ -1107,6 +1259,12 @@ def build_control_plane_app(
     app = Starlette(
         debug=False,
         routes=[
+            Route("/api/v1/assessment", handlers["assessment"], methods=["GET"]),
+            Route(
+                "/api/v1/assessment/nodes/{node_id}",
+                handlers["assessment_node"],
+                methods=["GET"],
+            ),
             Route("/api/v1/team/setup", handlers["github_setup"], methods=["GET"]),
             *[
                 Route(f"/api/v1/team/setup/{action}", handlers["github_setup"], methods=["POST"])

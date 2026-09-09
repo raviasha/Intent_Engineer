@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
+import os
 import re
 import secrets
 import threading
@@ -11,8 +13,20 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import PurePosixPath
+from types import MappingProxyType
 from typing import cast
 
+from intent_engineering.assessment.models import AssessmentReport, AssessmentSnapshot, NodeScorecard
+from intent_engineering.assessment.service import GraphAssessmentService
+from intent_engineering.assessment.snapshot import (
+    _parse_held as _parse_assessment_held,
+)
+from intent_engineering.assessment.snapshot import (
+    _snapshot_model as _assessment_snapshot_model,
+)
+from intent_engineering.assessment.snapshot import (
+    _visible_projection as _visible_assessment_projection,
+)
 from intent_engineering.capture.mcp.profile_loader import (
     load_connector_config_bytes,
     load_strict_yaml_mapping_bytes,
@@ -23,6 +37,12 @@ from intent_engineering.cli.intent_workflow import (
 )
 from intent_engineering.cli.runtime import Runtime
 from intent_engineering.cli.writes import MutationPolicy, write_workflow
+from intent_engineering.control_plane.http_models import (
+    MAX_HTTP_RESPONSE_BYTES,
+    AssessmentNodeResponse,
+    AssessmentResponse,
+    require_exact_json,
+)
 from intent_engineering.control_plane.models import (
     AttentionRoute,
     CredentialRecord,
@@ -100,6 +120,12 @@ _MAX_PENDING_ANSWERS = 64
 _MAX_VISIBLE_CLARIFICATION_SESSIONS = 64
 _ANSWER_ID = re.compile(r"^answer:[0-9a-f]{64}$")
 _TEAM_REPOSITORY_ID = re.compile(r"^[a-z0-9.-]+/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+_ASSESSMENT_REFERENCE = re.compile(r"^[A-Za-z0-9:._-]{1,512}$")
+_ASSESSMENT_CURSOR = re.compile(r"^page:([0-9a-f]{64}):([1-9][0-9]{0,3})$")
+_MAX_ASSESSMENT_NODES = 2_000
+_ASSESSMENT_PAGE_SIZE = 100
+
+type _FileChangeToken = tuple[int, int, int, int, int, int, int] | None
 
 
 class ControlPlaneError(ValueError):
@@ -107,6 +133,13 @@ class ControlPlaneError(ValueError):
 
     def __init__(self) -> None:
         super().__init__("control plane unavailable")
+
+
+class AssessmentNodeUnavailable(LookupError):
+    """The fixed lookup failure shared by hidden and unknown assessment nodes."""
+
+    def __init__(self) -> None:
+        super().__init__("assessment node unavailable")
 
 
 @dataclass(frozen=True, slots=True)
@@ -137,21 +170,64 @@ class _PendingTeamEnrollment:
 @dataclass(slots=True)
 class _Authority:
     files: dict[str, SecureFile]
+    snapshot_files: dict[str, SecureFile]
     policies: dict[str, LocalTransactionExtraReadPolicy]
     preimages: dict[str, bytes | None]
+    change_tokens: dict[str, _FileChangeToken]
     snapshot: LocalTransactionSnapshot
     config: ProjectConfig
     policy: MutationPolicy
     provider_principals: dict[str, frozenset[str]]
     membership_digest: str
 
-    def close(self) -> None:
-        for file in self.files.values():
-            file.close()
-        self.files.clear()
-        self.policies.clear()
+    def scrub_private(self) -> None:
+        """Discard authority content before any fallible descriptor release."""
         self.preimages.clear()
+        self.change_tokens.clear()
         self.provider_principals.clear()
+        self.policies.clear()
+        self.snapshot = cast(LocalTransactionSnapshot, None)
+        self.config = cast(ProjectConfig, None)
+        self.policy = cast(MutationPolicy, None)
+        self.membership_digest = ""
+
+    def close(self) -> None:
+        signal: BaseException | None = None
+        self.scrub_private()
+        files = (*self.files.values(), *self.snapshot_files.values())
+        self.files.clear()
+        self.snapshot_files.clear()
+        for file in files:
+            try:
+                file.close()
+            except BaseException as caught:  # noqa: BLE001 - close every held descriptor
+                if signal is None:
+                    caught.__traceback__ = None
+                    caught.__cause__ = None
+                    caught.__context__ = None
+                    signal = caught
+        files = ()
+        if signal is not None:
+            caught_signal = signal
+            signal = None
+            raise caught_signal.with_traceback(None)
+
+
+class _OpaqueAssessmentResult:
+    """Keep a ready response out of traceback-local representations during close."""
+
+    __slots__ = ("_value",)
+
+    def __init__(self, value: dict[str, object]) -> None:
+        self._value: dict[str, object] | None = value
+
+    def take(self) -> dict[str, object] | None:
+        value = self._value
+        self._value = None
+        return value
+
+    def clear(self) -> None:
+        self._value = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -283,6 +359,8 @@ class ControlPlaneService:
         if publication_service is not None and type(publication_service) is not PublicationService:
             raise TypeError("invalid publication service")
         self._publication_service = publication_service
+        self._assessment_service = GraphAssessmentService(clock=self._clock)
+        self._assessment_cursor_key = bytearray(secrets.token_bytes(32))
         self._team_enrollment_guard = threading.RLock()
         self._team_enrollment_blocked = False
         self._pending_team_enrollment: _PendingTeamEnrollment | None = None
@@ -894,8 +972,10 @@ class ControlPlaneService:
             preimages = {name: snapshot.content.get(name) for name in files}
             return _Authority(
                 files=files,
+                snapshot_files={},
                 policies=policies,
                 preimages=preimages,
+                change_tokens={},
                 snapshot=snapshot,
                 config=config,
                 policy=policy,
@@ -910,6 +990,94 @@ class ControlPlaneService:
         finally:
             records = ()
             profile_paths.clear()
+
+    def _read_only_authority(self) -> _Authority:
+        """Acquire control-plane authority without recovering interrupted writes."""
+        files: dict[str, SecureFile] = {
+            "authority_config": self._config_file.duplicate(),
+            "authority_policy": self._policy_file.duplicate(),
+            "authority_plans": self._plans_file.duplicate(),
+        }
+        snapshot_files: dict[str, SecureFile] = {}
+        records: tuple[tuple[PurePosixPath, SecureRead], ...] = ()
+        profile_paths: set[str] = set()
+        try:
+            records = _membership_records(self._connectors_directory, read_content=True)
+            membership_digest = _membership_digest(records)
+            for index, (relative, source) in enumerate(records):
+                files[f"authority_binding_{index}"] = self._connectors_directory.file(relative)
+                profile_paths.add(load_connector_config_bytes(source.content).profile_path)
+            for index, profile_path in enumerate(sorted(profile_paths)):
+                files[f"authority_profile_{index}"] = self._runtime.project_directory.file(
+                    profile_path
+                )
+            snapshot_files = {
+                name: self._runtime.transactions.target_file(name)
+                for name in self._runtime.transactions.target_names
+            }
+            policies = self._read_policies(files)
+            initial_tokens = self._assessment_change_tokens(files, snapshot_files)
+            snapshot = self._runtime.transactions.snapshot_without_recovery(
+                files,
+                extra_read_policies=policies,
+            )
+            if (
+                self._membership_now() != membership_digest
+                or self._assessment_change_tokens(files, snapshot_files) != initial_tokens
+            ):
+                raise ValueError("control plane authority changed")
+            config, policy, provider_principals = ProposalConfirmationService._authority(snapshot)
+            if config != self._runtime.config:
+                raise ValueError("control plane configuration changed")
+            preimages = {name: snapshot.content.get(name) for name in files}
+            return _Authority(
+                files=files,
+                snapshot_files=snapshot_files,
+                policies=policies,
+                preimages=preimages,
+                change_tokens=initial_tokens,
+                snapshot=snapshot,
+                config=config,
+                policy=policy,
+                provider_principals=provider_principals,
+                membership_digest=membership_digest,
+            )
+        except BaseException:
+            for file in (*files.values(), *snapshot_files.values()):
+                file.close()
+            files.clear()
+            snapshot_files.clear()
+            raise
+        finally:
+            records = ()
+            profile_paths.clear()
+
+    @staticmethod
+    def _assessment_file_change_token(file: SecureFile) -> _FileChangeToken:
+        try:
+            metadata = os.stat(file.name, dir_fd=file.parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return None
+        return (
+            metadata.st_dev,
+            metadata.st_ino,
+            metadata.st_mode,
+            metadata.st_nlink,
+            metadata.st_size,
+            metadata.st_mtime_ns,
+            metadata.st_ctime_ns,
+        )
+
+    @classmethod
+    def _assessment_change_tokens(
+        cls,
+        authority_files: Mapping[str, SecureFile],
+        snapshot_files: Mapping[str, SecureFile],
+    ) -> dict[str, _FileChangeToken]:
+        return {
+            name: cls._assessment_file_change_token(file)
+            for name, file in sorted({**snapshot_files, **authority_files}.items())
+        }
 
     def _authority_matches(self, authority: _Authority) -> bool:
         if self._membership_now() != authority.membership_digest:
@@ -932,6 +1100,35 @@ class ControlPlaneService:
             snapshot.content.get(name) == value for name, value in authority.preimages.items()
         )
 
+    def _read_only_authority_matches(self, authority: _Authority) -> bool:
+        if self._membership_now() != authority.membership_digest:
+            return False
+        before = self._assessment_change_tokens(authority.files, authority.snapshot_files)
+        if before != authority.change_tokens:
+            return False
+        snapshot = self._runtime.transactions.snapshot_without_recovery(
+            authority.files,
+            extra_read_policies=authority.policies,
+        )
+        after = self._assessment_change_tokens(authority.files, authority.snapshot_files)
+        expected = {
+            name: content
+            for name, content in authority.snapshot.content.items()
+            if name != "webauthn_challenges"
+        }
+        current = {
+            name: content
+            for name, content in snapshot.content.items()
+            if name != "webauthn_challenges"
+        }
+        return (
+            before == after == authority.change_tokens
+            and current == expected
+            and all(
+                snapshot.content.get(name) == value for name, value in authority.preimages.items()
+            )
+        )
+
     def _principals(self, authority: _Authority, actor: str) -> frozenset[str]:
         aliases = ProposalConfirmationService._aliases(
             actor,
@@ -941,6 +1138,495 @@ class ControlPlaneService:
         if actor not in aliases:
             raise ValueError("control plane actor unavailable")
         return frozenset({"agent:codex", *aliases})
+
+    @staticmethod
+    def _assessment_reference(value: object, *, optional: bool) -> str | None:
+        if value is None and optional:
+            return None
+        if (
+            type(value) is not str
+            or _ASSESSMENT_REFERENCE.fullmatch(value) is None
+            or len(value.encode("utf-8")) > 512
+        ):
+            raise ValueError("invalid assessment reference")
+        return value
+
+    @staticmethod
+    def _assessment_snapshot_from_authority(
+        authority: _Authority,
+        actor: str,
+        principals: frozenset[str],
+    ) -> AssessmentSnapshot:
+        """Project the exact graph and ACL preimages held by one authority capture."""
+        held: LocalTransactionSnapshot | None = None
+        parsed: object = None
+        projection: object = None
+        try:
+            content = dict(authority.snapshot.content)
+            content["config"] = content.get("authority_config")
+            held = LocalTransactionSnapshot(MappingProxyType(content), False)
+            parsed = _parse_assessment_held(held)
+            if parsed.config != authority.config:
+                raise ValueError("assessment configuration changed")
+            projection = _visible_assessment_projection(
+                config=parsed.config,
+                graph=parsed.graph,
+                evidence=parsed.evidence,
+                ingestions=parsed.ingestions,
+                cases=parsed.cases,
+                proposals=parsed.proposals,
+                decisions=parsed.decisions,
+                clarifications=parsed.clarifications,
+                history=parsed.history,
+                actor=actor,
+                principals=principals,
+            )
+            return _assessment_snapshot_model(
+                config=parsed.config,
+                graph=projection.graph,
+                evidence=projection.evidence,
+                ingestions=projection.ingestions,
+                cases=projection.cases,
+                clarifications=projection.clarifications,
+                history=projection.history,
+                principals=projection.principals,
+            )
+        finally:
+            content = {}
+            held = None
+            parsed = None
+            projection = None
+            actor = ""
+            principals = frozenset()
+
+    def _assessment_cursor_extent_mask(self, snapshot_digest: str, focus: str | None) -> int:
+        material = _canonical_bytes(
+            {
+                "schema": "intent.control-plane-assessment-page-extent.v1",
+                "snapshot_digest": snapshot_digest,
+                "focus": focus,
+            }
+        )
+        digest = hmac.new(bytes(self._assessment_cursor_key), material, hashlib.sha256).digest()
+        return int.from_bytes(digest[:2], "big")
+
+    def _assessment_cursor(
+        self,
+        *,
+        snapshot_digest: str,
+        focus: str | None,
+        extent: int,
+        offset: int,
+    ) -> str:
+        if not 1 <= extent <= _MAX_ASSESSMENT_NODES or not 0 < offset < extent:
+            raise ValueError("invalid assessment cursor")
+        concealed_extent = extent ^ self._assessment_cursor_extent_mask(snapshot_digest, focus)
+        material = _canonical_bytes(
+            {
+                "schema": "intent.control-plane-assessment-page.v2",
+                "snapshot_digest": snapshot_digest,
+                "focus": focus,
+                "extent": extent,
+                "offset": offset,
+            }
+        )
+        tag = hmac.new(bytes(self._assessment_cursor_key), material, hashlib.sha256).hexdigest()[
+            :60
+        ]
+        return f"page:{concealed_extent:04x}{tag}:{offset}"
+
+    def _assessment_page_offset(
+        self,
+        cursor: object,
+        *,
+        snapshot: AssessmentSnapshot,
+        focus: str | None,
+    ) -> tuple[int, int | None]:
+        if cursor is None:
+            return 0, None
+        if type(cursor) is not str:
+            raise ValueError("invalid assessment cursor")
+        matched = _ASSESSMENT_CURSOR.fullmatch(cursor)
+        if matched is None:
+            raise ValueError("invalid assessment cursor")
+        offset = int(matched.group(2))
+        token = matched.group(1)
+        extent = int(token[:4], 16) ^ self._assessment_cursor_extent_mask(
+            snapshot.aggregate_digest, focus
+        )
+        maximum = min(len(snapshot.graph.nodes), _MAX_ASSESSMENT_NODES)
+        if (
+            not 1 <= extent <= maximum
+            or offset % _ASSESSMENT_PAGE_SIZE
+            or offset >= extent
+            or not hmac.compare_digest(
+                token,
+                self._assessment_cursor(
+                    snapshot_digest=snapshot.aggregate_digest,
+                    focus=focus,
+                    extent=extent,
+                    offset=offset,
+                ).split(":")[1],
+            )
+        ):
+            raise ValueError("stale assessment cursor")
+        return offset, extent
+
+    def _assessment_projection_candidate(
+        self,
+        report: AssessmentReport,
+        *,
+        selected: list[NodeScorecard],
+        focus: str | None,
+        offset: int,
+        truncated: bool,
+        size_probe: bool,
+    ) -> dict[str, object]:
+        visible_nodes = list(report.nodes)
+        focus_node = next((item for item in visible_nodes if item.node_id == focus), None)
+        selected_ids = {item.node_id for item in selected}
+
+        report_data = report.model_dump(mode="json")
+        report_data["nodes"] = [item.model_dump(mode="json") for item in selected]
+        branch_data: list[dict[str, object]] = []
+        visible_branch_ids: list[str] = []
+        for branch in report.branches:
+            if branch.root_node_id not in selected_ids:
+                continue
+            branch_nodes = tuple(item for item in branch.node_ids if item in selected_ids)
+            branch_projection = branch.model_copy(
+                update={
+                    "node_ids": branch_nodes,
+                    "contribution_weights": {
+                        item: branch.contribution_weights[item] for item in branch_nodes
+                    },
+                }
+            )
+            visible_branch_ids.append(branch.branch_id)
+            branch_data.append(branch_projection.model_dump(mode="json"))
+        report_data["branches"] = branch_data
+        project_nodes = tuple(
+            item for item in report.project.contributing_node_ids if item in selected_ids
+        )
+        report_data["project"] = report.project.model_copy(
+            update={
+                "branch_ids": tuple(visible_branch_ids),
+                "contributing_node_ids": project_nodes,
+                "contribution_weights": {
+                    item: report.project.contribution_weights[item] for item in visible_branch_ids
+                },
+            }
+        ).model_dump(mode="json")
+        if truncated:
+            report_data["warnings"] = sorted(
+                {*cast(list[str], report_data["warnings"]), "response node projection truncated"}
+            )
+            report_data["assessment_complete"] = False
+
+        rows = (
+            sorted(
+                selected,
+                key=lambda item: (
+                    -len(_canonical_bytes(item.model_dump(mode="json"))),
+                    item.node_id,
+                ),
+            )[:_ASSESSMENT_PAGE_SIZE]
+            if size_probe
+            else selected[offset : offset + _ASSESSMENT_PAGE_SIZE]
+        )
+        next_offset = offset + len(rows)
+        next_cursor = None
+        if (size_probe and len(selected) > _ASSESSMENT_PAGE_SIZE) or (
+            not size_probe and next_offset < len(selected)
+        ):
+            cursor_offset = (
+                1_000
+                if size_probe and len(selected) > 1_000
+                else _ASSESSMENT_PAGE_SIZE
+                if size_probe
+                else next_offset
+            )
+            next_cursor = self._assessment_cursor(
+                snapshot_digest=report.snapshot_digest,
+                focus=focus,
+                extent=len(selected),
+                offset=cursor_offset,
+            )
+        focus_data = None
+        if focus is not None:
+            projected_focus_branch = next(
+                (item for item in branch_data if item.get("branch_id") == focus),
+                None,
+            )
+            detached_focus_branch = (
+                None
+                if projected_focus_branch is None
+                else json.loads(_canonical_bytes(projected_focus_branch))
+            )
+            focus_data = {
+                "reference": focus,
+                "node": None if focus_node is None else focus_node.model_dump(mode="json"),
+                "branch": detached_focus_branch,
+            }
+        return {
+            "schema_version": 1,
+            "assessment": report_data,
+            "focus": focus_data,
+            "page": {
+                "rows": [item.model_dump(mode="json") for item in rows],
+                "next_cursor": next_cursor,
+            },
+        }
+
+    def _assessment_projection(
+        self,
+        report: AssessmentReport,
+        *,
+        focus: str | None,
+        offset: int,
+        expected_extent: int | None = None,
+    ) -> dict[str, object]:
+        visible_nodes = list(report.nodes)
+        focus_node = next((item for item in visible_nodes if item.node_id == focus), None)
+        focus_branch = next((item for item in report.branches if item.branch_id == focus), None)
+        if focus is not None and focus_node is None and focus_branch is None:
+            raise LookupError("assessment reference unavailable")
+
+        priority_ids: tuple[str, ...] = ()
+        if focus_branch is not None:
+            priority_ids = focus_branch.node_ids
+        if focus_node is not None:
+            priority_ids = (focus_node.node_id, *priority_ids)
+        by_id = {item.node_id: item for item in visible_nodes}
+        ordered: list[NodeScorecard] = []
+        ordered_ids: set[str] = set()
+        for identifier in (*priority_ids, *(item.node_id for item in visible_nodes)):
+            node = by_id.get(identifier)
+            if node is None or identifier in ordered_ids:
+                continue
+            ordered.append(node)
+            ordered_ids.add(identifier)
+            if len(ordered) == _MAX_ASSESSMENT_NODES:
+                break
+
+        low = 0
+        high = len(ordered)
+        while low < high:
+            middle = (low + high + 1) // 2
+            candidate = self._assessment_projection_candidate(
+                report,
+                selected=ordered[:middle],
+                focus=focus,
+                offset=0,
+                truncated=len(visible_nodes) > middle,
+                size_probe=True,
+            )
+            try:
+                require_exact_json(candidate, maximum_bytes=MAX_HTTP_RESPONSE_BYTES)
+                fits = True
+            except ValueError:
+                fits = False
+            if fits:
+                low = middle
+            else:
+                high = middle - 1
+            candidate = {}
+        if focus is not None and low == 0:
+            raise ValueError("focused assessment exceeds response bound")
+        if expected_extent is not None and low != expected_extent:
+            raise ValueError("stale assessment cursor")
+        if offset and offset >= low:
+            raise ValueError("stale assessment cursor")
+        result = self._assessment_projection_candidate(
+            report,
+            selected=ordered[:low],
+            focus=focus,
+            offset=offset,
+            truncated=len(visible_nodes) > low,
+            size_probe=False,
+        )
+        require_exact_json(result, maximum_bytes=MAX_HTTP_RESPONSE_BYTES)
+        return result
+
+    def assessment(
+        self,
+        focus: str | None = None,
+        *,
+        page_cursor: str | None = None,
+    ) -> dict[str, object]:
+        """Return one bounded read-only assessment from held, reauthenticated authority."""
+        authority: _Authority | None = None
+        snapshot: AssessmentSnapshot | None = None
+        report: AssessmentReport | None = None
+        projected: dict[str, object] | None = None
+        detached: AssessmentResponse | None = None
+        sealed: _OpaqueAssessmentResult | None = None
+        signal: BaseException | None = None
+        failed = False
+        try:
+            validated_focus = self._assessment_reference(focus, optional=True)
+            authority = self._read_only_authority()
+            actor = authority.config.local_actor
+            principals = self._principals(authority, actor)
+            snapshot = self._assessment_snapshot_from_authority(authority, actor, principals)
+            offset, expected_extent = self._assessment_page_offset(
+                page_cursor,
+                snapshot=snapshot,
+                focus=validated_focus,
+            )
+            report = self._assessment_service.assess(snapshot)
+            projected = self._assessment_projection(
+                report,
+                focus=validated_focus,
+                offset=offset,
+                expected_extent=expected_extent,
+            )
+            detached = AssessmentResponse.model_validate(projected)
+            if not self._read_only_authority_matches(authority):
+                raise ValueError("assessment authority changed")
+            sealed = _OpaqueAssessmentResult(detached.model_dump(mode="json"))
+        except Exception:  # noqa: BLE001 - fixed opaque assessment boundary
+            failed = True
+        except BaseException as caught:  # noqa: BLE001 - preserve cancellation identity
+            caught.__traceback__ = None
+            caught.__cause__ = None
+            caught.__context__ = None
+            signal = caught
+        finally:
+            focus = None
+            page_cursor = None
+            if "validated_focus" in locals():
+                validated_focus = None
+            if "actor" in locals():
+                actor = ""
+            if "principals" in locals():
+                principals = frozenset()
+            if "offset" in locals():
+                offset = 0
+            if "expected_extent" in locals():
+                expected_extent = None
+            projected = None
+            detached = None
+            closing_authority = authority
+            authority = None
+            snapshot = None
+            report = None
+            if closing_authority is not None:
+                closing_authority.scrub_private()
+                try:
+                    closing_authority.close()
+                except Exception:  # noqa: BLE001 - fixed close failure boundary
+                    failed = True
+                    if sealed is not None:
+                        sealed.clear()
+                except BaseException as caught:  # noqa: BLE001 - preserve close cancellation
+                    caught.__traceback__ = None
+                    caught.__cause__ = None
+                    caught.__context__ = None
+                    if signal is None:
+                        signal = caught
+                    if sealed is not None:
+                        sealed.clear()
+            closing_authority = None
+        if signal is not None:
+            if sealed is not None:
+                sealed.clear()
+            sealed = None
+            caught_signal = signal
+            signal = None
+            raise caught_signal.with_traceback(None)
+        result = None if sealed is None else sealed.take()
+        sealed = None
+        if failed or result is None:
+            raise ControlPlaneError() from None
+        return result
+
+    def assessment_node(self, node_id: str) -> dict[str, object]:
+        """Return one visible node or the same fixed failure for hidden and unknown IDs."""
+        authority: _Authority | None = None
+        snapshot: AssessmentSnapshot | None = None
+        report: AssessmentReport | None = None
+        detached: AssessmentNodeResponse | None = None
+        sealed: _OpaqueAssessmentResult | None = None
+        signal: BaseException | None = None
+        failed = False
+        missing = False
+        try:
+            validated_node_id = self._assessment_reference(node_id, optional=False)
+            authority = self._read_only_authority()
+            actor = authority.config.local_actor
+            principals = self._principals(authority, actor)
+            snapshot = self._assessment_snapshot_from_authority(authority, actor, principals)
+            report = self._assessment_service.assess(snapshot)
+            scorecard = next(
+                (item for item in report.nodes if item.node_id == validated_node_id),
+                None,
+            )
+            if scorecard is not None:
+                detached = AssessmentNodeResponse(
+                    snapshot_digest=report.snapshot_digest,
+                    node=scorecard.model_dump(mode="json"),
+                )
+            if not self._read_only_authority_matches(authority):
+                raise ValueError("assessment authority changed")
+            missing = scorecard is None
+            if detached is not None:
+                sealed = _OpaqueAssessmentResult(detached.model_dump(mode="json"))
+        except Exception:  # noqa: BLE001 - hidden and unknown are deliberately identical
+            failed = True
+        except BaseException as caught:  # noqa: BLE001 - preserve cancellation identity
+            caught.__traceback__ = None
+            caught.__cause__ = None
+            caught.__context__ = None
+            signal = caught
+        finally:
+            node_id = ""
+            if "validated_node_id" in locals():
+                validated_node_id = None
+            if "scorecard" in locals():
+                scorecard = None
+            if "actor" in locals():
+                actor = ""
+            if "principals" in locals():
+                principals = frozenset()
+            detached = None
+            closing_authority = authority
+            authority = None
+            snapshot = None
+            report = None
+            if closing_authority is not None:
+                closing_authority.scrub_private()
+                try:
+                    closing_authority.close()
+                except Exception:  # noqa: BLE001 - fixed close failure boundary
+                    failed = True
+                    missing = False
+                    if sealed is not None:
+                        sealed.clear()
+                except BaseException as caught:  # noqa: BLE001 - preserve close cancellation
+                    caught.__traceback__ = None
+                    caught.__cause__ = None
+                    caught.__context__ = None
+                    missing = False
+                    if signal is None:
+                        signal = caught
+                    if sealed is not None:
+                        sealed.clear()
+            closing_authority = None
+        if signal is not None:
+            if sealed is not None:
+                sealed.clear()
+            sealed = None
+            caught_signal = signal
+            signal = None
+            raise caught_signal.with_traceback(None)
+        if missing:
+            raise AssessmentNodeUnavailable() from None
+        result = None if sealed is None else sealed.take()
+        sealed = None
+        if failed or result is None:
+            raise ControlPlaneError() from None
+        return result
 
     def status(self) -> dict[str, object]:
         """Return one detached local readiness projection without granting authority."""
@@ -2108,6 +2794,9 @@ class ControlPlaneService:
     def close(self) -> None:
         """Release descriptors owned by this service while leaving Runtime ownership intact."""
         self._stop_development_observation()
+        if self._assessment_cursor_key:
+            self._assessment_cursor_key[:] = b"\x00" * len(self._assessment_cursor_key)
+            self._assessment_cursor_key.clear()
         if self._dev_observer is not None:
             self._dev_observer.close()
             self._dev_observer = None
