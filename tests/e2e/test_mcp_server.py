@@ -127,6 +127,13 @@ async def test_intent_mcp_stdio_is_protocol_clean_and_read_only(tmp_path: Path) 
             initialized = await client.initialize()
             tools = await client.list_tools()
             status = await client.call_tool("intent_status", {})
+            assessment = await client.call_tool("intent_assessment_summary", {})
+            assessment_scorecard = await client.call_tool(
+                "intent_assessment_scorecard", {"reference": "intent:mcp-stdio"}
+            )
+            assessment_gaps = await client.call_tool(
+                "intent_assessment_gaps", {"limit": 1, "health": "red"}
+            )
             invalid = await client.call_tool(
                 "intent_context",
                 {"format": "PRIVATE-MISSING-MCP-WIRE-ARG-" + "x" * 200},
@@ -298,6 +305,9 @@ async def test_intent_mcp_stdio_is_protocol_clean_and_read_only(tmp_path: Path) 
         "intent_drift",
         "intent_status",
         "intent_validate",
+        "intent_assessment_summary",
+        "intent_assessment_scorecard",
+        "intent_assessment_gaps",
         "intent_reconcile_list",
         "intent_reconcile_show",
         "intent_changeset_propose",
@@ -317,6 +327,15 @@ async def test_intent_mcp_stdio_is_protocol_clean_and_read_only(tmp_path: Path) 
         "intent_clarification_confirm",
     }
     assert status.structured_content["schema_version"] == "1"
+    assert assessment.structured_content["assessment"]["project"]["health"] in {
+        "green",
+        "orange",
+        "red",
+        "unassessed",
+    }
+    assert assessment_scorecard.structured_content["node"]["node_id"] == "intent:mcp-stdio"
+    assert assessment_gaps.structured_content["limit"] == 1
+    assert "token" not in repr((assessment, assessment_scorecard, assessment_gaps)).casefold()
     assert invalid.is_error is True
     assert "invalid intent tool arguments" in repr(invalid.content)
     assert "PRIVATE-MISSING-MCP-WIRE-ARG" not in repr(invalid)

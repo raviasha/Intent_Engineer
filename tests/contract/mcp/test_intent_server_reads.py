@@ -41,6 +41,9 @@ _TOOLS = {
     "intent_drift",
     "intent_status",
     "intent_validate",
+    "intent_assessment_summary",
+    "intent_assessment_scorecard",
+    "intent_assessment_gaps",
     "intent_reconcile_list",
     "intent_reconcile_show",
 }

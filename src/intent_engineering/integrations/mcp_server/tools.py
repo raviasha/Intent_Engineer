@@ -11,6 +11,8 @@ from mcp.server.mcpserver import MCPServer
 from mcp.types import INTERNAL_ERROR, INVALID_PARAMS, ToolAnnotations
 from pydantic import BaseModel, WithJsonSchema
 
+from intent_engineering.assessment.models import AssessmentHealth, AssessmentReport
+from intent_engineering.assessment.service import GraphAssessmentService
 from intent_engineering.capture.mcp.profile_loader import load_strict_yaml_mapping_bytes
 from intent_engineering.cli.connectors import configured_actor_principals
 from intent_engineering.cli.runtime import Runtime
@@ -40,6 +42,15 @@ _READ_ONLY = ToolAnnotations(
     open_world_hint=False,
 )
 _SCHEMA_VERSION = "1"
+_MAX_ASSESSMENT_GAPS = 100
+_MAX_ASSESSMENT_RESPONSE_BYTES = 32 * 1024 * 1024
+_ASSESSMENT_TOOL_NAMES = frozenset(
+    {
+        "intent_assessment_summary",
+        "intent_assessment_scorecard",
+        "intent_assessment_gaps",
+    }
+)
 type _IdentifierInput = Annotated[
     object,
     WithJsonSchema({"type": "string", "minLength": 1, "maxLength": 512}),
@@ -60,6 +71,14 @@ type _StatusInput = Annotated[
             "enum": [status.value for status in ReconciliationStatus],
         }
     ),
+]
+type _AssessmentHealthInput = Annotated[
+    object,
+    WithJsonSchema({"type": "string", "enum": ["green", "orange", "red"]}),
+]
+type _AssessmentLimitInput = Annotated[
+    object,
+    WithJsonSchema({"type": "integer", "minimum": 1, "maximum": _MAX_ASSESSMENT_GAPS}),
 ]
 
 
@@ -85,6 +104,46 @@ def _input_string(
 
 def _invalid_input() -> Never:
     raise MCPError(INVALID_PARAMS, "invalid intent tool arguments") from None
+
+
+def _scrub_signal(error: BaseException) -> BaseException:
+    """Remove retained private material while preserving cancellation object identity."""
+    error.args = ()
+    error.__traceback__ = None
+    error.__cause__ = None
+    error.__context__ = None
+    error.__dict__.clear()
+    return error
+
+
+def _bounded_assessment_response(payload: dict[str, object]) -> dict[str, object] | None:
+    """Return one canonically encodable response within the shared public byte bound."""
+    encoded = b""
+    bounded: dict[str, object] | None = None
+    signal: BaseException | None = None
+    try:
+        encoded = json.dumps(
+            payload,
+            allow_nan=False,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        if len(encoded) <= _MAX_ASSESSMENT_RESPONSE_BYTES:
+            bounded = payload
+    except Exception:  # noqa: BLE001 - one fixed response-encoding failure boundary
+        bounded = None
+    except BaseException as caught:  # noqa: BLE001 - preserve cancellation identity
+        signal = _scrub_signal(caught)
+    finally:
+        payload = {}
+        encoded = b""
+    if signal is not None:
+        caught_signal = signal
+        signal = None
+        bounded = None
+        raise caught_signal.with_traceback(None)
+    return bounded
 
 
 @dataclass(frozen=True)
@@ -121,6 +180,131 @@ class McpReadServices:
 
     def __init__(self, runtime: Runtime) -> None:
         self.runtime = runtime
+        self._assessment_service = GraphAssessmentService()
+
+    def _assessment_report(self) -> AssessmentReport | None:
+        """Assess one fresh no-recovery snapshot behind a fixed public failure boundary."""
+        snapshot = None
+        report: AssessmentReport | None = None
+        signal: BaseException | None = None
+        failed = False
+        try:
+            snapshot = self.runtime.assessment_snapshot(self.runtime.config.local_actor)
+            report = self._assessment_service.assess(snapshot)
+        except Exception:  # noqa: BLE001 - expose one fixed assessment-read failure
+            failed = True
+        except BaseException as caught:  # noqa: BLE001 - preserve cancellation identity
+            signal = _scrub_signal(caught)
+        finally:
+            snapshot = None
+        if signal is not None:
+            caught_signal = signal
+            signal = None
+            report = None
+            del self
+            raise caught_signal.with_traceback(None)
+        if failed:
+            return None
+        return report
+
+    def assessment_summary(self) -> dict[str, object] | None:
+        """Return the complete deterministic report for one current visible snapshot."""
+        report = self._assessment_report()
+        if report is None:
+            return None
+        bounded: dict[str, object] | None = None
+        signal: BaseException | None = None
+        try:
+            bounded = _bounded_assessment_response(
+                {
+                    "schema_version": _SCHEMA_VERSION,
+                    "assessment": report.model_dump(mode="json"),
+                    "semantic_digest": report.semantic_digest,
+                }
+            )
+        except BaseException as caught:  # noqa: BLE001 - preserve cancellation identity
+            signal = _scrub_signal(caught)
+        finally:
+            report = None
+        if signal is not None:
+            caught_signal = signal
+            signal = None
+            bounded = None
+            del self
+            raise caught_signal.with_traceback(None)
+        return bounded
+
+    def assessment_scorecard(self, reference: str) -> dict[str, object] | None:
+        """Return visible node and branch scorecards sharing one exact stable reference."""
+        report = self._assessment_report()
+        if report is None:
+            return None
+        node = next((item for item in report.nodes if item.node_id == reference), None)
+        branch = next((item for item in report.branches if item.branch_id == reference), None)
+        if node is None and branch is None:
+            return None
+        bounded: dict[str, object] | None = None
+        signal: BaseException | None = None
+        try:
+            bounded = _bounded_assessment_response(
+                {
+                    "schema_version": _SCHEMA_VERSION,
+                    "semantic_digest": report.semantic_digest,
+                    "reference": reference,
+                    "node": None if node is None else node.model_dump(mode="json"),
+                    "branch": None if branch is None else branch.model_dump(mode="json"),
+                }
+            )
+        except BaseException as caught:  # noqa: BLE001 - preserve cancellation identity
+            signal = _scrub_signal(caught)
+        finally:
+            report = None
+            node = None
+            branch = None
+            reference = ""
+        if signal is not None:
+            caught_signal = signal
+            signal = None
+            bounded = None
+            del self
+            raise caught_signal.with_traceback(None)
+        return bounded
+
+    def assessment_gaps(
+        self,
+        *,
+        limit: int = 20,
+        health: AssessmentHealth | None = None,
+    ) -> dict[str, object] | None:
+        """Return a bounded stable prefix of visible rubric gaps."""
+        report = self._assessment_report()
+        if report is None:
+            return None
+        gaps = tuple(item for item in report.gaps if health is None or item.severity is health)
+        bounded: dict[str, object] | None = None
+        signal: BaseException | None = None
+        try:
+            bounded = _bounded_assessment_response(
+                {
+                    "schema_version": _SCHEMA_VERSION,
+                    "semantic_digest": report.semantic_digest,
+                    "health": None if health is None else health.value,
+                    "limit": limit,
+                    "gaps": [item.model_dump(mode="json") for item in gaps[:limit]],
+                }
+            )
+        except BaseException as caught:  # noqa: BLE001 - preserve cancellation identity
+            signal = _scrub_signal(caught)
+        finally:
+            report = None
+            gaps = ()
+        if signal is not None:
+            caught_signal = signal
+            signal = None
+            bounded = None
+            del self
+            raise caught_signal.with_traceback(None)
+        return bounded
 
     def _snapshot(self) -> _ReadSnapshot | None:
         try:
@@ -423,6 +607,66 @@ def _found(payload: dict[str, object] | None) -> dict[str, object]:
     return payload
 
 
+def validate_assessment_tool_call(name: str, arguments: dict[str, object]) -> None:
+    """Validate exact raw assessment arguments before SDK coercion or handler lookup."""
+    from intent_engineering.integrations.mcp_server.intent_workflow import (
+        _require_exact_json,
+    )
+
+    signal: BaseException | None = None
+    try:
+        if type(name) is not str or name not in _ASSESSMENT_TOOL_NAMES:
+            raise ValueError("invalid assessment request")
+        if type(arguments) is not dict:
+            raise ValueError("invalid assessment request")
+        _require_exact_json(arguments)
+        keys = set(dict.keys(arguments))
+        if name == "intent_assessment_summary":
+            if keys:
+                raise ValueError("invalid assessment request")
+        elif name == "intent_assessment_scorecard":
+            if (
+                keys != {"reference"}
+                or _input_string(
+                    dict.__getitem__(arguments, "reference"),
+                    maximum=512,
+                    identifier=True,
+                )
+                is None
+            ):
+                raise ValueError("invalid assessment request")
+        else:
+            if not keys.issubset({"limit", "health"}):
+                raise ValueError("invalid assessment request")
+            if "limit" in keys:
+                limit = dict.__getitem__(arguments, "limit")
+                if type(limit) is not int or not 1 <= limit <= _MAX_ASSESSMENT_GAPS:
+                    raise ValueError("invalid assessment request")
+            if "health" in keys:
+                health = dict.__getitem__(arguments, "health")
+                if (
+                    health is not None
+                    and _input_string(
+                        health,
+                        maximum=6,
+                        choices=frozenset({"green", "orange", "red"}),
+                    )
+                    is None
+                ):
+                    raise ValueError("invalid assessment request")
+    except Exception:  # noqa: BLE001 - one fixed raw assessment boundary
+        raise ValueError("invalid intent tool arguments") from None
+    except BaseException as caught:  # noqa: BLE001 - preserve cancellation identity
+        signal = _scrub_signal(caught)
+    finally:
+        name = ""
+        arguments = {}
+    if signal is not None:
+        caught_signal = signal
+        signal = None
+        raise caught_signal.with_traceback(None)
+
+
 def register_read_tools(server: MCPServer, services: McpReadServices) -> None:
     """Register the exact version-1 read-only tool surface."""
 
@@ -502,6 +746,63 @@ def register_read_tools(server: MCPServer, services: McpReadServices) -> None:
     def intent_status() -> dict[str, object]:
         """Summarize the authorized durable graph, evidence, and case state."""
         return _available(services.status())
+
+    @server.tool(
+        name="intent_assessment_summary",
+        annotations=_READ_ONLY,
+        structured_output=True,
+    )
+    def intent_assessment_summary() -> dict[str, object]:
+        """Return the current explainable assessment for one authorized snapshot."""
+        return _available(services.assessment_summary())
+
+    @server.tool(
+        name="intent_assessment_scorecard",
+        annotations=_READ_ONLY,
+        structured_output=True,
+    )
+    def intent_assessment_scorecard(reference: _IdentifierInput) -> dict[str, object]:
+        """Return one authorized node and branch assessment by exact reference."""
+        selected = _input_string(reference, maximum=512, identifier=True)
+        del reference
+        if selected is None:
+            _invalid_input()
+        payload = services.assessment_scorecard(selected)
+        del selected
+        return _found(payload)
+
+    @server.tool(
+        name="intent_assessment_gaps",
+        annotations=_READ_ONLY,
+        structured_output=True,
+    )
+    def intent_assessment_gaps(
+        limit: _AssessmentLimitInput = 20,
+        health: _AssessmentHealthInput | None = None,
+    ) -> dict[str, object]:
+        """Return a bounded stable list of authorized assessment gaps."""
+        selected_limit = (
+            limit if type(limit) is int and 1 <= limit <= _MAX_ASSESSMENT_GAPS else None
+        )
+        selected_health = (
+            None
+            if health is None
+            else _input_string(
+                health,
+                maximum=6,
+                choices=frozenset({"green", "orange", "red"}),
+            )
+        )
+        health_was_supplied = health is not None
+        del limit, health
+        if selected_limit is None or (health_was_supplied and selected_health is None):
+            _invalid_input()
+        payload = services.assessment_gaps(
+            limit=selected_limit,
+            health=None if selected_health is None else AssessmentHealth(selected_health),
+        )
+        del selected_limit, selected_health
+        return _available(payload)
 
     @server.tool(name="intent_validate", annotations=_READ_ONLY, structured_output=True)
     def intent_validate() -> dict[str, object]:
