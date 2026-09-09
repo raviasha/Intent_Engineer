@@ -2,6 +2,14 @@
   color-scheme: light dark;
   font-family: system-ui, sans-serif;
   line-height: 1.5;
+  --health-green-text: #067647;
+  --health-green-background: #ecfdf3;
+  --health-orange-text: #93370d;
+  --health-orange-background: #fffaeb;
+  --health-red-text: #b42318;
+  --health-red-background: #fef3f2;
+  --health-unassessed-text: #344054;
+  --health-unassessed-background: #f2f4f7;
 }
 
 body {
@@ -40,7 +48,10 @@ button[aria-current="page"] {
 
 button:focus-visible,
 a:focus-visible,
-input:focus-visible {
+input:focus-visible,
+select:focus-visible,
+.assessment-graph-node:focus-visible,
+.assessment-table-row:focus-visible {
   outline: 3px solid Highlight;
   outline-offset: 3px;
 }
@@ -87,4 +98,135 @@ dt {
 dd {
   margin: 0;
   overflow-wrap: anywhere;
+}
+
+.assessment-controls,
+.assessment-pagination {
+  align-items: end;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+  margin: 1rem 0;
+}
+
+.assessment-controls label {
+  display: grid;
+  font-weight: 700;
+  gap: 0.25rem;
+}
+
+.assessment-controls strong {
+  flex-basis: 100%;
+}
+
+.assessment-graph-items {
+  display: grid;
+  gap: 0.75rem;
+  grid-template-columns: repeat(auto-fit, minmax(13rem, 1fr));
+}
+
+.assessment-graph-node {
+  align-items: start;
+  display: grid;
+  gap: 0.35rem;
+  overflow-wrap: anywhere;
+  text-align: left;
+}
+
+.assessment-graph-node[aria-pressed="true"],
+.assessment-table-row[aria-selected="true"] {
+  box-shadow: 0 0 0 3px currentColor;
+  font-weight: 700;
+}
+
+.assessment-table-region {
+  margin-top: 1.5rem;
+  overflow-x: auto;
+}
+
+.assessment-table-region table {
+  border-collapse: collapse;
+  min-width: 58rem;
+  width: 100%;
+}
+
+.assessment-table-region th,
+.assessment-table-region td {
+  border: 1px solid currentColor;
+  overflow-wrap: anywhere;
+  padding: 0.55rem;
+  text-align: left;
+  vertical-align: top;
+}
+
+.assessment-table-row {
+  cursor: pointer;
+}
+
+.assessment-detail {
+  border: 2px solid CanvasText;
+  margin-top: 1.5rem;
+  padding: 1rem;
+}
+
+.assessment-dimension {
+  border-left: 0.45rem solid currentColor;
+  margin: 0.75rem 0;
+  padding: 0.5rem 0.75rem;
+}
+
+.assessment-project-summary {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+  padding: 0.75rem;
+}
+
+.assessment-health-icon {
+  display: inline-block;
+  font-weight: 800;
+  margin-right: 0.35rem;
+  min-width: 1.1rem;
+  text-align: center;
+}
+
+.assessment-health-label {
+  font-weight: 700;
+  margin-right: 0.4rem;
+  text-decoration: underline;
+}
+
+.health-green {
+  background: var(--health-green-background);
+  border-style: solid;
+  color: var(--health-green-text);
+}
+
+.health-orange {
+  background: var(--health-orange-background);
+  border-style: dashed;
+  color: var(--health-orange-text);
+}
+
+.health-red {
+  background: var(--health-red-background);
+  border-style: double;
+  color: var(--health-red-text);
+}
+
+.health-unassessed {
+  background: var(--health-unassessed-background);
+  border-style: dotted;
+  color: var(--health-unassessed-text);
+}
+
+@media (max-width: 40rem) {
+  body {
+    padding: 0.75rem;
+  }
+
+  .assessment-graph-items {
+    grid-template-columns: 1fr;
+  }
 }

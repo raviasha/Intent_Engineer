@@ -26,9 +26,20 @@
     decisionVerify: "/api/v1/decisions/verify",
     developmentObservation: "/api/v1/development/observation",
     reviewedTests: "/api/v1/development/tests/run",
+    assessment: "/api/v1/assessment",
     browserBootstrap: "/_intent/browser/bootstrap",
   });
-  const viewNames = new Set(["home", "onboarding", "inbox", "proposal", "team_state"]);
+  const viewNames = new Set(["home", "onboarding", "inbox", "proposal", "team_state", "assessment"]);
+  const MAX_ASSESSMENT_NODES = 2000;
+  const MAX_ASSESSMENT_ROWS = 100;
+  const MAX_ASSESSMENT_DIMENSIONS = 7;
+  const MAX_ASSESSMENT_CHECKS = 64;
+  const assessmentHealth = Object.freeze({
+    green: Object.freeze({ label: "Green", icon: "✓" }),
+    orange: Object.freeze({ label: "Orange", icon: "!" }),
+    red: Object.freeze({ label: "Red", icon: "×" }),
+    unassessed: Object.freeze({ label: "Unassessed", icon: "?" }),
+  });
   const app = document.getElementById("app");
   const statusRegion = document.getElementById("status");
   const navigation = Array.from(document.querySelectorAll("[data-view]"));
@@ -47,6 +58,18 @@
     teamSetupPreview: null,
     teamSetupResult: null,
   };
+  const assessmentState = Object.seal({
+    report: null,
+    selectedNodeId: null,
+    filters: Object.seal({ health: "", dimension: "", type: "" }),
+    pageCursor: null,
+    pageFocus: null,
+    nextCursor: null,
+    pageRows: [],
+    overlay: "approved",
+    unavailable: false,
+    generation: 0,
+  });
   let csrfToken = readCsrfBootstrap();
 
   function readCsrfBootstrap() {
@@ -181,6 +204,626 @@
     return section;
   }
 
+  function boundedAssessmentArray(value, maximum, label) {
+    if (!Array.isArray(value) || value.length > maximum) {
+      throw new Error(`Invalid bounded assessment ${label}.`);
+    }
+    return value;
+  }
+
+  function assessmentScore(value) {
+    return Number.isInteger(value) && value >= 0 && value <= 100 ? value : null;
+  }
+
+  function validateAssessmentNode(node) {
+    if (
+      !node ||
+      typeof node !== "object" ||
+      typeof node.node_id !== "string" ||
+      node.node_id.length === 0 ||
+      node.node_id.length > 512 ||
+      typeof node.node_type !== "string" ||
+      node.node_type.length > 128 ||
+      !assessmentHealth[node.health]
+    ) {
+      throw new Error("Invalid assessment scorecard.");
+    }
+    if (node.robustness !== null && assessmentScore(node.robustness) === null) {
+      throw new Error("Invalid assessment robustness.");
+    }
+    if (node.confidence !== null && assessmentScore(node.confidence) === null) {
+      throw new Error("Invalid assessment confidence.");
+    }
+    if (
+      node.projected_robustness !== null &&
+      assessmentScore(node.projected_robustness) === null
+    ) {
+      throw new Error("Invalid projected robustness.");
+    }
+    if (
+      node.projected_confidence !== null &&
+      assessmentScore(node.projected_confidence) === null
+    ) {
+      throw new Error("Invalid projected confidence.");
+    }
+    const dimensions = boundedAssessmentArray(
+      node.dimensions,
+      MAX_ASSESSMENT_DIMENSIONS,
+      "dimensions"
+    );
+    for (const dimension of dimensions) {
+      if (!dimension || typeof dimension !== "object" || typeof dimension.dimension !== "string") {
+        throw new Error("Invalid assessment dimension.");
+      }
+      boundedAssessmentArray(dimension.passed, MAX_ASSESSMENT_CHECKS, "passed checks");
+      boundedAssessmentArray(dimension.failed, MAX_ASSESSMENT_CHECKS, "failed checks");
+      if (dimension.passed.length + dimension.failed.length > MAX_ASSESSMENT_CHECKS) {
+        throw new Error("Too many assessment checks.");
+      }
+      if (dimension.score !== null && assessmentScore(dimension.score) === null) {
+        throw new Error("Invalid assessment dimension score.");
+      }
+      if (dimension.confidence !== null && assessmentScore(dimension.confidence) === null) {
+        throw new Error("Invalid assessment dimension confidence.");
+      }
+    }
+    boundedAssessmentArray(node.blocking_case_refs, MAX_ASSESSMENT_CHECKS, "blocking cases");
+    return node;
+  }
+
+  function exactAssessmentObject(left, right) {
+    return JSON.stringify(left) === JSON.stringify(right);
+  }
+
+  function acceptAssessmentResponse(payload, expectedFocus = null) {
+    if (
+      !payload ||
+      typeof payload !== "object" ||
+      !payload.assessment ||
+      typeof payload.assessment !== "object" ||
+      !payload.page ||
+      typeof payload.page !== "object"
+    ) {
+      throw new Error("Invalid assessment response.");
+    }
+    const nodes = boundedAssessmentArray(
+      payload.assessment.nodes,
+      MAX_ASSESSMENT_NODES,
+      "nodes"
+    );
+    const rows = boundedAssessmentArray(payload.page.rows, MAX_ASSESSMENT_ROWS, "rows");
+    boundedAssessmentArray(
+      payload.assessment.branches,
+      MAX_ASSESSMENT_NODES,
+      "branches"
+    );
+    boundedAssessmentArray(payload.assessment.gaps, MAX_ASSESSMENT_NODES, "gaps");
+    boundedAssessmentArray(payload.assessment.warnings, MAX_ASSESSMENT_NODES, "warnings");
+    const nodesById = new Map();
+    for (const node of nodes) {
+      validateAssessmentNode(node);
+      if (nodesById.has(node.node_id)) {
+        throw new Error("Duplicate assessment scorecard.");
+      }
+      nodesById.set(node.node_id, node);
+    }
+    const rowIds = new Set();
+    const canonicalRows = rows.map((row) => {
+      if (!row || typeof row !== "object" || !nodesById.has(row.node_id)) {
+        throw new Error("Assessment page does not reference a scorecard.");
+      }
+      if (rowIds.has(row.node_id)) {
+        throw new Error("Duplicate assessment page row.");
+      }
+      rowIds.add(row.node_id);
+      const canonicalNode = nodesById.get(row.node_id);
+      if (!exactAssessmentObject(row, canonicalNode)) {
+        throw new Error("Assessment page row does not match its scorecard.");
+      }
+      return canonicalNode;
+    });
+    if (expectedFocus === null) {
+      if (payload.focus !== null) {
+        throw new Error("Unexpected assessment focus.");
+      }
+    } else {
+      if (
+        !payload.focus ||
+        typeof payload.focus !== "object" ||
+        payload.focus.reference !== expectedFocus ||
+        !payload.focus.node ||
+        typeof payload.focus.node !== "object" ||
+        payload.focus.node.node_id !== expectedFocus
+      ) {
+        throw new Error("Assessment focus does not match the request.");
+      }
+      const canonicalFocus = nodesById.get(expectedFocus);
+      if (
+        !canonicalFocus ||
+        !exactAssessmentObject(payload.focus.node, canonicalFocus) ||
+        canonicalRows.filter((node) => node === canonicalFocus).length !== 1
+      ) {
+        throw new Error("Assessment focus is not one canonical page row.");
+      }
+      payload.focus.node = canonicalFocus;
+    }
+    const nextCursor = payload.page.next_cursor;
+    if (nextCursor !== null && (typeof nextCursor !== "string" || nextCursor.length > 512)) {
+      throw new Error("Invalid assessment cursor.");
+    }
+    return { report: payload.assessment, rows: canonicalRows, nextCursor };
+  }
+
+  function assessmentNode(nodeId) {
+    if (!assessmentState.report || typeof nodeId !== "string") {
+      return null;
+    }
+    return assessmentState.report.nodes.find((node) => node.node_id === nodeId) || null;
+  }
+
+  function displayedAssessmentScore(node) {
+    return assessmentState.overlay === "projected"
+      ? node.projected_robustness
+      : node.robustness;
+  }
+
+  function displayedAssessmentConfidence(node) {
+    return assessmentState.overlay === "projected"
+      ? node.projected_confidence
+      : node.confidence;
+  }
+
+  function scoreText(value) {
+    return assessmentScore(value) === null ? "N/A" : String(value);
+  }
+
+  function assessmentOverlayName() {
+    return assessmentState.overlay === "projected" ? "Projected" : "Approved";
+  }
+
+  function assessmentValueText(label, value) {
+    if (assessmentScore(value) !== null) {
+      return `${assessmentOverlayName()} ${label} ${value}`;
+    }
+    return assessmentState.overlay === "projected"
+      ? `Projected ${label} N/A — unavailable`
+      : `Approved ${label} N/A — unassessed`;
+  }
+
+  function displayedAssessmentHealth(node) {
+    return assessmentState.overlay === "projected" ? "unassessed" : node.health;
+  }
+
+  function assessmentHealthText(node, subject = "") {
+    const prefix = subject ? `${subject} ` : "";
+    return assessmentState.overlay === "projected"
+      ? `Projected ${prefix}health unavailable`
+      : `Approved ${prefix}health ${assessmentHealth[node.health].label}`;
+  }
+
+  function focusAssessmentRepresentation(role, nodeId) {
+    const nodes = role === "table"
+      ? assessmentState.pageRows
+      : assessmentState.report.nodes;
+    const index = nodes.findIndex((node) => node.node_id === nodeId);
+    if (index < 0) {
+      return;
+    }
+    const candidate = document.getElementById(
+      role === "table" ? `assessment-row-${index}` : `assessment-node-${index}`
+    );
+    if (
+      !candidate ||
+      candidate.dataset.nodeId !== nodeId ||
+      candidate.dataset.assessmentRole !== role
+    ) {
+      return;
+    }
+    candidate.focus();
+    if (typeof candidate.scrollIntoView === "function") {
+      candidate.scrollIntoView({ block: "nearest" });
+    }
+  }
+
+  async function selectAssessmentNode(nodeId, source) {
+    if (!assessmentNode(nodeId)) {
+      return;
+    }
+    if (
+      source === "graph" &&
+      !assessmentState.pageRows.some((node) => node.node_id === nodeId)
+    ) {
+      await loadAssessment(null, nodeId, "table", nodeId);
+      return;
+    }
+    assessmentState.selectedNodeId = nodeId;
+    render();
+    focusAssessmentRepresentation(source === "table" ? "graph" : "table", nodeId);
+  }
+
+  function assessmentSelectionHandler(node, source) {
+    return (event) => {
+      if (event.key === "Enter" || event.key === " ") {
+        event.preventDefault();
+        void selectAssessmentNode(node.node_id, source);
+      }
+    };
+  }
+
+  function assessmentMatchesFilters(node) {
+    const filters = assessmentState.filters;
+    return (
+      (!filters.health || node.health === filters.health) &&
+      (!filters.type || node.node_type === filters.type) &&
+      (!filters.dimension ||
+        node.worst_dimension === filters.dimension ||
+        node.dimensions.some((dimension) => dimension.dimension === filters.dimension))
+    );
+  }
+
+  function addOption(select, value, label) {
+    const option = document.createElement("option");
+    option.value = value;
+    option.textContent = label;
+    select.append(option);
+  }
+
+  function assessmentFilter(id, label, values, selected, key) {
+    const wrapper = document.createElement("label");
+    wrapper.textContent = label;
+    const select = document.createElement("select");
+    select.id = id;
+    addOption(select, "", `All ${label.toLowerCase()}`);
+    for (const value of values) {
+      addOption(select, value, value);
+    }
+    select.value = selected;
+    select.addEventListener("change", (event) => {
+      assessmentState.filters[key] = event.target.value;
+      render();
+    });
+    wrapper.append(select);
+    return wrapper;
+  }
+
+  function addAssessmentHealth(parent, health, label = null) {
+    const display = assessmentHealth[health] || assessmentHealth.unassessed;
+    const icon = addText(parent, "span", display.icon);
+    icon.className = "assessment-health-icon";
+    icon.setAttribute("aria-hidden", "true");
+    const text = addText(parent, "span", label === null ? display.label : label);
+    text.className = "assessment-health-label";
+  }
+
+  function assessmentClass(health, base) {
+    return `${base} assessment-health health-${health}`;
+  }
+
+  function renderAssessmentGraph(section) {
+    const graph = document.createElement("section");
+    graph.className = "assessment-graph";
+    graph.setAttribute("aria-labelledby", "assessment-graph-title");
+    addText(graph, "h3", "Graph scorecards").id = "assessment-graph-title";
+    addText(
+      graph,
+      "p",
+      "This view renders the server-bounded canonical graph subset. Select a node to synchronize every view."
+    );
+    const items = document.createElement("div");
+    items.className = "assessment-graph-items";
+    assessmentState.report.nodes.forEach((node, index) => {
+      if (!assessmentMatchesFilters(node)) {
+        return;
+      }
+      const item = document.createElement("button");
+      item.type = "button";
+      item.id = `assessment-node-${index}`;
+      item.dataset.nodeId = node.node_id;
+      item.dataset.assessmentRole = "graph";
+      item.setAttribute("data-assessment-role", "graph");
+      item.setAttribute(
+        "aria-pressed",
+        String(assessmentState.selectedNodeId === node.node_id)
+      );
+      item.className = assessmentClass(
+        displayedAssessmentHealth(node),
+        "assessment-graph-node"
+      );
+      addAssessmentHealth(
+        item,
+        displayedAssessmentHealth(node),
+        assessmentHealthText(node)
+      );
+      addText(item, "strong", node.node_id);
+      addText(
+        item,
+        "span",
+        assessmentValueText("score", displayedAssessmentScore(node))
+      );
+      addText(
+        item,
+        "span",
+        assessmentValueText("confidence", displayedAssessmentConfidence(node))
+      );
+      const worst = document.createElement("span");
+      const worstIcon = addText(worst, "span", "◆");
+      worstIcon.className = "assessment-dimension-icon";
+      worstIcon.setAttribute("aria-hidden", "true");
+      addText(worst, "span", `Worst dimension (approved): ${node.worst_dimension || "N/A"}`);
+      item.append(worst);
+      item.addEventListener("click", () => void selectAssessmentNode(node.node_id, "graph"));
+      items.append(item);
+    });
+    graph.append(items);
+    section.append(graph);
+  }
+
+  function renderAssessmentTable(section) {
+    const region = document.createElement("section");
+    region.className = "assessment-table-region";
+    region.setAttribute("aria-labelledby", "assessment-table-title");
+    addText(region, "h3", "Scorecard table").id = "assessment-table-title";
+    const table = document.createElement("table");
+    const head = document.createElement("thead");
+    const heading = document.createElement("tr");
+    for (const value of [
+      "Node",
+      "Type",
+      `${assessmentOverlayName()} health`,
+      `${assessmentOverlayName()} score`,
+      `${assessmentOverlayName()} confidence`,
+      "Worst dimension (approved)",
+      "Next action",
+    ]) {
+      addText(heading, "th", value).setAttribute("scope", "col");
+    }
+    head.append(heading);
+    const body = document.createElement("tbody");
+    assessmentState.pageRows.forEach((node, index) => {
+      if (!assessmentMatchesFilters(node)) {
+        return;
+      }
+      const row = document.createElement("tr");
+      row.id = `assessment-row-${index}`;
+      row.dataset.nodeId = node.node_id;
+      row.dataset.assessmentRole = "table";
+      row.setAttribute("data-assessment-role", "table");
+      row.setAttribute("tabindex", "0");
+      row.setAttribute(
+        "aria-selected",
+        String(assessmentState.selectedNodeId === node.node_id)
+      );
+      row.className = assessmentClass(
+        displayedAssessmentHealth(node),
+        "assessment-table-row"
+      );
+      addText(row, "th", node.node_id).setAttribute("scope", "row");
+      addText(row, "td", node.node_type);
+      const health = document.createElement("td");
+      addAssessmentHealth(
+        health,
+        displayedAssessmentHealth(node),
+        assessmentHealthText(node)
+      );
+      row.append(health);
+      addText(
+        row,
+        "td",
+        assessmentValueText("score", displayedAssessmentScore(node))
+      );
+      addText(
+        row,
+        "td",
+        assessmentValueText("confidence", displayedAssessmentConfidence(node))
+      );
+      addText(row, "td", node.worst_dimension || "N/A");
+      addText(row, "td", node.recommended_next_action || "No action suggested");
+      row.addEventListener("click", () => void selectAssessmentNode(node.node_id, "table"));
+      row.addEventListener("keydown", assessmentSelectionHandler(node, "table"));
+      body.append(row);
+    });
+    table.append(head, body);
+    region.append(table);
+    const pagination = document.createElement("div");
+    pagination.className = "assessment-pagination";
+    const first = actionButton("First scorecard page", () =>
+      loadAssessment(null, assessmentState.pageFocus)
+    );
+    first.disabled = assessmentState.pageCursor === null;
+    const next = actionButton("Next scorecard page", () =>
+      loadAssessment(assessmentState.nextCursor, assessmentState.pageFocus)
+    );
+    next.disabled = assessmentState.nextCursor === null;
+    pagination.append(first, next);
+    region.append(pagination);
+    section.append(region);
+  }
+
+  function renderAssessmentDetail(section) {
+    const node = assessmentNode(assessmentState.selectedNodeId);
+    const detail = document.createElement("aside");
+    detail.id = "assessment-detail";
+    detail.className = "assessment-detail";
+    detail.setAttribute("aria-labelledby", "assessment-detail-title");
+    addText(detail, "h3", "Selected scorecard detail").id = "assessment-detail-title";
+    if (!node) {
+      addText(detail, "p", "Select a graph node or table row to inspect its server explanation.");
+      section.append(detail);
+      return;
+    }
+    addText(detail, "p", node.node_id);
+    const healthLine = document.createElement("p");
+    addAssessmentHealth(healthLine, displayedAssessmentHealth(node), "");
+    if (assessmentState.overlay === "projected") {
+      addText(healthLine, "span", "Projected health unavailable").id =
+        "assessment-detail-health";
+    } else {
+      addText(healthLine, "span", "Approved health: ");
+      addText(healthLine, "span", assessmentHealth[node.health].label).id =
+        "assessment-detail-health";
+    }
+    detail.append(healthLine);
+    const worstLine = document.createElement("p");
+    addText(worstLine, "span", "Approved worst dimension: ");
+    addText(worstLine, "span", node.worst_dimension || "N/A").id =
+      "assessment-detail-worst";
+    detail.append(worstLine);
+    const scoreLine = document.createElement("p");
+    addText(scoreLine, "span", `${assessmentOverlayName()} score: `);
+    addText(scoreLine, "span", scoreText(displayedAssessmentScore(node))).id =
+      "assessment-detail-score";
+    if (displayedAssessmentScore(node) === null) {
+      addText(
+        scoreLine,
+        "span",
+        assessmentState.overlay === "projected" ? " — unavailable" : " — unassessed"
+      );
+    }
+    detail.append(scoreLine);
+    addText(
+      detail,
+      "p",
+      assessmentValueText("confidence", displayedAssessmentConfidence(node))
+    );
+    if (node.recommended_next_action) {
+      addText(detail, "p", `Recommended next action: ${node.recommended_next_action}`);
+    }
+    for (const dimension of node.dimensions) {
+      const card = document.createElement("article");
+      card.className = assessmentClass(
+        assessmentState.overlay === "projected" ? "unassessed" : dimension.health,
+        "assessment-dimension"
+      );
+      addText(card, "h4", dimension.dimension);
+      addText(
+        card,
+        "p",
+        assessmentState.overlay === "projected"
+          ? "Projected dimension score N/A — unavailable; projected confidence N/A — unavailable."
+          : dimension.applicability === "not_applicable"
+          ? "Approved dimension: N/A — this dimension does not apply."
+          : `Approved dimension score ${scoreText(dimension.score)}; approved confidence ${scoreText(dimension.confidence)}`
+      );
+      if (assessmentState.overlay === "projected") {
+        addText(card, "p", "The checks below explain the approved score, not a projected score.");
+      }
+      for (const check of dimension.failed) {
+        addText(card, "p", `${check.severity || "gap"}: ${check.explanation || check.rule_id}`);
+      }
+      if (dimension.recommended_next_action) {
+        addText(card, "p", `Recommended next action: ${dimension.recommended_next_action}`);
+      }
+      detail.append(card);
+    }
+    section.append(detail);
+  }
+
+  function renderAssessment() {
+    const section = panel("Graph assessment");
+    if (assessmentState.unavailable) {
+      addText(section, "p", "Assessment unavailable. No canonical state was changed.");
+      section.append(actionButton("Retry graph assessment", () => loadAssessment(null)));
+      return section;
+    }
+    if (!assessmentState.report) {
+      addText(section, "p", "Loading the server-derived graph assessment.");
+      return section;
+    }
+    addText(
+      section,
+      "p",
+      "Scores are derived, explainable, ACL-filtered, noncanonical, and model-independent."
+    );
+    const project = assessmentState.report.project;
+    if (project && typeof project === "object") {
+      const summary = document.createElement("p");
+      const projectHealth = assessmentState.overlay === "projected"
+        ? "unassessed"
+        : project.health;
+      summary.className = assessmentClass(projectHealth, "assessment-project-summary");
+      if (assessmentState.overlay === "projected") {
+        addAssessmentHealth(summary, "unassessed", "Projected project health unavailable");
+        addText(summary, "span", "Projected project robustness N/A — unavailable");
+        addText(summary, "span", "Projected project confidence N/A — unavailable");
+      } else {
+        addAssessmentHealth(
+          summary,
+          project.health,
+          `Approved project health ${assessmentHealth[project.health].label}`
+        );
+        addText(
+          summary,
+          "span",
+          `Approved project robustness ${scoreText(project.robustness)}`
+        );
+        addText(
+          summary,
+          "span",
+          `Approved project confidence ${scoreText(project.confidence)}`
+        );
+      }
+      section.append(summary);
+    }
+    const controls = document.createElement("div");
+    controls.className = "assessment-controls";
+    const approved = actionButton("Approved scores", () => {
+      assessmentState.overlay = "approved";
+      render();
+    });
+    approved.setAttribute("aria-pressed", String(assessmentState.overlay === "approved"));
+    const projected = actionButton("Projected scores", () => {
+      assessmentState.overlay = "projected";
+      render();
+    });
+    projected.setAttribute("aria-pressed", String(assessmentState.overlay === "projected"));
+    const overlayLabel = addText(
+      controls,
+      "strong",
+      `${assessmentOverlayName()} scores`
+    );
+    overlayLabel.id = "assessment-overlay-label";
+    controls.append(approved, projected);
+    const types = Array.from(
+      new Set(assessmentState.report.nodes.map((node) => node.node_type))
+    ).sort();
+    controls.append(
+      assessmentFilter(
+        "assessment-filter-health",
+        "Health",
+        ["green", "orange", "red", "unassessed"],
+        assessmentState.filters.health,
+        "health"
+      ),
+      assessmentFilter(
+        "assessment-filter-dimension",
+        "Dimension",
+        [
+          "intent_clarity",
+          "evidence_strength",
+          "requirement_coverage",
+          "implementation_traceability",
+          "test_verification",
+          "consistency",
+          "freshness",
+        ],
+        assessmentState.filters.dimension,
+        "dimension"
+      ),
+      assessmentFilter(
+        "assessment-filter-type",
+        "Type",
+        types,
+        assessmentState.filters.type,
+        "type"
+      )
+    );
+    section.append(controls);
+    renderAssessmentGraph(section);
+    renderAssessmentTable(section);
+    renderAssessmentDetail(section);
+    return section;
+  }
+
   function updateNavigation() {
     for (const button of navigation) {
       const selected = button.dataset.view === state.view;
@@ -212,6 +855,7 @@
     section.append(
       actionButton("Refresh development evidence", () => refreshDevelopmentObservation(false))
     );
+    section.append(actionButton("Open graph assessment", () => showView("assessment")));
     return section;
   }
 
@@ -489,6 +1133,8 @@
       next = renderProposal();
     } else if (state.view === "team_state") {
       next = renderTeamState();
+    } else if (state.view === "assessment") {
+      next = renderAssessment();
     } else {
       next = renderHome();
     }
@@ -896,6 +1542,87 @@
     }
   }
 
+  async function loadAssessment(
+    cursor = null,
+    focus = null,
+    focusRole = null,
+    requestedSelection = null
+  ) {
+    if (
+      (cursor !== null && typeof cursor !== "string") ||
+      (focus !== null && typeof focus !== "string") ||
+      (requestedSelection !== null && typeof requestedSelection !== "string")
+    ) {
+      return;
+    }
+    const previousSelection = assessmentState.selectedNodeId;
+    const initialAssessment = assessmentState.report === null;
+    const generation = assessmentState.generation + 1;
+    assessmentState.generation = generation;
+    assessmentState.unavailable = false;
+    if (!assessmentState.report && state.view === "assessment") {
+      render();
+    }
+    let path = focus === null
+      ? api.assessment
+      : `${api.assessment}?focus=${encodeURIComponent(focus)}`;
+    if (cursor !== null) {
+      path += `${focus === null ? "?" : "&"}cursor=${encodeURIComponent(cursor)}`;
+    }
+    try {
+      const accepted = acceptAssessmentResponse(await fetchJson(path), focus);
+      if (assessmentState.generation !== generation) {
+        return;
+      }
+      let nextSelection = null;
+      if (requestedSelection !== null) {
+        if (
+          focus !== requestedSelection ||
+          !accepted.rows.some((node) => node.node_id === requestedSelection)
+        ) {
+          throw new Error("Requested assessment selection was not authenticated.");
+        }
+        nextSelection = requestedSelection;
+      } else if (
+        previousSelection !== null &&
+        accepted.rows.some((node) => node.node_id === previousSelection)
+      ) {
+        nextSelection = previousSelection;
+      } else if (initialAssessment && accepted.rows.length > 0) {
+        nextSelection = accepted.rows[0].node_id;
+      }
+      assessmentState.report = accepted.report;
+      assessmentState.pageRows = accepted.rows;
+      assessmentState.pageCursor = cursor;
+      assessmentState.pageFocus = focus;
+      assessmentState.nextCursor = accepted.nextCursor;
+      assessmentState.selectedNodeId = nextSelection;
+      assessmentState.unavailable = false;
+      if (state.view === "assessment") {
+        render();
+        if (focusRole !== null && assessmentState.selectedNodeId !== null) {
+          focusAssessmentRepresentation(focusRole, assessmentState.selectedNodeId);
+        }
+      }
+      announce("Graph assessment updated from the canonical server snapshot.");
+    } catch (_error) {
+      if (assessmentState.generation !== generation) {
+        return;
+      }
+      assessmentState.report = null;
+      assessmentState.pageRows = [];
+      assessmentState.pageCursor = null;
+      assessmentState.pageFocus = null;
+      assessmentState.nextCursor = null;
+      assessmentState.selectedNodeId = null;
+      assessmentState.unavailable = true;
+      if (state.view === "assessment") {
+        render();
+      }
+      announce("Assessment is unavailable. No canonical state was changed.");
+    }
+  }
+
   async function showView(view) {
     if (!viewNames.has(view)) {
       return;
@@ -912,6 +1639,8 @@
       await loadPreview();
     } else if (view === "team_state") {
       await refreshTeamEnrollment();
+    } else if (view === "assessment") {
+      await loadAssessment(null);
     }
   }
 
