@@ -393,6 +393,7 @@ def test_historical_v2_receipt_bytes_without_device_binding_remain_readable(tmp_
         b'"schema_version":2,"signature_id":"signer:sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"}'
     )
     trust = LocalTrustConfigV2.model_validate_json(historical)
+    assert trust.migration_recipient_binding is None
     workspace = tmp_path / ".intent"
     workspace.mkdir(mode=0o700, exist_ok=True)
     target = workspace / "team-trust.json"
@@ -887,6 +888,71 @@ def test_migration_device_signer_reuses_only_public_recipient_and_never_deletes_
     Ed25519PublicKey.from_public_bytes(material.signing_public_key).verify(
         signature, b"migration-preimage"
     )
+
+    from intent_engineering.team_state.crypto import (
+        _encrypt_bundle_for_public_keys,
+        canonical_encrypted_bundle_bytes,
+    )
+    from intent_engineering.team_state.keys import MigratedDeviceKeyStore
+
+    legacy_binding = RecipientEnrollmentBinding(
+        project_id=binding.project_id,
+        repository_id=binding.repository_id,
+        actor="local:alice",
+        github_identity=GitHubIdentity(account_id="123", login="alice"),
+        webauthn_credential_id="Y3JlZGVudGlhbA",
+        webauthn_credential_public_key="cHVibGljLWtleS1tYXRlcmlhbA",
+        enrolled_at=datetime(2026, 9, 1, tzinfo=UTC),
+    )
+    legacy = KeyringRecipientKeyStore(
+        legacy_binding,
+        backend=backend,
+        private_key_source=lambda: b"a" * 32,
+        lock_root=tmp_path / "locks",
+    )
+    recipient = legacy.generate(legacy_binding.project_id, legacy_binding.actor)
+    adapter = MigratedDeviceKeyStore(
+        binding, legacy_binding, material, recipient_store=legacy, signer=store
+    )
+    from tests.unit.team_state.test_crypto import _aad
+
+    aad = _aad(recipient_ids=(material.recipient_key_id,))
+    encrypted = _encrypt_bundle_for_public_keys(
+        b"private restored state", {material.recipient_key_id: recipient_public}, aad
+    )
+    from intent_engineering.team_state.keys import MigrationRecipientDecryptor
+
+    decryptor = MigrationRecipientDecryptor(
+        legacy_binding, material.recipient_key_id, recipient_store=legacy
+    )
+    assert (
+        decryptor.decrypt_bundle(
+            material.recipient_key_id, canonical_encrypted_bundle_bytes(encrypted), aad
+        )
+        == b"private restored state"
+    )
+    assert not hasattr(decryptor, "private_key") and not hasattr(decryptor, "sign")
+    assert (
+        adapter.decrypt_bundle(
+            material.recipient_key_id, canonical_encrypted_bundle_bytes(encrypted), aad
+        )
+        == b"private restored state"
+    )
+    assert adapter.create(binding) == material
+    assert not hasattr(adapter, "private_key")
+    Ed25519PublicKey.from_public_bytes(material.signing_public_key).verify(
+        adapter.sign(material.signature_id, b"next-publication"), b"next-publication"
+    )
+    assert legacy.private_key(recipient.key_id) == b"a" * 32
+    with pytest.raises(ValueError):
+        adapter.decrypt_bundle(
+            "recipient:sha256:" + "f" * 64, canonical_encrypted_bundle_bytes(encrypted), aad
+        )
+    del backend.values[(service, _account)]
+    before_missing_sign = dict(backend.values)
+    with pytest.raises(ValueError):
+        adapter.sign(material.signature_id, b"do-not-recreate-a-missing-signer")
+    assert backend.values == before_missing_sign
 
 
 @pytest.mark.parametrize("kind", ["symlink", "hardlink", "mode", "owner"])

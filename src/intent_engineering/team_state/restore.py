@@ -87,7 +87,7 @@ from intent_engineering.team_state.crypto import (
     decrypt_bundle_for_recipient,
 )
 from intent_engineering.team_state.keys import (
-    DeviceKeyStore,
+    DeviceBundleDecryptor,
     RecipientKeyStore,
     RecipientKeyStoreError,
 )
@@ -121,7 +121,12 @@ from intent_engineering.validation import validate_canonical_snapshot
 
 if TYPE_CHECKING:
     from intent_engineering.team_state.governance import GovernanceRegistry
-    from intent_engineering.team_state.local_trust import LocalTrustProvider, PendingJoinTrustV2
+    from intent_engineering.team_state.local_trust import (
+        LocalTrustConfig,
+        LocalTrustConfigV2,
+        LocalTrustProvider,
+        PendingJoinTrustV2,
+    )
 
 # Explicit v1 compatibility re-export used by the publication module.
 StateSignatureEnvelope = _StateSignatureEnvelope
@@ -2715,10 +2720,165 @@ def _v2_descendant_commits(reader: _GitRefReader, base: str, tip: str) -> tuple[
     raise ValueError("version two ancestry unavailable")
 
 
+def load_accepted_device_release(
+    reader: _GitRefReader,
+    commit: str,
+    trust: LocalTrustConfigV2,
+    store: DeviceBundleDecryptor,
+    legacy_signing_keys: tuple[TrustedSigningKey, ...],
+    now: datetime,
+) -> VerifiedReleaseV2:
+    """Reload only an exact locally accepted release, including the initial migration."""
+    manifest_bytes = reader.blob(commit, "manifest.json", MAX_MANIFEST_BYTES)
+    manifest = parse_team_manifest(manifest_bytes)
+    if (
+        type(manifest) is not TeamStateManifestV2
+        or manifest.project_id != trust.project_id
+        or manifest.repository_id != trust.repository_id
+        or manifest.root_key_id != trust.root.root_key_id
+        or manifest.authority_epoch != trust.root.authority_epoch
+        or manifest.bundle_digest != trust.accepted_bundle_digest
+        or manifest.authority_digest != trust.accepted_authority_digest
+        or trust.recipient_key_id not in manifest.recipient_key_ids
+    ):
+        raise ValueError("accepted release changed")
+    if manifest.migration is None:
+        return _device_release(
+            reader,
+            commit,
+            store,
+            trust.recipient_key_id,
+            trust.root,
+            trust.accepted_authority_sequence,
+            now,
+        )
+    if trust.accepted_authority_sequence != 1:
+        raise ValueError("accepted migration changed")
+    release = _load_device_migration(
+        reader, commit, store, trust.recipient_key_id, legacy_signing_keys, now
+    )
+    if release.authority.root != trust.root:
+        raise ValueError("accepted migration changed")
+    return release
+
+
+def load_installed_device_migration(
+    reader: _GitRefReader,
+    commit: str,
+    legacy: LocalTrustConfig,
+    store: DeviceBundleDecryptor,
+    now: datetime,
+) -> VerifiedReleaseV2:
+    """Verify the dual-signed migration before converting any v1 local trust."""
+    from intent_engineering.team_state.authority import derive_recipient_key_id
+    from intent_engineering.team_state.local_trust import trust_from_verified_migration
+
+    recipient = derive_recipient_key_id(
+        legacy.project_id, legacy.repository_id, legacy.recipient.public_key
+    )
+    release = _load_device_migration(
+        reader, commit, store, recipient, legacy.trusted_signing_keys(), now
+    )
+    prior_commit = reader.parents(commit)[0]
+    prior = parse_team_manifest(reader.blob(prior_commit, "manifest.json", MAX_MANIFEST_BYTES))
+    if (
+        type(prior) is not TeamStateManifest
+        or legacy.recipient_key_id not in prior.recipient_key_ids
+    ):
+        raise ValueError("installed migration parent changed")
+    prior_bundle = reader.blob(
+        prior_commit, f"bundles/{_release_name(prior)}.intent", MAX_BUNDLE_BYTES
+    )
+    if len(prior_bundle) != prior.bundle_size or _digest(prior_bundle) != prior.bundle_digest:
+        raise ValueError("installed migration parent changed")
+    aad = _manifest_aad(
+        project_id=prior.project_id,
+        repository_id=prior.repository_id,
+        graph_version=prior.graph_version,
+        parent_bundle_digest=prior.parent_bundle_digest,
+        created_at=prior.created_at,
+        recipient_key_ids=prior.recipient_key_ids,
+        required_signature_ids=prior.required_signature_ids,
+    )
+    prior_files = _parse_payload(store.decrypt_bundle(recipient, prior_bundle, aad), prior)
+    if release.snapshot is None or prior_files != {
+        f.path: f.content for f in release.snapshot.files
+    }:
+        raise ValueError("installed migration snapshot changed")
+    trust_from_verified_migration(legacy, release)
+    return release
+
+
+def _load_device_migration(
+    reader: _GitRefReader,
+    commit: str,
+    store: DeviceBundleDecryptor,
+    recipient: str,
+    legacy_signing_keys: tuple[TrustedSigningKey, ...],
+    now: datetime,
+) -> VerifiedReleaseV2:
+    manifest_bytes = reader.blob(commit, "manifest.json", MAX_MANIFEST_BYTES)
+    manifest = parse_team_manifest(manifest_bytes)
+    if (
+        type(manifest) is not TeamStateManifestV2
+        or manifest.migration is None
+        or len(reader.parents(commit)) != 1
+        or manifest.parent_bundle_digest is None
+    ):
+        raise ValueError("accepted migration changed")
+    name = f"{manifest.graph_version}-{manifest.bundle_digest.removeprefix('sha256:')}"
+    reader.require_release_tree(commit, name)
+    envelope = parse_signature_envelope(
+        reader.blob(commit, f"signatures/{name}.json", MAX_SIGNATURE_BYTES)
+    )
+    if type(envelope) is not StateSignatureEnvelopeV2:
+        raise ValueError("accepted migration changed")
+    prior_bytes = reader.blob(reader.parents(commit)[0], "manifest.json", MAX_MANIFEST_BYTES)
+    prior = parse_team_manifest(prior_bytes)
+    if type(prior) is not TeamStateManifest or not legacy_signing_keys:
+        raise ValueError("accepted migration changed")
+    bundle = reader.blob(commit, f"bundles/{name}.intent", MAX_BUNDLE_BYTES)
+    if len(bundle) != manifest.bundle_size or _digest(bundle) != manifest.bundle_digest:
+        raise ValueError("accepted migration changed")
+    aad = canonical_authenticated_context_bytes(
+        AuthenticatedBundleContextV2(
+            project_id=manifest.project_id,
+            repository_id=manifest.repository_id,
+            graph_version=manifest.graph_version,
+            parent_bundle_digest=manifest.parent_bundle_digest,
+            recipient_key_ids=manifest.recipient_key_ids,
+            authority_digest=manifest.authority_digest,
+            authority_epoch=manifest.authority_epoch,
+            authority_sequence=1,
+            root_key_id=manifest.root_key_id,
+            created_at=manifest.created_at,
+        )
+    )
+    restored = validate_archive_v2(store.decrypt_bundle(recipient, bundle, aad))
+    registry = restored.authority
+    if (
+        registry.sequence != 1
+        or registry.previous_authority_digest is not None
+        or recipient not in registry.active_recipient_key_ids()
+    ):
+        raise ValueError("accepted migration changed")
+    verify_v1_migration(
+        current=VerifiedV1Release(prior, prior_bytes, legacy_signing_keys, restored.snapshot),
+        manifest=manifest,
+        envelope=envelope,
+        root=registry.root,
+        authority=registry,
+        expected_ci_recipient=registry.ci_recipient,
+        now=now,
+    )
+    _validate_v2_snapshot(restored.snapshot, manifest)
+    return VerifiedReleaseV2(manifest, manifest_bytes, registry, commit, restored.snapshot)
+
+
 def _device_release(
     reader: _GitRefReader,
     commit: str,
-    store: DeviceKeyStore,
+    store: DeviceBundleDecryptor,
     recipient: str,
     root: TeamRootTrustV2,
     sequence: int,
@@ -2814,7 +2974,7 @@ def _device_release(
 def _pending_release(
     reader: _GitRefReader,
     pending: PendingJoinTrustV2,
-    store: DeviceKeyStore,
+    store: DeviceBundleDecryptor,
     now: datetime,
 ) -> VerifiedReleaseV2:
     commits = _v2_descendant_commits(reader, pending.invite.base_state_commit, reader.commit())
@@ -2838,7 +2998,7 @@ def _pending_release(
 def _pending_enrollment_release(
     reader: _GitRefReader,
     pending: PendingJoinTrustV2,
-    store: DeviceKeyStore,
+    store: DeviceBundleDecryptor,
     now: datetime,
     commit: str,
 ) -> VerifiedReleaseV2:
@@ -3037,7 +3197,7 @@ class GitSharedStateRestorer:
         refresh_remote: bool = False,
         prior_marker: Mapping[str, object] | None = None,
         expected_remote_state: RemoteStateSnapshot | None = None,
-        device_key_store: DeviceKeyStore | None = None,
+        device_key_store: DeviceBundleDecryptor | None = None,
         governance_registry: GovernanceRegistry | None = None,
     ) -> None:
         if type(refresh_remote) is not bool:
@@ -3149,9 +3309,25 @@ class GitSharedStateRestorer:
                 else None
             )
             if store is None:
-                if binding is None:
+                if (
+                    isinstance(active, LocalTrustConfigV2)
+                    and active.migration_recipient_binding is not None
+                ):
+                    from intent_engineering.team_state.keys import (
+                        KeyringRecipientKeyStore,
+                        MigrationRecipientDecryptor,
+                    )
+
+                    legacy_binding = active.migration_recipient_binding
+                    store = MigrationRecipientDecryptor(
+                        legacy_binding,
+                        active.recipient_key_id,
+                        recipient_store=KeyringRecipientKeyStore(legacy_binding),
+                    )
+                elif binding is None:
                     raise _Unavailable("device decryption unavailable")
-                store = KeyringDeviceKeyStore(binding)
+                else:
+                    store = KeyringDeviceKeyStore(binding)
             repository_id = (
                 pending.invite.repository_id
                 if pending is not None
@@ -3181,15 +3357,28 @@ class GitSharedStateRestorer:
                     or manifest.authority_digest != active.accepted_authority_digest
                 ):
                     raise _Diverged("member state requires reconciliation")
-                release = _device_release(
-                    reader,
-                    commit,
-                    store,
-                    active.recipient_key_id,
-                    active.root,
-                    active.accepted_authority_sequence,
-                    self._clock(),
+                legacy_keys: tuple[TrustedSigningKey, ...] = ()
+                if active.migration_recipient_binding is not None:
+                    from intent_engineering.team_state.signing import SigningKeyStore
+
+                    legacy_keys = tuple(
+                        TrustedSigningKey(k, v)
+                        for k, v in sorted(
+                            SigningKeyStore(
+                                active.project_id,
+                                active.repository_id,
+                                active.migration_recipient_binding.actor,
+                            )
+                            .public_keys()
+                            .items()
+                        )
+                    )
+                release = load_accepted_device_release(
+                    reader, commit, active, store, legacy_keys, self._clock()
                 )
+                from intent_engineering.team_state.publication import authority_from_verified_state
+
+                authority_from_verified_state(release, active)
                 assert release.snapshot is not None
                 baseline_files = {f.path: f.content for f in release.snapshot.files}
                 descendants = _v2_descendant_commits(reader, commit, reader.commit())

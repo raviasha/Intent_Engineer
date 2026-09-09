@@ -13,7 +13,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Annotated, Protocol, cast
+from typing import TYPE_CHECKING, Annotated, Protocol, cast
 
 import keyring
 from cryptography.hazmat.primitives import hashes, serialization
@@ -28,6 +28,9 @@ from intent_engineering.storage._atomic import same_path_lock
 from intent_engineering.team_state.authority import derive_recipient_key_id, derive_signature_id
 from intent_engineering.team_state.crypto import recipient_possession_proof
 from intent_engineering.team_state.models import RecipientRecord
+
+if TYPE_CHECKING:
+    from intent_engineering.team_state.signing import ExistingRecipientDeviceSigner
 
 _PROJECT_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _ACTOR = re.compile(r"^[a-z][a-z0-9._:-]{0,127}$")
@@ -197,7 +200,11 @@ class DeviceSealedIdentityProof:
     ciphertext: bytes
 
 
-class DeviceKeyStore(Protocol):
+class DeviceBundleDecryptor(Protocol):
+    def decrypt_bundle(self, recipient_key_id: str, bundle: bytes, aad: bytes) -> bytes: ...
+
+
+class DeviceKeyStore(DeviceBundleDecryptor, Protocol):
     """Non-exporting device recipient and signing key boundary."""
 
     def enrollment_binding(self) -> DeviceEnrollmentBinding: ...
@@ -842,6 +849,138 @@ class KeyringDeviceKeyStore:
 
     def __repr__(self) -> str:
         return "KeyringDeviceKeyStore()"
+
+
+class MigrationRecipientDecryptor:
+    """Authenticate an accepted archive before its migrated signer can be reconstructed."""
+
+    def __init__(
+        self,
+        binding: RecipientEnrollmentBinding,
+        recipient_key_id: str,
+        *,
+        recipient_store: RecipientKeyStore,
+    ) -> None:
+        self._binding = _validated_binding(binding)
+        self._recipient_key_id = recipient_key_id
+        self._recipient_store = recipient_store
+
+    def decrypt_bundle(self, recipient_key_id: str, bundle: bytes, aad: bytes) -> bytes:
+        import traceback
+
+        from intent_engineering.storage.jsonl.strict import loads_strict_object
+        from intent_engineering.team_state.crypto import (
+            EncryptedBundle,
+            canonical_encrypted_bundle_bytes,
+            decrypt_bundle,
+        )
+        from intent_engineering.team_state.models import MAX_BUNDLE_BYTES
+
+        private = b""
+        try:
+            if (
+                type(bundle) is not bytes
+                or not bundle
+                or len(bundle) > MAX_BUNDLE_BYTES
+                or type(aad) is not bytes
+                or not aad
+                or len(aad) > 64 * 1024
+            ):
+                raise RecipientKeyStoreError()
+            loads_strict_object(bundle.decode())
+            encrypted = EncryptedBundle.model_validate_json(bundle)
+            if (
+                canonical_encrypted_bundle_bytes(encrypted) != bundle
+                or recipient_key_id != self._recipient_key_id
+            ):
+                raise RecipientKeyStoreError()
+            private = self._recipient_store.private_key(_key_id(self._binding))
+            public = X25519PrivateKey.from_private_bytes(private).public_key().public_bytes_raw()
+            if (
+                derive_recipient_key_id(
+                    self._binding.project_id, self._binding.repository_id, _b64url(public)
+                )
+                != recipient_key_id
+            ):
+                raise RecipientKeyStoreError()
+            return decrypt_bundle(encrypted, private, aad)
+        except BaseException as error:  # noqa: BLE001 - private recipient never escapes this boundary
+            if error.__traceback__ is not None:
+                traceback.clear_frames(error.__traceback__)
+            error.__dict__.clear()
+            failure = _prepare_device_failure(error)
+            del error, self, bundle, aad, recipient_key_id
+            raise failure.with_traceback(None) from None
+        finally:
+            private = b""
+
+
+class MigratedDeviceKeyStore(KeyringDeviceKeyStore):
+    """Reuse the legacy recipient slot; never copy it into the new device keyring."""
+
+    def __init__(
+        self,
+        binding: DeviceEnrollmentBinding,
+        legacy_binding: RecipientEnrollmentBinding,
+        material: DevicePublicMaterial,
+        *,
+        recipient_store: RecipientKeyStore,
+        signer: ExistingRecipientDeviceSigner,
+    ) -> None:
+        self._binding = DeviceEnrollmentBinding.model_validate(binding.model_dump(mode="python"))
+        legacy_binding = _validated_binding(legacy_binding)
+        if (
+            legacy_binding.project_id != binding.project_id
+            or legacy_binding.repository_id != binding.repository_id
+            or int(legacy_binding.github_identity.account_id) != binding.github_account_id
+            or legacy_binding.github_identity.login != binding.github_login
+            or material.device_id != binding.device_id
+        ):
+            raise RecipientKeyStoreError()
+        self._legacy_key_id = _key_id(legacy_binding)
+        self._recipient_store = recipient_store
+        self._signer = signer
+        self._expected_material = material
+
+    def _load_or_create(self, *, create: bool) -> tuple[bytes, bytes]:
+        del create
+        private = self._recipient_store.private_key(self._legacy_key_id)
+        try:
+            self._material(private, b"")
+            return private, b""
+        finally:
+            private = b""
+
+    def _material(self, recipient: bytes, signing: bytes) -> DevicePublicMaterial:
+        del signing
+        public = X25519PrivateKey.from_private_bytes(recipient).public_key().public_bytes_raw()
+        if public != self._expected_material.recipient_public_key:
+            raise RecipientKeyStoreError()
+        return self._expected_material
+
+    def sign(self, signature_id: str, preimage: bytes) -> bytes:
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+
+        try:
+            if signature_id != self._expected_material.signature_id:
+                raise RecipientKeyStoreError()
+            signature = self._signer.sign(signature_id, preimage)
+            Ed25519PublicKey.from_public_bytes(self._expected_material.signing_public_key).verify(
+                signature, preimage
+            )
+            return signature
+        except BaseException as error:  # noqa: BLE001 - fixed keyring boundary
+            import traceback
+
+            if error.__traceback__ is not None:
+                traceback.clear_frames(error.__traceback__)
+            error.__dict__.clear()
+            failure = _prepare_device_failure(error)
+            del self, signature_id, preimage, error
+            raise failure.with_traceback(None) from None
+
+    def __repr__(self) -> str:
+        return "MigratedDeviceKeyStore()"
 
 
 __all__ = [

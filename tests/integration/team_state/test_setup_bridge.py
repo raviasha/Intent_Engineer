@@ -112,6 +112,122 @@ class _Enrollment:
 
 
 @pytest.mark.anyio
+async def test_normal_v2_member_publication_uses_guarded_existing_draft_lifecycle(
+    tmp_path, monkeypatch
+):
+    """B publishes normally without sponsor/root authority or another CLI command."""
+    from intent_engineering.cli.runtime import load_runtime
+    from intent_engineering.control_plane.webauthn_service import VerifiedHumanDecision
+    from intent_engineering.team_state.enrollment import VerifiedRemoteStateV2
+    from intent_engineering.team_state.keys import DeviceEnrollmentBinding
+    from intent_engineering.team_state.publication import PublicationAuthorityV2, PublicationService
+    from intent_engineering.team_state.restore import VerifiedReleaseV2
+    from tests.unit.team_state.test_enrollment import NOW, _fixture
+
+    _, preview, enrolled, _, _ = _prepared(tmp_path)
+    runtime = load_runtime(tmp_path / "publication" / "project")
+    _, member, _, _, _ = _fixture(tmp_path)
+    response = preview.response
+    member._device_store.create(
+        DeviceEnrollmentBinding(
+            project_id=response.project_id,
+            repository_id=response.repository_id,
+            actor=response.actor,
+            github_account_id=response.github_account_id,
+            github_login=response.github_login,
+            device_id=response.device_id,
+        )
+    )
+    parent = VerifiedReleaseV2(
+        enrolled.manifest, enrolled.manifest_bytes, enrolled.authority, "3" * 40
+    )
+    authority = PublicationAuthorityV2(
+        enrolled.authority,
+        response.proposed_member.member_id,
+        preview.certificate.certificate_id,
+        parent,
+        parent.commit,
+    )
+    bridge = object.__new__(GitHubSetupBridge)
+    bridge.service = SimpleNamespace(_runtime=runtime, _now=lambda: NOW)
+    bridge.repository = "acme/project"
+    bridge.transport = setup_state_module._PublicationTransport()
+    current = VerifiedRemoteStateV2(
+        authority=enrolled.authority,
+        state_commit=parent.commit,
+        bundle_digest=parent.manifest.bundle_digest,
+        default_branch="main",
+        default_branch_commit="2" * 40,
+        tooling_digest="sha256:" + "d" * 64,
+    )
+    status = _status().model_copy(update={"branch_commit": parent.commit})
+    preflight_count = []
+
+    async def preflight(_self, _api, _current, _certificate_id, *, require_sponsor=True):
+        assert require_sponsor is False
+        preflight_count.append(1)
+        return status, _Client(_api), _protection()
+
+    bridge._member_preflight = MethodType(preflight, bridge)
+
+    class _Publisher:
+        def __init__(self, guarded, _inspector, _reviewed):
+            self.guarded = guarded
+
+        async def publish(self, publication, *, base_commit):
+            assert _draft(runtime).external_write_attempted
+            assert publication.manifest.authority_digest == enrolled.manifest.authority_digest
+            assert base_commit == parent.commit
+            await self.guarded.before_write()
+            return "4" * 40
+
+    class _Client:
+        def __init__(self, guarded, **_kwargs):
+            self.guarded = guarded
+
+        async def inspect(self, _repository):
+            return status
+
+        async def open_publication_pr(self, _publication, *, expected_head_commit):
+            assert expected_head_commit == "4" * 40
+            await self.guarded.before_write()
+            return PublicationPullRequest(
+                repository_id=current.authority.repository_id,
+                number=9,
+                url="https://github.com/acme/project/pull/9",
+                created=True,
+            )
+
+    monkeypatch.setattr(setup_state_module, "github_api", _Api)
+    monkeypatch.setattr(setup_state_module, "GitHubTeamStateClient", _Client)
+    monkeypatch.setattr(github_publication_module, "GitHubApiPublisher", _Publisher)
+    publication = PublicationService(
+        runtime,
+        repository_id=response.repository_id,
+        decision_repository_id=response.credential.repository_id,
+        authority=lambda: authority,
+        publisher=bridge.transport,
+        device_signer=member._device_store,
+    )
+    try:
+        reviewed = publication.preview(now=NOW)
+        assert reviewed.payload.actor == "github:200"
+        result = await bridge.publish_member_state(
+            publication=publication,
+            decision=VerifiedHumanDecision(reviewed.payload, response.credential, NOW),
+            current=current,
+            certificate_id=preview.certificate.certificate_id,
+            protection=_protection(),
+            verify_local=lambda: None,
+        )
+        assert result["state"] == "publication_pending"
+        assert _draft(runtime).pull_request_number == 9
+        assert len(preflight_count) >= 3
+    finally:
+        runtime.close()
+
+
+@pytest.mark.anyio
 async def test_member_approval_stages_recovery_before_consuming_replay_token(
     tmp_path, monkeypatch
 ) -> None:

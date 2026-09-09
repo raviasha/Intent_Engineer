@@ -20,6 +20,11 @@ from pydantic import ConfigDict, Field
 from intent_engineering.cli.output import OutputFormat, emit
 from intent_engineering.cli.runtime import Runtime, github_repository_scope, load_runtime
 from intent_engineering.cli.team_ci import ci_app
+from intent_engineering.cli.team_enrollment import (
+    approve_join_command,
+    invite_command,
+    join_command,
+)
 from intent_engineering.cli.writes import policy_actor_aliases
 from intent_engineering.control_plane.models import HumanDecisionPayload
 from intent_engineering.control_plane.webauthn_service import VerifiedHumanDecision
@@ -45,6 +50,9 @@ team_app = typer.Typer(help="Configure and inspect shared intent state.")
 team_enable_app = typer.Typer(help="Enable one reviewed team-state provider.")
 team_app.add_typer(team_enable_app, name="enable")
 team_app.add_typer(ci_app, name="ci")
+team_app.command("invite")(invite_command)
+team_app.command("join")(join_command)
+team_app.command("approve-join")(approve_join_command)
 
 _GITHUB_LOGIN = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,37}[a-z0-9])?\Z")
 

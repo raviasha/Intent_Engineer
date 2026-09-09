@@ -362,6 +362,66 @@ def _join(
     return a_service, b_service, state, invite, response
 
 
+def test_join_preview_precedes_counter_advance_and_allows_human_ceremony_time(tmp_path):
+    """Catches a circular challenge requiring an unknown future authenticator counter."""
+    sponsor, member, state, identity, before = _fixture(tmp_path)
+    invite = sponsor.create_invite(state=state, intended_identity=identity, now=NOW)
+    material = member.device_public_material(invite=invite, local_identity=identity)
+    payload = build_join_decision_payload(
+        invite=invite,
+        identity=identity,
+        material=material,
+        credential=before,
+        identity_proof=IDENTITY_PROOF,
+        pre_assertion_sign_count=7,
+        challenge=b"j" * 32,
+        now=NOW,
+    )
+    after = before.model_copy(update={"id": "credential:advanced", "sign_count": 12})
+    verified_at = NOW + timedelta(seconds=30)
+    decision = VerifiedHumanDecision(payload=payload, credential=after, verified_at=verified_at)
+    response = member.create_join_response(
+        invite=invite,
+        local_identity=identity,
+        decision=decision,
+        identity_proof=IDENTITY_PROOF,
+        pre_assertion_sign_count=7,
+        webauthn_assertion=_assertion(after),
+        now=verified_at,
+    )
+    preview = sponsor.preview_approval(
+        invite=invite, response=response, current=state, now=verified_at
+    )
+    assert preview.response.credential.sign_count == 12
+    assert preview.response.webauthn_pre_assertion_sign_count == 7
+    assert response.created_at == NOW
+    assert response.webauthn_decision.verified_at == verified_at
+    credential = _credential(100, "alice", "github:100")
+    sponsor_payload = build_sponsor_decision_payload(
+        preview=preview, credential=credential, challenge=b"s" * 32, now=verified_at
+    )
+    approved = sponsor.approve(
+        preview=preview,
+        current=state,
+        sponsor_decision=VerifiedHumanDecision(sponsor_payload, credential, verified_at),
+        sponsor_pre_assertion_sign_count=6,
+        sponsor_assertion=_assertion(credential),
+        now=verified_at,
+    )
+    assert approved.authority.sequence == 2
+
+
+def test_certificate_identity_survives_counter_updates_but_not_key_substitution():
+    """Catches a device certificate expiring on routine counter advancement."""
+    from intent_engineering.control_plane.models import credential_identity_digest
+
+    before = _credential(200, "bob", "github:200")
+    after = before.model_copy(update={"id": "credential:updated", "sign_count": 12})
+    substituted = after.model_copy(update={"public_key": _b64(b"another-public-key")})
+    assert credential_identity_digest(before) == credential_identity_digest(after)
+    assert credential_identity_digest(before) != credential_identity_digest(substituted)
+
+
 def test_join_decision_expires_with_a_nearly_expired_invitation(tmp_path: object) -> None:
     """Catches a decision lifetime extending past the public invitation it authorizes."""
     a_service, b_service, state, identity, credential = _fixture(tmp_path)
@@ -431,6 +491,80 @@ def test_public_exchange_uses_independent_keyrings_and_approves_exact_transition
     assert b_service not in vars(a_service).values()
 
 
+@pytest.mark.parametrize("substitution", [None, "credential", "repository", "counter"])
+def test_sponsor_reuses_certificate_bound_local_credential_after_counter_advance(
+    tmp_path, monkeypatch, substitution
+):
+    """A's existing relying-party binding is independent of the signed team repository."""
+    from intent_engineering.control_plane.models import credential_identity_digest
+
+    original = _fixture
+    before = _credential(100, "alice", "github:100").model_copy(
+        update={"repository_id": "repo:sha256:" + "a" * 64}
+    )
+
+    def fixture(path):
+        sponsor, member, state, identity, credential = original(path)
+        prior = state.authority.device_certificates[0]
+        certificate = issue_device_certificate(
+            prior.claims.model_copy(
+                update={"webauthn_credential_digest": credential_identity_digest(before)}
+            ),
+            sponsor._root_store,
+        )
+        authority = state.authority.model_copy(
+            update={
+                "device_certificates": (certificate,),
+                "members": (
+                    state.authority.members[0].model_copy(
+                        update={"device_certificate_ids": (certificate.certificate_id,)}
+                    ),
+                ),
+            }
+        )
+        sponsor._sponsor_certificate_id = certificate.certificate_id
+        return (
+            sponsor,
+            member,
+            state.model_copy(update={"authority": authority}),
+            identity,
+            credential,
+        )
+
+    monkeypatch.setitem(_join.__globals__, "_fixture", fixture)
+    sponsor, _, state, invite, response = _join(tmp_path)
+    preview = sponsor.preview_approval(invite=invite, response=response, current=state, now=NOW)
+    payload = build_sponsor_decision_payload(
+        preview=preview, credential=before, challenge=b"z" * 32, now=NOW
+    )
+    assert payload.repository_id == before.repository_id
+    after = before.model_copy(update={"id": "credential:next", "sign_count": 8})
+    if substitution == "credential":
+        after = after.model_copy(update={"credential_id": _b64(b"different-credential")})
+    if substitution == "repository":
+        payload = payload.model_copy(update={"repository_id": "repo:sha256:" + "b" * 64})
+    if substitution == "counter":
+        after = after.model_copy(update={"sign_count": 6})
+
+    def approve():
+        return sponsor.approve(
+            preview=preview,
+            sponsor_decision=VerifiedHumanDecision(
+                payload=payload, credential=after, verified_at=NOW + timedelta(seconds=10)
+            ),
+            sponsor_pre_assertion_sign_count=7,
+            sponsor_assertion=_assertion(after),
+            current=state,
+            now=NOW + timedelta(seconds=10),
+        )
+
+    if substitution is None:
+        assert approve().authority.sequence == 2
+    else:
+        with pytest.raises(TeamEnrollmentError):
+            approve()
+
+
 def test_approved_enrollment_builds_one_parent_bound_v2_publication_for_unchanged_ci(
     tmp_path: object,
 ) -> None:
@@ -438,7 +572,7 @@ def test_approved_enrollment_builds_one_parent_bound_v2_publication_for_unchange
     from pathlib import Path
 
     assert isinstance(tmp_path, Path)
-    a_service, _b_service, state, invite, response = _join(tmp_path)
+    a_service, b_service, state, invite, response = _join(tmp_path)
     preview = a_service.preview_approval(invite=invite, response=response, current=state, now=NOW)
     sponsor_credential = _credential(100, "alice", "github:100")
     sponsor_payload = build_sponsor_decision_payload(
@@ -513,6 +647,70 @@ def test_approved_enrollment_builds_one_parent_bound_v2_publication_for_unchange
     )
     assert accepted.authority == approved.authority
     assert accepted.snapshot == snapshot
+
+    # B's next ordinary publication must accept the same key after a real counter advance.
+    from intent_engineering.cli.runtime import load_runtime
+    from intent_engineering.team_state.publication import PublicationAuthorityV2, PublicationService
+
+    authority = PublicationAuthorityV2(
+        registry=accepted.authority,
+        local_member_id=preview.certificate.claims.member_id,
+        local_device_certificate_id=preview.certificate.certificate_id,
+        remote_state=accepted,
+        publication_base_commit=accepted.commit,
+    )
+    publications = []
+
+    class Publisher:
+        def publish(self, publication, *, base_commit):
+            assert base_commit == "3" * 40
+            publications.append(publication)
+
+    runtime = load_runtime(source)
+    try:
+        service = PublicationService(
+            runtime,
+            repository_id=REPOSITORY,
+            decision_repository_id=response.credential.repository_id,
+            authority=lambda: authority,
+            publisher=Publisher(),
+            device_signer=b_service._device_store,
+        )
+        next_preview = service.preview(now=NOW + timedelta(seconds=40))
+        assert next_preview.payload.actor == response.proposed_member.actor
+        exact_draft = service.pending_publication()
+        service = PublicationService(
+            runtime,
+            repository_id=REPOSITORY,
+            decision_repository_id=response.credential.repository_id,
+            authority=lambda: authority,
+            publisher=Publisher(),
+            device_signer=b_service._device_store,
+        )
+        next_preview = service.recover_device_preview(
+            exact_draft, device_store=b_service._device_store, now=NOW + timedelta(seconds=45)
+        )
+        assert service.pending_publication() == exact_draft
+        advanced = response.credential.model_copy(
+            update={"id": "credential:later", "sign_count": 9}
+        )
+        with pytest.raises(ValueError):
+            service.prepare(
+                VerifiedHumanDecision(
+                    next_preview.payload,
+                    advanced.model_copy(update={"actor": "github:100"}),
+                    NOW + timedelta(seconds=50),
+                ),
+                now=NOW + timedelta(seconds=50),
+            )
+        assert publications == []
+        prepared = service.prepare(
+            VerifiedHumanDecision(next_preview.payload, advanced, NOW + timedelta(seconds=50)),
+            now=NOW + timedelta(seconds=50),
+        )
+        assert publications == [prepared]
+    finally:
+        runtime.close()
 
 
 @pytest.mark.parametrize(

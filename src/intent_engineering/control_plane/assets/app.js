@@ -10,6 +10,7 @@
     registrationOptions: "/api/v1/webauthn/register/options",
     registrationVerify: "/api/v1/webauthn/register/verify",
     teamEnrollment: "/api/v1/team/enrollment",
+    membership: "/api/v1/team/membership",
     teamEnrollmentOptions: "/api/v1/team/enrollment/options",
     teamEnrollmentVerify: "/api/v1/team/enrollment/verify",
     teamEnrollmentCancel: "/api/v1/team/enrollment/cancel",
@@ -60,6 +61,7 @@
     proposalGeneration: 0,
     developmentObservation: null,
     teamEnrollment: null,
+    membership: null,
     teamPublication: null,
     teamSetup: null,
     teamSetupPreview: null,
@@ -1404,6 +1406,120 @@
     return section;
   }
 
+  async function membershipAction(action, response) {
+    const body = { session_id: state.membership.session_id };
+    if (response) body.response = response;
+    return fetchJson(`${api.membership}/${action}`, { method: "POST", body: JSON.stringify(body) });
+  }
+
+  async function reviewMembership(action = "preview") {
+    try {
+      state.membership = await membershipAction(action);
+      render();
+      announce("Enrollment review updated.");
+    } catch (_error) {
+      announce("Team enrollment unavailable.");
+    }
+  }
+
+  async function enrollMembership() {
+    let options = null;
+    let credential = null;
+    let response = null;
+    try {
+      options = creationOptions(await membershipAction("register-options"));
+      credential = await navigator.credentials.create(options);
+      response = serializeCredential(credential);
+      await membershipAction("register-verify", response);
+      await reviewMembership();
+    } catch (_error) {
+      announce("Team enrollment unavailable.");
+    } finally {
+      clearOptionBuffers(options);
+      options = credential = response = null;
+    }
+  }
+
+  async function authorizeMembership() {
+    let options = null;
+    let credential = null;
+    let response = null;
+    try {
+      options = requestOptions(await membershipAction("options"));
+      credential = await navigator.credentials.get(options);
+      response = serializeCredential(credential);
+      state.membership = await membershipAction("verify", response);
+      render();
+      announce("Enrollment progress updated.");
+    } catch (_error) {
+      // Refresh durable progress, including an attempted write whose response was lost.
+      try { state.membership = await fetchJson(api.membership); render(); } catch (_refreshError) {}
+      announce("Team enrollment unavailable. Check enrollment progress.");
+    } finally {
+      clearOptionBuffers(options);
+      options = credential = response = null;
+    }
+  }
+
+  async function authorizeMemberPublication() {
+    let options = null;
+    let credential = null;
+    let response = null;
+    try {
+      options = requestOptions(await membershipAction("publish-options"));
+      credential = await navigator.credentials.get(options);
+      response = serializeCredential(credential);
+      const result = await membershipAction("publish-verify", response);
+      state.membership = { ...state.membership, ...result };
+      render();
+      announce("Team-state publication progress updated.");
+    } catch (_error) {
+      try { state.membership = await fetchJson(api.membership); render(); } catch (_refreshError) {}
+      announce("Team-state publication is unavailable. Check publication progress.");
+    } finally {
+      clearOptionBuffers(options);
+      options = credential = response = null;
+    }
+  }
+
+  function renderMembership(section) {
+    const membership = state.membership;
+    addText(section, "h3", "Second developer enrollment");
+    addProjection(section, membership);
+    if (membership.action === "invite" && membership.state === "review_required") {
+      section.append(actionButton("Create public invitation", () => reviewMembership("create-invite")));
+    }
+    if (membership.action === "join" && membership.state === "review_required") {
+      section.append(actionButton("Enroll this device with WebAuthn", enrollMembership));
+      section.append(actionButton("Review join", () => reviewMembership()));
+    }
+    if (membership.action === "approve-join" && membership.state === "review_required") {
+      section.append(actionButton("Review exact membership change", () => reviewMembership()));
+    }
+    if (membership.state === "preview_ready") {
+      section.append(actionButton(membership.action === "join" ? "Authorize join with WebAuthn" : "Approve membership with WebAuthn", authorizeMembership, "danger"));
+    }
+    if (membership.state === "member-active") {
+      section.append(actionButton("Review team-state publication", () => reviewMembership("publish-preview")));
+    }
+    if (membership.state === "publication_preview" || membership.state === "publication_draft") {
+      section.append(actionButton("Authorize team-state publication with WebAuthn", authorizeMemberPublication, "danger"));
+    }
+    if (["approved", "publication-pending", "publication_pending", "pr-pending", "publication_recovery_required"].includes(membership.state)) {
+      section.append(actionButton("Refresh enrollment progress", () => reviewMembership("reconcile")));
+    }
+    if (membership.state === "closed") {
+      section.append(actionButton("Discard closed enrollment and start fresh", () => reviewMembership("restart")));
+    }
+    if (membership.state === "response-ready") {
+      addText(section, "p", "Your public response is ready. Share it with your sponsor. After approval merges, continue your normal development workflow to restore shared state.");
+    }
+    if (membership.can_cancel === true) {
+      section.append(actionButton("Cancel enrollment", () => reviewMembership("cancel")));
+    }
+    return section;
+  }
+
   function renderTeamState() {
     const section = panel("Team state");
     addText(
@@ -1413,6 +1529,9 @@
     );
     if (state.status) {
       addProjection(section, state.status);
+    }
+    if (state.membership && state.membership.state !== "unconfigured") {
+      return renderMembership(section);
     }
     if (state.teamSetup) {
       addText(section, "h3", "GitHub team setup");
@@ -1678,6 +1797,10 @@
   }
 
   async function refreshTeamEnrollment(quiet = false) {
+    void fetchJson(api.membership).then((membership) => {
+      state.membership = membership;
+      if (state.view === "team_state") render();
+    }).catch(() => {});
     void fetchJson(api.teamSetup)
       .then(async (setup) => {
         state.teamSetup = setup;

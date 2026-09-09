@@ -16,7 +16,7 @@ from datetime import UTC, datetime, timedelta
 from functools import wraps
 from pathlib import PurePosixPath
 from types import MappingProxyType
-from typing import Literal, cast
+from typing import TYPE_CHECKING, Literal, cast
 
 from intent_engineering.assessment.models import AssessmentReport, AssessmentSnapshot, NodeScorecard
 from intent_engineering.assessment.service import GraphAssessmentService
@@ -60,6 +60,9 @@ from intent_engineering.control_plane.webauthn_service import (
     WebAuthnService,
     WebAuthnVerifier,
 )
+
+if TYPE_CHECKING:
+    from intent_engineering.control_plane.team_enrollment import MembershipSession
 from intent_engineering.core.models import (
     EvidenceRecord,
     ProjectConfig,
@@ -429,6 +432,7 @@ class ControlPlaneService:
         self._team_recipient: TeamRecipientRecord | None = None
         self._team_key_store: RecipientKeyStore | None = None
         self._github_setup_bridge: object | None = None
+        self._membership_session: MembershipSession | None = None
         self._dev_observer: DevObserver | None = None
         self._observation_guard = threading.Lock()
         self._observation_state_guard = threading.Lock()
@@ -3123,6 +3127,9 @@ class ControlPlaneService:
 
     def close(self) -> None:
         """Release descriptors owned by this service while leaving Runtime ownership intact."""
+        if self._membership_session is not None:
+            self._membership_session.close()
+            self._membership_session = None
         self._stop_development_observation()
         if self._assessment_cursor_key:
             self._assessment_cursor_key[:] = b"\x00" * len(self._assessment_cursor_key)

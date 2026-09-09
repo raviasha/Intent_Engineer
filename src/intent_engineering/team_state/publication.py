@@ -18,7 +18,7 @@ import tempfile
 import time
 import traceback
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Protocol, cast
@@ -33,6 +33,8 @@ from intent_engineering.control_plane.models import (
     DecisionAction,
     DecisionSubject,
     HumanDecisionPayload,
+    credential_identity_digest,
+    credential_matches_digest,
 )
 from intent_engineering.control_plane.webauthn_service import VerifiedHumanDecision
 from intent_engineering.core.models import ProjectConfig
@@ -58,7 +60,11 @@ from intent_engineering.team_state.crypto import (
     canonical_encrypted_bundle_bytes,
     decrypt_bundle,
 )
-from intent_engineering.team_state.keys import DeviceEnrollmentBinding, KeyringDeviceKeyStore
+from intent_engineering.team_state.keys import (
+    DeviceBundleDecryptor,
+    DeviceEnrollmentBinding,
+    KeyringDeviceKeyStore,
+)
 from intent_engineering.team_state.local_trust import LocalTrustConfig, LocalTrustConfigV2
 from intent_engineering.team_state.models import (
     CANONICAL_STATE_PATHS,
@@ -1150,8 +1156,7 @@ def preview_v1_migration(
             recipient_public_key=base64.urlsafe_b64encode(recipient_public).rstrip(b"=").decode(),
             signature_id=material.signature_id,
             signing_public_key=base64.urlsafe_b64encode(signing_public).rstrip(b"=").decode(),
-            webauthn_credential_digest="sha256:"
-            + hashlib.sha256(credential.canonical_bytes()).hexdigest(),
+            webauthn_credential_digest=credential_identity_digest(credential),
             serial=1,
             issued_at=now.astimezone(UTC),
             expires_at=now.astimezone(UTC) + timedelta(days=366),
@@ -1481,8 +1486,7 @@ def prepare_v1_migration(
             recipient_public_key=base64.urlsafe_b64encode(recipient_public).rstrip(b"=").decode(),
             signature_id=material.signature_id,
             signing_public_key=base64.urlsafe_b64encode(signing_public).rstrip(b"=").decode(),
-            webauthn_credential_digest="sha256:"
-            + hashlib.sha256(credential.canonical_bytes()).hexdigest(),
+            webauthn_credential_digest=credential_identity_digest(credential),
             serial=1,
             issued_at=payload.issued_at,
             expires_at=payload.issued_at + timedelta(days=366),
@@ -1991,10 +1995,13 @@ class PublicationService:
         if parent_digest is None:
             raise ValueError("publication parent binding changed")
         snapshot_digest = self._digest(archive)
+        member = next(
+            m for m in authority.registry.members if m.member_id == authority.local_member_id
+        )
         payload = HumanDecisionPayload(
             project_id=snapshot.project_id,
             repository_id=self._decision_repository_id,
-            actor=self._runtime.config.local_actor,
+            actor=member.actor,
             action=DecisionAction.PUBLISH_STATE,
             graph_version=snapshot.graph_version,
             parent_bundle_digest=parent_digest,
@@ -2113,6 +2120,67 @@ class PublicationService:
             raise ValueError("publication draft unavailable")
         # Task 7 broadens the transport/receipt model; retain its v1 static seam meanwhile.
         return cast(PreparedPublication, self._pending[1])
+
+    def recover_device_preview(
+        self, prepared: PreparedPublicationV2, *, device_store: DeviceBundleDecryptor, now: datetime
+    ) -> PublicationPreviewV2:
+        """Reauthorize the same durable v2 artifacts without exporting a recipient key."""
+        try:
+            current = self.preview(now=now)
+            authority = self._current_authority()
+            pending = self._pending
+            if (
+                type(prepared) is not PreparedPublicationV2
+                or type(current) is not PublicationPreviewV2
+                or type(authority) is not PublicationAuthorityV2
+                or pending is None
+            ):
+                raise ValueError("publication draft changed")
+            _, _, archive, authority_bytes, parent_commit = pending
+            manifest = prepared.manifest
+            if (
+                prepared.authority != authority.registry
+                or manifest.parent_bundle_digest != current.manifest.parent_bundle_digest
+                or manifest.graph_version != current.manifest.graph_version
+                or manifest.created_at > now
+            ):
+                raise ValueError("publication draft changed")
+            verify_v2_envelope(
+                manifest, prepared.envelope, authority.registry.root, authority.registry, now
+            )
+            certificate = next(
+                c
+                for c in authority.registry.device_certificates
+                if c.certificate_id == authority.local_device_certificate_id
+            )
+            aad = canonical_authenticated_context_bytes(
+                AuthenticatedBundleContextV2(
+                    project_id=manifest.project_id,
+                    repository_id=manifest.repository_id,
+                    graph_version=manifest.graph_version,
+                    parent_bundle_digest=cast(str, manifest.parent_bundle_digest),
+                    recipient_key_ids=manifest.recipient_key_ids,
+                    authority_digest=manifest.authority_digest,
+                    authority_epoch=manifest.authority_epoch,
+                    authority_sequence=authority.registry.sequence,
+                    root_key_id=manifest.root_key_id,
+                    created_at=manifest.created_at,
+                )
+            )
+            if (
+                device_store.decrypt_bundle(
+                    certificate.claims.recipient_key_id, prepared.bundle, aad
+                )
+                != archive
+            ):
+                raise ValueError("publication draft changed")
+            payload = current.payload.model_copy(update={"result_digest": manifest.bundle_digest})
+            preview = replace(current, payload=payload, manifest=manifest, branch=prepared.branch)
+            self._pending = (preview, prepared, archive, authority_bytes, parent_commit)
+            return preview
+        except BaseException:
+            self._pending = None
+            raise
 
     def recover_preview(
         self,
@@ -2241,12 +2309,24 @@ class PublicationService:
             certificate = {
                 item.certificate_id: item for item in current.registry.device_certificates
             }.get(current.local_device_certificate_id)
+            member = next(
+                (m for m in current.registry.members if m.member_id == current.local_member_id),
+                None,
+            )
             if (
                 certificate is None
+                or member is None
+                or member.status != "active"
+                or certificate.claims.member_id != member.member_id
+                or credential.actor != member.actor
+                or decision.payload.actor != member.actor
+                or credential.project_id != snapshot.project_id
+                or credential.repository_id != self._decision_repository_id
                 or credential.github_account_id != str(certificate.claims.github_account_id)
                 or credential.github_login != certificate.claims.github_login
-                or "sha256:" + hashlib.sha256(credential.canonical_bytes()).hexdigest()
-                != certificate.claims.webauthn_credential_digest
+                or not credential_matches_digest(
+                    credential, certificate.claims.webauthn_credential_digest
+                )
                 or build_archive_v2(snapshot, current.registry) != expected_archive
                 or canonical_authority_bytes(current.registry) != expected_authority
                 or current.publication_base_commit != parent_commit

@@ -73,6 +73,24 @@ _CSP = (
     "style-src 'self'; connect-src 'self'"
 )
 _STATIC_METHODS = {
+    "/api/v1/team/membership": "GET",
+    **{
+        f"/api/v1/team/membership/{action}": "POST"
+        for action in (
+            "register-options",
+            "register-verify",
+            "preview",
+            "options",
+            "verify",
+            "cancel",
+            "create-invite",
+            "reconcile",
+            "restart",
+            "publish-preview",
+            "publish-options",
+            "publish-verify",
+        )
+    },
     "/api/v1/assessment": "GET",
     "/api/v1/status": "GET",
     "/api/v1/inbox": "GET",
@@ -1107,6 +1125,62 @@ def _make_handlers(
                 detached = cast(CredentialRecord, None)
         return _end_handler(request, signal, response)
 
+    async def membership_endpoint(request: Request) -> Response:
+        from intent_engineering.control_plane.team_enrollment import (
+            MembershipSession,
+            cancel_enrollment,
+            enrollment_status,
+        )
+
+        response: Response | None = None
+        signal: BaseException | None = None
+        body = None
+        try:
+            if request.url.path == "/api/v1/team/membership":
+                result = enrollment_status(service._runtime)
+            else:
+                from intent_engineering.storage.jsonl.strict import loads_strict_object
+
+                body = loads_strict_object(_request_bytes(request).decode())
+                action = request.url.path.rsplit("/", 1)[-1]
+                if set(body) not in ({"session_id"}, {"session_id", "response"}) or not isinstance(
+                    body["session_id"], str
+                ):
+                    raise _HandlerRequestError()
+                if re.fullmatch(r"[0-9a-f]{64}", body["session_id"]) is None:
+                    raise _HandlerRequestError()
+                if action == "cancel":
+                    if set(body) != {"session_id"}:
+                        raise _HandlerRequestError()
+                    result = cancel_enrollment(service._runtime, body["session_id"])
+                    if service._membership_session is not None:
+                        service._membership_session.close()
+                        service._membership_session = None
+                else:
+                    if ("response" in body) != (
+                        action in {"verify", "register-verify", "publish-verify"}
+                    ):
+                        raise _HandlerRequestError()
+                    encoded = canonical_json_object(body["response"]) if "response" in body else b""
+                    if service._membership_session is None:
+                        service._membership_session = MembershipSession(service)
+                    result = await service._membership_session.action(
+                        action, body["session_id"], response=encoded
+                    )
+            response = _json_response(result)
+        except _HandlerRequestError:
+            response = _fixed_response(400)
+        except Exception:  # noqa: BLE001 - fixed enrollment HTTP boundary
+            response = _fixed_response(503)
+        except BaseException as caught:  # noqa: BLE001 - preserve scrubbed cancellation
+            caught.__traceback__ = None
+            caught.__cause__ = None
+            caught.__context__ = None
+            signal = caught
+        finally:
+            body = None
+        return _end_handler(request, signal, response)
+
     async def github_setup_endpoint(request: Request) -> Response:
         response: Response | None = None
         signal: BaseException | None = None
@@ -1338,6 +1412,7 @@ def _make_handlers(
         "team_enrollment_verify": team_enrollment_verify_endpoint,
         "team_enrollment_cancel": team_enrollment_cancel_endpoint,
         "team_publication_preview": team_publication_preview_endpoint,
+        "membership": membership_endpoint,
         "decision_options": decision_options_endpoint,
         "decision_verify": decision_verify_endpoint,
     }
@@ -1365,6 +1440,24 @@ def build_control_plane_app(
     app = Starlette(
         debug=False,
         routes=[
+            Route("/api/v1/team/membership", handlers["membership"], methods=["GET"]),
+            *[
+                Route(f"/api/v1/team/membership/{action}", handlers["membership"], methods=["POST"])
+                for action in (
+                    "register-options",
+                    "register-verify",
+                    "preview",
+                    "options",
+                    "verify",
+                    "cancel",
+                    "create-invite",
+                    "reconcile",
+                    "restart",
+                    "publish-preview",
+                    "publish-options",
+                    "publish-verify",
+                )
+            ],
             Route("/api/v1/assessment", handlers["assessment"], methods=["GET"]),
             Route(
                 "/api/v1/assessment/nodes/{node_id}",

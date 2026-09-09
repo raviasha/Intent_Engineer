@@ -323,10 +323,12 @@ class KeyringExistingRecipientDeviceSigner:
             self._account,
         )
 
-    def _private(self) -> bytes:
+    def _private(self, *, create: bool = False) -> bytes:
         with same_path_lock(self._lock_target):
             stored = self._backend.get_password(self._service, self._account)
             if stored is None:
+                if not create:
+                    raise ValueError("device signing key missing")
                 private = self._private_key_source()
                 if type(private) is not bytes or len(private) != 32:
                     raise ValueError("invalid device signing key source")
@@ -353,7 +355,7 @@ class KeyringExistingRecipientDeviceSigner:
                 or len(recipient_public_key) != 32
             ):
                 raise ValueError("migration device binding changed")
-            private = self._private()
+            private = self._private(create=True)
             signing_public = (
                 Ed25519PrivateKey.from_private_bytes(private).public_key().public_bytes_raw()
             )

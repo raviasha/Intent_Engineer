@@ -626,6 +626,31 @@ def test_prepare_v1_migration_is_dual_signed_and_does_not_advance_local_trust(
         required_signature_ids=("signer:legacy",),
         created_at=NOW,
     )
+    from intent_engineering.team_state.archive import build_archive
+    from intent_engineering.team_state.crypto import (
+        canonical_encrypted_bundle_bytes,
+        encrypt_bundle,
+    )
+    from intent_engineering.team_state.restore import _manifest_aad
+
+    legacy_aad = _manifest_aad(
+        project_id=legacy_manifest.project_id,
+        repository_id=legacy_manifest.repository_id,
+        graph_version=legacy_manifest.graph_version,
+        parent_bundle_digest=legacy_manifest.parent_bundle_digest,
+        created_at=legacy_manifest.created_at,
+        recipient_key_ids=legacy_manifest.recipient_key_ids,
+        required_signature_ids=legacy_manifest.required_signature_ids,
+    )
+    legacy_bundle = canonical_encrypted_bundle_bytes(
+        encrypt_bundle(build_archive(snapshot), (recipient,), legacy_aad)
+    )
+    legacy_manifest = legacy_manifest.model_copy(
+        update={
+            "bundle_digest": "sha256:" + hashlib.sha256(legacy_bundle).hexdigest(),
+            "bundle_size": len(legacy_bundle),
+        }
+    )
     current = VerifiedV1Release(
         manifest=legacy_manifest,
         manifest_bytes=canonical_manifest_bytes(legacy_manifest),
@@ -845,6 +870,147 @@ def test_prepare_v1_migration_is_dual_signed_and_does_not_advance_local_trust(
         accepted_authority_sequence=migrated.authority.sequence,
         accepted_bundle_digest=migrated.manifest.bundle_digest,
     )
+    from intent_engineering.team_state.crypto import EncryptedBundle, decrypt_bundle
+    from intent_engineering.team_state.local_trust import trust_from_verified_migration
+    from intent_engineering.team_state.restore import load_accepted_device_release
+
+    class Reader:
+        def __init__(self, corrupt_legacy=False):
+            self.corrupt_legacy = corrupt_legacy
+
+        def parents(self, commit):
+            assert commit == "c" * 40
+            return ("b" * 40,)
+
+        def require_release_tree(self, commit, name):
+            assert commit == "c" * 40
+            assert (
+                name
+                == f"{prepared.manifest.graph_version}-{prepared.manifest.bundle_digest.removeprefix('sha256:')}"
+            )
+
+        def blob(self, commit, path, limit):
+            if commit == "b" * 40 and path == "manifest.json":
+                return current.manifest_bytes
+            if commit == "b" * 40 and path.startswith("bundles/"):
+                return legacy_bundle + (b"changed" if self.corrupt_legacy else b"")
+            assert commit == "c" * 40
+            value = (
+                prepared.manifest_bytes
+                if path == "manifest.json"
+                else prepared.bundle
+                if path.startswith("bundles/")
+                else prepared.signatures
+            )
+            assert len(value) <= limit
+            return value
+
+    class DeviceDecryptor:
+        def decrypt_bundle(self, key_id, bundle, aad):
+            assert key_id == preview.certificate.claims.recipient_key_id
+            return decrypt_bundle(
+                EncryptedBundle.model_validate_json(bundle),
+                recipient_private.private_bytes_raw(),
+                aad,
+            )
+
+    for _restart in range(2):
+        accepted = load_accepted_device_release(
+            Reader(), "c" * 40, v2_trust, DeviceDecryptor(), current.signing_keys, NOW
+        )
+        assert accepted == migrated
+        from intent_engineering.team_state.restore import load_installed_device_migration
+
+        assert (
+            load_installed_device_migration(
+                Reader(), "c" * 40, legacy_trust, DeviceDecryptor(), NOW
+            )
+            == accepted
+        )
+        converted = trust_from_verified_migration(legacy_trust, accepted)
+        assert converted.migration_recipient_binding == legacy_trust.enrollment_binding()
+        assert converted.device_binding is None
+        assert converted.accepted_bundle_digest == migrated.manifest.bundle_digest
+        from intent_engineering.team_state.keys import (
+            DeviceEnrollmentBinding,
+            KeyringRecipientKeyStore,
+        )
+        from intent_engineering.team_state.local_trust import migrated_device_store
+        from tests.unit.team_state.test_local_trust import Backend
+
+        backend = Backend()
+        legacy_store = KeyringRecipientKeyStore(
+            legacy_trust.enrollment_binding(),
+            backend=backend,
+            private_key_source=lambda: b"a" * 32,
+            lock_root=tmp_path / "migration-locks",
+        )
+        legacy_store.generate(legacy_trust.project_id, legacy_trust.recipient.actor)
+        device = migrated_device_store(
+            converted, accepted, recipient_store=legacy_store, signer=DeviceSigner()
+        )
+        assert device.enrollment_binding() == DeviceEnrollmentBinding(
+            project_id=converted.project_id,
+            repository_id=converted.repository_id,
+            actor=accepted.authority.members[0].actor,
+            github_account_id=preview.certificate.claims.github_account_id,
+            github_login=preview.certificate.claims.github_login,
+            device_id=preview.certificate.claims.device_id,
+        )
+        assert device.sign(converted.signature_id, b"restart") == device_private.sign(b"restart")
+    for field, value in (
+        ("accepted_bundle_digest", "sha256:" + "f" * 64),
+        ("accepted_authority_digest", "sha256:" + "f" * 64),
+        ("accepted_authority_sequence", 2),
+    ):
+        with pytest.raises(ValueError):
+            load_accepted_device_release(
+                Reader(),
+                "c" * 40,
+                v2_trust.model_copy(update={field: value}),
+                DeviceDecryptor(),
+                current.signing_keys,
+                NOW,
+            )
+    with pytest.raises(ValueError):
+        load_installed_device_migration(
+            Reader(corrupt_legacy=True), "c" * 40, legacy_trust, DeviceDecryptor(), NOW
+        )
+    import json
+
+    from intent_engineering.team_state.local_trust import (
+        LocalTrustProvider,
+        _canonical_bytes,
+        activate_installed_migration,
+    )
+
+    trust_path = source / ".intent" / "team-trust.json"
+    trust_path.write_bytes(_canonical_bytes(legacy_trust))
+    trust_path.chmod(0o600)
+    marker_path = source / ".intent" / "cache" / "shared-state.json"
+    marker_path.parent.mkdir(exist_ok=True)
+    marker_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "bundle_digest": migrated.manifest.bundle_digest,
+                "graph_version": migrated.manifest.graph_version,
+                "ref_commit": migrated.commit,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    )
+    with pytest.raises(ValueError):
+        activate_installed_migration(source, legacy_trust, migrated, merged_state_commit="d" * 40)
+    assert LocalTrustProvider(source).load_versioned() == legacy_trust
+    activate_installed_migration(
+        source, legacy_trust, migrated, merged_state_commit=migrated.commit
+    )
+    activate_installed_migration(
+        source, legacy_trust, migrated, merged_state_commit=migrated.commit
+    )
+    assert LocalTrustProvider(source).load_versioned() == converted
     ordinary = prepare_v2_publication(
         snapshot=snapshot,
         authority=authority_from_verified_state(migrated, v2_trust),

@@ -1007,13 +1007,32 @@ def _digest(value: object) -> str:
 class GitHubSetupBridge:
     """Server-owned setup session; browser data never fabricates a verified decision."""
 
-    def __init__(self, service: ControlPlaneService) -> None:
-        request = load_setup_request(service._runtime)
-        if request is None:
-            context = _enrollment_context(service._runtime)
-            request = None if context is None else context.request
+    def __init__(
+        self,
+        service: ControlPlaneService,
+        *,
+        request: GitHubSetupRequest | None = None,
+    ) -> None:
+        saved_request = load_setup_request(service._runtime)
+        context = _enrollment_context(service._runtime)
+        persisted = (
+            saved_request
+            if saved_request is not None
+            else (None if context is None else context.request)
+        )
+        if request is not None:
+            request = GitHubSetupRequest.model_validate(request.model_dump(mode="python"))
+            if persisted is not None and persisted != request:
+                raise ValueError("GitHub setup changed")
+        else:
+            request = persisted
         if request is None:
             raise ValueError("GitHub setup unavailable")
+        if (
+            request.preview.project_id != service._runtime.config.project_id
+            or request.preview.repository_id != service._team_repository_id
+        ):
+            raise ValueError("GitHub setup changed")
         self.service = service
         self.request = request
         self.repository = request.preview.repository_id.removeprefix("github.com/")
@@ -1216,6 +1235,8 @@ class GitHubSetupBridge:
         api: GitHubTeamStateApi,
         current: VerifiedRemoteStateV2,
         sponsor_certificate_id: str,
+        *,
+        require_sponsor: bool = True,
     ) -> tuple[GitHubTeamStateStatus, GitHubTeamStateClient, GitHubProtectionPreview]:
         """Reconstruct every GitHub-owned enrollment preimage from live reads."""
         current = VerifiedRemoteStateV2.model_validate(current.model_dump(mode="python"))
@@ -1230,7 +1251,7 @@ class GitHubSetupBridge:
             if member.member_id == sponsor.claims.member_id
         )
         if (
-            sponsor_member.role != "sponsor"
+            (require_sponsor and sponsor_member.role != "sponsor")
             or sponsor_member.status != "active"
             or sponsor.certificate_id not in sponsor_member.device_certificate_ids
         ):
@@ -1265,6 +1286,118 @@ class GitHubSetupBridge:
         if protection.requires_change or protection.branch_creation_required:
             raise ValueError("team enrollment changed")
         return status, client, protection
+
+    async def publish_member_state(
+        self,
+        *,
+        publication: PublicationService,
+        decision: VerifiedHumanDecision,
+        current: VerifiedRemoteStateV2,
+        certificate_id: str,
+        protection: GitHubProtectionPreview,
+        verify_local: Callable[[], None],
+    ) -> dict[str, object]:
+        """Publish an ordinary v2 member release through the existing guarded PR transport."""
+        from intent_engineering.team_state.github_publication import GitHubApiPublisher
+        from intent_engineering.team_state.publication import PreparedPublicationV2
+
+        api: _CloseOnceApi | None = None
+        try:
+            api = _CloseOnceApi(github_api())
+            status, _, live = await self._member_preflight(
+                api, current, certificate_id, require_sponsor=False
+            )
+            if live != protection:
+                raise ValueError("team publication changed")
+            prepared = cast(
+                PreparedPublication | PreparedPublicationV2, publication.pending_publication()
+            )
+            if type(prepared) is not PreparedPublicationV2:
+                raise ValueError("team publication changed")
+            old = _draft(self.service._runtime)
+            if old is not None and (
+                old.publication() != prepared or old.anchor != current.state_commit
+            ):
+                raise ValueError("team publication changed")
+            _draft(
+                self.service._runtime,
+                prepared=prepared,
+                anchor=current.state_commit,
+                external_write_attempted=True,
+                publication_commit=None if old is None else old.publication_commit,
+                pull_request_number=None if old is None else old.pull_request_number,
+                pull_request_url=None if old is None else old.pull_request_url,
+            )
+
+            async def require_live() -> None:
+                assert api is not None
+                verify_local()
+                _, _, actual = await self._member_preflight(
+                    api, current, certificate_id, require_sponsor=False
+                )
+                if actual != protection or self.service._now() > decision.payload.expires_at:
+                    raise ValueError("team publication changed")
+
+            guarded = _GuardedApi(api, require_live)
+            certificate = next(
+                c
+                for c in current.authority.device_certificates
+                if c.certificate_id == certificate_id
+            )
+            client = GitHubTeamStateClient(
+                guarded,
+                expected_account_id=str(certificate.claims.github_account_id),
+                expected_login=certificate.claims.github_login,
+            )
+            reviewed = await client.inspect(self.repository)
+            if reviewed != status:
+                raise ValueError("team publication changed")
+            self.transport.publisher = GitHubApiPublisher(guarded, client, status)
+            try:
+                await anyio.to_thread.run_sync(
+                    lambda: publication.prepare(decision, now=self.service._now())
+                )
+            finally:
+                self.transport.publisher = None
+            commit = self.transport.published_commit
+            if commit is None:
+                raise ValueError("team publication unavailable")
+            _draft(
+                self.service._runtime,
+                prepared=prepared,
+                anchor=current.state_commit,
+                external_write_attempted=True,
+                publication_commit=commit,
+            )
+            pr = await client.open_publication_pr(prepared, expected_head_commit=commit)
+            _draft(
+                self.service._runtime,
+                prepared=prepared,
+                anchor=current.state_commit,
+                external_write_attempted=True,
+                publication_commit=commit,
+                pull_request_number=pr.number,
+                pull_request_url=pr.url,
+            )
+            return {
+                "state": "publication_pending",
+                "repository_id": pr.repository_id,
+                "pull_request_url": pr.url,
+            }
+        except BaseException as error:  # noqa: BLE001 - shared fixed publication boundary
+            failure = _setup_failure(error, "team enrollment unavailable")
+            del error, self, publication, decision, current, verify_local
+            raise failure.with_traceback(None) from None
+        finally:
+            if api is not None:
+                active_error = sys.exc_info()[1]
+                with anyio.CancelScope(shield=True):
+                    try:
+                        await api.aclose()
+                    except BaseException as close_error:  # noqa: BLE001 - fixed provider-close boundary
+                        if active_error is None:
+                            failure = _setup_failure(close_error, "team enrollment unavailable")
+                            raise failure.with_traceback(None) from None
 
     async def _require_join_identity(
         self,

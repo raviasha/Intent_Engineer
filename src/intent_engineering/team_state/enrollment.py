@@ -11,7 +11,8 @@ import traceback
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
-from typing import Annotated, Literal, Never, Protocol
+from pathlib import Path
+from typing import TYPE_CHECKING, Annotated, Literal, Never, Protocol, cast
 
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import hashes
@@ -21,11 +22,17 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from pydantic import ConfigDict, Field, field_validator, model_validator
 
+if TYPE_CHECKING:
+    from intent_engineering.storage.secure import SecureFile
+    from intent_engineering.team_state.keys import _KeyringBackend
+
 from intent_engineering.control_plane.models import (
     CredentialRecord,
     DecisionAction,
     DecisionSubject,
     HumanDecisionPayload,
+    credential_identity_digest,
+    credential_matches_digest,
 )
 from intent_engineering.control_plane.webauthn_service import (
     AuthenticationRequest,
@@ -434,6 +441,183 @@ class InMemoryEnrollmentReplayStateStore:
         if invite_id not in self._invites or invite_id in self._consumed:
             raise ValueError("enrollment invitation unavailable")
         self._consumed.add(invite_id)
+
+
+class FileEnrollmentReplayStateStore:
+    """Public invitations and irreversible local replay markers, scoped to one repository."""
+
+    def __init__(self, directory: Path, project_id: str, repository_id: str) -> None:
+        self.directory = directory
+        self.project_id = project_id
+        self.repository_id = repository_id
+
+    def _target(self, invite_id: str, suffix: str) -> SecureFile:
+        from intent_engineering.storage.secure import SecureDirectory
+
+        if not invite_id.startswith("invite:sha256:") or len(invite_id) != 78:
+            raise TeamEnrollmentError("team enrollment unavailable")
+        digest = invite_id.removeprefix("invite:sha256:")
+        if any(character not in "0123456789abcdef" for character in digest):
+            raise TeamEnrollmentError("team enrollment unavailable")
+        directory = SecureDirectory.open(self.directory, create=True)
+        try:
+            return directory.file(digest + suffix)
+        finally:
+            directory.close()
+
+    def put_invite(self, invite: TeamInviteV2) -> None:
+        from intent_engineering.storage._atomic import same_path_lock
+
+        if invite.project_id != self.project_id or invite.repository_id != self.repository_id:
+            raise TeamEnrollmentError("team enrollment unavailable")
+        target = self._target(invite.invite_id, ".json")
+        try:
+            with same_path_lock(target):
+                if target.exists():
+                    raise TeamEnrollmentError("team enrollment unavailable")
+                target.atomic_write(export_team_invite(invite), reject_target_races=True)
+        finally:
+            target.close()
+
+    def get_invite(self, invite_id: str) -> TeamInviteV2 | None:
+        target = self._target(invite_id, ".json")
+        try:
+            content = target.read_optional_nonblocking(max_bytes=_INVITE_MAX)
+            if content is None:
+                return None
+            invite = parse_team_invite(content)
+            if (
+                invite.invite_id != invite_id
+                or invite.project_id != self.project_id
+                or invite.repository_id != self.repository_id
+            ):
+                raise TeamEnrollmentError("team enrollment unavailable")
+            return invite
+        finally:
+            target.close()
+
+    def is_consumed(self, invite_id: str) -> bool:
+        target = self._target(invite_id, ".consumed")
+        try:
+            value = target.read_optional_nonblocking(max_bytes=1)
+            if value not in {None, b"1"}:
+                raise TeamEnrollmentError("team enrollment unavailable")
+            return value is not None
+        finally:
+            target.close()
+
+    def consume(self, invite_id: str) -> None:
+        from intent_engineering.storage._atomic import same_path_lock
+
+        target = self._target(invite_id, ".consumed")
+        try:
+            with same_path_lock(target):
+                if self.get_invite(invite_id) is None or target.exists():
+                    raise TeamEnrollmentError("team enrollment unavailable")
+                target.atomic_write(b"1", reject_target_races=True)
+        finally:
+            target.close()
+
+
+class KeyringEnrollmentChallengeKeyStore:
+    """Persist ephemeral invitation secrets locally; reuse the established proof operations."""
+
+    def __init__(
+        self,
+        project_id: str,
+        repository_id: str,
+        *,
+        backend: _KeyringBackend | None = None,
+        lock_root: Path | None = None,
+    ) -> None:
+        import keyring
+
+        from intent_engineering.team_state.keys import _default_lock_root
+
+        self._backend = keyring if backend is None else backend
+        self._service = "intent-enrollment-challenge-v2/" + _digest(
+            _canonical({"project_id": project_id, "repository_id": repository_id})
+        )
+        self._lock_root = _default_lock_root() if lock_root is None else lock_root
+
+    def _operation(self, invite_id: str, action: str, *arguments: bytes) -> bytes | bool | None:
+        from intent_engineering.storage._atomic import same_path_lock
+        from intent_engineering.team_state.keys import _lock_target
+
+        memory = InMemoryEnrollmentChallengeKeyStore()
+        encoded = ""
+        private = b""
+        try:
+            if re.fullmatch(r"invite:sha256:[0-9a-f]{64}", invite_id) is None:
+                raise ValueError("team enrollment unavailable")
+            with same_path_lock(_lock_target(self._lock_root, self._service, invite_id)):
+                stored = self._backend.get_password(self._service, invite_id)
+                if action == "has":
+                    return stored is not None
+                if action == "create":
+                    if stored is not None:
+                        raise ValueError("team enrollment unavailable")
+                    public = memory.create(invite_id, arguments[0])
+                    encoded = _b64(arguments[0])
+                    self._backend.set_password(self._service, invite_id, encoded)
+                    if self._backend.get_password(self._service, invite_id) != encoded:
+                        raise ValueError("team enrollment unavailable")
+                    return public
+                if stored is None:
+                    raise ValueError("team enrollment unavailable")
+                private = _decode(stored, 32)
+                memory.create(invite_id, private)
+                if action == "delete":
+                    self._backend.delete_password(self._service, invite_id)
+                    if self._backend.get_password(self._service, invite_id) is not None:
+                        raise ValueError("team enrollment unavailable")
+                    return None
+                if action == "verify":
+                    return memory.verify(invite_id, arguments[0], arguments[1], arguments[2])
+                if action == "decrypt_identity_proof":
+                    return memory.decrypt_identity_proof(
+                        invite_id, arguments[0], arguments[1], arguments[2], arguments[3]
+                    )
+                raise ValueError("team enrollment unavailable")
+        except BaseException as error:  # noqa: BLE001 - erase backend frames and secret arguments
+            failure = _prepared_failure(error, "team enrollment unavailable")
+            del self, arguments, error
+            raise failure.with_traceback(None) from None
+        finally:
+            memory._keys.clear()
+            private = b""
+            encoded = ""
+
+    def create(self, invite_id: str, private_key: bytes) -> bytes:
+        return cast(bytes, self._operation(invite_id, "create", private_key))
+
+    def verify(
+        self, invite_id: str, recipient_public_key: bytes, subject: bytes, proof: bytes
+    ) -> bool:
+        return cast(
+            bool, self._operation(invite_id, "verify", recipient_public_key, subject, proof)
+        )
+
+    def decrypt_identity_proof(
+        self,
+        invite_id: str,
+        recipient_public_key: bytes,
+        nonce: bytes,
+        ciphertext: bytes,
+        aad: bytes,
+    ) -> bytes:
+        return cast(
+            bytes,
+            self._operation(
+                invite_id, "decrypt_identity_proof", recipient_public_key, nonce, ciphertext, aad
+            ),
+        )
+
+    def delete(self, invite_id: str) -> None:
+        self._operation(invite_id, "delete")
+
+    def has(self, invite_id: str) -> bool:
+        return cast(bool, self._operation(invite_id, "has"))
 
 
 class JoinResponseV2(_EnrollmentModel):
@@ -1083,7 +1267,7 @@ def parse_join_response(content: bytes) -> JoinResponseV2:
 
 
 def _credential_digest(credential: CredentialRecord) -> str:
-    return _digest(credential.canonical_bytes())
+    return credential_identity_digest(credential)
 
 
 def _decision_repository_id(repository_id: str) -> str:
@@ -1180,7 +1364,7 @@ def _join_subject(
             "authority_before_digest": invite.authority_digest,
             "base_bundle_digest": invite.base_bundle_digest,
             "base_state_commit": invite.base_state_commit,
-            "credential": credential.model_dump(mode="json"),
+            "credential": credential.model_dump(mode="json", exclude={"id", "sign_count"}),
             "created_at": created_at.isoformat().replace("+00:00", "Z"),
             "device_id": material.device_id,
             "github_account_id": int(identity.account_id),
@@ -1227,7 +1411,6 @@ def build_join_decision_payload(
             or type(pre_assertion_sign_count) is not int
             or not 0 <= pre_assertion_sign_count <= 2**32 - 1
             or credential.sign_count < pre_assertion_sign_count
-            or (credential.sign_count == pre_assertion_sign_count and credential.sign_count != 0)
         ):
             raise ValueError("invalid decision challenge")
         identity_proof_digest = _digest(identity_proof)
@@ -1306,7 +1489,7 @@ def build_sponsor_decision_payload(
     )
     return HumanDecisionPayload(
         project_id=preview.invite.project_id,
-        repository_id=_decision_repository_id(preview.invite.repository_id),
+        repository_id=credential.repository_id,
         actor=sponsor.actor,
         action=DecisionAction.APPROVE_EXTERNAL_WRITE,
         graph_version=preview.authority_after.sequence,
@@ -1734,7 +1917,6 @@ class TeamEnrollmentService:
                 decision.payload != expected
                 or decision.verified_at < decision.payload.issued_at
                 or decision.verified_at > decision.payload.expires_at
-                or now != decision.payload.issued_at
                 or now < decision.verified_at
                 or now > decision.payload.expires_at
                 or credential.local_only
@@ -1745,6 +1927,8 @@ class TeamEnrollmentService:
                 or credential.github_login != identity.login
             ):
                 raise ValueError("invalid join decision")
+            # The signed preview fixes transition times; the human may finish later.
+            now = decision.payload.issued_at
             claims, member = _proposed_addition(
                 invite=invite,
                 identity=identity,
@@ -1977,7 +2161,7 @@ class TeamEnrollmentService:
                 or decision.verified_at > decision.payload.expires_at
                 or response.created_at != decision.payload.issued_at
                 or response.expires_at != decision.payload.expires_at
-                or response.created_at < decision.verified_at
+                or now < decision.verified_at
                 or decision.credential != credential
             ):
                 raise ValueError("join WebAuthn binding changed")
@@ -2072,7 +2256,7 @@ class TeamEnrollmentService:
                 invite=preview.invite,
                 response=preview.response,
                 current=current,
-                now=preview.certificate.claims.issued_at,
+                now=now,
             )
             if (
                 recomputed != preview
@@ -2117,7 +2301,7 @@ class TeamEnrollmentService:
                 or now > sponsor_decision.payload.expires_at
                 or credential.local_only
                 or credential.project_id != preview.invite.project_id
-                or credential.repository_id != _decision_repository_id(preview.invite.repository_id)
+                or sponsor_decision.payload.repository_id != credential.repository_id
                 or credential.actor != sponsor.actor
                 or credential.github_account_id != str(sponsor.github_account_id)
                 or credential.github_login != sponsor.github_login
@@ -2126,8 +2310,9 @@ class TeamEnrollmentService:
                 or live_sponsor.login != sponsor.github_login
                 or active_sponsor != sponsor
                 or active_certificate != preview.invite.sponsor_certificate
-                or _credential_digest(credential)
-                != active_certificate.claims.webauthn_credential_digest
+                or not credential_matches_digest(
+                    credential, active_certificate.claims.webauthn_credential_digest
+                )
                 or sponsor.role != "sponsor"
                 or sponsor.status != "active"
                 or self._root_store is None

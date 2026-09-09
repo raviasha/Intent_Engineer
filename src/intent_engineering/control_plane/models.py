@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from datetime import UTC, datetime, timedelta
@@ -267,6 +268,25 @@ class HumanDecisionPayload(_ControlPlaneModel):
     def canonical_bytes(self) -> bytes:
         """Return the exact UTF-8 JSON bytes that an authenticator binds."""
         return _canonical_json_bytes(self.model_dump(mode="json"))
+
+
+def credential_identity_digest(credential: CredentialRecord) -> str:
+    """Commit to immutable WebAuthn identity; counters belong to assertion verification."""
+    identity = credential.model_dump(mode="json", exclude={"id", "sign_count"})
+    return (
+        "sha256:"
+        + hashlib.sha256(
+            b"intent.webauthn-credential-identity.v2\0" + _canonical_json_bytes(identity)
+        ).hexdigest()
+    )
+
+
+def credential_matches_digest(credential: CredentialRecord, digest: str) -> bool:
+    """Accept stable identity or an exactly matching legacy full-record commitment."""
+    return digest in {
+        credential_identity_digest(credential),
+        "sha256:" + hashlib.sha256(credential.canonical_bytes()).hexdigest(),
+    }
 
 
 class CredentialRecord(_ControlPlaneModel):

@@ -29,10 +29,16 @@ from intent_engineering.team_state.keys import (
     DeviceEnrollmentBinding,
     GitHubIdentity,
     KeyringRecipientKeyStore,
+    MigratedDeviceKeyStore,
     RecipientEnrollmentBinding,
+    RecipientKeyStore,
     _key_id,
 )
-from intent_engineering.team_state.models import RecipientRecord, TeamRootTrustV2
+from intent_engineering.team_state.models import (
+    CANONICAL_STATE_PATHS,
+    RecipientRecord,
+    TeamRootTrustV2,
+)
 from intent_engineering.team_state.restore import (
     TRUST_ENVIRONMENT_VARIABLE,
     EnvironmentTrustProvider,
@@ -44,6 +50,8 @@ from intent_engineering.team_state.restore import (
 
 if TYPE_CHECKING:
     from intent_engineering.cli.runtime import Runtime
+    from intent_engineering.team_state.restore import VerifiedReleaseV2
+    from intent_engineering.team_state.signing import ExistingRecipientDeviceSigner
 
 MAX_LOCAL_TRUST_BYTES = 32 * 1024
 MAX_PENDING_JOIN_BYTES = 128 * 1024
@@ -157,6 +165,7 @@ class LocalTrustConfigV2(StrictModel):
     accepted_authority_sequence: int = Field(ge=1, le=2**63 - 1)
     accepted_bundle_digest: str = Field(pattern=_SHA256.pattern)
     device_binding: DeviceEnrollmentBinding | None = None
+    migration_recipient_binding: RecipientEnrollmentBinding | None = None
 
     @field_validator("schema_version", "accepted_authority_sequence", mode="before")
     @classmethod
@@ -177,10 +186,192 @@ class LocalTrustConfigV2(StrictModel):
             or self.device_binding.repository_id != self.repository_id
         ):
             raise ValueError("version two device binding changed")
+        legacy = self.migration_recipient_binding
+        if legacy is not None:
+            from intent_engineering.team_state.authority import derive_member_id
+
+            if (
+                self.device_binding is not None
+                or legacy.project_id != self.project_id
+                or legacy.repository_id != self.repository_id
+                or derive_member_id(
+                    self.project_id, self.repository_id, int(legacy.github_identity.account_id)
+                )
+                != self.member_id
+            ):
+                raise ValueError("version two migration binding changed")
         return self
 
     def canonical_bytes(self) -> bytes:
         return _canonical_bytes(self)
+
+
+def migrated_device_store(
+    trust: LocalTrustConfigV2,
+    release: VerifiedReleaseV2,
+    *,
+    recipient_store: RecipientKeyStore | None = None,
+    signer: ExistingRecipientDeviceSigner | None = None,
+) -> MigratedDeviceKeyStore:
+    """Derive signing authority only from the authenticated active registry."""
+    from intent_engineering.team_state.keys import DevicePublicMaterial
+    from intent_engineering.team_state.publication import authority_from_verified_state
+    from intent_engineering.team_state.signing import KeyringExistingRecipientDeviceSigner
+
+    authority = authority_from_verified_state(release, trust)
+    legacy = trust.migration_recipient_binding
+    if legacy is None:
+        raise LocalTrustError()
+    member = next(m for m in authority.registry.members if m.member_id == trust.member_id)
+    certificate = next(
+        c
+        for c in authority.registry.device_certificates
+        if c.certificate_id == trust.device_certificate_id
+    )
+    claims = certificate.claims
+    binding = DeviceEnrollmentBinding(
+        project_id=trust.project_id,
+        repository_id=trust.repository_id,
+        actor=member.actor,
+        github_account_id=member.github_account_id,
+        github_login=member.github_login,
+        device_id=claims.device_id,
+    )
+    material = DevicePublicMaterial(
+        claims.device_id,
+        claims.recipient_key_id,
+        base64.urlsafe_b64decode(
+            claims.recipient_public_key + "=" * (-len(claims.recipient_public_key) % 4)
+        ),
+        claims.signature_id,
+        base64.urlsafe_b64decode(
+            claims.signing_public_key + "=" * (-len(claims.signing_public_key) % 4)
+        ),
+    )
+    return MigratedDeviceKeyStore(
+        binding,
+        legacy,
+        material,
+        recipient_store=recipient_store or KeyringRecipientKeyStore(legacy),
+        signer=signer or KeyringExistingRecipientDeviceSigner(binding),
+    )
+
+
+def trust_from_verified_migration(
+    legacy: LocalTrustConfig, release: VerifiedReleaseV2
+) -> LocalTrustConfigV2:
+    """Preserve the exact legacy keyring binding after verification, never key bytes."""
+    from intent_engineering.team_state.authority import derive_member_id
+    from intent_engineering.team_state.restore import VerifiedReleaseV2
+
+    if (
+        type(legacy) is not LocalTrustConfig
+        or type(release) is not VerifiedReleaseV2
+        or release.manifest.migration is None
+    ):
+        raise LocalTrustError()
+    identity = legacy.enrollment_binding().github_identity
+    member_id = derive_member_id(legacy.project_id, legacy.repository_id, int(identity.account_id))
+    members = [m for m in release.authority.members if m.member_id == member_id]
+    certificates = [
+        c for c in release.authority.device_certificates if c.claims.member_id == member_id
+    ]
+    if len(members) != 1 or len(certificates) != 1:
+        raise LocalTrustError()
+    member, certificate = members[0], certificates[0]
+    if (
+        release.manifest.project_id != legacy.project_id
+        or release.manifest.repository_id != legacy.repository_id
+        or member.actor != f"github:{identity.account_id}"
+        or member.github_login != identity.login
+        or member.status != "active"
+        or certificate.certificate_id not in member.device_certificate_ids
+        or certificate.claims.recipient_public_key != legacy.recipient.public_key
+    ):
+        raise LocalTrustError()
+    return LocalTrustConfigV2(
+        project_id=legacy.project_id,
+        repository_id=legacy.repository_id,
+        root=release.authority.root,
+        member_id=member_id,
+        device_certificate_id=certificate.certificate_id,
+        recipient_key_id=certificate.claims.recipient_key_id,
+        signature_id=certificate.claims.signature_id,
+        accepted_authority_digest=release.manifest.authority_digest,
+        accepted_authority_sequence=release.authority.sequence,
+        accepted_bundle_digest=release.manifest.bundle_digest,
+        migration_recipient_binding=legacy.enrollment_binding(),
+    )
+
+
+@contextmanager
+def _migration_activation_transaction(
+    root: Path,
+) -> Iterator[tuple[LocalTransactionCoordinator, dict[str, str]]]:
+    with ExitStack() as stack:
+        workspace = SecureDirectory.open(root / ".intent")
+        stack.callback(workspace.close)
+        _require_owner_directory(workspace, harden=True)
+        paths = {path: f"state_{i}" for i, path in enumerate(CANONICAL_STATE_PATHS)}
+        paths.update(
+            {
+                "cache/shared-state.json": "shared_state",
+                "team-trust.json": "team_trust",
+                "team-join-pending.json": "pending_join_trust",
+            }
+        )
+        targets = {name: workspace.file(path) for path, name in paths.items()}
+        for target in targets.values():
+            stack.callback(target.close)
+        journal = workspace.file("team-migration-activation.json")
+        stack.callback(journal.close)
+        coordinator = LocalTransactionCoordinator(
+            journal, targets, max_recovery_bytes=24 * 1024 * 1024
+        )
+        stack.callback(coordinator.close)
+        try:
+            yield coordinator, paths
+        finally:
+            if targets["team_trust"].exists():
+                _harden_owner_target(targets["team_trust"])
+
+
+def activate_installed_migration(
+    root: Path, legacy: LocalTrustConfig, release: VerifiedReleaseV2, *, merged_state_commit: str
+) -> None:
+    """Atomically convert public trust only after the exact verified migration is installed."""
+    try:
+        if release.commit != merged_state_commit or release.snapshot is None:
+            raise LocalTrustError()
+        trust = trust_from_verified_migration(legacy, release)
+        expected = {f.path: f.content for f in release.snapshot.files}
+        expected["cache/shared-state.json"] = json.dumps(
+            {
+                "schema_version": 1,
+                "bundle_digest": release.manifest.bundle_digest,
+                "graph_version": release.manifest.graph_version,
+                "ref_commit": release.commit,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+        with (
+            _migration_activation_transaction(root) as (coordinator, paths),
+            coordinator.transaction() as transaction,
+        ):
+            for path, content in expected.items():
+                if (transaction.read_optional(paths[path]) or b"") != content:
+                    raise LocalTrustError()
+            if transaction.read_optional("pending_join_trust") not in {None, b""}:
+                raise LocalTrustError()
+            before = transaction.read_optional("team_trust")
+            if before == trust.canonical_bytes():
+                return
+            if before != _canonical_bytes(legacy):
+                raise LocalTrustError()
+            transaction.write("team_trust", trust.canonical_bytes())
+    except BaseException as error:  # noqa: BLE001 - fixed public activation boundary
+        _failure(error)
 
 
 class PendingJoinTrustV2(StrictModel):
@@ -377,6 +568,8 @@ def _canonical_bytes(value: StrictModel) -> bytes:
     document = value.model_dump(mode="json")
     if isinstance(value, LocalTrustConfigV2) and value.device_binding is None:
         document.pop("device_binding")
+    if isinstance(value, LocalTrustConfigV2) and value.migration_recipient_binding is None:
+        document.pop("migration_recipient_binding")
     return json.dumps(
         document,
         ensure_ascii=False,
@@ -698,6 +891,13 @@ class LocalTrustProvider:
         try:
             project, workspace = _open_workspace(self._root, harden=None)
             try:
+                migration_journal = workspace.file("team-migration-activation.json")
+                try:
+                    if migration_journal.exists():
+                        with _migration_activation_transaction(self._root) as (coordinator, _paths):
+                            coordinator.snapshot(target_names=())
+                finally:
+                    migration_journal.close()
                 target = workspace.file(_FILENAME)
                 journal = workspace.file(_ACTIVATION_JOURNAL_FILENAME)
                 try:
