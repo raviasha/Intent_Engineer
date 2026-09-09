@@ -8,6 +8,7 @@ import os
 import signal
 import traceback
 from datetime import UTC, datetime, timedelta
+from types import TracebackType
 
 import pytest
 import yaml  # type: ignore[import-untyped]
@@ -15,6 +16,7 @@ import yaml  # type: ignore[import-untyped]
 from intent_engineering.assessment.snapshot import (
     AssessmentUnavailable,
     build_assessment_snapshot,
+    build_assessment_snapshot_from_transaction,
 )
 from intent_engineering.core.models import (
     ChangeKind,
@@ -48,6 +50,7 @@ from intent_engineering.storage.jsonl.case_store import serialize_case
 from intent_engineering.storage.jsonl.evidence_store import parse_evidence_lines
 from intent_engineering.storage.jsonl.history_store import serialize_changeset
 from intent_engineering.storage.secure import SecureFile
+from intent_engineering.storage.transaction import LocalTransaction, LocalTransactionExtraReadPolicy
 from intent_engineering.storage.yaml.graph_store import parse_graph, serialize_graph
 
 
@@ -84,12 +87,259 @@ def test_runtime_exposes_the_same_snapshot_boundary(assessment_runtime) -> None:
     assert assessment_runtime.runtime.assessment_snapshot("local:asha") == direct
 
 
+def test_snapshot_can_consume_one_already_authenticated_write_transaction(
+    assessment_runtime, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Catches enrichment nesting a second recovery/read-lock snapshot."""
+    runtime = assessment_runtime.runtime
+    expected = build_assessment_snapshot(runtime, "local:asha")
+    config = runtime.workspace_directory.file("config.yaml")
+    policy = runtime.workspace_directory.file("approvals/policy.yaml")
+    extras = {"config": config, "acl_policy": policy}
+    policies = {
+        name: LocalTransactionExtraReadPolicy(max_bytes=1024 * 1024, nonblocking_regular=True)
+        for name in extras
+    }
+
+    def forbidden(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("nested assessment snapshot acquisition")
+
+    monkeypatch.setattr(runtime.transactions, "snapshot_without_recovery", forbidden)
+    try:
+        with runtime.transactions.transaction(
+            rollback_base_exceptions=True,
+            extras=extras,
+            extra_read_policies=policies,
+        ) as transaction:
+            actual = build_assessment_snapshot_from_transaction(
+                runtime,
+                "local:asha",
+                transaction,
+            )
+    finally:
+        policy.close()
+        config.close()
+
+    assert actual == expected
+
+
+def test_transaction_snapshot_requires_bounded_authority_extras(assessment_runtime) -> None:
+    """Catches an enrichment caller bypassing config and ACL allocation bounds."""
+    runtime = assessment_runtime.runtime
+    config = runtime.workspace_directory.file("config.yaml")
+    policy = runtime.workspace_directory.file("approvals/policy.yaml")
+    try:
+        with (
+            runtime.transactions.transaction(
+                rollback_base_exceptions=True,
+                extras={"config": config, "acl_policy": policy},
+            ) as transaction,
+            pytest.raises(AssessmentUnavailable, match="^assessment unavailable$"),
+        ):
+            build_assessment_snapshot_from_transaction(
+                runtime,
+                "local:asha",
+                transaction,
+            )
+    finally:
+        policy.close()
+        config.close()
+
+
+@pytest.mark.parametrize("substituted", ("config", "acl_policy"))
+def test_transaction_snapshot_rejects_substituted_authority_descriptors(
+    assessment_runtime, substituted: str
+) -> None:
+    runtime = assessment_runtime.runtime
+    config = runtime.workspace_directory.file("config.yaml")
+    policy = runtime.workspace_directory.file("approvals/policy.yaml")
+    replacement = runtime.workspace_directory.file(f"history/substituted-{substituted}.yaml")
+    replacement.atomic_write(
+        config.read_bytes() if substituted == "config" else policy.read_bytes()
+    )
+    extras = {"config": config, "acl_policy": policy}
+    extras[substituted] = replacement
+    policies = {
+        name: LocalTransactionExtraReadPolicy(max_bytes=1024 * 1024, nonblocking_regular=True)
+        for name in extras
+    }
+    try:
+        with (
+            runtime.transactions.transaction(
+                rollback_base_exceptions=True,
+                extras=extras,
+                extra_read_policies=policies,
+            ) as transaction,
+            pytest.raises(AssessmentUnavailable, match="^assessment unavailable$"),
+        ):
+            build_assessment_snapshot_from_transaction(runtime, "local:asha", transaction)
+    finally:
+        replacement.close()
+        policy.close()
+        config.close()
+
+
+def test_transaction_snapshot_rejects_direct_forged_and_stale_handles(
+    assessment_runtime,
+) -> None:
+    """Catches shape-equivalent handles that were never issued for the live lock scope."""
+    runtime = assessment_runtime.runtime
+    config = runtime.workspace_directory.file("config.yaml")
+    policy = runtime.workspace_directory.file("approvals/policy.yaml")
+    extras = {"config": config, "acl_policy": policy}
+    policies = {
+        name: LocalTransactionExtraReadPolicy(max_bytes=1024 * 1024, nonblocking_regular=True)
+        for name in extras
+    }
+    forged = LocalTransaction(
+        runtime.transactions,
+        extras,
+        extra_read_policies=policies,
+    )
+    held: LocalTransaction | None = None
+    try:
+        with pytest.raises(AssessmentUnavailable, match="^assessment unavailable$"):
+            build_assessment_snapshot_from_transaction(runtime, "local:asha", forged)
+        with runtime.transactions.transaction(
+            rollback_base_exceptions=True,
+            extras=extras,
+            extra_read_policies=policies,
+        ) as transaction:
+            held = transaction
+            assert (
+                build_assessment_snapshot_from_transaction(
+                    runtime, "local:asha", transaction
+                ).graph.id
+                == "graph:assessment"
+            )
+            in_scope_forged = LocalTransaction(
+                runtime.transactions,
+                extras,
+                extra_read_policies=policies,
+            )
+            with pytest.raises(AssessmentUnavailable, match="^assessment unavailable$"):
+                build_assessment_snapshot_from_transaction(runtime, "local:asha", in_scope_forged)
+            in_scope_forged._finish()
+        assert held is not None
+        with pytest.raises(AssessmentUnavailable, match="^assessment unavailable$"):
+            build_assessment_snapshot_from_transaction(runtime, "local:asha", held)
+    finally:
+        forged._finish()
+        policy.close()
+        config.close()
+
+
+def test_transaction_snapshot_cancellation_scrubs_retained_dependency_frames(
+    assessment_runtime, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Catches private bytes surviving through an externally retained old traceback."""
+    runtime = assessment_runtime.runtime
+    config = runtime.workspace_directory.file("config.yaml")
+    policy = runtime.workspace_directory.file("approvals/policy.yaml")
+    extras = {"config": config, "acl_policy": policy}
+    policies = {
+        name: LocalTransactionExtraReadPolicy(max_bytes=1024 * 1024, nonblocking_regular=True)
+        for name in extras
+    }
+    secret = "PRIVATE-HELD-SNAPSHOT-CANCELLATION-8197"
+    signal = CancellationSignal(secret)
+    retained: list[TracebackType] = []
+    try:
+        with runtime.transactions.transaction(
+            rollback_base_exceptions=True,
+            extras=extras,
+            extra_read_policies=policies,
+        ) as transaction:
+            original = transaction.read_optional
+
+            def cancel(name: str) -> bytes | None:
+                marker = secret
+                assert marker
+                if name == "cases":
+                    try:
+                        raise signal
+                    except BaseException as caught:
+                        if caught.__traceback__ is not None:
+                            retained.append(caught.__traceback__)
+                        raise
+                return original(name)
+
+            monkeypatch.setattr(transaction, "read_optional", cancel)
+            with pytest.raises(CancellationSignal) as caught:
+                build_assessment_snapshot_from_transaction(runtime, "local:asha", transaction)
+            assert caught.value is signal
+            assert caught.value.args == ()
+            assert caught.value.__dict__ == {}
+            assert caught.value.__cause__ is None
+            assert caught.value.__context__ is None
+            assert retained
+            retained_locals = "\n".join(
+                repr(frame.f_locals) for frame, _line in traceback.walk_tb(retained[0])
+            )
+            assert secret not in retained_locals
+    finally:
+        policy.close()
+        config.close()
+
+
+def test_transaction_snapshot_ordinary_failure_scrubs_retained_dependency_frames(
+    assessment_runtime, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Catches private bytes retained after a fixed ordinary snapshot failure."""
+    runtime = assessment_runtime.runtime
+    config = runtime.workspace_directory.file("config.yaml")
+    policy = runtime.workspace_directory.file("approvals/policy.yaml")
+    extras = {"config": config, "acl_policy": policy}
+    policies = {
+        name: LocalTransactionExtraReadPolicy(max_bytes=1024 * 1024, nonblocking_regular=True)
+        for name in extras
+    }
+    secret = "PRIVATE-HELD-SNAPSHOT-FAILURE-8197"
+    retained: list[TracebackType] = []
+    try:
+        with runtime.transactions.transaction(
+            rollback_base_exceptions=True,
+            extras=extras,
+            extra_read_policies=policies,
+        ) as transaction:
+            original = transaction.read_optional
+
+            def fail(name: str) -> bytes | None:
+                marker = secret
+                if name == "cases":
+                    try:
+                        raise ValueError(marker)
+                    except ValueError as caught:
+                        if caught.__traceback__ is not None:
+                            retained.append(caught.__traceback__)
+                        raise
+                return original(name)
+
+            monkeypatch.setattr(transaction, "read_optional", fail)
+            with pytest.raises(AssessmentUnavailable, match="^assessment unavailable$") as caught:
+                build_assessment_snapshot_from_transaction(runtime, "local:asha", transaction)
+            assert caught.value.__cause__ is None
+            assert caught.value.__context__ is None
+            assert retained
+            retained_locals = "\n".join(
+                repr(frame.f_locals) for frame, _line in traceback.walk_tb(retained[0])
+            )
+            assert secret not in retained_locals
+    finally:
+        policy.close()
+        config.close()
+
+
 def test_assessment_package_exports_snapshot_boundary() -> None:
     """Catches callers having to import private module structure for the public interface."""
     from intent_engineering import assessment
 
     assert assessment.AssessmentUnavailable is AssessmentUnavailable
     assert assessment.build_assessment_snapshot is build_assessment_snapshot
+    assert (
+        assessment.build_assessment_snapshot_from_transaction
+        is build_assessment_snapshot_from_transaction
+    )
 
 
 def test_snapshot_resolves_exact_live_actor_aliases(assessment_runtime) -> None:

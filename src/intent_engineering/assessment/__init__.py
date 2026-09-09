@@ -23,6 +23,7 @@ from intent_engineering.assessment.service import AssessmentComparison, GraphAss
 from intent_engineering.assessment.snapshot import (
     AssessmentUnavailable,
     build_assessment_snapshot,
+    build_assessment_snapshot_from_transaction,
 )
 
 __all__ = [
@@ -45,4 +46,5 @@ __all__ = [
     "ProjectScorecard",
     "RubricCheck",
     "build_assessment_snapshot",
+    "build_assessment_snapshot_from_transaction",
 ]

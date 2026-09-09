@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import traceback
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -49,6 +50,8 @@ from intent_engineering.intent_workflow.conversation import (
     validate_conversation_ingestion,
     verify_codex_conversation_ref,
 )
+from intent_engineering.intent_workflow.enrichment_models import EnrichmentProposalBinding
+from intent_engineering.intent_workflow.enrichment_store import EnrichmentSessionStore
 from intent_engineering.intent_workflow.models import (
     ClarificationAnswer,
     ClarificationConflict,
@@ -84,6 +87,7 @@ from intent_engineering.storage.jsonl.evidence_store import (
 from intent_engineering.storage.jsonl.history_store import serialize_changeset
 from intent_engineering.storage.secure import SecureFile
 from intent_engineering.storage.transaction import (
+    LocalTransaction,
     LocalTransactionCoordinator,
     LocalTransactionExtraReadPolicy,
     LocalTransactionSnapshot,
@@ -177,6 +181,19 @@ class ClarificationError(ValueError):
 
     def __init__(self) -> None:
         super().__init__("intent clarification unavailable")
+
+
+def _scrub_enrichment_proposal_signal(error: BaseException) -> BaseException:
+    old_traceback = error.__traceback__
+    error.args = ()
+    error.__dict__.clear()
+    error.__traceback__ = None
+    error.__cause__ = None
+    error.__context__ = None
+    if old_traceback is not None:
+        traceback.clear_frames(old_traceback)
+    old_traceback = None
+    return error
 
 
 class ProposalConfirmationStatus(StrEnum):
@@ -394,6 +411,91 @@ class ClarificationCoordinator:
                 for name, content in self._authority_preimages.items()
             ):
                 raise ValueError("clarification authority changed")
+
+    @contextmanager
+    def _enrichment_authority_transaction(
+        self,
+        authority_files: Mapping[str, SecureFile],
+        authority_read_policies: Mapping[str, LocalTransactionExtraReadPolicy],
+    ) -> Iterator[tuple[LocalTransaction, dict[str, str]]]:
+        """Own one complete authority lock set for enrichment proposal validation."""
+        incoming_files = dict(authority_files)
+        incoming_policies = dict(authority_read_policies)
+        if (
+            set(incoming_files) != {"acl_policy", "config"}
+            or set(incoming_policies) != set(incoming_files)
+            or any(
+                type(policy) is not LocalTransactionExtraReadPolicy
+                for policy in incoming_policies.values()
+            )
+        ):
+            raise ValueError("invalid enrichment authority binding")
+        combined_files = dict(self._authority_files)
+        combined_policies = dict(self._authority_read_policies)
+        if len({file.lock_key for file in incoming_files.values()}) != len(incoming_files) or len(
+            {file.lock_key for file in combined_files.values()}
+        ) != len(combined_files):
+            raise ValueError("invalid enrichment authority binding")
+        configured_aliases = {
+            "acl_policy": ("acl_policy", "authority_policy"),
+            "config": ("config", "authority_config"),
+        }
+        aliases: dict[str, str] = {}
+        for logical_name in ("acl_policy", "config"):
+            incoming = incoming_files[logical_name]
+            configured = tuple(
+                name for name in configured_aliases[logical_name] if name in combined_files
+            )
+            identity_matches = tuple(
+                name
+                for name, configured in combined_files.items()
+                if configured.lock_key == incoming.lock_key
+            )
+            if (
+                len(configured) > 1
+                or (configured and combined_files[configured[0]].lock_key != incoming.lock_key)
+                or len(identity_matches) > 1
+            ):
+                raise ValueError("invalid enrichment authority binding")
+            alias = (
+                configured[0]
+                if configured
+                else identity_matches[0]
+                if identity_matches
+                else logical_name
+            )
+            incoming_policy = incoming_policies[logical_name]
+            configured_policy = combined_policies.get(alias)
+            if configured_policy is not None and configured_policy != incoming_policy:
+                raise ValueError("invalid enrichment authority binding")
+            if not configured and not identity_matches:
+                combined_files[alias] = incoming
+            combined_policies[alias] = incoming_policy
+            aliases[logical_name] = alias
+        with self._transactions.transaction(
+            rollback_base_exceptions=True,
+            extras=combined_files,
+            extra_read_policies=combined_policies,
+        ) as transaction:
+            if not self._authority_membership_matches() or any(
+                transaction.read_optional(name) != content
+                for name, content in self._authority_preimages.items()
+            ):
+                raise ValueError("clarification authority changed")
+            yield transaction, aliases
+            if not self._authority_membership_matches() or any(
+                transaction.read_optional(name) != content
+                for name, content in self._authority_preimages.items()
+            ):
+                raise ValueError("clarification authority changed")
+
+    @contextmanager
+    def _proposal_transaction(self, held: LocalTransaction | None) -> Iterator[LocalTransaction]:
+        if held is not None:
+            yield held
+            return
+        with self._transactions.transaction(rollback_base_exceptions=True) as transaction:
+            yield transaction
 
     @staticmethod
     def _evidence_index(
@@ -1026,8 +1128,21 @@ class ClarificationCoordinator:
         submission: ClarificationProposalSubmission,
         *,
         principals: frozenset[str],
+        enrichment_binding: EnrichmentProposalBinding | None = None,
+        enrichment_store: EnrichmentSessionStore | None = None,
+        enrichment_transaction: LocalTransaction | None = None,
+        enrichment_preimage_names: Mapping[str, str] | None = None,
     ) -> ClarificationIntentProposal:
-        if type(submission) is not ClarificationProposalSubmission:
+        if (
+            type(submission) is not ClarificationProposalSubmission
+            or (enrichment_binding is None) != (enrichment_store is None)
+            or (enrichment_binding is None) != (enrichment_transaction is None)
+            or (enrichment_binding is None) != (enrichment_preimage_names is None)
+            or (
+                enrichment_binding is not None
+                and type(enrichment_binding) is not EnrichmentProposalBinding
+            )
+        ):
             raise ValueError("invalid clarification proposal")
         submission = ClarificationProposalSubmission.model_validate_json(
             submission.model_dump_json()
@@ -1046,6 +1161,7 @@ class ClarificationCoordinator:
             or submission.actor != session.answers[-1].actor
             or submission.actor not in principals
             or submission.timestamp < session.answers[-1].answered_at
+            or (enrichment_binding is not None and enrichment_binding.actor != submission.actor)
         ):
             raise ValueError("incomplete clarification")
         snapshot = self._transactions.snapshot()
@@ -1057,6 +1173,11 @@ class ClarificationCoordinator:
                     session.classification_evidence_ref,
                     *(item.evidence_ref for item in session.questions),
                     *(item.evidence_ref for item in session.answers),
+                    *(
+                        ()
+                        if enrichment_binding is None
+                        else enrichment_binding.answer_evidence_refs
+                    ),
                 )
             )
         )
@@ -1120,7 +1241,21 @@ class ClarificationCoordinator:
             clarification_session_id=session.id,
             task_id=session.task_id,
         )
+        ledger = self._store.bytes()
         if session.status == "proposed":
+            if enrichment_binding is not None and enrichment_store is not None:
+                with self._proposal_transaction(enrichment_transaction) as transaction:
+                    enrichment_store.validate_proposal_binding(
+                        enrichment_binding,
+                        transaction,
+                        preimage_names=enrichment_preimage_names,
+                    )
+                    if (
+                        transaction.read("graph") != snapshot.content.get("graph")
+                        or transaction.read_optional("evidence") != snapshot.content.get("evidence")
+                        or transaction.read("intent_proposals") != ledger
+                    ):
+                        raise ValueError("clarification snapshot changed")
             stored_replay = self._store.get(proposal.id)
             if stored_replay != proposal or not isinstance(
                 stored_replay, ClarificationIntentProposal
@@ -1136,7 +1271,6 @@ class ClarificationCoordinator:
             session.latest_event_id,
             proposal.id,
         )
-        ledger = self._store.bytes()
         event_frame = serialize_intent_ledger_record(
             IntentLedgerRecord(sequence=len(ledger.splitlines()), clarification=proposed_event)
         )
@@ -1147,7 +1281,13 @@ class ClarificationCoordinator:
             )
         )
         try:
-            with self._transactions.transaction(rollback_base_exceptions=True) as transaction:
+            with self._proposal_transaction(enrichment_transaction) as transaction:
+                if enrichment_binding is not None and enrichment_store is not None:
+                    enrichment_store.validate_proposal_binding(
+                        enrichment_binding,
+                        transaction,
+                        preimage_names=enrichment_preimage_names,
+                    )
                 if (
                     transaction.read("graph") != snapshot.content.get("graph")
                     or transaction.read_optional("evidence") != snapshot.content.get("evidence")
@@ -1186,6 +1326,53 @@ class ClarificationCoordinator:
         finally:
             submission = cast(ClarificationProposalSubmission, None)
             principals = frozenset()
+        if signal is not None:
+            caught_signal = signal
+            signal = None
+            raise caught_signal.with_traceback(None)
+        if failed or result is None:
+            raise ClarificationError()
+        return result
+
+    def propose_enrichment(
+        self,
+        submission: ClarificationProposalSubmission,
+        *,
+        principals: frozenset[str],
+        binding: EnrichmentProposalBinding,
+        enrichment_store: EnrichmentSessionStore,
+        authority_files: Mapping[str, SecureFile],
+        authority_read_policies: Mapping[str, LocalTransactionExtraReadPolicy],
+    ) -> ClarificationIntentProposal:
+        """Propose with an enrichment precondition revalidated in the append transaction."""
+        result: ClarificationIntentProposal | None = None
+        signal: BaseException | None = None
+        failed = False
+        try:
+            with self._enrichment_authority_transaction(
+                authority_files,
+                authority_read_policies,
+            ) as (transaction, preimage_names):
+                result = self._propose(
+                    submission,
+                    principals=principals,
+                    enrichment_binding=binding,
+                    enrichment_store=enrichment_store,
+                    enrichment_transaction=transaction,
+                    enrichment_preimage_names=preimage_names,
+                )
+        except Exception as caught:  # noqa: BLE001 - fixed opaque boundary; no logging
+            _scrub_enrichment_proposal_signal(caught)
+            failed = True
+        except BaseException as caught:  # noqa: BLE001 - preserve exact cancellation identity
+            signal = _scrub_enrichment_proposal_signal(caught)
+        finally:
+            submission = cast(ClarificationProposalSubmission, None)
+            principals = frozenset()
+            binding = cast(EnrichmentProposalBinding, None)
+            enrichment_store = cast(EnrichmentSessionStore, None)
+            authority_files = {}
+            authority_read_policies = {}
         if signal is not None:
             caught_signal = signal
             signal = None

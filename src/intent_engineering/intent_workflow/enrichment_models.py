@@ -15,6 +15,15 @@ from intent_engineering.core.models._base import StrictModel
 _HASH_PATTERN = r"^sha256:[0-9a-f]{64}$"
 _IDENTIFIER_PATTERN = r"^[^\x00-\x20\x7f]{1,256}$"
 _CONTROL = re.compile(r"[\x00-\x1f\x7f]")
+_PROPOSAL_PREIMAGE_NAMES = (
+    "acl_policy",
+    "cases",
+    "config",
+    "evidence",
+    "graph",
+    "history",
+    "intent_proposals",
+)
 
 
 def _utc(value: datetime) -> datetime:
@@ -100,11 +109,20 @@ class EnrichmentEvent(_EnrichmentModel):
     sequence: Annotated[int, Field(ge=0, le=1_000_000)]
     predecessor_event_digest: Annotated[str, Field(pattern=_HASH_PATTERN)] | None = None
     event_type: Literal[
-        "opened", "answered", "skipped", "paused", "resumed", "completed", "cancelled"
+        "opened",
+        "answered",
+        "skipped",
+        "paused",
+        "resumed",
+        "reassessed",
+        "completed",
+        "cancelled",
     ]
     session: EnrichmentSession
     gap_id: Annotated[str, Field(pattern=_IDENTIFIER_PATTERN)] | None = None
     answer_evidence_ref: Annotated[str, Field(pattern=_IDENTIFIER_PATTERN)] | None = None
+    reassessment_predecessor_digest: Annotated[str, Field(pattern=_HASH_PATTERN)] | None = None
+    operation_id: Annotated[str, Field(pattern=_HASH_PATTERN)] | None = None
     at: datetime
 
     @field_validator("at")
@@ -121,7 +139,16 @@ class EnrichmentEvent(_EnrichmentModel):
                 raise ValueError("invalid opening event")
         elif self.sequence == 0 or self.predecessor_event_digest is None:
             raise ValueError("enrichment event requires predecessor")
-        if self.event_type == "answered":
+        if self.event_type == "reassessed":
+            if (
+                self.reassessment_predecessor_digest is None
+                or self.gap_id is not None
+                or self.answer_evidence_ref is not None
+            ):
+                raise ValueError("reassessment event requires only its snapshot predecessor")
+        elif self.reassessment_predecessor_digest is not None:
+            raise ValueError("only reassessment may bind a snapshot predecessor")
+        elif self.event_type == "answered":
             if self.gap_id is None or self.answer_evidence_ref is None:
                 raise ValueError("answer event requires gap and evidence")
             if not self.answer_evidence_ref.startswith("evidence:"):
@@ -135,8 +162,13 @@ class EnrichmentEvent(_EnrichmentModel):
 
     @property
     def digest(self) -> str:
+        material = self.model_dump(mode="json")
+        if self.reassessment_predecessor_digest is None:
+            material.pop("reassessment_predecessor_digest")
+        if self.operation_id is None:
+            material.pop("operation_id")
         payload = json.dumps(
-            self.model_dump(mode="json"),
+            material,
             allow_nan=False,
             ensure_ascii=False,
             separators=(",", ":"),
@@ -145,4 +177,51 @@ class EnrichmentEvent(_EnrichmentModel):
         return f"sha256:{hashlib.sha256(payload).hexdigest()}"
 
 
-__all__ = ["EnrichmentEvent", "EnrichmentSession"]
+class EnrichmentProposalBinding(_EnrichmentModel):
+    """Exact enrichment precondition consumed by the governed proposal transaction."""
+
+    schema_version: Literal[1] = 1
+    session_id: Annotated[str, Field(pattern=r"^refine:[^\x00-\x20\x7f]{1,249}$")]
+    latest_event_digest: Annotated[str, Field(pattern=_HASH_PATTERN)]
+    snapshot_digest: Annotated[str, Field(pattern=_HASH_PATTERN)]
+    actor: Annotated[str, Field(pattern=_IDENTIFIER_PATTERN)]
+    answered_gap_ids: Annotated[tuple[str, ...], Field(min_length=1, max_length=256)]
+    answer_evidence_refs: Annotated[tuple[str, ...], Field(min_length=1, max_length=256)]
+    assessment_preimage_digests: Annotated[
+        tuple[tuple[str, Annotated[str, Field(pattern=_HASH_PATTERN)]], ...],
+        Field(min_length=7, max_length=7),
+    ]
+
+    @field_validator("answered_gap_ids")
+    @classmethod
+    def require_gap_ids(cls, values: tuple[str, ...]) -> tuple[str, ...]:
+        if any(not value or len(value) > 256 or _CONTROL.search(value) for value in values):
+            raise ValueError("invalid enrichment proposal gap")
+        if len(values) != len(set(values)):
+            raise ValueError("duplicate enrichment proposal gap")
+        return values
+
+    @field_validator("answer_evidence_refs")
+    @classmethod
+    def require_evidence_refs(cls, values: tuple[str, ...]) -> tuple[str, ...]:
+        if any(
+            not value.startswith("evidence:") or len(value) > 256 or _CONTROL.search(value)
+            for value in values
+        ):
+            raise ValueError("invalid enrichment proposal evidence")
+        if len(values) != len(set(values)):
+            raise ValueError("duplicate enrichment proposal evidence")
+        return values
+
+    @model_validator(mode="after")
+    def align_answers(self) -> Self:
+        if len(self.answered_gap_ids) != len(self.answer_evidence_refs):
+            raise ValueError("enrichment proposal answers do not align")
+        if tuple(name for name, _digest in self.assessment_preimage_digests) != (
+            _PROPOSAL_PREIMAGE_NAMES
+        ):
+            raise ValueError("invalid enrichment proposal preimages")
+        return self
+
+
+__all__ = ["EnrichmentEvent", "EnrichmentProposalBinding", "EnrichmentSession"]

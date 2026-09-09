@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import json
+import traceback
 from contextlib import nullcontext
 from datetime import UTC, datetime, timedelta
+from hashlib import sha256
 from pathlib import Path
 
 import pytest
@@ -51,6 +53,7 @@ def _event(
     predecessor_event_digest: str | None = None,
     gap_id: str | None = None,
     answer_evidence_ref: str | None = None,
+    reassessment_predecessor_digest: str | None = None,
 ) -> EnrichmentEvent:
     return EnrichmentEvent.model_validate(
         {
@@ -60,6 +63,7 @@ def _event(
             "session": session,
             "gap_id": gap_id,
             "answer_evidence_ref": answer_evidence_ref,
+            "reassessment_predecessor_digest": reassessment_predecessor_digest,
             "at": session.updated_at,
         }
     )
@@ -212,6 +216,75 @@ def test_lifecycle_only_events_cannot_rewrite_audited_session_facts(tmp_path: Pa
         store.append(forged_resume)
 
 
+def test_only_bound_reassessment_can_replace_snapshot_and_current_gap(tmp_path: Path) -> None:
+    store = EnrichmentSessionStore(tmp_path / "enrichment-sessions.jsonl")
+    opened = _event(0, "opened", _session())
+    store.append(opened)
+    paused_session = _session(
+        status="paused", remaining_budget_seconds=299, updated_at=NOW + timedelta(seconds=1)
+    )
+    paused = _event(1, "paused", paused_session, predecessor_event_digest=opened.digest)
+    store.append(paused)
+    reassessed_session = paused_session.model_copy(
+        update={
+            "snapshot_digest": "sha256:" + "3" * 64,
+            "current_gap_id": "gap:new-current",
+            "updated_at": NOW + timedelta(minutes=5),
+        }
+    )
+    forged = _event(
+        2,
+        "reassessed",
+        reassessed_session,
+        predecessor_event_digest=paused.digest,
+        reassessment_predecessor_digest="sha256:" + "2" * 64,
+    )
+    with pytest.raises(EnrichmentStoreError):
+        store.append(forged)
+
+    reassessed = _event(
+        2,
+        "reassessed",
+        reassessed_session,
+        predecessor_event_digest=paused.digest,
+        reassessment_predecessor_digest=paused.session.snapshot_digest,
+    )
+    assert store.append(reassessed) is True
+    assert store.latest("refine:1") == reassessed_session
+
+
+def test_reassessment_extension_preserves_existing_schema_one_frame_bytes(tmp_path: Path) -> None:
+    path = tmp_path / "enrichment-sessions.jsonl"
+    opened = _event(0, "opened", _session())
+    legacy_payload = opened.model_dump(mode="json")
+    legacy_payload.pop("reassessment_predecessor_digest")
+    legacy_payload.pop("operation_id")
+    legacy_frame = (
+        json.dumps(
+            legacy_payload,
+            allow_nan=False,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        + b"\n"
+    )
+    path.write_bytes(legacy_frame)
+
+    store = EnrichmentSessionStore(path)
+    paused = _event(
+        1,
+        "paused",
+        _session(
+            status="paused", remaining_budget_seconds=299, updated_at=NOW + timedelta(seconds=1)
+        ),
+        predecessor_event_digest=f"sha256:{sha256(legacy_frame[:-1]).hexdigest()}",
+    )
+
+    assert store.append(paused) is True
+    assert store.events()[0] == opened
+
+
 def test_budget_debits_only_whole_active_seconds_and_excludes_paused_time(tmp_path: Path) -> None:
     with pytest.raises(EnrichmentStoreError):
         EnrichmentSessionStore(tmp_path / "bad-opening.jsonl").append(
@@ -349,6 +422,34 @@ def test_cancellation_identity_is_preserved_without_ledger_material(
         ):
             assert marker not in repr(traceback.tb_frame.f_locals)
         traceback = traceback.tb_next
+
+
+def test_append_validation_failure_clears_externally_retained_frames(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = EnrichmentSessionStore(tmp_path / "enrichment-sessions.jsonl")
+    event = _event(0, "opened", _session())
+    secret = "PRIVATE-VALIDATION-FRAME-8197"
+    retained: list[object] = []
+
+    def fail(*_args: object, **_kwargs: object) -> EnrichmentEvent:
+        marker = secret
+        try:
+            raise ValueError(marker)
+        except ValueError as caught:
+            retained.append(caught.__traceback__)
+            raise
+
+    monkeypatch.setattr(EnrichmentEvent, "model_validate_json", fail)
+
+    with pytest.raises(EnrichmentStoreError, match="^enrichment session ledger unavailable$"):
+        store.append(event)
+
+    assert retained[0] is not None
+    assert secret not in "\n".join(
+        repr(frame.f_locals)
+        for frame, _line in traceback.walk_tb(retained[0])  # type: ignore[arg-type]
+    )
 
 
 @pytest.mark.parametrize("method_name", ["latest", "events", "bytes"])

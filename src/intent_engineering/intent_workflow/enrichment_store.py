@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import traceback
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -15,15 +16,21 @@ from pydantic import ValidationError
 
 from intent_engineering.intent_workflow.enrichment_models import (
     EnrichmentEvent,
+    EnrichmentProposalBinding,
     EnrichmentSession,
 )
 from intent_engineering.storage._atomic import append_durable_line, same_path_lock
 from intent_engineering.storage.jsonl.strict import loads_strict_object
 from intent_engineering.storage.secure import SecureFile, UnsafePathError, coerce_secure_file
-from intent_engineering.storage.transaction import LocalTransactionCoordinator
+from intent_engineering.storage.transaction import LocalTransaction, LocalTransactionCoordinator
 
 _MAX_LEDGER_BYTES = 8 * 1024 * 1024
 _MAX_EVENTS = 100_000
+
+
+def _preimage_digest(content: bytes | None) -> str:
+    framed = b"absent" if content is None else b"present\x00" + content
+    return f"sha256:{hashlib.sha256(framed).hexdigest()}"
 
 
 class EnrichmentStoreError(ValueError):
@@ -41,9 +48,14 @@ class _LedgerState:
 
 
 def _serialize(event: EnrichmentEvent) -> bytes:
+    material = event.model_dump(mode="json")
+    if event.reassessment_predecessor_digest is None:
+        material.pop("reassessment_predecessor_digest")
+    if event.operation_id is None:
+        material.pop("operation_id")
     return (
         json.dumps(
-            event.model_dump(mode="json"),
+            material,
             allow_nan=False,
             ensure_ascii=False,
             separators=(",", ":"),
@@ -132,6 +144,15 @@ def _valid_transition(previous: EnrichmentEvent | None, event: EnrichmentEvent) 
             and session.skipped_gap_ids == before.skipped_gap_ids
             and session.answer_evidence_refs == before.answer_evidence_refs
         )
+    if event.event_type == "reassessed":
+        return (
+            before.status == session.status
+            and before.status in {"open", "paused"}
+            and event.reassessment_predecessor_digest == before.snapshot_digest
+            and session.answered_gap_ids == before.answered_gap_ids
+            and session.skipped_gap_ids == before.skipped_gap_ids
+            and session.answer_evidence_refs == before.answer_evidence_refs
+        )
     if event.event_type == "completed":
         return (
             before.status == "open"
@@ -158,6 +179,8 @@ def _parse(content: bytes) -> _LedgerState | None:
         return None
     events: list[EnrichmentEvent] = []
     sessions: dict[str, list[EnrichmentEvent]] = {}
+    completed_operations: dict[str, set[str]] = {}
+    current_operation: dict[str, str | None] = {}
     try:
         lines = content.splitlines(keepends=True)
         if len(lines) > _MAX_EVENTS:
@@ -171,6 +194,16 @@ def _parse(content: bytes) -> _LedgerState | None:
             if _serialize(event) != encoded:
                 return None
             ledger = sessions.setdefault(event.session.id, [])
+            operation_id = event.operation_id
+            prior_operation = current_operation.get(event.session.id)
+            if operation_id != prior_operation:
+                if prior_operation is not None:
+                    completed_operations.setdefault(event.session.id, set()).add(prior_operation)
+                if operation_id is not None and operation_id in completed_operations.get(
+                    event.session.id, set()
+                ):
+                    return None
+                current_operation[event.session.id] = operation_id
             if not _valid_transition(ledger[-1] if ledger else None, event):
                 return None
             ledger.append(event)
@@ -331,8 +364,8 @@ class EnrichmentSessionStore:
         state: _LedgerState | None = None
         existing: tuple[EnrichmentEvent, ...] = ()
         encoded: bytes | None = None
-        validated = EnrichmentEvent.model_validate_json(event.model_dump_json())
         with self._locked():
+            validated = EnrichmentEvent.model_validate_json(event.model_dump_json())
             state = self._decode_unlocked()
             if state is None:
                 raise EnrichmentStoreError()
@@ -357,7 +390,8 @@ class EnrichmentSessionStore:
         signal: BaseException | None = None
         try:
             result = self._append(event)
-        except Exception:  # noqa: BLE001 - expose one fixed public integrity failure
+        except Exception as caught:  # noqa: BLE001 - expose one fixed public integrity failure
+            _scrub_signal(caught)
             failed = True
         except BaseException as caught:  # noqa: BLE001 - preserve cancellation identity
             signal = _scrub_signal(caught)
@@ -429,6 +463,62 @@ class EnrichmentSessionStore:
         if failed or result is None:
             raise EnrichmentStoreError() from None
         return result
+
+    def validate_proposal_binding(
+        self,
+        binding: EnrichmentProposalBinding,
+        transaction: LocalTransaction,
+        *,
+        preimage_names: Mapping[str, str] | None = None,
+    ) -> EnrichmentSession:
+        """Require an exact latest session state inside the caller's held write scope."""
+        aliases = dict(preimage_names or {})
+        if (
+            type(binding) is not EnrichmentProposalBinding
+            or self._transactions is None
+            or not self._transactions.owns_active_write_transaction(transaction)
+            or not self._transactions.target_matches("enrichment_sessions", self._file)
+            or set(aliases) - {"acl_policy", "config"}
+            or any(type(value) is not str or not value for value in aliases.values())
+        ):
+            raise EnrichmentStoreError() from None
+        try:
+            validated = EnrichmentProposalBinding.model_validate_json(binding.model_dump_json())
+            if validated != binding:
+                raise ValueError("invalid enrichment proposal binding")
+            content = (
+                transaction.read_optional_bounded(
+                    "enrichment_sessions", max_bytes=_MAX_LEDGER_BYTES
+                )
+                or b""
+            )
+            state = _parse(content)
+            if state is None:
+                raise ValueError("invalid enrichment proposal ledger")
+            events = state.by_session.get(binding.session_id, ())
+            latest = events[-1] if events else None
+            session = None if latest is None else latest.session
+            if (
+                latest is None
+                or session is None
+                or latest.digest != binding.latest_event_digest
+                or session.snapshot_digest != binding.snapshot_digest
+                or session.answered_gap_ids != binding.answered_gap_ids
+                or session.answer_evidence_refs != binding.answer_evidence_refs
+                or tuple(
+                    (
+                        name,
+                        _preimage_digest(transaction.read_optional(aliases.get(name, name))),
+                    )
+                    for name, _digest in binding.assessment_preimage_digests
+                )
+                != binding.assessment_preimage_digests
+            ):
+                raise ValueError("stale enrichment proposal binding")
+            return session
+        except Exception as caught:  # noqa: BLE001 - fixed internal trust boundary
+            _scrub_signal(caught)
+            raise EnrichmentStoreError() from None
 
     def bytes(self) -> bytes:
         result: bytes | None = None

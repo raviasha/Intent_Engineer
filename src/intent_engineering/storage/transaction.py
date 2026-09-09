@@ -155,6 +155,7 @@ class LocalTransaction:
         read_only: bool = False,
         extra_read_policies: Mapping[str, LocalTransactionExtraReadPolicy] | None = None,
         extra_read_budget: _ExtraReadBudget | None = None,
+        _issued_by: object | None = None,
     ) -> None:
         self._owner = owner
         self._extras = dict(extras or {})
@@ -162,6 +163,7 @@ class LocalTransaction:
         self._extra_read_policies = dict(extra_read_policies or {})
         self._extra_read_budget = extra_read_budget or _ExtraReadBudget(self._extra_read_policies)
         self._active = True
+        self._issued_by = _issued_by
 
     def _target(self, name: str) -> SecureFile:
         if not self._active:
@@ -202,6 +204,14 @@ class LocalTransaction:
             return content
         return self._read_target(name).read_bytes()
 
+    def read_optional_bounded(self, name: str, *, max_bytes: int) -> bytes | None:
+        """Read one held regular target only up to an exact caller-supplied bound."""
+        if type(max_bytes) is not int or max_bytes < 0:
+            raise ValueError("invalid local transaction read bound")
+        if name in self._extras:
+            raise ValueError("bounded canonical read cannot target an extra")
+        return self._read_target(name).read_optional_nonblocking(max_bytes=max_bytes)
+
     def write(self, name: str, content: bytes) -> None:
         """Durably replace one target and expose its deterministic crash stage."""
         target = self._target(name)
@@ -230,6 +240,7 @@ class _TransactionThreadState(local):
         self.extra_read_policies: dict[str, LocalTransactionExtraReadPolicy] = {}
         self.extra_read_budget: _ExtraReadBudget | None = None
         self.poisoned = False
+        self.issued_write_transactions: list[LocalTransaction] = []
 
 
 class LocalTransactionCoordinator:
@@ -263,6 +274,7 @@ class LocalTransactionCoordinator:
         self._fault_hook = fault_hook
         self._legacy_target_sets = frozenset(legacy_sets)
         self._thread_state = _TransactionThreadState()
+        self.__transaction_authority = object()
 
     def close(self) -> None:
         """Release journal and target descriptors after all transactions quiesce."""
@@ -360,6 +372,20 @@ class LocalTransactionCoordinator:
             return self._targets[name].duplicate()
         except KeyError as error:
             raise ValueError("unknown local transaction target") from error
+
+    def owns_active_write_transaction(self, transaction: object) -> bool:
+        """Authenticate one exact mutation handle issued for the current held lock scope."""
+        return bool(
+            type(transaction) is LocalTransaction
+            and transaction._owner is self
+            and transaction._issued_by is self.__transaction_authority
+            and transaction._active
+            and not transaction._read_only
+            and self._thread_state.active
+            and any(
+                transaction is issued for issued in self._thread_state.issued_write_transactions
+            )
+        )
 
     def _fault(self, stage: str) -> None:
         if self._fault_hook is not None:
@@ -673,13 +699,16 @@ class LocalTransactionCoordinator:
                 extra_files,
                 extra_read_policies=policies,
                 extra_read_budget=budget,
+                _issued_by=self.__transaction_authority,
             )
+            self._thread_state.issued_write_transactions.append(transaction)
             try:
                 yield transaction
             except BaseException:
                 self._thread_state.poisoned = True
                 raise
             finally:
+                self._thread_state.issued_write_transactions.remove(transaction)
                 transaction._finish()
             return
         with self._locks(extra_files):
@@ -694,12 +723,14 @@ class LocalTransactionCoordinator:
                 extra_files,
                 extra_read_policies=policies,
                 extra_read_budget=budget,
+                _issued_by=self.__transaction_authority,
             )
             self._thread_state.active = True
             self._thread_state.extras = extra_files
             self._thread_state.extra_read_policies = policies
             self._thread_state.extra_read_budget = budget
             self._thread_state.poisoned = False
+            self._thread_state.issued_write_transactions.append(transaction)
             try:
                 self._fault("journal_prepared")
                 yield transaction
@@ -726,6 +757,7 @@ class LocalTransactionCoordinator:
                         raise TransactionRecoveryError() from recovery_error
                 raise
             finally:
+                self._thread_state.issued_write_transactions.remove(transaction)
                 transaction._finish()
                 self._thread_state.active = False
                 self._thread_state.extras = {}

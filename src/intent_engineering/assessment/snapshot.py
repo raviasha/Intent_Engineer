@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import traceback
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from types import MappingProxyType
 from typing import TYPE_CHECKING, cast
 
 from pydantic import BaseModel
@@ -38,6 +40,7 @@ from intent_engineering.storage.jsonl.evidence_store import parse_evidence_lines
 from intent_engineering.storage.jsonl.strict import loads_strict_object
 from intent_engineering.storage.secure import SecureFile
 from intent_engineering.storage.transaction import (
+    LocalTransaction,
     LocalTransactionExtraReadPolicy,
     LocalTransactionSnapshot,
 )
@@ -644,8 +647,132 @@ def _build_assessment_snapshot(
         config_file.close()
 
 
+def _canonical_authority_state(
+    runtime: AssessmentRuntimeProtocol,
+) -> tuple[dict[str, object], BaseException | None, tuple[BaseException, ...]]:
+    canonical_files: list[SecureFile] = []
+    primary: BaseException | None = None
+    cleanups: list[BaseException] = []
+    canonical_keys: dict[str, object] = {}
+    try:
+        canonical_files = [
+            runtime.workspace_directory.file("config.yaml"),
+            runtime.workspace_directory.file("approvals/policy.yaml"),
+        ]
+        canonical_keys = {
+            "config": canonical_files[0].lock_key,
+            "acl_policy": canonical_files[1].lock_key,
+        }
+    except BaseException as caught:  # noqa: BLE001 - defer through complete cleanup
+        primary = caught
+    finally:
+        for canonical_file in reversed(canonical_files):
+            try:
+                canonical_file.close()
+            except BaseException as caught:  # noqa: BLE001 - close every descriptor
+                cleanups.append(caught)
+        canonical_files.clear()
+    return canonical_keys, primary, tuple(cleanups)
+
+
+def _build_assessment_snapshot_from_transaction(
+    runtime: AssessmentRuntimeProtocol,
+    actor: str,
+    transaction: LocalTransaction,
+) -> AssessmentSnapshot:
+    canonical_keys, primary, cleanups = _canonical_authority_state(runtime)
+    cleanup_cancellation = next(
+        (item for item in cleanups if not isinstance(item, Exception)), None
+    )
+    selected = (
+        primary
+        if primary is not None and not isinstance(primary, Exception)
+        else cleanup_cancellation
+        if cleanup_cancellation is not None
+        else primary
+        if primary is not None
+        else cleanups[0]
+        if cleanups
+        else None
+    )
+    for signal in (*cleanups, *((primary,) if primary is not None else ())):
+        _scrub_signal(signal)
+    cleanups = ()
+    primary = None
+    cleanup_cancellation = None
+    signal = None
+    if selected is not None:
+        _raise_signal(selected)
+    if (
+        type(transaction) is not LocalTransaction
+        or not runtime.transactions.owns_active_write_transaction(transaction)
+        or transaction._read_only
+        or set(transaction._extras) != set(_AUTHORITY_POLICIES)
+        or transaction._extra_read_policies != _AUTHORITY_POLICIES
+        or {name: transaction._extras[name].lock_key for name in sorted(_AUTHORITY_POLICIES)}
+        != canonical_keys
+        or not _ASSESSMENT_TARGETS.issubset(runtime.transactions.target_names)
+    ):
+        raise ValueError("invalid assessment transaction")
+    held: LocalTransactionSnapshot | None = None
+    parsed: _ParsedSnapshot | None = None
+    projection: _VisibleSnapshot | None = None
+    try:
+        names = (*sorted(_ASSESSMENT_TARGETS), *sorted(_AUTHORITY_POLICIES))
+        held = LocalTransactionSnapshot(
+            MappingProxyType({name: transaction.read_optional(name) for name in names}),
+            False,
+        )
+        parsed = _parse_held(held)
+        config = parsed.config
+        if config != runtime.config:
+            raise ValueError("assessment runtime config changed")
+        principals = _actor_principals(actor, config, held.content.get("acl_policy"))
+        projection = _visible_projection(
+            config=config,
+            graph=parsed.graph,
+            evidence=parsed.evidence,
+            ingestions=parsed.ingestions,
+            cases=parsed.cases,
+            proposals=parsed.proposals,
+            decisions=parsed.decisions,
+            clarifications=parsed.clarifications,
+            history=parsed.history,
+            actor=actor,
+            principals=principals,
+        )
+        return _snapshot_model(
+            config=config,
+            graph=projection.graph,
+            evidence=projection.evidence,
+            ingestions=projection.ingestions,
+            cases=projection.cases,
+            clarifications=projection.clarifications,
+            history=projection.history,
+            principals=projection.principals,
+        )
+    finally:
+        held = None
+        parsed = None
+        projection = None
+        actor = ""
+
+
 def _raise_signal(signal: BaseException) -> None:
     raise signal.with_traceback(None)
+
+
+def _scrub_signal(signal: BaseException) -> BaseException:
+    old_traceback = signal.__traceback__
+    signal.args = ()
+    signal.__dict__.clear()
+    signal.__traceback__ = None
+    signal.__cause__ = None
+    signal.__context__ = None
+    if old_traceback is not None:
+        traceback.clear_frames(old_traceback)
+    old_traceback = None
+    return signal
 
 
 def build_assessment_snapshot(
@@ -658,13 +785,11 @@ def build_assessment_snapshot(
     failed = False
     try:
         result = _build_assessment_snapshot(runtime, actor)
-    except Exception:  # noqa: BLE001 - expose one fixed assessment boundary
+    except Exception as caught:  # noqa: BLE001 - expose one fixed assessment boundary
+        _scrub_signal(caught)
         failed = True
     except BaseException as caught:  # noqa: BLE001 - preserve cancellation identity
-        caught.__traceback__ = None
-        caught.__cause__ = None
-        caught.__context__ = None
-        signal = caught
+        signal = _scrub_signal(caught)
     finally:
         runtime = cast("AssessmentRuntimeProtocol", None)
         actor = ""
@@ -677,4 +802,37 @@ def build_assessment_snapshot(
     return result
 
 
-__all__ = ["AssessmentUnavailable", "build_assessment_snapshot"]
+def build_assessment_snapshot_from_transaction(
+    runtime: AssessmentRuntimeProtocol,
+    actor: str,
+    transaction: LocalTransaction,
+) -> AssessmentSnapshot:
+    """Build a visible assessment from one caller-held authenticated transaction."""
+    result: AssessmentSnapshot | None = None
+    signal: BaseException | None = None
+    failed = False
+    try:
+        result = _build_assessment_snapshot_from_transaction(runtime, actor, transaction)
+    except Exception as caught:  # noqa: BLE001 - expose one fixed assessment boundary
+        _scrub_signal(caught)
+        failed = True
+    except BaseException as caught:  # noqa: BLE001 - preserve cancellation identity
+        signal = _scrub_signal(caught)
+    finally:
+        runtime = cast("AssessmentRuntimeProtocol", None)
+        transaction = cast("LocalTransaction", None)
+        actor = ""
+    if signal is not None:
+        caught_signal = signal
+        signal = None
+        _raise_signal(caught_signal)
+    if failed or result is None:
+        raise AssessmentUnavailable() from None
+    return result
+
+
+__all__ = [
+    "AssessmentUnavailable",
+    "build_assessment_snapshot",
+    "build_assessment_snapshot_from_transaction",
+]
