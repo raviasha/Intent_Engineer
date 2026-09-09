@@ -9,11 +9,17 @@ from typing import Protocol
 
 import anyio
 
+from intent_engineering.team_state.enrollment import (
+    EnrollmentTransitionProofV2,
+    PreparedEnrollmentPublicationV2,
+    authenticate_enrollment_publication,
+)
 from intent_engineering.team_state.github import (
     GitHubTeamStateApi,
     GitHubTeamStateStatus,
 )
 from intent_engineering.team_state.models import PreparedPublication
+from intent_engineering.team_state.publication import PreparedPublicationV2
 
 _COMMIT = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?\Z")
 _REPOSITORY_ID = re.compile(
@@ -30,6 +36,55 @@ class GitHubPublicationError(ValueError):
 
 class GitHubStatusInspector(Protocol):
     async def inspect(self, repository: str) -> GitHubTeamStateStatus: ...
+
+
+PublicationArtifacts = PreparedPublication | PreparedPublicationV2 | PreparedEnrollmentPublicationV2
+
+
+def _validated_publication(
+    publication: object,
+    transition_proof: EnrollmentTransitionProofV2 | None = None,
+) -> PublicationArtifacts:
+    try:
+        if type(publication) is PreparedPublication:
+            if transition_proof is not None:
+                raise GitHubPublicationError()
+            return PreparedPublication.model_validate(publication.model_dump(mode="python"))
+        if type(publication) is PreparedPublicationV2:
+            if transition_proof is not None:
+                raise GitHubPublicationError()
+            return PreparedPublicationV2(
+                repository_id=publication.repository_id,
+                branch=publication.branch,
+                manifest=publication.manifest,
+                manifest_bytes=publication.manifest_bytes,
+                bundle=publication.bundle,
+                envelope=publication.envelope,
+                signatures=publication.signatures,
+                bundle_path=publication.bundle_path,
+                signature_path=publication.signature_path,
+                authority=publication.authority,
+            )
+        if type(publication) is PreparedEnrollmentPublicationV2:
+            if transition_proof is None:
+                raise GitHubPublicationError()
+            candidate = PreparedEnrollmentPublicationV2(
+                repository_id=publication.repository_id,
+                branch=publication.branch,
+                manifest=publication.manifest,
+                manifest_bytes=publication.manifest_bytes,
+                bundle=publication.bundle,
+                envelope=publication.envelope,
+                signatures=publication.signatures,
+                bundle_path=publication.bundle_path,
+                signature_path=publication.signature_path,
+                authority=publication.authority,
+            )
+            return authenticate_enrollment_publication(candidate, transition_proof)
+    except Exception as error:  # noqa: BLE001 - fixed public adapter boundary
+        error.__traceback__ = None
+        raise GitHubPublicationError() from None
+    raise GitHubPublicationError()
 
 
 def _sha(value: object) -> str:
@@ -191,14 +246,15 @@ class GitHubApiPublisher:
 
     async def publish(
         self,
-        publication: PreparedPublication,
+        publication: PublicationArtifacts,
         *,
         base_commit: str | None,
+        transition_proof: EnrollmentTransitionProofV2 | None = None,
     ) -> str:
         """Create an exact publication branch; never update the protected state ref."""
-        if type(publication) is not PreparedPublication or base_commit is None:
+        if base_commit is None:
             raise GitHubPublicationError()
-        publication = PreparedPublication.model_validate(publication.model_dump(mode="python"))
+        publication = _validated_publication(publication, transition_proof)
         if (
             publication.repository_id != self._reviewed.repository_id
             or _COMMIT.fullmatch(base_commit) is None

@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import hashlib
 from collections.abc import Mapping
+from dataclasses import replace
 from datetime import UTC, datetime
 
 import anyio
@@ -18,6 +19,7 @@ from intent_engineering.team_state.github import (
 from intent_engineering.team_state.github_publication import (
     GitHubApiPublisher,
     GitHubPublicationError,
+    PublicationArtifacts,
 )
 from intent_engineering.team_state.models import (
     PreparedPublication,
@@ -116,7 +118,7 @@ def _response(status: int, payload: Mapping[str, object]) -> GitHubJsonResponse:
 
 
 def _success_responses(
-    publication: PreparedPublication, *, created_tree_recursive: bool = False
+    publication: PublicationArtifacts, *, created_tree_recursive: bool = False
 ) -> list[GitHubJsonResponse]:
     paths = ("manifest.json", publication.bundle_path, publication.signature_path)
     blobs = ("b" * 40, "c" * 40, "d" * 40)
@@ -272,6 +274,67 @@ async def test_publisher_creates_only_exact_encrypted_publication_objects_and_re
     assert all(
         path != "/repos/acme/project/git/refs/heads/intent-state" for _, path, _ in api.calls
     )
+
+
+@pytest.mark.anyio
+async def test_publisher_uses_identical_three_artifact_path_for_enrollment_v2(tmp_path) -> None:
+    """Catches authority enrollment gaining a direct state-ref or caller-policy write path."""
+    from tests.unit.team_state.test_setup import _prepared
+
+    _state, _preview, publication, proof, _request = _prepared(tmp_path)
+    api = RecordingApi(_success_responses(publication))
+    commit = await GitHubApiPublisher(api, InspectClient([_status()] * 6), _status()).publish(
+        publication,
+        base_commit=ANCHOR,
+        transition_proof=proof,
+    )
+    assert commit == "f" * 40
+    writes = [(method, path) for method, path, _ in api.calls if method == "POST"]
+    assert ("POST", "/repos/acme/project/git/refs") in writes
+    assert api.calls[6][2] == {
+        "ref": f"refs/heads/{publication.branch}",
+        "sha": "f" * 40,
+    }
+    assert all(
+        path != "/repos/acme/project/git/refs/heads/intent-state" for _, path, _ in api.calls
+    )
+
+
+@pytest.mark.anyio
+async def test_publisher_rejects_unproved_enrollment_before_any_write(tmp_path) -> None:
+    from tests.unit.team_state.test_setup import _prepared
+
+    publication = _prepared(tmp_path)[2]
+    api = RecordingApi([])
+
+    with pytest.raises(GitHubPublicationError):
+        await GitHubApiPublisher(api, InspectClient([]), _status()).publish(
+            publication,
+            base_commit=ANCHOR,
+        )
+
+    assert api.calls == []
+
+
+@pytest.mark.anyio
+async def test_publisher_rejects_enrollment_with_mismatched_envelope_before_network(
+    tmp_path,
+) -> None:
+    from tests.unit.team_state.test_setup import _prepared
+
+    _state, _preview, publication, proof, _request = _prepared(tmp_path)
+    envelope = publication.envelope.model_copy(update={"manifest_digest": "sha256:" + "0" * 64})
+    malformed = replace(publication, envelope=envelope, signatures=envelope.canonical_bytes())
+    api = RecordingApi([])
+
+    with pytest.raises(GitHubPublicationError):
+        await GitHubApiPublisher(api, InspectClient([]), _status()).publish(
+            malformed,
+            base_commit=ANCHOR,
+            transition_proof=proof,
+        )
+
+    assert api.calls == []
 
 
 @pytest.mark.anyio

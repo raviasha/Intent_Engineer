@@ -7,10 +7,13 @@ import hashlib
 import json
 import os
 import re
+import traceback
 from collections.abc import Callable
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from typing import Annotated, Literal, Never, Protocol
 
+from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey
@@ -32,15 +35,24 @@ from intent_engineering.control_plane.webauthn_service import (
 )
 from intent_engineering.core.models._base import StrictModel
 from intent_engineering.storage.jsonl.strict import loads_strict_object
+from intent_engineering.team_state.archive import build_archive_v2
 from intent_engineering.team_state.authority import (
     authority_digest,
     canonical_authority_attestation_preimage,
     canonical_certificate_signing_preimage,
+    canonical_state_signature_preimage,
     derive_certificate_id,
     derive_member_id,
     issue_device_certificate,
+    verify_v2_envelope,
 )
-from intent_engineering.team_state.crypto import verify_recipient_possession_proof
+from intent_engineering.team_state.crypto import (
+    AuthenticatedBundleContextV2,
+    _encrypt_bundle_for_public_keys,
+    canonical_authenticated_context_bytes,
+    canonical_encrypted_bundle_bytes,
+    verify_recipient_possession_proof,
+)
 from intent_engineering.team_state.keys import (
     DeviceEnrollmentBinding,
     DeviceKeyStore,
@@ -49,13 +61,20 @@ from intent_engineering.team_state.keys import (
     GitHubIdentityVerifier,
 )
 from intent_engineering.team_state.models import (
+    MAX_BUNDLE_BYTES,
     AuthorityAttestationV2,
+    CanonicalStateSnapshot,
+    CertifiedStateSignatureV2,
+    CiRecipientRecord,
     DeviceCertificateClaimsV2,
     DeviceSignerCertificateV2,
     MemberRecordV2,
+    StateSignatureEnvelopeV2,
     TeamAuthorityRegistryV2,
     TeamRootTrustV2,
+    TeamStateManifestV2,
 )
+from intent_engineering.team_state.restore import VerifiedReleaseV2, _validate_v2_snapshot
 from intent_engineering.team_state.signing import TeamRootKeyStore
 
 _INVITE_MAX = 32 * 1024
@@ -78,7 +97,13 @@ class TeamEnrollmentError(ValueError):
     """One coarse, secret-safe enrollment boundary failure."""
 
     def __init__(
-        self, message: Literal["team enrollment unavailable", "team enrollment changed"]
+        self,
+        message: Literal[
+            "team enrollment unavailable",
+            "team enrollment changed",
+            "enrollment transition plan changed",
+            "enrollment publication authentication failed",
+        ],
     ) -> None:
         super().__init__(message)
 
@@ -142,12 +167,22 @@ def _utc_second(value: datetime) -> datetime:
 
 def _prepared_failure(
     error: BaseException,
-    message: Literal["team enrollment unavailable", "team enrollment changed"],
+    message: Literal[
+        "team enrollment unavailable",
+        "team enrollment changed",
+        "enrollment transition plan changed",
+        "enrollment publication authentication failed",
+    ],
 ) -> BaseException:
+    error_traceback = error.__traceback__
+    if error_traceback is not None:
+        traceback.clear_frames(error_traceback)
+    error_traceback = None
     error.__traceback__ = None
     error.__cause__ = None
     error.__context__ = None
     error.args = ()
+    error.__dict__.clear()
     if not isinstance(error, Exception):
         return error
     return TeamEnrollmentError(message)
@@ -531,11 +566,414 @@ class JoinApprovalPreviewV2(_EnrollmentModel):
         return _canonical(self.model_dump(mode="json"))
 
 
+class EnrollmentPublicationPlanV2(_EnrollmentModel):
+    """Exact unsigned encrypted release bytes reviewed before sponsor WebAuthn."""
+
+    manifest: TeamStateManifestV2
+    authority: TeamAuthorityRegistryV2
+    bundle: str = Field(max_length=MAX_BUNDLE_BYTES * 2)
+    branch: str
+    bundle_path: str
+    signature_path: str
+    snapshot_digest: Annotated[str, Field(pattern=_SHA256.pattern)]
+    parent_manifest_digest: Annotated[str, Field(pattern=_SHA256.pattern)]
+    parent_commit: Annotated[str, Field(pattern=_COMMIT.pattern)]
+
+    @model_validator(mode="after")
+    def require_exact_artifacts(self) -> EnrollmentPublicationPlanV2:
+        bundle = _decode_variable(self.bundle, MAX_BUNDLE_BYTES)
+        digest_hex = self.manifest.bundle_digest.removeprefix("sha256:")
+        release = f"{self.manifest.graph_version}-{digest_hex}"
+        if (
+            _digest(bundle) != self.manifest.bundle_digest
+            or len(bundle) != self.manifest.bundle_size
+            or authority_digest(self.authority) != self.manifest.authority_digest
+            or self.authority.active_recipient_key_ids() != self.manifest.recipient_key_ids
+            or self.branch != f"intent-publication/{digest_hex}"
+            or self.bundle_path != f"bundles/{release}.intent"
+            or self.signature_path != f"signatures/{release}.json"
+        ):
+            raise ValueError("enrollment publication plan changed")
+        return self
+
+    def bundle_bytes(self) -> bytes:
+        return _decode_variable(self.bundle, MAX_BUNDLE_BYTES)
+
+    def canonical_bytes(self) -> bytes:
+        return _canonical(self.model_dump(mode="json"))
+
+    def digest(self) -> str:
+        return _digest(self.canonical_bytes())
+
+
 class ApprovedAuthorityTransitionV2(_EnrollmentModel):
     approval: SponsorJoinApprovalV2
     certificate: DeviceSignerCertificateV2
     authority: TeamAuthorityRegistryV2
     attestation: AuthorityAttestationV2
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedEnrollmentPublicationV2:
+    """Three exact Git artifacts for one sponsor-approved authority transition."""
+
+    repository_id: str
+    branch: str
+    manifest: TeamStateManifestV2
+    manifest_bytes: bytes
+    bundle: bytes
+    envelope: StateSignatureEnvelopeV2
+    signatures: bytes
+    bundle_path: str
+    signature_path: str
+    authority: TeamAuthorityRegistryV2
+
+    def __post_init__(self) -> None:
+        digest_hex = self.manifest.bundle_digest.removeprefix("sha256:")
+        release = f"{self.manifest.graph_version}-{digest_hex}"
+        if (
+            self.repository_id != self.manifest.repository_id
+            or self.branch != f"intent-publication/{digest_hex}"
+            or self.manifest_bytes != self.manifest.canonical_bytes()
+            or self.signatures != self.envelope.canonical_bytes()
+            or self.bundle_path != f"bundles/{release}.intent"
+            or self.signature_path != f"signatures/{release}.json"
+            or len(self.bundle) != self.manifest.bundle_size
+            or _digest(self.bundle) != self.manifest.bundle_digest
+            or authority_digest(self.authority) != self.manifest.authority_digest
+            or self.authority.active_recipient_key_ids() != self.manifest.recipient_key_ids
+            or self.envelope.authority_attestation is None
+            or self.envelope.authority_attestation.operation != "enroll"
+            or self.envelope.migration_proof is not None
+        ):
+            raise ValueError("prepared enrollment publication changed")
+
+
+class EnrollmentTransitionProofV2(_EnrollmentModel):
+    """Bounded root-signed proof of the parent inventory and approved descendant."""
+
+    schema_version: Literal[2] = 2
+    root: TeamRootTrustV2
+    authority_before_sequence: int = Field(ge=1)
+    authority_after_sequence: int = Field(ge=2)
+    authority_before_digest: str
+    authority_after_digest: str
+    parent_members_digest: str
+    parent_certificates_digest: str
+    parent_revocations_digest: str
+    parent_policy_digest: str
+    parent_ci_recipient: CiRecipientRecord
+    sponsor_member: MemberRecordV2
+    sponsor_certificate: DeviceSignerCertificateV2
+    invite_id: str
+    response_digest: str
+    new_member: MemberRecordV2
+    new_certificate: DeviceSignerCertificateV2
+    base_state_commit: str
+    base_bundle_digest: str
+    default_branch_commit: str
+    tooling_digest: str
+    publication_manifest_digest: str
+    authority_attestation: AuthorityAttestationV2
+    root_signature: str
+
+    @field_validator(
+        "authority_before_digest",
+        "authority_after_digest",
+        "parent_members_digest",
+        "parent_certificates_digest",
+        "parent_revocations_digest",
+        "parent_policy_digest",
+        "response_digest",
+        "base_bundle_digest",
+        "tooling_digest",
+        "publication_manifest_digest",
+    )
+    @classmethod
+    def require_digest(cls, value: str) -> str:
+        if _SHA256.fullmatch(value) is None:
+            raise ValueError("invalid enrollment transition proof digest")
+        return value
+
+    @field_validator("base_state_commit", "default_branch_commit")
+    @classmethod
+    def require_commit(cls, value: str) -> str:
+        if _COMMIT.fullmatch(value) is None:
+            raise ValueError("invalid enrollment transition proof commit")
+        return value
+
+    @field_validator("root_signature")
+    @classmethod
+    def require_root_signature(cls, value: str) -> str:
+        _decode(value, 64)
+        return value
+
+    @model_validator(mode="after")
+    def require_bindings(self) -> EnrollmentTransitionProofV2:
+        if (
+            self.authority_after_sequence != self.authority_before_sequence + 1
+            or self.root.repository_id != self.parent_ci_recipient.repository_id
+            or self.root.project_id != self.parent_ci_recipient.project_id
+            or self.root.project_id != self.authority_attestation.project_id
+            or self.root.repository_id != self.authority_attestation.repository_id
+            or self.root.authority_epoch != self.authority_attestation.authority_epoch
+            or self.root.root_key_id != self.authority_attestation.root_key_id
+            or self.sponsor_member.status != "active"
+            or self.sponsor_member.role != "sponsor"
+            or self.sponsor_member.actor != f"github:{self.sponsor_member.github_account_id}"
+            or self.sponsor_certificate.certificate_id
+            not in self.sponsor_member.device_certificate_ids
+            or self.sponsor_certificate.claims.member_id != self.sponsor_member.member_id
+            or self.sponsor_certificate.claims.github_account_id
+            != self.sponsor_member.github_account_id
+            or self.sponsor_certificate.claims.github_login != self.sponsor_member.github_login
+            or self.sponsor_certificate.claims.project_id != self.root.project_id
+            or self.sponsor_certificate.claims.repository_id != self.root.repository_id
+            or self.sponsor_certificate.claims.authority_epoch != self.root.authority_epoch
+            or self.sponsor_certificate.root_key_id != self.root.root_key_id
+            or self.new_member.status != "active"
+            or self.new_member.role != "member"
+            or self.new_member.actor != f"github:{self.new_member.github_account_id}"
+            or self.new_member.member_id == self.sponsor_member.member_id
+            or self.new_member.github_account_id == self.sponsor_member.github_account_id
+            or self.new_member.device_certificate_ids != (self.new_certificate.certificate_id,)
+            or self.new_certificate.certificate_id not in self.new_member.device_certificate_ids
+            or self.new_certificate.claims.member_id != self.new_member.member_id
+            or self.new_certificate.claims.github_account_id != self.new_member.github_account_id
+            or self.new_certificate.claims.github_login != self.new_member.github_login
+            or self.new_certificate.claims.project_id != self.root.project_id
+            or self.new_certificate.claims.repository_id != self.root.repository_id
+            or self.new_certificate.claims.authority_epoch != self.root.authority_epoch
+            or self.new_certificate.root_key_id != self.root.root_key_id
+            or self.new_member.enrolled_at != self.new_certificate.claims.issued_at
+            or self.authority_attestation.decided_at != self.new_certificate.claims.issued_at
+            or self.authority_attestation.operation != "enroll"
+            or self.authority_attestation.previous_authority_digest != self.authority_before_digest
+            or self.authority_attestation.authority_digest != self.authority_after_digest
+            or self.authority_attestation.parent_bundle_digest != self.base_bundle_digest
+            or self.authority_attestation.subject_digest != self.response_digest
+            or self.authority_attestation.sponsor_member_id != self.sponsor_member.member_id
+            or self.authority_attestation.sponsor_device_certificate_id
+            != self.sponsor_certificate.certificate_id
+        ):
+            raise ValueError("enrollment transition proof changed")
+        try:
+            Ed25519PublicKey.from_public_bytes(_decode(self.root.root_public_key, 32)).verify(
+                _decode(self.root_signature, 64), self.signing_preimage()
+            )
+        except InvalidSignature:
+            raise ValueError("enrollment transition proof changed") from None
+        return self
+
+    def signing_preimage(self) -> bytes:
+        return _canonical(
+            {
+                "domain": "intent.team.enrollment-transition-receipt.v2",
+                "proof": self.model_dump(mode="json", exclude={"root_signature"}),
+            }
+        )
+
+    def canonical_bytes(self) -> bytes:
+        return _canonical(self.model_dump(mode="json"))
+
+
+def enrollment_transition_plan_digest(
+    preview: JoinApprovalPreviewV2,
+    plan: EnrollmentPublicationPlanV2,
+) -> str:
+    """Commit to the deterministic transition proof fields available before approval."""
+    try:
+        if type(preview) is not JoinApprovalPreviewV2:
+            raise ValueError("enrollment transition plan changed")
+        plan = EnrollmentPublicationPlanV2.model_validate(plan.model_dump(mode="python"))
+        after = plan.authority
+        new_member = preview.response.proposed_member
+        new_certificate = preview.certificate
+        remaining_members = tuple(item for item in after.members if item != new_member)
+        remaining_certificates = tuple(
+            item for item in after.device_certificates if item != new_certificate
+        )
+        sponsor_member = next(
+            item for item in remaining_members if item.member_id == preview.invite.sponsor_member_id
+        )
+        sponsor_certificate = next(
+            item
+            for item in remaining_certificates
+            if item.certificate_id == preview.invite.sponsor_certificate.certificate_id
+        )
+        if (
+            preview.authority_after != after
+            or preview.authority_after_digest != authority_digest(after)
+            or after.previous_authority_digest != preview.authority_before_digest
+            or after.sequence != preview.invite.authority_sequence + 1
+            or after.root != preview.invite.root
+            or after.ci_recipient.project_id != after.project_id
+            or after.ci_recipient.repository_id != after.repository_id
+            or len(remaining_members) + 1 != len(after.members)
+            or len(remaining_certificates) + 1 != len(after.device_certificates)
+            or sponsor_member.role != "sponsor"
+            or sponsor_member.status != "active"
+            or sponsor_certificate != preview.invite.sponsor_certificate
+            or new_member.role != "member"
+            or new_member.status != "active"
+            or new_member.device_certificate_ids != (new_certificate.certificate_id,)
+            or new_certificate.claims.member_id != new_member.member_id
+            or new_certificate.claims.github_account_id != new_member.github_account_id
+            or new_certificate.claims.github_login != new_member.github_login
+            or new_certificate.claims.recipient_key_id != preview.response.recipient_key_id
+            or new_certificate.claims.recipient_public_key != preview.response.recipient_public_key
+            or new_certificate.claims.signature_id != preview.response.signature_id
+            or new_certificate.claims.signing_public_key != preview.response.signing_public_key
+        ):
+            raise ValueError("enrollment transition plan changed")
+        return _digest(
+            _canonical(
+                {
+                    "domain": "intent.team.enrollment-transition-plan.v2",
+                    "root": after.root.model_dump(mode="json"),
+                    "authority_before_sequence": preview.invite.authority_sequence,
+                    "authority_after_sequence": after.sequence,
+                    "authority_before_digest": preview.authority_before_digest,
+                    "authority_after_digest": preview.authority_after_digest,
+                    "parent_members_digest": _digest(
+                        _canonical([item.model_dump(mode="json") for item in remaining_members])
+                    ),
+                    "parent_certificates_digest": _digest(
+                        _canonical(
+                            [item.model_dump(mode="json") for item in remaining_certificates]
+                        )
+                    ),
+                    "parent_revocations_digest": _digest(
+                        _canonical([item.model_dump(mode="json") for item in after.revocations])
+                    ),
+                    "parent_policy_digest": _digest(
+                        _canonical(after.policy.model_dump(mode="json"))
+                    ),
+                    "parent_ci_recipient": after.ci_recipient.model_dump(mode="json"),
+                    "sponsor_member": sponsor_member.model_dump(mode="json"),
+                    "sponsor_certificate": sponsor_certificate.model_dump(mode="json"),
+                    "invite_id": preview.invite.invite_id,
+                    "response_digest": preview.response_digest,
+                    "new_member": new_member.model_dump(mode="json"),
+                    "new_certificate": new_certificate.model_dump(mode="json"),
+                    "base_state_commit": preview.base_state_commit,
+                    "base_bundle_digest": preview.base_bundle_digest,
+                    "default_branch_commit": preview.default_branch_commit,
+                    "tooling_digest": preview.tooling_digest,
+                    "publication_manifest_digest": _digest(plan.manifest.canonical_bytes()),
+                    "attestation": {
+                        "project_id": after.project_id,
+                        "repository_id": after.repository_id,
+                        "authority_epoch": after.authority_epoch,
+                        "previous_authority_digest": preview.authority_before_digest,
+                        "authority_digest": preview.authority_after_digest,
+                        "parent_bundle_digest": preview.base_bundle_digest,
+                        "operation": "enroll",
+                        "subject_digest": preview.response_digest,
+                        "sponsor_member_id": sponsor_member.member_id,
+                        "sponsor_device_certificate_id": sponsor_certificate.certificate_id,
+                        "decided_at": plan.manifest.created_at.isoformat().replace("+00:00", "Z"),
+                        "root_key_id": after.root.root_key_id,
+                    },
+                }
+            )
+        )
+    except BaseException as error:  # noqa: BLE001 - fixed public verification boundary
+        failure = _prepared_failure(error, "enrollment transition plan changed")
+        del preview, plan, error
+        if not isinstance(failure, Exception):
+            raise failure.with_traceback(None) from None
+        raise ValueError("enrollment transition plan changed") from None
+
+
+def authenticate_enrollment_publication(
+    publication: PreparedEnrollmentPublicationV2,
+    proof: EnrollmentTransitionProofV2,
+) -> PreparedEnrollmentPublicationV2:
+    """Authenticate an enrollment release from its bounded root-signed parent proof."""
+    try:
+        publication = replace(publication)
+        proof = EnrollmentTransitionProofV2.model_validate(proof.model_dump(mode="python"))
+        after = publication.authority
+        manifest = publication.manifest
+        envelope = publication.envelope
+        attestation = envelope.authority_attestation
+        remaining_members = tuple(item for item in after.members if item != proof.new_member)
+        remaining_certificates = tuple(
+            item for item in after.device_certificates if item != proof.new_certificate
+        )
+        if (
+            attestation is None
+            or proof.new_member not in after.members
+            or after.members.count(proof.new_member) != 1
+            or proof.new_certificate not in after.device_certificates
+            or after.device_certificates.count(proof.new_certificate) != 1
+            or proof.sponsor_member not in remaining_members
+            or proof.sponsor_certificate not in remaining_certificates
+            or after.root != proof.root
+            or after.project_id != proof.root.project_id
+            or after.repository_id != proof.root.repository_id
+            or after.sequence != proof.authority_after_sequence
+            or after.previous_authority_digest != proof.authority_before_digest
+            or authority_digest(after) != proof.authority_after_digest
+            or after.ci_recipient != proof.parent_ci_recipient
+            or _digest(_canonical([item.model_dump(mode="json") for item in remaining_members]))
+            != proof.parent_members_digest
+            or _digest(
+                _canonical([item.model_dump(mode="json") for item in remaining_certificates])
+            )
+            != proof.parent_certificates_digest
+            or _digest(_canonical([item.model_dump(mode="json") for item in after.revocations]))
+            != proof.parent_revocations_digest
+            or _digest(_canonical(after.policy.model_dump(mode="json")))
+            != proof.parent_policy_digest
+            or manifest.authority_digest != proof.authority_after_digest
+            or manifest.parent_bundle_digest != proof.base_bundle_digest
+            or _digest(publication.manifest_bytes) != proof.publication_manifest_digest
+            or envelope.manifest_digest != _digest(publication.manifest_bytes)
+            or envelope.bundle_digest != manifest.bundle_digest
+            or envelope.bundle_digest != _digest(publication.bundle)
+            or envelope.authority_digest != manifest.authority_digest
+            or envelope.authority_digest != authority_digest(after)
+            or attestation != proof.authority_attestation
+            or attestation.decided_at != manifest.created_at
+            or envelope.certificates != (proof.sponsor_certificate,)
+            or len(envelope.signatures) != 1
+            or envelope.signatures[0].certificate_id != proof.sponsor_certificate.certificate_id
+            or envelope.signatures[0].signature_id != proof.sponsor_certificate.claims.signature_id
+            or not proof.sponsor_certificate.claims.issued_at
+            <= attestation.decided_at
+            < proof.sponsor_certificate.claims.expires_at
+            or any(
+                revocation.certificate_id == proof.sponsor_certificate.certificate_id
+                and revocation.revoked_at <= attestation.decided_at
+                for revocation in after.revocations
+            )
+        ):
+            raise ValueError("enrollment publication authentication failed")
+        root_key = Ed25519PublicKey.from_public_bytes(_decode(proof.root.root_public_key, 32))
+        for certificate in after.device_certificates:
+            root_key.verify(
+                _decode(certificate.root_signature, 64),
+                canonical_certificate_signing_preimage(certificate.claims),
+            )
+        root_key.verify(
+            _decode(attestation.root_signature, 64),
+            canonical_authority_attestation_preimage(attestation),
+        )
+        Ed25519PublicKey.from_public_bytes(
+            _decode(proof.sponsor_certificate.claims.signing_public_key, 32)
+        ).verify(
+            _decode(envelope.signatures[0].signature, 64),
+            canonical_state_signature_preimage(manifest),
+        )
+        return publication
+    except BaseException as error:  # noqa: BLE001 - fixed public verification boundary
+        failure = _prepared_failure(error, "enrollment publication authentication failed")
+        del publication, proof, error
+        if not isinstance(failure, Exception):
+            raise failure.with_traceback(None) from None
+        raise ValueError("enrollment publication authentication failed") from None
 
 
 def _export_team_invite_unsafe(invite: TeamInviteV2) -> bytes:
@@ -849,9 +1287,17 @@ def build_sponsor_decision_payload(
     credential: CredentialRecord,
     challenge: bytes,
     now: datetime,
+    approval_request_digest: str | None = None,
 ) -> HumanDecisionPayload:
     now = _utc_second(now)
-    if type(challenge) is not bytes or len(challenge) < 16:
+    if (
+        type(challenge) is not bytes
+        or len(challenge) < 16
+        or (
+            approval_request_digest is not None
+            and _SHA256.fullmatch(approval_request_digest) is None
+        )
+    ):
         raise ValueError("invalid decision challenge")
     sponsor = next(
         member
@@ -869,8 +1315,19 @@ def build_sponsor_decision_payload(
             kind="join_approval",
             id="join_approval:" + preview.response_digest.removeprefix("sha256:"),
         ),
-        subject_digest=_digest(preview.canonical_bytes()),
-        result_digest=preview.authority_after_digest,
+        subject_digest=(
+            _digest(
+                _canonical(
+                    {
+                        "approval_request_digest": approval_request_digest,
+                        "preview": preview.model_dump(mode="json"),
+                    }
+                )
+            )
+            if approval_request_digest is not None
+            else _digest(preview.canonical_bytes())
+        ),
+        result_digest=(approval_request_digest or preview.authority_after_digest),
         challenge="challenge:" + hashlib.sha256(challenge).hexdigest(),
         issued_at=now,
         expires_at=now + _DECISION_LIFETIME,
@@ -1599,6 +2056,8 @@ class TeamEnrollmentService:
         sponsor_assertion: bytes,
         current: VerifiedRemoteStateV2,
         now: datetime,
+        persist_approval: Callable[[ApprovedAuthorityTransitionV2], None] | None = None,
+        approval_request_digest: str | None = None,
     ) -> ApprovedAuthorityTransitionV2:
         try:
             now = _utc_second(now)
@@ -1626,6 +2085,7 @@ class TeamEnrollmentService:
                 or preview.authority_before_digest != authority_digest(current.authority)
                 or preview.authority_after_digest != authority_digest(preview.authority_after)
                 or type(sponsor_decision) is not VerifiedHumanDecision
+                or (persist_approval is not None and not callable(persist_approval))
             ):
                 raise ValueError("approval changed")
             credential = sponsor_decision.credential
@@ -1634,6 +2094,7 @@ class TeamEnrollmentService:
                 credential=credential,
                 challenge=b"placeholder-challenge",
                 now=sponsor_decision.payload.issued_at,
+                approval_request_digest=approval_request_digest,
             ).model_copy(update={"challenge": sponsor_decision.payload.challenge})
             sponsor = next(
                 member
@@ -1715,11 +2176,371 @@ class TeamEnrollmentService:
                 authority=preview.authority_after,
                 attestation=attestation,
             )
+            if persist_approval is not None:
+                persist_approval(result)
             self._replay_store.consume(preview.invite.invite_id)
             self._challenge_store.delete(preview.invite.invite_id)
             return result
         except BaseException as error:  # noqa: BLE001
             self._raise_public(error, "team enrollment unavailable")
+
+    def plan_publication(
+        self,
+        *,
+        snapshot: CanonicalStateSnapshot,
+        parent: VerifiedReleaseV2,
+        preview: JoinApprovalPreviewV2,
+        now: datetime,
+    ) -> EnrollmentPublicationPlanV2:
+        """Create the exact unsigned encrypted artifacts shown before sponsor approval."""
+        try:
+            if (
+                type(preview) is not JoinApprovalPreviewV2
+                or preview.authority_before_digest != authority_digest(parent.authority)
+                or preview.authority_after_digest != authority_digest(preview.authority_after)
+                or preview.base_state_commit != parent.commit
+                or preview.base_bundle_digest != parent.manifest.bundle_digest
+            ):
+                raise ValueError("enrollment publication plan changed")
+            return self._publication_plan_unsafe(
+                snapshot=snapshot,
+                parent=parent,
+                after=preview.authority_after,
+                now=now,
+            )
+        except BaseException as error:  # noqa: BLE001 - fixed public crypto boundary
+            failure = _prepared_failure(error, "team enrollment unavailable")
+            del self, snapshot, parent, preview, now, error
+            raise failure.with_traceback(None) from None
+
+    def _publication_plan_unsafe(
+        self,
+        *,
+        snapshot: CanonicalStateSnapshot,
+        parent: VerifiedReleaseV2,
+        after: TeamAuthorityRegistryV2,
+        now: datetime,
+    ) -> EnrollmentPublicationPlanV2:
+        snapshot = CanonicalStateSnapshot.model_validate(snapshot.model_dump(mode="python"))
+        parent = replace(parent)
+        after = TeamAuthorityRegistryV2.model_validate(after.model_dump(mode="python"))
+        now = _utc_second(now)
+        before = parent.authority
+        if (
+            parent.snapshot is not None
+            and parent.snapshot != snapshot
+            or snapshot.project_id != before.project_id
+            or snapshot.repository_id != before.repository_id
+            or snapshot.graph_version < parent.manifest.graph_version
+            or after.root != before.root
+            or after.sequence != before.sequence + 1
+            or after.previous_authority_digest != authority_digest(before)
+            or after.ci_recipient != before.ci_recipient
+        ):
+            raise ValueError("enrollment publication plan changed")
+        recipient_ids = after.active_recipient_key_ids()
+        public_keys = {
+            item.claims.recipient_key_id: _decode(item.claims.recipient_public_key, 32)
+            for item in after.device_certificates
+            if item.claims.recipient_key_id in recipient_ids
+        }
+        public_keys[after.ci_recipient.key_id] = _decode(after.ci_recipient.public_key, 32)
+        public_keys = dict(sorted(public_keys.items()))
+        if tuple(public_keys) != recipient_ids:
+            raise ValueError("enrollment recipients changed")
+        archive = build_archive_v2(snapshot, after)
+        context = AuthenticatedBundleContextV2(
+            project_id=snapshot.project_id,
+            repository_id=snapshot.repository_id,
+            graph_version=snapshot.graph_version,
+            parent_bundle_digest=parent.manifest.bundle_digest,
+            recipient_key_ids=recipient_ids,
+            authority_digest=authority_digest(after),
+            authority_epoch=after.authority_epoch,
+            authority_sequence=after.sequence,
+            root_key_id=after.root.root_key_id,
+            created_at=now,
+        )
+        bundle = canonical_encrypted_bundle_bytes(
+            _encrypt_bundle_for_public_keys(
+                archive,
+                public_keys,
+                canonical_authenticated_context_bytes(context),
+            )
+        )
+        manifest = TeamStateManifestV2(
+            project_id=snapshot.project_id,
+            repository_id=snapshot.repository_id,
+            graph_version=snapshot.graph_version,
+            parent_bundle_digest=parent.manifest.bundle_digest,
+            bundle_digest=_digest(bundle),
+            bundle_size=len(bundle),
+            recipient_key_ids=recipient_ids,
+            authority_digest=authority_digest(after),
+            authority_epoch=after.authority_epoch,
+            root_key_id=after.root.root_key_id,
+            created_at=now,
+        )
+        _validate_v2_snapshot(snapshot, manifest)
+        digest_hex = manifest.bundle_digest.removeprefix("sha256:")
+        release = f"{manifest.graph_version}-{digest_hex}"
+        return EnrollmentPublicationPlanV2(
+            manifest=manifest,
+            authority=after,
+            bundle=_b64(bundle),
+            branch=f"intent-publication/{digest_hex}",
+            bundle_path=f"bundles/{release}.intent",
+            signature_path=f"signatures/{release}.json",
+            snapshot_digest=_digest(_canonical(snapshot.model_dump(mode="json"))),
+            parent_manifest_digest=_digest(parent.manifest_bytes),
+            parent_commit=parent.commit,
+        )
+
+    def prepare_publication(
+        self,
+        *,
+        snapshot: CanonicalStateSnapshot,
+        parent: VerifiedReleaseV2,
+        transition: ApprovedAuthorityTransitionV2,
+        now: datetime,
+        plan: EnrollmentPublicationPlanV2 | None = None,
+    ) -> PreparedEnrollmentPublicationV2:
+        """Build the exact authority-changing release approved by the sponsor ceremony."""
+        result: PreparedEnrollmentPublicationV2 | None = None
+        failure: BaseException | None = None
+        signature = b""
+        try:
+            snapshot = CanonicalStateSnapshot.model_validate(snapshot.model_dump(mode="python"))
+            if (
+                type(parent) is not VerifiedReleaseV2
+                or type(transition) is not ApprovedAuthorityTransitionV2
+            ):
+                raise ValueError("enrollment publication changed")
+            transition = ApprovedAuthorityTransitionV2.model_validate(
+                transition.model_dump(mode="python")
+            )
+            now = _utc_second(now)
+            before = parent.authority
+            after = transition.authority
+            attestation = transition.attestation
+            sponsor_certificate = next(
+                (
+                    item
+                    for item in before.device_certificates
+                    if item.certificate_id == attestation.sponsor_device_certificate_id
+                ),
+                None,
+            )
+            if (
+                parent.snapshot is not None
+                and parent.snapshot != snapshot
+                or snapshot.project_id != before.project_id
+                or snapshot.repository_id != before.repository_id
+                or snapshot.graph_version < parent.manifest.graph_version
+                or after.root != before.root
+                or after.sequence != before.sequence + 1
+                or after.previous_authority_digest != authority_digest(before)
+                or after.ci_recipient != before.ci_recipient
+                or transition.approval.authority_before_digest != authority_digest(before)
+                or transition.approval.authority_after_digest != authority_digest(after)
+                or transition.approval.join_response_digest != attestation.subject_digest
+                or transition.approval.sponsor_member_id != attestation.sponsor_member_id
+                or transition.approval.sponsor_decision_digest
+                != attestation.sponsor_decision_digest
+                or transition.certificate not in after.device_certificates
+                or sponsor_certificate is None
+                or attestation.operation != "enroll"
+                or attestation.parent_bundle_digest != parent.manifest.bundle_digest
+                or attestation.decided_at != now
+            ):
+                raise ValueError("enrollment publication changed")
+            if plan is None:
+                plan = self._publication_plan_unsafe(
+                    snapshot=snapshot,
+                    parent=parent,
+                    after=after,
+                    now=now,
+                )
+            else:
+                plan = EnrollmentPublicationPlanV2.model_validate(plan.model_dump(mode="python"))
+                if (
+                    plan.authority != after
+                    or plan.snapshot_digest != _digest(_canonical(snapshot.model_dump(mode="json")))
+                    or plan.parent_manifest_digest != _digest(parent.manifest_bytes)
+                    or plan.parent_commit != parent.commit
+                    or plan.manifest.parent_bundle_digest != parent.manifest.bundle_digest
+                    or plan.manifest.created_at != now
+                ):
+                    raise ValueError("enrollment publication plan changed")
+            manifest = plan.manifest
+            bundle = plan.bundle_bytes()
+            signature = self._device_store.sign(
+                sponsor_certificate.claims.signature_id,
+                canonical_state_signature_preimage(manifest),
+            )
+            envelope = StateSignatureEnvelopeV2(
+                manifest_digest=_digest(manifest.canonical_bytes()),
+                bundle_digest=manifest.bundle_digest,
+                authority_digest=manifest.authority_digest,
+                certificates=(sponsor_certificate,),
+                signatures=(
+                    CertifiedStateSignatureV2(
+                        certificate_id=sponsor_certificate.certificate_id,
+                        signature_id=sponsor_certificate.claims.signature_id,
+                        signature=_b64(signature),
+                    ),
+                ),
+                authority_attestation=attestation,
+            )
+            verify_v2_envelope(manifest, envelope, before.root, before, now)
+            result = PreparedEnrollmentPublicationV2(
+                repository_id=manifest.repository_id,
+                branch=plan.branch,
+                manifest=manifest,
+                manifest_bytes=manifest.canonical_bytes(),
+                bundle=bundle,
+                envelope=envelope,
+                signatures=envelope.canonical_bytes(),
+                bundle_path=plan.bundle_path,
+                signature_path=plan.signature_path,
+                authority=after,
+            )
+        except BaseException as caught:  # noqa: BLE001 - public secret-bearing boundary
+            caught_traceback = caught.__traceback__
+            if caught_traceback is not None:
+                traceback.clear_frames(caught_traceback)
+            caught_traceback = None
+            caught.args = ()
+            caught.__dict__.clear()
+            caught.__traceback__ = None
+            caught.__cause__ = None
+            caught.__context__ = None
+            failure = (
+                caught
+                if not isinstance(caught, Exception)
+                else TeamEnrollmentError("team enrollment unavailable")
+            )
+        finally:
+            signature = b""
+            snapshot = None  # type: ignore[assignment]
+            parent = None  # type: ignore[assignment]
+            transition = None  # type: ignore[assignment]
+            now = None  # type: ignore[assignment]
+        if failure is not None:
+            detached = failure
+            failure = None
+            raise detached.with_traceback(None) from None
+        assert result is not None
+        return result
+
+    def transition_proof(
+        self,
+        *,
+        preview: JoinApprovalPreviewV2,
+        parent: VerifiedReleaseV2,
+        publication: PreparedEnrollmentPublicationV2,
+    ) -> EnrollmentTransitionProofV2:
+        try:
+            return self._transition_proof_unsafe(
+                preview=preview,
+                parent=parent,
+                publication=publication,
+            )
+        except BaseException as error:  # noqa: BLE001 - preserve cancellation identity
+            failure = _prepared_failure(error, "team enrollment unavailable")
+            del self, preview, parent, publication, error
+            raise failure.with_traceback(None) from None
+
+    def _transition_proof_unsafe(
+        self,
+        *,
+        preview: JoinApprovalPreviewV2,
+        parent: VerifiedReleaseV2,
+        publication: PreparedEnrollmentPublicationV2,
+    ) -> EnrollmentTransitionProofV2:
+        """Create the compact public proof B needs to authenticate the exact descendant."""
+        signature = b""
+        try:
+            if (
+                type(preview) is not JoinApprovalPreviewV2
+                or type(parent) is not VerifiedReleaseV2
+                or type(publication) is not PreparedEnrollmentPublicationV2
+            ):
+                raise ValueError("enrollment transition proof changed")
+            before = parent.authority
+            after = publication.authority
+            attestation = publication.envelope.authority_attestation
+            root_store = self._root_store
+            if attestation is None or root_store is None:
+                raise ValueError("enrollment transition proof unavailable")
+            sponsor_member = next(
+                member
+                for member in before.members
+                if member.member_id == preview.invite.sponsor_member_id
+            )
+            sponsor_certificate = next(
+                certificate
+                for certificate in before.device_certificates
+                if certificate.certificate_id == preview.invite.sponsor_certificate.certificate_id
+            )
+            if (
+                preview.authority_before_digest != authority_digest(before)
+                or preview.authority_after_digest != authority_digest(after)
+                or preview.authority_after != after
+                or publication.manifest.parent_bundle_digest != parent.manifest.bundle_digest
+            ):
+                raise ValueError("enrollment transition proof changed")
+            values = {
+                "root": before.root,
+                "authority_before_sequence": before.sequence,
+                "authority_after_sequence": after.sequence,
+                "authority_before_digest": authority_digest(before),
+                "authority_after_digest": authority_digest(after),
+                "parent_members_digest": _digest(
+                    _canonical([item.model_dump(mode="json") for item in before.members])
+                ),
+                "parent_certificates_digest": _digest(
+                    _canonical(
+                        [item.model_dump(mode="json") for item in before.device_certificates]
+                    )
+                ),
+                "parent_revocations_digest": _digest(
+                    _canonical([item.model_dump(mode="json") for item in before.revocations])
+                ),
+                "parent_policy_digest": _digest(_canonical(before.policy.model_dump(mode="json"))),
+                "parent_ci_recipient": before.ci_recipient,
+                "sponsor_member": sponsor_member,
+                "sponsor_certificate": sponsor_certificate,
+                "invite_id": preview.invite.invite_id,
+                "response_digest": preview.response_digest,
+                "new_member": preview.response.proposed_member,
+                "new_certificate": preview.certificate,
+                "base_state_commit": preview.base_state_commit,
+                "base_bundle_digest": preview.base_bundle_digest,
+                "default_branch_commit": preview.default_branch_commit,
+                "tooling_digest": preview.tooling_digest,
+                "publication_manifest_digest": _digest(publication.manifest_bytes),
+                "authority_attestation": attestation,
+            }
+            placeholder = EnrollmentTransitionProofV2.model_construct(
+                **values,  # type: ignore[arg-type]
+                root_signature=_b64(b"\0" * 64),
+            )
+            signature = root_store.sign(before.root.root_key_id, placeholder.signing_preimage())
+            result = EnrollmentTransitionProofV2.model_validate(
+                {**values, "root_signature": _b64(signature)}
+            )
+            Ed25519PublicKey.from_public_bytes(_decode(before.root.root_public_key, 32)).verify(
+                signature, result.signing_preimage()
+            )
+            if len(result.canonical_bytes()) > 64 * 1024:
+                raise ValueError("enrollment transition proof unavailable")
+            return result
+        except BaseException as error:  # noqa: BLE001 - public crypto boundary
+            failure = _prepared_failure(error, "team enrollment unavailable")
+            signature = b""
+            del self, preview, parent, publication, error
+            raise failure.with_traceback(None) from None
 
     def device_public_material(
         self, *, invite: TeamInviteV2, local_identity: GitHubIdentity
@@ -1806,6 +2627,8 @@ class TeamEnrollmentService:
         sponsor_assertion: bytes,
         current: VerifiedRemoteStateV2,
         now: datetime,
+        persist_approval: Callable[[ApprovedAuthorityTransitionV2], None] | None = None,
+        approval_request_digest: str | None = None,
     ) -> ApprovedAuthorityTransitionV2:
         try:
             return self._approve_unsafe(
@@ -1815,29 +2638,36 @@ class TeamEnrollmentService:
                 sponsor_assertion=sponsor_assertion,
                 current=current,
                 now=now,
+                persist_approval=persist_approval,
+                approval_request_digest=approval_request_digest,
             )
         except BaseException as error:  # noqa: BLE001
             failure = _prepared_failure(error, "team enrollment unavailable")
             del self, preview, sponsor_decision, sponsor_pre_assertion_sign_count
-            del sponsor_assertion, current, now, error
+            del sponsor_assertion, current, now, persist_approval, approval_request_digest, error
             raise failure.with_traceback(None) from None
 
 
 __all__ = [
     "ApprovedAuthorityTransitionV2",
     "EnrollmentChallengeKeyStore",
+    "EnrollmentPublicationPlanV2",
     "EnrollmentReplayStateStore",
+    "EnrollmentTransitionProofV2",
     "InMemoryEnrollmentChallengeKeyStore",
     "InMemoryEnrollmentReplayStateStore",
     "JoinApprovalPreviewV2",
     "JoinResponseV2",
+    "PreparedEnrollmentPublicationV2",
     "SponsorJoinApprovalV2",
     "TeamEnrollmentError",
     "TeamEnrollmentService",
     "TeamInviteV2",
     "VerifiedRemoteStateV2",
+    "authenticate_enrollment_publication",
     "build_join_decision_payload",
     "build_sponsor_decision_payload",
+    "enrollment_transition_plan_digest",
     "export_join_response",
     "export_team_invite",
     "parse_join_response",

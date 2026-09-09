@@ -41,14 +41,19 @@ from intent_engineering.team_state.keys import (
     KeyringDeviceKeyStore,
 )
 from intent_engineering.team_state.models import (
+    CanonicalStateFile,
+    CanonicalStateSnapshot,
     CiRecipientRecord,
     DeviceCertificateClaimsV2,
     MemberRecordV2,
     TeamAuthorityPolicyV2,
     TeamAuthorityRegistryV2,
     TeamRootTrustV2,
+    TeamStateManifestV2,
 )
+from intent_engineering.team_state.restore import VerifiedReleaseV2, verify_v2_release
 from intent_engineering.team_state.signing import RootEnrollmentBinding
+from tests.helpers.shared_state import canonical_files, ready_project
 
 NOW = datetime(2026, 9, 9, 10, tzinfo=UTC)
 PROJECT = "project"
@@ -424,6 +429,90 @@ def test_public_exchange_uses_independent_keyrings_and_approves_exact_transition
     assert approved.attestation.operation == "enroll"
     assert approved.attestation.authority_digest == authority_digest(approved.authority)
     assert b_service not in vars(a_service).values()
+
+
+def test_approved_enrollment_builds_one_parent_bound_v2_publication_for_unchanged_ci(
+    tmp_path: object,
+) -> None:
+    """Catches an approved authority transition bypassing the normal v2 publication format."""
+    from pathlib import Path
+
+    assert isinstance(tmp_path, Path)
+    a_service, _b_service, state, invite, response = _join(tmp_path)
+    preview = a_service.preview_approval(invite=invite, response=response, current=state, now=NOW)
+    sponsor_credential = _credential(100, "alice", "github:100")
+    sponsor_payload = build_sponsor_decision_payload(
+        preview=preview,
+        credential=sponsor_credential,
+        challenge=b"k" * 32,
+        now=NOW,
+    )
+    approved = a_service.approve(
+        preview=preview,
+        sponsor_decision=VerifiedHumanDecision(
+            payload=sponsor_payload,
+            credential=sponsor_credential,
+            verified_at=NOW,
+        ),
+        sponsor_pre_assertion_sign_count=6,
+        sponsor_assertion=_assertion(sponsor_credential),
+        current=state,
+        now=NOW,
+    )
+    source = tmp_path / "publication" / "project"
+    source.mkdir(parents=True)
+    ready_project(source)
+    files = canonical_files(source)
+    snapshot = CanonicalStateSnapshot(
+        project_id=PROJECT,
+        repository_id=REPOSITORY,
+        graph_version=1,
+        files=tuple(CanonicalStateFile(path=path, content=files[path]) for path in sorted(files)),
+    )
+    parent_manifest = TeamStateManifestV2(
+        project_id=PROJECT,
+        repository_id=REPOSITORY,
+        graph_version=1,
+        parent_bundle_digest="sha256:" + "a" * 64,
+        bundle_digest=state.bundle_digest,
+        bundle_size=100,
+        recipient_key_ids=state.authority.active_recipient_key_ids(),
+        authority_digest=authority_digest(state.authority),
+        authority_epoch=state.authority.authority_epoch,
+        root_key_id=state.authority.root.root_key_id,
+        created_at=NOW,
+    )
+    parent = VerifiedReleaseV2(
+        manifest=parent_manifest,
+        manifest_bytes=parent_manifest.canonical_bytes(),
+        authority=state.authority,
+        commit=state.state_commit,
+        snapshot=snapshot,
+    )
+
+    publication = a_service.prepare_publication(
+        snapshot=snapshot,
+        parent=parent,
+        transition=approved,
+        now=NOW,
+    )
+
+    assert publication.authority == approved.authority
+    assert publication.manifest.parent_bundle_digest == parent.manifest.bundle_digest
+    assert publication.envelope.authority_attestation == approved.attestation
+    assert publication.manifest.recipient_key_ids == approved.authority.active_recipient_key_ids()
+    accepted = verify_v2_release(
+        manifest_bytes=publication.manifest_bytes,
+        bundle_bytes=publication.bundle,
+        envelope_bytes=publication.signatures,
+        parent=parent,
+        recipient_key_id=state.authority.ci_recipient.key_id,
+        recipient_private_key=b"c" * 32,
+        commit="3" * 40,
+        now=NOW,
+    )
+    assert accepted.authority == approved.authority
+    assert accepted.snapshot == snapshot
 
 
 @pytest.mark.parametrize(

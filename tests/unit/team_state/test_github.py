@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 from collections.abc import Mapping
+from dataclasses import replace
 from datetime import UTC, datetime
 
 import anyio
@@ -19,6 +20,7 @@ from intent_engineering.team_state.github import (
     GitHubJsonResponse,
     GitHubTeamStateClient,
     GitHubTeamStateError,
+    _publication_artifacts,
 )
 from intent_engineering.team_state.models import (
     PreparedPublication,
@@ -41,6 +43,23 @@ WORKFLOW = b"name: Intent Engineering\njobs:\n  state:\n    name: Intent Enginee
 CHECK_WORKFLOW = (
     b"name: Intent Engineering Check\njobs:\n  check:\n    name: Intent Engineering / check\n"
 )
+
+
+def test_enrollment_artifact_reconstruction_requires_authenticated_transition_proof(
+    tmp_path,
+) -> None:
+    from tests.unit.team_state.test_setup import _prepared
+
+    _state, _preview, publication, proof, _request = _prepared(tmp_path)
+
+    with pytest.raises(GitHubTeamStateError):
+        _publication_artifacts(publication)
+
+    assert _publication_artifacts(publication, proof) == publication
+    envelope = publication.envelope.model_copy(update={"manifest_digest": "sha256:" + "0" * 64})
+    malformed = replace(publication, envelope=envelope, signatures=envelope.canonical_bytes())
+    with pytest.raises(GitHubTeamStateError):
+        _publication_artifacts(malformed, proof)
 
 
 class QueueApi:

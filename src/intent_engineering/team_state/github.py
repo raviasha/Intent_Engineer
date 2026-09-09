@@ -14,7 +14,13 @@ from pydantic import ConfigDict, Field
 
 from intent_engineering.capture.github.models import PageResult
 from intent_engineering.core.models._base import StrictModel
+from intent_engineering.team_state.enrollment import (
+    EnrollmentTransitionProofV2,
+    PreparedEnrollmentPublicationV2,
+    authenticate_enrollment_publication,
+)
 from intent_engineering.team_state.models import PreparedPublication
+from intent_engineering.team_state.publication import PreparedPublicationV2
 
 _REPOSITORY = re.compile(r"(?!-)(?!.*--)[a-z0-9-]{1,39}(?<!-)/[a-z0-9][a-z0-9._-]{0,99}\Z")
 _COMMIT = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?\Z")
@@ -33,6 +39,55 @@ _MAX_RUNNER_GROUPS = _MAX_RUNNER_GROUP_PAGES * _RUNNER_GROUPS_PER_PAGE
 
 ProtectionContext = Annotated[str, Field(min_length=1, max_length=255)]
 StatusCheckAppId = Annotated[int, Field(ge=-1)]
+PublicationArtifacts = PreparedPublication | PreparedPublicationV2 | PreparedEnrollmentPublicationV2
+
+
+def _publication_artifacts(
+    value: object,
+    transition_proof: EnrollmentTransitionProofV2 | None = None,
+) -> PublicationArtifacts:
+    try:
+        if type(value) is PreparedPublication:
+            if transition_proof is not None:
+                raise GitHubTeamStateError()
+            return PreparedPublication.model_validate(value.model_dump(mode="python"))
+        if type(value) is PreparedPublicationV2:
+            if transition_proof is not None:
+                raise GitHubTeamStateError()
+            publication_v2 = value
+            return PreparedPublicationV2(
+                repository_id=publication_v2.repository_id,
+                branch=publication_v2.branch,
+                manifest=publication_v2.manifest,
+                manifest_bytes=publication_v2.manifest_bytes,
+                bundle=publication_v2.bundle,
+                envelope=publication_v2.envelope,
+                signatures=publication_v2.signatures,
+                bundle_path=publication_v2.bundle_path,
+                signature_path=publication_v2.signature_path,
+                authority=publication_v2.authority,
+            )
+        if type(value) is PreparedEnrollmentPublicationV2:
+            if transition_proof is None:
+                raise GitHubTeamStateError()
+            enrollment_publication = value
+            candidate = PreparedEnrollmentPublicationV2(
+                repository_id=enrollment_publication.repository_id,
+                branch=enrollment_publication.branch,
+                manifest=enrollment_publication.manifest,
+                manifest_bytes=enrollment_publication.manifest_bytes,
+                bundle=enrollment_publication.bundle,
+                envelope=enrollment_publication.envelope,
+                signatures=enrollment_publication.signatures,
+                bundle_path=enrollment_publication.bundle_path,
+                signature_path=enrollment_publication.signature_path,
+                authority=enrollment_publication.authority,
+            )
+            return authenticate_enrollment_publication(candidate, transition_proof)
+    except Exception as error:  # noqa: BLE001 - fixed public adapter boundary
+        error.__traceback__ = None
+        raise GitHubTeamStateError() from None
+    raise GitHubTeamStateError()
 
 
 class GitHubTeamStateError(ValueError):
@@ -1230,7 +1285,7 @@ class GitHubTeamStateClient:
     async def _require_live_publication(
         self,
         repository: str,
-        publication: PreparedPublication,
+        publication: PublicationArtifacts,
         expected_head_commit: str,
         expected_base_commit: str,
     ) -> None:
@@ -1249,14 +1304,15 @@ class GitHubTeamStateClient:
 
     async def open_publication_pr(
         self,
-        publication: PreparedPublication,
+        publication: PublicationArtifacts,
         *,
         expected_head_commit: str,
+        transition_proof: EnrollmentTransitionProofV2 | None = None,
     ) -> PublicationPullRequest:
         reviewed = self._reviewed
-        if reviewed is None or type(publication) is not PreparedPublication:
+        if reviewed is None:
             raise GitHubTeamStateError()
-        publication = PreparedPublication.model_validate(publication.model_dump(mode="python"))
+        publication = _publication_artifacts(publication, transition_proof)
         repository = reviewed.repository_id.removeprefix("github.com/")
         expected_base_commit = reviewed.branch_commit
         if (
@@ -1376,17 +1432,18 @@ class GitHubTeamStateClient:
 
     async def confirm_publication_merge(
         self,
-        publication: PreparedPublication,
+        publication: PublicationArtifacts,
         *,
         expected_head_commit: str,
         expected_base_commit: str,
         pull_request_number: int,
+        transition_proof: EnrollmentTransitionProofV2 | None = None,
     ) -> GitHubTeamStateStatus:
         """Verify that one exact reviewed publication commit is now the protected state head."""
         reviewed = self._reviewed
-        if reviewed is None or type(publication) is not PreparedPublication:
+        if reviewed is None:
             raise GitHubTeamStateError()
-        publication = PreparedPublication.model_validate(publication.model_dump(mode="python"))
+        publication = _publication_artifacts(publication, transition_proof)
         repository = reviewed.repository_id.removeprefix("github.com/")
         if (
             publication.repository_id != reviewed.repository_id
@@ -1439,23 +1496,25 @@ class GitHubTeamStateClient:
 
     async def publication_pull_request_state(
         self,
-        publication: PreparedPublication,
+        publication: PublicationArtifacts,
         *,
         expected_head_commit: str,
         expected_base_commit: str,
         pull_request_number: int,
+        transition_proof: EnrollmentTransitionProofV2 | None = None,
     ) -> Literal["open", "closed", "merged"]:
         """Read one exact receipted PR state without trusting a branch name alone."""
         reviewed = self._reviewed
         if (
             reviewed is None
-            or type(publication) is not PreparedPublication
-            or publication.repository_id != reviewed.repository_id
             or _COMMIT.fullmatch(expected_head_commit) is None
             or _COMMIT.fullmatch(expected_base_commit) is None
             or type(pull_request_number) is not int
             or pull_request_number <= 0
         ):
+            raise GitHubTeamStateError()
+        publication = _publication_artifacts(publication, transition_proof)
+        if publication.repository_id != reviewed.repository_id:
             raise GitHubTeamStateError()
         repository = reviewed.repository_id.removeprefix("github.com/")
         try:
@@ -1485,7 +1544,7 @@ class GitHubTeamStateClient:
     async def _verify_merged_publication(
         self,
         repository: str,
-        publication: PreparedPublication,
+        publication: PublicationArtifacts,
         *,
         merged_commit: str,
         expected_parent: str,

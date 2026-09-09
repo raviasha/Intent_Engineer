@@ -7,9 +7,10 @@ import hashlib
 import json
 import os
 import sys
+import traceback
 from collections.abc import Awaitable, Callable, Mapping
-from datetime import timedelta
-from typing import TYPE_CHECKING, cast
+from datetime import datetime, timedelta
+from typing import TYPE_CHECKING, Literal, cast
 
 import anyio
 from pydantic import ConfigDict, Field, model_validator
@@ -17,7 +18,7 @@ from pydantic import ConfigDict, Field, model_validator
 from intent_engineering.capture.github.auth import GitHubCredentials
 from intent_engineering.capture.github.client import GitHubClient
 from intent_engineering.capture.github.models import PageResult
-from intent_engineering.cli.team import GitHubEnablePreview
+from intent_engineering.cli.team import GitHubEnablePreview, GitHubEnableResult
 from intent_engineering.control_plane.models import (
     DecisionAction,
     DecisionSubject,
@@ -26,11 +27,27 @@ from intent_engineering.control_plane.models import (
 from intent_engineering.control_plane.webauthn_service import VerifiedHumanDecision
 from intent_engineering.core.models._base import StrictModel
 from intent_engineering.storage._atomic import same_path_lock
+from intent_engineering.storage.transaction import LocalTransactionCoordinator
 from intent_engineering.team_state.ci import CiTrustConfig
+from intent_engineering.team_state.enrollment import (
+    ApprovedAuthorityTransitionV2,
+    EnrollmentPublicationPlanV2,
+    EnrollmentTransitionProofV2,
+    JoinApprovalPreviewV2,
+    JoinResponseV2,
+    PreparedEnrollmentPublicationV2,
+    TeamEnrollmentService,
+    TeamInviteV2,
+    VerifiedRemoteStateV2,
+    authenticate_enrollment_publication,
+    build_sponsor_decision_payload,
+    enrollment_transition_plan_digest,
+)
 from intent_engineering.team_state.github import (
     GitHubDefaultBranchBaseline,
     GitHubDefaultBranchTooling,
     GitHubJsonResponse,
+    GitHubProtectionPreview,
     GitHubTeamStateApi,
     GitHubTeamStateClient,
     GitHubTeamStateError,
@@ -39,12 +56,20 @@ from intent_engineering.team_state.github import (
 from intent_engineering.team_state.keys import GitHubIdentity
 from intent_engineering.team_state.models import (
     MAX_BUNDLE_BYTES,
+    CanonicalStateSnapshot,
     PreparedPublication,
     RecipientRecord,
+    TeamAuthorityRegistryV2,
     TeamStateManifest,
+    TeamStateManifestV2,
     canonical_manifest_bytes,
 )
-from intent_engineering.team_state.publication import PublicationAuthority, PublicationService
+from intent_engineering.team_state.publication import (
+    PreparedPublicationV2,
+    PublicationAuthority,
+    PublicationService,
+)
+from intent_engineering.team_state.restore import VerifiedReleaseV2
 from intent_engineering.team_state.signing import SigningKeyStore
 
 if TYPE_CHECKING:
@@ -53,16 +78,174 @@ if TYPE_CHECKING:
     from intent_engineering.team_state.suggestions import CodeSuggestionPreview
 
 
+PreparedStatePublication = (
+    PreparedPublication | PreparedPublicationV2 | PreparedEnrollmentPublicationV2
+)
+_DISCARDED_ENROLLMENT_STATE = b'{"discarded":true}'
+
+
 class GitHubSetupRequest(StrictModel):
     model_config = ConfigDict(frozen=True, strict=True, extra="forbid")
 
     preview: GitHubEnablePreview
 
 
+class GitHubEnrollmentContext(StrictModel):
+    """Owner-protected public GitHub/tooling context retained after initial setup."""
+
+    model_config = ConfigDict(frozen=True, strict=True, extra="forbid")
+
+    request: GitHubSetupRequest
+
+    def canonical_bytes(self) -> bytes:
+        return self.model_dump_json().encode()
+
+
+class EnrollmentApprovalRequest(StrictModel):
+    """Exact human and GitHub preimages approved for one membership change."""
+
+    model_config = ConfigDict(frozen=True, strict=True, extra="forbid")
+
+    preview: JoinApprovalPreviewV2
+    github_preflight: GitHubProtectionPreview
+    publication_plan: EnrollmentPublicationPlanV2
+    transition_plan_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+
+    @model_validator(mode="after")
+    def require_exact_plan(self) -> EnrollmentApprovalRequest:
+        if (
+            self.publication_plan.authority != self.preview.authority_after
+            or self.publication_plan.manifest.authority_digest
+            != self.preview.authority_after_digest
+            or self.publication_plan.manifest.parent_bundle_digest
+            != self.preview.base_bundle_digest
+            or self.publication_plan.parent_commit != self.preview.base_state_commit
+            or self.transition_plan_digest
+            != enrollment_transition_plan_digest(self.preview, self.publication_plan)
+        ):
+            raise ValueError("team enrollment approval changed")
+        return self
+
+    def canonical_bytes(self) -> bytes:
+        return json.dumps(
+            self.model_dump(mode="json"),
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode()
+
+    def digest(self) -> str:
+        return "sha256:" + hashlib.sha256(self.canonical_bytes()).hexdigest()
+
+
+class EnrollmentReceiptV2(StrictModel):
+    """Public, monotonic receipt linking one approval to its exact state PR."""
+
+    model_config = ConfigDict(frozen=True, strict=True, extra="forbid")
+
+    invite_id: str = Field(min_length=1, max_length=256)
+    response_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    authority_before_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    authority_after_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    publication_manifest_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    approval_request_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    approved_github_preflight: GitHubProtectionPreview
+    sponsor_decision: HumanDecisionPayload
+    transition_proof: EnrollmentTransitionProofV2
+    phase: Literal["approved", "publication-pending", "pr-pending", "merged", "closed"]
+    publication_commit: str | None = Field(default=None, pattern=r"^[0-9a-f]{40}$")
+    pull_request_number: int | None = Field(default=None, gt=0)
+    pull_request_url: str | None = Field(default=None, min_length=1, max_length=2048)
+    merged_commit: str | None = Field(default=None, pattern=r"^[0-9a-f]{40}$")
+
+    @model_validator(mode="after")
+    def require_exact_phase(self) -> EnrollmentReceiptV2:
+        has_pr = self.pull_request_number is not None and self.pull_request_url is not None
+        if (
+            self.transition_proof.authority_before_digest != self.authority_before_digest
+            or self.transition_proof.authority_after_digest != self.authority_after_digest
+            or self.transition_proof.response_digest != self.response_digest
+            or self.transition_proof.invite_id != self.invite_id
+            or self.transition_proof.publication_manifest_digest != self.publication_manifest_digest
+            or self.sponsor_decision.result_digest != self.approval_request_digest
+            or "sha256:" + hashlib.sha256(self.sponsor_decision.canonical_bytes()).hexdigest()
+            != self.transition_proof.authority_attestation.sponsor_decision_digest
+            or (self.pull_request_number is None) != (self.pull_request_url is None)
+            or (self.phase in {"approved"} and self.publication_commit is not None)
+            or (self.phase in {"approved", "publication-pending"} and has_pr)
+            or (self.phase in {"pr-pending", "merged", "closed"} and not has_pr)
+            or (
+                self.phase in {"pr-pending", "merged", "closed"} and self.publication_commit is None
+            )
+            or (self.phase == "merged") != (self.merged_commit is not None)
+        ):
+            raise ValueError("team enrollment receipt changed")
+        if has_pr:
+            expected = (
+                f"https://github.com/{self.transition_proof.root.repository_id.removeprefix('github.com/')}"
+                f"/pull/{self.pull_request_number}"
+            )
+            if self.pull_request_url != expected:
+                raise ValueError("team enrollment receipt changed")
+        return self
+
+    def canonical_bytes(self) -> bytes:
+        return self.model_dump_json().encode()
+
+
+def _require_current_enrollment_decision(
+    receipt: EnrollmentReceiptV2,
+    request: EnrollmentApprovalRequest,
+    now: datetime,
+) -> None:
+    payload = receipt.sponsor_decision
+    sponsor = next(
+        member
+        for member in request.preview.authority_after.members
+        if member.member_id == request.preview.invite.sponsor_member_id
+    )
+    expected_subject_digest = _digest(
+        {
+            "approval_request_digest": request.digest(),
+            "preview": request.preview.model_dump(mode="json"),
+        }
+    )
+    expected_repository_id = (
+        "repo:sha256:"
+        + hashlib.sha256(
+            b"intent.team-enrollment.local-repository.v2\0"
+            + request.preview.invite.repository_id.encode()
+        ).hexdigest()
+    )
+    if (
+        receipt.approval_request_digest != request.digest()
+        or payload.project_id != request.preview.invite.project_id
+        or payload.repository_id != expected_repository_id
+        or payload.actor != sponsor.actor
+        or payload.action is not DecisionAction.APPROVE_EXTERNAL_WRITE
+        or payload.graph_version != request.preview.authority_after.sequence
+        or payload.parent_bundle_digest != request.preview.base_bundle_digest
+        or payload.subject.kind != "join_approval"
+        or payload.subject.id
+        != "join_approval:" + request.preview.response_digest.removeprefix("sha256:")
+        or payload.subject_digest != expected_subject_digest
+        or payload.result_digest != request.digest()
+        or not payload.issued_at <= now < payload.expires_at
+    ):
+        raise ValueError("team enrollment changed")
+
+
 class EncryptedPublicationDraft(StrictModel):
     model_config = ConfigDict(frozen=True, strict=True, extra="forbid")
 
-    manifest: TeamStateManifest
+    manifest: TeamStateManifest | TeamStateManifestV2
+    authority: TeamAuthorityRegistryV2 | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    transition_proof: EnrollmentTransitionProofV2 | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     bundle: str = Field(max_length=MAX_BUNDLE_BYTES * 2)
     signatures: str = Field(max_length=1024 * 1024)
     anchor: str = Field(pattern=r"^[0-9a-f]{40}$")
@@ -73,6 +256,40 @@ class EncryptedPublicationDraft(StrictModel):
 
     @model_validator(mode="after")
     def validate_pending_receipt(self) -> EncryptedPublicationDraft:
+        enrollment_attestation = False
+        if type(self.manifest) is TeamStateManifestV2:
+            from intent_engineering.team_state.models import StateSignatureEnvelopeV2
+
+            try:
+                envelope = StateSignatureEnvelopeV2.model_validate_json(
+                    base64.b64decode(self.signatures, validate=True)
+                )
+            except (TypeError, ValueError):
+                raise ValueError("invalid publication authority") from None
+            enrollment_attestation = (
+                envelope.authority_attestation is not None
+                and envelope.authority_attestation.operation == "enroll"
+            )
+        if (type(self.manifest) is TeamStateManifest) != (self.authority is None) or (
+            type(self.manifest) is TeamStateManifestV2
+            and self.authority is not None
+            and (
+                self.manifest.authority_digest
+                != "sha256:" + hashlib.sha256(self.authority.canonical_bytes()).hexdigest()
+                or self.manifest.recipient_key_ids != self.authority.active_recipient_key_ids()
+            )
+        ):
+            raise ValueError("invalid publication authority")
+        if enrollment_attestation != (self.transition_proof is not None):
+            raise ValueError("invalid enrollment publication proof")
+        if self.transition_proof is not None and (
+            type(self.manifest) is not TeamStateManifestV2
+            or self.transition_proof.publication_manifest_digest
+            != "sha256:" + hashlib.sha256(self.manifest.canonical_bytes()).hexdigest()
+            or self.transition_proof.authority_after_digest != self.manifest.authority_digest
+            or self.transition_proof.authority_attestation != envelope.authority_attestation
+        ):
+            raise ValueError("invalid enrollment publication proof")
         if self.publication_commit is not None and not self.external_write_attempted:
             raise ValueError("invalid publication receipt")
         if self.publication_commit is None and (
@@ -90,20 +307,51 @@ class EncryptedPublicationDraft(StrictModel):
                 raise ValueError("invalid publication receipt")
         return self
 
-    def publication(self) -> PreparedPublication:
+    def publication(
+        self,
+    ) -> PreparedStatePublication:
         suffix = (
             f"{self.manifest.graph_version}-{self.manifest.bundle_digest.removeprefix('sha256:')}"
         )
-        return PreparedPublication(
+        if type(self.manifest) is TeamStateManifest:
+            return PreparedPublication(
+                repository_id=self.manifest.repository_id,
+                branch=f"intent-publication/{self.manifest.bundle_digest.removeprefix('sha256:')}",
+                manifest=self.manifest,
+                manifest_bytes=canonical_manifest_bytes(self.manifest),
+                bundle=base64.b64decode(self.bundle, validate=True),
+                signatures=base64.b64decode(self.signatures, validate=True),
+                bundle_path=f"bundles/{suffix}.intent",
+                signature_path=f"signatures/{suffix}.json",
+            )
+        assert self.authority is not None
+        from intent_engineering.team_state.models import StateSignatureEnvelopeV2
+
+        envelope = StateSignatureEnvelopeV2.model_validate_json(
+            base64.b64decode(self.signatures, validate=True)
+        )
+        publication_type = (
+            PreparedEnrollmentPublicationV2
+            if envelope.authority_attestation is not None
+            and envelope.authority_attestation.operation == "enroll"
+            else PreparedPublicationV2
+        )
+        publication = publication_type(
             repository_id=self.manifest.repository_id,
             branch=f"intent-publication/{self.manifest.bundle_digest.removeprefix('sha256:')}",
-            manifest=self.manifest,
+            manifest=cast(TeamStateManifestV2, self.manifest),
             manifest_bytes=canonical_manifest_bytes(self.manifest),
             bundle=base64.b64decode(self.bundle, validate=True),
+            envelope=envelope,
             signatures=base64.b64decode(self.signatures, validate=True),
             bundle_path=f"bundles/{suffix}.intent",
             signature_path=f"signatures/{suffix}.json",
+            authority=self.authority,
         )
+        if type(publication) is PreparedEnrollmentPublicationV2:
+            assert self.transition_proof is not None
+            return authenticate_enrollment_publication(publication, self.transition_proof)
+        return publication
 
 
 class GitHubBootstrapReceipt(StrictModel):
@@ -178,10 +426,107 @@ def _bootstrap_receipt(
         target.close()
 
 
+def _enrollment_receipt(
+    runtime: Runtime,
+    *,
+    receipt: EnrollmentReceiptV2 | None = None,
+    discard: bool = False,
+) -> EnrollmentReceiptV2 | None:
+    """Read or monotonically advance one public enrollment-publication receipt."""
+    _recover_enrollment_publication_state(runtime)
+    target = runtime.workspace_directory.file("team-enrollment-receipt.json")
+    try:
+        with same_path_lock(target):
+            content = target.read_optional_nonblocking(max_bytes=128 * 1024)
+            if content == _DISCARDED_ENROLLMENT_STATE:
+                content = None
+            existing: EnrollmentReceiptV2 | None = None
+            if content is not None:
+                existing = EnrollmentReceiptV2.model_validate_json(content)
+                if existing.canonical_bytes() != content:
+                    raise ValueError("team enrollment receipt changed")
+            if receipt is None:
+                if discard:
+                    if existing is None or existing.phase not in {"approved", "merged", "closed"}:
+                        raise ValueError("team enrollment requires reconciliation")
+                    target.unlink()
+                    return None
+                return existing
+            value = EnrollmentReceiptV2.model_validate_json(receipt.canonical_bytes())
+            encoded = value.canonical_bytes()
+            if len(encoded) > 128 * 1024:
+                raise ValueError("team enrollment receipt unavailable")
+            if existing is None:
+                if discard:
+                    return None
+                if value.phase != "approved":
+                    raise ValueError("team enrollment receipt changed")
+                target.atomic_write(encoded, reject_target_races=True)
+                return value
+            if discard:
+                if existing != value or existing.phase not in {"approved", "merged", "closed"}:
+                    raise ValueError("team enrollment requires reconciliation")
+                target.unlink()
+                return None
+            immutable = {
+                "invite_id",
+                "response_digest",
+                "authority_before_digest",
+                "authority_after_digest",
+                "publication_manifest_digest",
+                "approval_request_digest",
+                "approved_github_preflight",
+                "sponsor_decision",
+                "transition_proof",
+            }
+            if any(getattr(existing, name) != getattr(value, name) for name in immutable):
+                raise ValueError("team enrollment receipt changed")
+            if existing == value:
+                return existing
+            ranks = {
+                "approved": 0,
+                "publication-pending": 1,
+                "pr-pending": 2,
+                "merged": 3,
+                "closed": 3,
+            }
+            closing = existing.phase == "pr-pending" and value.phase == "closed"
+            same_phase_commit = (
+                existing.phase == value.phase == "publication-pending"
+                and existing.publication_commit is None
+                and value.publication_commit is not None
+            )
+            if (
+                (
+                    ranks[value.phase] <= ranks[existing.phase]
+                    and not closing
+                    and not same_phase_commit
+                )
+                or (
+                    existing.publication_commit is not None
+                    and existing.publication_commit != value.publication_commit
+                )
+                or (
+                    existing.pull_request_number is not None
+                    and (
+                        existing.pull_request_number != value.pull_request_number
+                        or existing.pull_request_url != value.pull_request_url
+                    )
+                )
+                or existing.merged_commit is not None
+            ):
+                raise ValueError("team enrollment receipt changed")
+            target.atomic_write(encoded, reject_target_races=True)
+            return value
+    finally:
+        target.close()
+
+
 def _draft(
     runtime: Runtime,
     *,
-    prepared: PreparedPublication | None = None,
+    prepared: PreparedStatePublication | None = None,
+    transition_proof: EnrollmentTransitionProofV2 | None = None,
     anchor: str | None = None,
     publication_commit: str | None = None,
     pull_request_number: int | None = None,
@@ -190,12 +535,15 @@ def _draft(
     restart_closed: bool = False,
     discard: bool = False,
 ) -> EncryptedPublicationDraft | None:
+    _recover_enrollment_publication_state(runtime)
     target = runtime.workspace_directory.file("team-publication.json")
     try:
         with same_path_lock(target):
             content = target.read_optional_nonblocking(
                 max_bytes=MAX_BUNDLE_BYTES * 2 + 2 * 1024 * 1024
             )
+            if content == _DISCARDED_ENROLLMENT_STATE:
+                content = None
             if prepared is not None:
                 existing: EncryptedPublicationDraft | None = None
                 if content is not None:
@@ -203,8 +551,27 @@ def _draft(
                     if legacy:
                         target.atomic_write(migrated, reject_target_races=True)
                         content = migrated
+                effective_proof = (
+                    transition_proof
+                    if transition_proof is not None
+                    else (existing.transition_proof if existing is not None else None)
+                )
+                if type(prepared) is PreparedEnrollmentPublicationV2:
+                    if effective_proof is None:
+                        raise ValueError("enrollment publication authentication failed")
+                    prepared = authenticate_enrollment_publication(prepared, effective_proof)
                 draft = EncryptedPublicationDraft(
                     manifest=prepared.manifest,
+                    authority=(
+                        cast(
+                            PreparedPublicationV2 | PreparedEnrollmentPublicationV2,
+                            prepared,
+                        ).authority
+                        if type(prepared)
+                        in {PreparedPublicationV2, PreparedEnrollmentPublicationV2}
+                        else None
+                    ),
+                    transition_proof=effective_proof,
                     bundle=base64.b64encode(prepared.bundle).decode("ascii"),
                     signatures=base64.b64encode(prepared.signatures).decode("ascii"),
                     anchor=cast(str, anchor),
@@ -226,6 +593,8 @@ def _draft(
                 assert existing is not None
                 if (
                     existing.manifest != draft.manifest
+                    or existing.authority != draft.authority
+                    or existing.transition_proof != draft.transition_proof
                     or existing.bundle != draft.bundle
                     or existing.signatures != draft.signatures
                     or existing.anchor != draft.anchor
@@ -277,6 +646,120 @@ def _draft(
         target.close()
 
 
+def _recover_enrollment_publication_state(runtime: Runtime) -> None:
+    draft_target = runtime.workspace_directory.file("team-publication.json")
+    receipt_target = runtime.workspace_directory.file("team-enrollment-receipt.json")
+    journal = runtime.workspace_directory.file("team-enrollment-restart-transaction.json")
+    coordinator: LocalTransactionCoordinator | None = None
+    try:
+        coordinator = LocalTransactionCoordinator(
+            journal,
+            {"draft": draft_target, "receipt": receipt_target},
+        )
+        coordinator.recover()
+    finally:
+        if coordinator is not None:
+            coordinator.close()
+        journal.close()
+        receipt_target.close()
+        draft_target.close()
+
+
+def _stage_enrollment_approval(
+    runtime: Runtime,
+    *,
+    publication: PreparedEnrollmentPublicationV2,
+    transition_proof: EnrollmentTransitionProofV2,
+    anchor: str,
+    receipt: EnrollmentReceiptV2,
+    fault_hook: Callable[[str], None] | None = None,
+) -> tuple[EncryptedPublicationDraft, EnrollmentReceiptV2]:
+    """Atomically stage the exact authenticated publication and approval receipt."""
+    publication = authenticate_enrollment_publication(publication, transition_proof)
+    draft = EncryptedPublicationDraft(
+        manifest=publication.manifest,
+        authority=publication.authority,
+        transition_proof=transition_proof,
+        bundle=base64.b64encode(publication.bundle).decode("ascii"),
+        signatures=base64.b64encode(publication.signatures).decode("ascii"),
+        anchor=anchor,
+    )
+    draft_content = draft.model_dump_json().encode()
+    receipt_content = receipt.canonical_bytes()
+    if (
+        receipt.phase != "approved"
+        or receipt.transition_proof != transition_proof
+        or receipt.publication_manifest_digest
+        != "sha256:" + hashlib.sha256(publication.manifest_bytes).hexdigest()
+        or len(receipt_content) > 128 * 1024
+    ):
+        raise ValueError("team enrollment changed")
+    draft_target = runtime.workspace_directory.file("team-publication.json")
+    receipt_target = runtime.workspace_directory.file("team-enrollment-receipt.json")
+    journal = runtime.workspace_directory.file("team-enrollment-restart-transaction.json")
+    coordinator: LocalTransactionCoordinator | None = None
+    try:
+        coordinator = LocalTransactionCoordinator(
+            journal,
+            {"draft": draft_target, "receipt": receipt_target},
+            fault_hook=fault_hook,
+        )
+        with coordinator.transaction(rollback_base_exceptions=True) as transaction:
+            existing_draft = transaction.read_optional_bounded(
+                "draft", max_bytes=MAX_BUNDLE_BYTES * 2 + 2 * 1024 * 1024
+            )
+            existing_receipt = transaction.read_optional_bounded("receipt", max_bytes=128 * 1024)
+            if existing_draft is None and existing_receipt is None:
+                transaction.write("draft", draft_content)
+                transaction.write("receipt", receipt_content)
+            elif existing_draft != draft_content or existing_receipt != receipt_content:
+                raise ValueError("team enrollment changed")
+        return draft, receipt
+    finally:
+        if coordinator is not None:
+            coordinator.close()
+        journal.close()
+        receipt_target.close()
+        draft_target.close()
+
+
+def _discard_enrollment_publication_state(
+    runtime: Runtime,
+    *,
+    draft: EncryptedPublicationDraft,
+    receipt: EnrollmentReceiptV2,
+) -> None:
+    """Atomically tombstone the exact closed enrollment receipt and publication draft."""
+    draft_target = runtime.workspace_directory.file("team-publication.json")
+    receipt_target = runtime.workspace_directory.file("team-enrollment-receipt.json")
+    journal = runtime.workspace_directory.file("team-enrollment-restart-transaction.json")
+    coordinator: LocalTransactionCoordinator | None = None
+    try:
+        coordinator = LocalTransactionCoordinator(
+            journal,
+            {"draft": draft_target, "receipt": receipt_target},
+        )
+        with coordinator.transaction(rollback_base_exceptions=True) as transaction:
+            if (
+                transaction.read_optional_bounded(
+                    "draft", max_bytes=MAX_BUNDLE_BYTES * 2 + 2 * 1024 * 1024
+                )
+                != draft.model_dump_json().encode()
+                or transaction.read_optional_bounded("receipt", max_bytes=128 * 1024)
+                != receipt.canonical_bytes()
+                or receipt.phase != "closed"
+            ):
+                raise ValueError("team enrollment requires reconciliation")
+            transaction.write("draft", _DISCARDED_ENROLLMENT_STATE)
+            transaction.write("receipt", _DISCARDED_ENROLLMENT_STATE)
+    finally:
+        if coordinator is not None:
+            coordinator.close()
+        journal.close()
+        receipt_target.close()
+        draft_target.close()
+
+
 def save_setup_request(runtime: Runtime, preview: GitHubEnablePreview) -> None:
     request = GitHubSetupRequest(preview=preview)
     content = request.model_dump_json().encode("utf-8")
@@ -314,8 +797,57 @@ def load_setup_request(runtime: Runtime) -> GitHubSetupRequest | None:
         target.close()
 
 
+def _enrollment_context(
+    runtime: Runtime,
+    *,
+    context: GitHubEnrollmentContext | None = None,
+) -> GitHubEnrollmentContext | None:
+    target = runtime.workspace_directory.file("team-github-context.json")
+    try:
+        with same_path_lock(target):
+            content = target.read_optional_nonblocking(max_bytes=65536)
+            if context is None:
+                if content is None:
+                    return None
+                existing = GitHubEnrollmentContext.model_validate_json(content)
+                if (
+                    existing.canonical_bytes() != content
+                    or existing.request.preview.project_id != runtime.config.project_id
+                    or existing.request.preview.actor != runtime.config.local_actor
+                    or existing.request.preview.preview_digest
+                    != _digest(
+                        existing.request.preview.model_dump(
+                            mode="json", exclude={"state", "preview_digest"}
+                        )
+                    )
+                ):
+                    raise ValueError("GitHub enrollment context changed")
+                return existing
+            value = GitHubEnrollmentContext.model_validate_json(context.canonical_bytes())
+            if (
+                value.request.preview.project_id != runtime.config.project_id
+                or value.request.preview.actor != runtime.config.local_actor
+                or value.request.preview.preview_digest
+                != _digest(
+                    value.request.preview.model_dump(
+                        mode="json", exclude={"state", "preview_digest"}
+                    )
+                )
+            ):
+                raise ValueError("GitHub enrollment context changed")
+            encoded = value.canonical_bytes()
+            if content is None:
+                target.atomic_write(encoded, reject_target_races=True)
+            elif content != encoded:
+                raise ValueError("GitHub enrollment context changed")
+            return value
+    finally:
+        target.close()
+
+
 def _complete_setup_request(runtime: Runtime, request: GitHubSetupRequest) -> None:
     """Remove only the exact completed handoff; allow later explicit setup requests."""
+    _enrollment_context(runtime, context=GitHubEnrollmentContext(request=request))
     target = runtime.workspace_directory.file("team-setup.json")
     try:
         with same_path_lock(target):
@@ -352,7 +884,7 @@ class _PublicationTransport:
         self.publisher: GitHubApiPublisher | None = None
         self.published_commit: str | None = None
 
-    def publish(self, publication: PreparedPublication, *, base_commit: str | None) -> None:
+    def publish(self, publication: PreparedStatePublication, *, base_commit: str | None) -> None:
         publisher = self.publisher
         if publisher is None:
             raise ValueError("GitHub publication transport unavailable")
@@ -411,6 +943,60 @@ class _GuardedApi:
         await self.api.aclose()
 
 
+class _CloseOnceApi:
+    """Make nested GitHub cancellation boundaries share one physical close."""
+
+    def __init__(self, api: GitHubTeamStateApi) -> None:
+        self.api = api
+        self.closed = False
+
+    async def request_json_object(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: Mapping[str, str] | None = None,
+        payload: Mapping[str, object] | None = None,
+        allowed_statuses: frozenset[int] = frozenset({200}),
+    ) -> GitHubJsonResponse:
+        return await self.api.request_json_object(
+            method, path, params=params, payload=payload, allowed_statuses=allowed_statuses
+        )
+
+    async def get_pages(
+        self, path: str, params: Mapping[str, str], etag: str | None = None
+    ) -> PageResult:
+        return await self.api.get_pages(path, params, etag)
+
+    async def request_bytes(
+        self,
+        method: str,
+        path: str,
+        *,
+        max_bytes: int,
+        accept: str,
+    ) -> bytes:
+        return await self.api.request_bytes(method, path, max_bytes=max_bytes, accept=accept)
+
+    async def aclose(self) -> None:
+        if not self.closed:
+            self.closed = True
+            await self.api.aclose()
+
+
+def _setup_failure(error: BaseException, message: str) -> BaseException:
+    old_traceback = error.__traceback__
+    if old_traceback is not None:
+        traceback.clear_frames(old_traceback)
+    old_traceback = None
+    error.args = ()
+    error.__dict__.clear()
+    error.__traceback__ = None
+    error.__cause__ = None
+    error.__context__ = None
+    return error if not isinstance(error, Exception) else ValueError(message)
+
+
 def _digest(value: object) -> str:
     content = json.dumps(
         value, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False
@@ -423,6 +1009,9 @@ class GitHubSetupBridge:
 
     def __init__(self, service: ControlPlaneService) -> None:
         request = load_setup_request(service._runtime)
+        if request is None:
+            context = _enrollment_context(service._runtime)
+            request = None if context is None else context.request
         if request is None:
             raise ValueError("GitHub setup unavailable")
         self.service = service
@@ -577,6 +1166,7 @@ class GitHubSetupBridge:
                     expected_head_commit=draft.publication_commit,
                     expected_base_commit=draft.anchor,
                     pull_request_number=draft.pull_request_number,
+                    transition_proof=draft.transition_proof,
                 )
                 self.publication_restart_required = state == "closed"
             return None
@@ -591,6 +1181,7 @@ class GitHubSetupBridge:
             expected_head_commit=draft.publication_commit,
             expected_base_commit=draft.anchor,
             pull_request_number=draft.pull_request_number,
+            transition_proof=draft.transition_proof,
         )
         from intent_engineering.team_state.local_trust import save_local_trust
 
@@ -619,6 +1210,724 @@ class GitHubSetupBridge:
             "pull_request_url": draft.pull_request_url,
             "repository_id": status.repository_id,
         }
+
+    async def _member_preflight(
+        self,
+        api: GitHubTeamStateApi,
+        current: VerifiedRemoteStateV2,
+        sponsor_certificate_id: str,
+    ) -> tuple[GitHubTeamStateStatus, GitHubTeamStateClient, GitHubProtectionPreview]:
+        """Reconstruct every GitHub-owned enrollment preimage from live reads."""
+        current = VerifiedRemoteStateV2.model_validate(current.model_dump(mode="python"))
+        sponsor = next(
+            certificate
+            for certificate in current.authority.device_certificates
+            if certificate.certificate_id == sponsor_certificate_id
+        )
+        sponsor_member = next(
+            member
+            for member in current.authority.members
+            if member.member_id == sponsor.claims.member_id
+        )
+        if (
+            sponsor_member.role != "sponsor"
+            or sponsor_member.status != "active"
+            or sponsor.certificate_id not in sponsor_member.device_certificate_ids
+        ):
+            raise ValueError("team enrollment changed")
+        client = GitHubTeamStateClient(
+            api,
+            expected_account_id=str(sponsor.claims.github_account_id),
+            expected_login=sponsor.claims.github_login,
+        )
+        status = await client.inspect(self.repository)
+        if (
+            status.repository_id != current.authority.repository_id
+            or status.branch_commit != current.state_commit
+            or status.default_branch != current.default_branch
+            or status.default_branch_commit != current.default_branch_commit
+            or not status.protection_compatible
+        ):
+            raise ValueError("team enrollment changed")
+        tooling = await client.verify_default_branch_tooling(
+            codeowners=self.request.preview.codeowners_suggestion.encode("utf-8"),
+            workflow=self.request.preview.workflow_suggestion.encode("utf-8"),
+            check_workflow=self.request.preview.check_workflow_suggestion.encode("utf-8"),
+            runner_id=(
+                self.request.preview.ci_recipient.runner_id
+                if self.request.preview.ci_recipient is not None
+                else ""
+            ),
+        )
+        if _digest(tooling.model_dump(mode="json")) != current.tooling_digest:
+            raise ValueError("team enrollment changed")
+        protection = client.protection_preview()
+        if protection.requires_change or protection.branch_creation_required:
+            raise ValueError("team enrollment changed")
+        return status, client, protection
+
+    async def _require_join_identity(
+        self,
+        api: GitHubTeamStateApi,
+        request: EnrollmentApprovalRequest,
+    ) -> None:
+        """Re-resolve the invited account without trusting the response's display identity."""
+        response = await api.request_json_object(
+            "GET", f"/users/{request.preview.response.github_login}"
+        )
+        account_id = response.payload.get("id")
+        login = response.payload.get("login")
+        if (
+            type(account_id) is not int
+            or account_id != request.preview.response.github_account_id
+            or type(login) is not str
+            or login != request.preview.response.github_login
+        ):
+            raise ValueError("team enrollment changed")
+
+    async def preview_member_approval(
+        self,
+        *,
+        enrollment: TeamEnrollmentService,
+        invite: TeamInviteV2,
+        response: JoinResponseV2,
+        current: VerifiedRemoteStateV2,
+        parent: VerifiedReleaseV2,
+        snapshot: CanonicalStateSnapshot,
+        now: datetime,
+    ) -> EnrollmentApprovalRequest:
+        try:
+            return await self._preview_member_approval_unsafe(
+                enrollment=enrollment,
+                invite=invite,
+                response=response,
+                current=current,
+                parent=parent,
+                snapshot=snapshot,
+                now=now,
+            )
+        except BaseException as error:  # noqa: BLE001 - preserve cancellation identity
+            failure = _setup_failure(error, "team enrollment unavailable")
+            del self, enrollment, invite, response, current, parent, snapshot, now, error
+            raise failure.with_traceback(None) from None
+
+    async def _preview_member_approval_unsafe(
+        self,
+        *,
+        enrollment: TeamEnrollmentService,
+        invite: TeamInviteV2,
+        response: JoinResponseV2,
+        current: VerifiedRemoteStateV2,
+        parent: VerifiedReleaseV2,
+        snapshot: CanonicalStateSnapshot,
+        now: datetime,
+    ) -> EnrollmentApprovalRequest:
+        """Bind one sponsor preview to the exact live GitHub protection/tooling state."""
+        api: GitHubTeamStateApi | None = None
+        try:
+            api = _CloseOnceApi(github_api())
+            _, _, protection = await self._member_preflight(
+                api, current, invite.sponsor_certificate.certificate_id
+            )
+            preview = enrollment.preview_approval(
+                invite=invite,
+                response=response,
+                current=current,
+                now=now,
+            )
+            if (
+                preview.default_branch_commit != current.default_branch_commit
+                or preview.tooling_digest != current.tooling_digest
+                or preview.base_state_commit != current.state_commit
+                or preview.base_bundle_digest != current.bundle_digest
+            ):
+                raise ValueError("team enrollment changed")
+            plan = enrollment.plan_publication(
+                snapshot=snapshot,
+                parent=parent,
+                preview=preview,
+                now=now,
+            )
+            return EnrollmentApprovalRequest(
+                preview=preview,
+                github_preflight=protection,
+                publication_plan=plan,
+                transition_plan_digest=enrollment_transition_plan_digest(preview, plan),
+            )
+        except BaseException:
+            if api is not None:
+                try:
+                    with anyio.CancelScope(shield=True):
+                        await api.aclose()
+                except BaseException as cleanup:  # noqa: BLE001 - secondary signal is scrubbed
+                    _setup_failure(cleanup, "team enrollment unavailable")
+                    del cleanup
+                api = None
+            raise
+        finally:
+            if api is not None:
+                await api.aclose()
+
+    @staticmethod
+    def _enrollment_receipt_for(
+        request: EnrollmentApprovalRequest,
+        publication: PreparedEnrollmentPublicationV2,
+        *,
+        sponsor_decision: VerifiedHumanDecision,
+        transition_proof: EnrollmentTransitionProofV2,
+        phase: Literal["approved", "publication-pending", "pr-pending", "merged", "closed"],
+        publication_commit: str | None = None,
+        pull_request_number: int | None = None,
+        pull_request_url: str | None = None,
+        merged_commit: str | None = None,
+    ) -> EnrollmentReceiptV2:
+        return EnrollmentReceiptV2(
+            invite_id=request.preview.invite.invite_id,
+            response_digest=request.preview.response_digest,
+            authority_before_digest=request.preview.authority_before_digest,
+            authority_after_digest=request.preview.authority_after_digest,
+            publication_manifest_digest=(
+                "sha256:" + hashlib.sha256(publication.manifest_bytes).hexdigest()
+            ),
+            approval_request_digest=request.digest(),
+            approved_github_preflight=request.github_preflight,
+            sponsor_decision=sponsor_decision.payload,
+            transition_proof=transition_proof,
+            phase=phase,
+            publication_commit=publication_commit,
+            pull_request_number=pull_request_number,
+            pull_request_url=pull_request_url,
+            merged_commit=merged_commit,
+        )
+
+    async def approve_member(
+        self,
+        *,
+        request: EnrollmentApprovalRequest,
+        enrollment: TeamEnrollmentService,
+        sponsor_decision: VerifiedHumanDecision,
+        sponsor_pre_assertion_sign_count: int,
+        sponsor_assertion: bytes,
+        current: VerifiedRemoteStateV2,
+        parent: VerifiedReleaseV2,
+        snapshot: CanonicalStateSnapshot,
+        now: datetime,
+    ) -> GitHubEnableResult:
+        try:
+            return await self._approve_member_unsafe(
+                request=request,
+                enrollment=enrollment,
+                sponsor_decision=sponsor_decision,
+                sponsor_pre_assertion_sign_count=sponsor_pre_assertion_sign_count,
+                sponsor_assertion=sponsor_assertion,
+                current=current,
+                parent=parent,
+                snapshot=snapshot,
+                now=now,
+            )
+        except BaseException as error:  # noqa: BLE001 - preserve cancellation identity
+            failure = _setup_failure(error, "team enrollment unavailable")
+            sponsor_assertion = b""
+            del self, request, enrollment, sponsor_decision, sponsor_pre_assertion_sign_count
+            del sponsor_assertion, current, parent, snapshot, now, error
+            raise failure.with_traceback(None) from None
+
+    async def _approve_member_unsafe(
+        self,
+        *,
+        request: EnrollmentApprovalRequest,
+        enrollment: TeamEnrollmentService,
+        sponsor_decision: VerifiedHumanDecision,
+        sponsor_pre_assertion_sign_count: int,
+        sponsor_assertion: bytes,
+        current: VerifiedRemoteStateV2,
+        parent: VerifiedReleaseV2,
+        snapshot: CanonicalStateSnapshot,
+        now: datetime,
+    ) -> GitHubEnableResult:
+        """Approve and publish one authority change through the guarded Task 6 PR path."""
+        api: GitHubTeamStateApi | None = None
+        try:
+            api = _CloseOnceApi(github_api())
+            status, _, protection = await self._member_preflight(
+                api, current, request.preview.invite.sponsor_certificate.certificate_id
+            )
+            fresh = enrollment.preview_approval(
+                invite=request.preview.invite,
+                response=request.preview.response,
+                current=current,
+                now=now,
+            )
+            if request.preview != fresh or request.github_preflight != protection:
+                raise ValueError("team enrollment changed")
+
+            staged_transition: ApprovedAuthorityTransitionV2 | None = None
+            publication: PreparedEnrollmentPublicationV2 | None = None
+            transition_proof: EnrollmentTransitionProofV2 | None = None
+            receipt: EnrollmentReceiptV2 | None = None
+
+            def persist_approval(transition: ApprovedAuthorityTransitionV2) -> None:
+                nonlocal staged_transition, publication, transition_proof, receipt
+                if staged_transition is not None:
+                    raise ValueError("team enrollment changed")
+                staged_transition = transition
+                publication = enrollment.prepare_publication(
+                    snapshot=snapshot,
+                    parent=parent,
+                    transition=transition,
+                    now=now,
+                    plan=request.publication_plan,
+                )
+                transition_proof = enrollment.transition_proof(
+                    preview=request.preview,
+                    parent=parent,
+                    publication=publication,
+                )
+                receipt = self._enrollment_receipt_for(
+                    request,
+                    publication,
+                    sponsor_decision=sponsor_decision,
+                    transition_proof=transition_proof,
+                    phase="approved",
+                )
+                _stage_enrollment_approval(
+                    self.service._runtime,
+                    publication=publication,
+                    transition_proof=transition_proof,
+                    anchor=current.state_commit,
+                    receipt=receipt,
+                )
+
+            transition = enrollment.approve(
+                preview=request.preview,
+                sponsor_decision=sponsor_decision,
+                sponsor_pre_assertion_sign_count=sponsor_pre_assertion_sign_count,
+                sponsor_assertion=sponsor_assertion,
+                current=current,
+                now=now,
+                persist_approval=persist_approval,
+                approval_request_digest=request.digest(),
+            )
+            if (
+                transition != staged_transition
+                or publication is None
+                or transition_proof is None
+                or receipt is None
+            ):
+                raise ValueError("team enrollment changed")
+            _draft(
+                self.service._runtime,
+                prepared=publication,
+                transition_proof=transition_proof,
+                anchor=current.state_commit,
+                external_write_attempted=True,
+            )
+            receipt = receipt.model_copy(update={"phase": "publication-pending"})
+            _enrollment_receipt(self.service._runtime, receipt=receipt)
+            authoritative_receipt = receipt
+
+            async def require_live() -> None:
+                assert api is not None
+                live_draft = _draft(self.service._runtime)
+                live_receipt = _enrollment_receipt(self.service._runtime)
+                if (
+                    live_draft is None
+                    or live_receipt != authoritative_receipt
+                    or live_draft.publication() != publication
+                    or live_draft.transition_proof != transition_proof
+                    or live_receipt.approval_request_digest != request.digest()
+                    or live_receipt.approved_github_preflight != request.github_preflight
+                ):
+                    raise ValueError("team enrollment changed")
+                await self._require_join_identity(api, request)
+                live_now = self.service._now()
+                _require_current_enrollment_decision(live_receipt, request, live_now)
+                if type(sponsor_decision) is VerifiedHumanDecision:
+                    expected_decision = build_sponsor_decision_payload(
+                        preview=request.preview,
+                        credential=sponsor_decision.credential,
+                        challenge=b"placeholder-challenge",
+                        now=sponsor_decision.payload.issued_at,
+                        approval_request_digest=request.digest(),
+                    ).model_copy(update={"challenge": sponsor_decision.payload.challenge})
+                    live_preview = enrollment.preview_approval(
+                        invite=request.preview.invite,
+                        response=request.preview.response,
+                        current=current,
+                        now=live_now,
+                    )
+                    if (
+                        sponsor_decision.payload != expected_decision
+                        or not sponsor_decision.payload.issued_at
+                        <= live_now
+                        < sponsor_decision.payload.expires_at
+                        or live_preview != request.preview
+                    ):
+                        raise ValueError("team enrollment changed")
+                _, _, live_protection = await self._member_preflight(
+                    api,
+                    current,
+                    request.preview.invite.sponsor_certificate.certificate_id,
+                )
+                if live_protection != request.github_preflight:
+                    raise ValueError("team enrollment changed")
+
+            guarded = _GuardedApi(api, require_live)
+            live_client = GitHubTeamStateClient(
+                guarded,
+                expected_account_id=status.account_id,
+                expected_login=status.login,
+            )
+            live_status = await live_client.inspect(self.repository)
+            if live_status != status:
+                raise ValueError("team enrollment changed")
+            from intent_engineering.team_state.github_publication import GitHubApiPublisher
+
+            commit = await GitHubApiPublisher(guarded, live_client, status).publish(
+                publication,
+                base_commit=current.state_commit,
+                transition_proof=transition_proof,
+            )
+            _draft(
+                self.service._runtime,
+                prepared=publication,
+                transition_proof=transition_proof,
+                anchor=current.state_commit,
+                external_write_attempted=True,
+                publication_commit=commit,
+            )
+            receipt = receipt.model_copy(update={"publication_commit": commit})
+            _enrollment_receipt(self.service._runtime, receipt=receipt)
+            authoritative_receipt = receipt
+            publication_pr = await live_client.open_publication_pr(
+                publication,
+                expected_head_commit=commit,
+                transition_proof=transition_proof,
+            )
+            _draft(
+                self.service._runtime,
+                prepared=publication,
+                transition_proof=transition_proof,
+                anchor=current.state_commit,
+                external_write_attempted=True,
+                publication_commit=commit,
+                pull_request_number=publication_pr.number,
+                pull_request_url=publication_pr.url,
+            )
+            receipt = receipt.model_copy(
+                update={
+                    "phase": "pr-pending",
+                    "pull_request_number": publication_pr.number,
+                    "pull_request_url": publication_pr.url,
+                }
+            )
+            _enrollment_receipt(self.service._runtime, receipt=receipt)
+            return GitHubEnableResult(
+                state="published",
+                repository_id=status.repository_id,
+                preview_digest=_digest(request.model_dump(mode="json")),
+                protection_digest=request.github_preflight.digest,
+                pull_request_url=publication_pr.url,
+            )
+        except BaseException:
+            if api is not None:
+                try:
+                    with anyio.CancelScope(shield=True):
+                        await api.aclose()
+                except BaseException as cleanup:  # noqa: BLE001 - secondary signal is scrubbed
+                    _setup_failure(cleanup, "team enrollment unavailable")
+                    del cleanup
+                api = None
+            raise
+        finally:
+            sponsor_assertion = b""
+            if api is not None:
+                await api.aclose()
+
+    async def reconcile_member_approval(
+        self,
+        *,
+        request: EnrollmentApprovalRequest,
+        current: VerifiedRemoteStateV2,
+        restart_closed: bool = False,
+    ) -> GitHubEnableResult:
+        try:
+            return await self._reconcile_member_approval_unsafe(
+                request=request,
+                current=current,
+                restart_closed=restart_closed,
+            )
+        except BaseException as error:  # noqa: BLE001 - preserve cancellation identity
+            message = (
+                "team enrollment requires reconciliation"
+                if str(error) == "team enrollment requires reconciliation"
+                else "team enrollment unavailable"
+            )
+            failure = _setup_failure(error, message)
+            del self, request, current, restart_closed, error, message
+            raise failure.with_traceback(None) from None
+
+    async def _reconcile_member_approval_unsafe(
+        self,
+        *,
+        request: EnrollmentApprovalRequest,
+        current: VerifiedRemoteStateV2,
+        restart_closed: bool,
+    ) -> GitHubEnableResult:
+        """Resume only the exact receipted enrollment publication or attest its merge."""
+        api: GitHubTeamStateApi | None = None
+        try:
+            if type(restart_closed) is not bool:
+                raise ValueError("team enrollment requires reconciliation")
+            draft = _draft(self.service._runtime)
+            if draft is None:
+                raise ValueError("team enrollment requires reconciliation")
+            publication = draft.publication()
+            receipt = _enrollment_receipt(self.service._runtime)
+            if receipt is None:
+                raise ValueError("team enrollment requires reconciliation")
+            if (
+                type(publication) is not PreparedEnrollmentPublicationV2
+                or receipt.invite_id != request.preview.invite.invite_id
+                or receipt.response_digest != request.preview.response_digest
+                or receipt.authority_before_digest != request.preview.authority_before_digest
+                or receipt.authority_after_digest != request.preview.authority_after_digest
+                or receipt.transition_proof.authority_before_digest
+                != request.preview.authority_before_digest
+                or receipt.transition_proof.authority_after_digest
+                != request.preview.authority_after_digest
+                or receipt.publication_manifest_digest
+                != "sha256:" + hashlib.sha256(publication.manifest_bytes).hexdigest()
+                or receipt.approval_request_digest != request.digest()
+                or receipt.approved_github_preflight != request.github_preflight
+                or publication.authority != request.preview.authority_after
+                or draft.anchor != request.preview.base_state_commit
+            ):
+                raise ValueError("team enrollment changed")
+            api = _CloseOnceApi(github_api())
+            sponsor = request.preview.invite.sponsor_certificate.claims
+            client = GitHubTeamStateClient(
+                api,
+                expected_account_id=str(sponsor.github_account_id),
+                expected_login=sponsor.github_login,
+            )
+            status = await client.inspect(self.repository)
+            preview_digest = _digest(request.model_dump(mode="json"))
+            if receipt.phase == "closed":
+                if (
+                    not restart_closed
+                    or status.branch_commit != draft.anchor
+                    or draft.publication_commit is None
+                    or draft.pull_request_number is None
+                    or draft.pull_request_url is None
+                ):
+                    raise ValueError("team enrollment requires reconciliation")
+                _, _, live_protection = await self._member_preflight(
+                    api,
+                    current,
+                    request.preview.invite.sponsor_certificate.certificate_id,
+                )
+                if live_protection != request.github_preflight:
+                    raise ValueError("team enrollment changed")
+                state = await client.publication_pull_request_state(
+                    publication,
+                    expected_head_commit=draft.publication_commit,
+                    expected_base_commit=draft.anchor,
+                    pull_request_number=draft.pull_request_number,
+                    transition_proof=receipt.transition_proof,
+                )
+                if state != "closed":
+                    raise ValueError("team enrollment changed")
+                _discard_enrollment_publication_state(
+                    self.service._runtime,
+                    draft=draft,
+                    receipt=receipt,
+                )
+                return GitHubEnableResult(
+                    state="bootstrap_required",
+                    repository_id=status.repository_id,
+                    preview_digest=preview_digest,
+                    protection_digest=request.github_preflight.digest,
+                    control_plane_path="/",
+                )
+            if status.branch_commit != draft.anchor:
+                if (
+                    draft.publication_commit is None
+                    or draft.pull_request_number is None
+                    or draft.pull_request_url is None
+                ):
+                    raise ValueError("team enrollment requires reconciliation")
+                merged = await client.confirm_publication_merge(
+                    publication,
+                    expected_head_commit=draft.publication_commit,
+                    expected_base_commit=draft.anchor,
+                    pull_request_number=draft.pull_request_number,
+                    transition_proof=receipt.transition_proof,
+                )
+                if merged.branch_commit is None:
+                    raise ValueError("team enrollment requires reconciliation")
+                merged_receipt = receipt.model_copy(
+                    update={
+                        "phase": "merged",
+                        "publication_commit": draft.publication_commit,
+                        "pull_request_number": draft.pull_request_number,
+                        "pull_request_url": draft.pull_request_url,
+                        "merged_commit": merged.branch_commit,
+                    }
+                )
+                _enrollment_receipt(self.service._runtime, receipt=merged_receipt)
+                return GitHubEnableResult(
+                    state="published",
+                    repository_id=status.repository_id,
+                    preview_digest=preview_digest,
+                    protection_digest=request.github_preflight.digest,
+                    pull_request_url=draft.pull_request_url,
+                )
+
+            _, _, live_protection = await self._member_preflight(
+                api,
+                current,
+                request.preview.invite.sponsor_certificate.certificate_id,
+            )
+            if live_protection != request.github_preflight:
+                raise ValueError("team enrollment changed")
+            authoritative_receipt = receipt
+
+            async def require_live() -> None:
+                assert api is not None
+                live_draft = _draft(self.service._runtime)
+                live_receipt = _enrollment_receipt(self.service._runtime)
+                if (
+                    live_draft is None
+                    or live_receipt != authoritative_receipt
+                    or live_draft.publication() != publication
+                    or live_draft.transition_proof != authoritative_receipt.transition_proof
+                    or live_receipt.approval_request_digest != request.digest()
+                    or live_receipt.approved_github_preflight != request.github_preflight
+                ):
+                    raise ValueError("team enrollment changed")
+                await self._require_join_identity(api, request)
+                _require_current_enrollment_decision(
+                    live_receipt,
+                    request,
+                    self.service._now(),
+                )
+                _, _, protection = await self._member_preflight(
+                    api,
+                    current,
+                    request.preview.invite.sponsor_certificate.certificate_id,
+                )
+                if protection != request.github_preflight:
+                    raise ValueError("team enrollment changed")
+
+            guarded = _GuardedApi(api, require_live)
+            guarded_client = GitHubTeamStateClient(
+                guarded,
+                expected_account_id=status.account_id,
+                expected_login=status.login,
+            )
+            if await guarded_client.inspect(self.repository) != status:
+                raise ValueError("team enrollment changed")
+            if not draft.external_write_attempted:
+                draft = cast(
+                    EncryptedPublicationDraft,
+                    _draft(
+                        self.service._runtime,
+                        prepared=publication,
+                        anchor=draft.anchor,
+                        external_write_attempted=True,
+                    ),
+                )
+                receipt = receipt.model_copy(update={"phase": "publication-pending"})
+                _enrollment_receipt(self.service._runtime, receipt=receipt)
+                authoritative_receipt = receipt
+            from intent_engineering.team_state.github_publication import GitHubApiPublisher
+
+            commit = await GitHubApiPublisher(guarded, guarded_client, status).publish(
+                publication,
+                base_commit=draft.anchor,
+                transition_proof=receipt.transition_proof,
+            )
+            if draft.publication_commit is not None and draft.publication_commit != commit:
+                raise ValueError("team enrollment changed")
+            draft = cast(
+                EncryptedPublicationDraft,
+                _draft(
+                    self.service._runtime,
+                    prepared=publication,
+                    anchor=draft.anchor,
+                    external_write_attempted=True,
+                    publication_commit=commit,
+                    pull_request_number=draft.pull_request_number,
+                    pull_request_url=draft.pull_request_url,
+                ),
+            )
+            if receipt.publication_commit is None:
+                receipt = receipt.model_copy(update={"publication_commit": commit})
+                _enrollment_receipt(self.service._runtime, receipt=receipt)
+                authoritative_receipt = receipt
+            publication_pr = await guarded_client.open_publication_pr(
+                publication,
+                expected_head_commit=commit,
+                transition_proof=receipt.transition_proof,
+            )
+            if draft.pull_request_number is not None and (
+                draft.pull_request_number != publication_pr.number
+                or draft.pull_request_url != publication_pr.url
+            ):
+                raise ValueError("team enrollment changed")
+            _draft(
+                self.service._runtime,
+                prepared=publication,
+                anchor=draft.anchor,
+                external_write_attempted=True,
+                publication_commit=commit,
+                pull_request_number=publication_pr.number,
+                pull_request_url=publication_pr.url,
+            )
+            if receipt.phase != "pr-pending":
+                receipt = receipt.model_copy(
+                    update={
+                        "phase": "pr-pending",
+                        "publication_commit": commit,
+                        "pull_request_number": publication_pr.number,
+                        "pull_request_url": publication_pr.url,
+                    }
+                )
+                _enrollment_receipt(self.service._runtime, receipt=receipt)
+            state = await guarded_client.publication_pull_request_state(
+                publication,
+                expected_head_commit=commit,
+                expected_base_commit=draft.anchor,
+                pull_request_number=publication_pr.number,
+                transition_proof=receipt.transition_proof,
+            )
+            if state == "closed":
+                _enrollment_receipt(
+                    self.service._runtime,
+                    receipt=receipt.model_copy(update={"phase": "closed"}),
+                )
+                raise ValueError("team enrollment requires reconciliation")
+            return GitHubEnableResult(
+                state="published",
+                repository_id=status.repository_id,
+                preview_digest=preview_digest,
+                protection_digest=request.github_preflight.digest,
+                pull_request_url=publication_pr.url,
+            )
+        except BaseException:
+            if api is not None:
+                try:
+                    with anyio.CancelScope(shield=True):
+                        await api.aclose()
+                except BaseException as cleanup:  # noqa: BLE001 - secondary signal is scrubbed
+                    _setup_failure(cleanup, "team enrollment unavailable")
+                    del cleanup
+                api = None
+            raise
+        finally:
+            if api is not None:
+                await api.aclose()
 
     async def action(
         self, action: str, *, payload: HumanDecisionPayload | None = None, response: bytes = b""
@@ -844,7 +2153,7 @@ class GitHubSetupBridge:
                     ):
                         raise ValueError("GitHub publication draft changed")
                     preview = self.publication.recover_preview(
-                        draft.publication(),
+                        cast(PreparedPublication, draft.publication()),
                         recipient_private_key=key_store.private_key(recipient.key_id),
                         now=service._now(),
                     )
