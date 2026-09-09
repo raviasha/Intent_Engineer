@@ -202,6 +202,22 @@ unsupported inputs remain `unassessed`, and a critical red path caps branch and 
 at 49. The CLI, read-only MCP tools, and CI comparison share the same semantic report digest. See
 [the assessment guide](docs/assessment.md) for dimensions, exact exit codes, and CI defaults.
 
+Improve the graph when you have time; this does not require a new development prompt:
+
+```bash
+intent refine --project . --minutes 5
+intent refine --project . --session <session-id> --action pause --format json
+intent refine --project . --session <session-id> --action resume --format json
+```
+
+The same workflow is available as **Improve graph** in `intent dev`. It asks one deterministic,
+gap-linked question at a time. An explicit answer is captured immediately as ACL-scoped evidence;
+the session ledger keeps only its evidence reference. Pause/restart/resume is durable. Neither an
+answer nor an enrichment session changes the canonical graph. A proposed change still enters the
+existing human-governed proposal and approval workflow. MCP exposes only bounded status and
+next-question reads—never answer, skip, pause, resume, propose, approve, or mutation authority.
+See [the assessment guide](docs/assessment.md) for the CLI and MCP response contract.
+
 For team conversations and external requirements, configure GitHub and/or a compatible MCP source,
 then schedule capture independently from reconciliation:
 
@@ -233,6 +249,19 @@ records a deterministic preview and returns an approval hash with review-require
 exit status. Re-run it with the exact `--approve <hash>` to apply the approved
 ChangeSet and resolve the case. `defer` and `mark-false-positive` are terminal
 case actions and do not mutate the graph.
+
+## Current release boundary
+
+Included now are explainable assessment and visualization, resumable progressive enrichment,
+CLI/browser/read-only-MCP journeys, deterministic validation, and the existing reviewed guarded
+enrollment foundation. The local assessment and enrichment path works offline; configured remote
+evidence sources still require their provider connection. The `intent-advisor` plugin can suggest
+when to inspect or clarify intent, but it cannot provide human approval or bypass repository ACL,
+proposal, reconciliation, or release controls.
+
+Deferred follow-up work is explicitly not shipped or reachable: automatic second-developer
+activation/reconciliation beyond the guarded publication foundation, generation of alternative or
+simpler requirements, and the broader state-hardening backlog.
 
 ## What classifications mean
 

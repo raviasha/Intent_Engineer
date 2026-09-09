@@ -14,6 +14,8 @@ from typing import Literal, cast
 import pytest
 import yaml  # type: ignore[import-untyped]
 
+from intent_engineering.assessment.models import AssessmentReport, AssessmentSnapshot
+from intent_engineering.assessment.service import GraphAssessmentService
 from intent_engineering.cli.runtime import Runtime, load_runtime
 from intent_engineering.core.models import (
     ChangeSet,
@@ -37,6 +39,7 @@ from intent_engineering.intent_workflow.enrichment import (
     GraphEnrichmentService,
 )
 from intent_engineering.intent_workflow.enrichment_models import (
+    EnrichmentEvent,
     EnrichmentProposalBinding,
     EnrichmentSession,
 )
@@ -48,7 +51,10 @@ from intent_engineering.intent_workflow.models import (
 )
 from intent_engineering.storage.jsonl.history_store import serialize_changeset
 from intent_engineering.storage.secure import SecureFile
-from intent_engineering.storage.transaction import LocalTransactionExtraReadPolicy
+from intent_engineering.storage.transaction import (
+    LocalTransaction,
+    LocalTransactionExtraReadPolicy,
+)
 from intent_engineering.storage.yaml.graph_store import serialize_graph
 
 NOW = datetime(2026, 9, 2, 12, 0, tzinfo=UTC)
@@ -174,6 +180,14 @@ def _target_bytes(runtime: Runtime, name: str) -> bytes:
         return target.read_optional() or b""
     finally:
         target.close()
+
+
+def _durable_bytes(runtime: Runtime) -> dict[str, bytes]:
+    return {
+        path.relative_to(runtime.root).as_posix(): path.read_bytes()
+        for path in sorted((runtime.root / ".intent").rglob("*"))
+        if path.is_file() and not path.name.endswith(".lock")
+    }
 
 
 def _clarification_proposal(
@@ -869,6 +883,204 @@ def test_optional_wording_may_change_only_prompt(runtime: Runtime) -> None:
     )
     with pytest.raises(GraphEnrichmentError, match="^graph enrichment unavailable$"):
         raw_enum.next_question(opened.id)
+
+
+def test_read_projection_returns_current_session_and_question_without_writes(
+    runtime: Runtime,
+) -> None:
+    """Catches MCP-safe reads appending a journal, reassessment, or lifecycle event."""
+    service = _service(runtime, Clock())
+    opened = service.start(minutes=5)
+    before = _durable_bytes(runtime)
+
+    status = service.read_status(opened.id)
+    question = service.read_next_question(opened.id)
+
+    assert status == opened
+    assert question.gap_id == opened.current_gap_id
+    assert _durable_bytes(runtime) == before
+
+
+@pytest.mark.parametrize("operation", ("status", "question"))
+def test_read_projection_rejects_expired_session_without_writes(
+    runtime: Runtime,
+    operation: str,
+) -> None:
+    """Catches a nominal read persisting terminal state when the active budget expires."""
+    clock = Clock()
+    service = _service(runtime, clock)
+    opened = service.start(minutes=5)
+    clock.advance(seconds=300)
+    before = _durable_bytes(runtime)
+
+    with pytest.raises(GraphEnrichmentError, match="^graph enrichment unavailable$"):
+        if operation == "status":
+            service.read_status(opened.id)
+        else:
+            service.read_next_question(opened.id)
+
+    assert _durable_bytes(runtime) == before
+
+
+def test_read_projection_samples_budget_after_the_held_state_read(
+    runtime: Runtime,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catches lock acquisition/read delay crossing the budget deadline after an early clock read."""
+    clock = Clock()
+    service = _service(runtime, clock)
+    opened = service.start(minutes=5)
+    before = _durable_bytes(runtime)
+    real_events = runtime.enrichment_sessions.events_from_transaction
+
+    def advance_during_held_read(
+        transaction: LocalTransaction,
+        session_id: str,
+    ) -> tuple[EnrichmentEvent, ...]:
+        clock.advance(seconds=300)
+        return real_events(transaction, session_id)
+
+    monkeypatch.setattr(
+        runtime.enrichment_sessions,
+        "events_from_transaction",
+        advance_during_held_read,
+    )
+
+    with pytest.raises(GraphEnrichmentError, match="^graph enrichment unavailable$"):
+        service.read_status(opened.id)
+
+    assert _durable_bytes(runtime) == before
+
+
+@pytest.mark.parametrize("operation", ("status", "question"))
+def test_read_projection_rejects_stale_snapshot_without_writes(
+    runtime: Runtime,
+    operation: str,
+) -> None:
+    """Catches a read silently reassessing and appending after canonical state changes."""
+    service = _service(runtime, Clock())
+    opened = service.start(minutes=5)
+    changed = runtime.graph_store.load().model_copy(update={"version": 2})
+    with runtime.transactions.transaction() as transaction:
+        transaction.write("graph", serialize_graph(changed))
+    before = _durable_bytes(runtime)
+
+    with pytest.raises(GraphEnrichmentError, match="^graph enrichment unavailable$"):
+        if operation == "status":
+            service.read_status(opened.id)
+        else:
+            service.read_next_question(opened.id)
+
+    assert _durable_bytes(runtime) == before
+
+
+def test_read_projection_hides_another_actor_session_like_a_missing_session(
+    runtime: Runtime,
+) -> None:
+    """Catches read-only status exposing a durable session outside actor authority."""
+    opened = _service(runtime, Clock()).start(minutes=5)
+    outsider = GraphEnrichmentService(runtime, actor="local:other", clock=Clock())
+    before = _durable_bytes(runtime)
+    failures: list[str] = []
+
+    for session_id in (opened.id, "refine:" + "f" * 64):
+        with pytest.raises(GraphEnrichmentError) as caught:
+            outsider.read_status(session_id)
+        failures.append(str(caught.value))
+
+    assert failures == ["graph enrichment unavailable", "graph enrichment unavailable"]
+    assert _durable_bytes(runtime) == before
+
+
+def test_read_projection_performs_the_same_bounded_work_before_hidden_or_missing_failure(
+    runtime: Runtime,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catches session existence changing the authenticated assessment/read call path."""
+    opened = _service(runtime, Clock()).start(minutes=5)
+    hidden_id = (
+        "refine:"
+        + hashlib.sha256(
+            json.dumps(
+                [
+                    "local:other",
+                    opened.snapshot_digest,
+                    opened.focus_id,
+                    opened.budget_minutes,
+                    opened.started_at.isoformat(),
+                ],
+                allow_nan=False,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode()
+        ).hexdigest()
+    )
+    opening_event = runtime.enrichment_sessions.events(opened.id)[0]
+    hidden_session = opened.model_copy(update={"id": hidden_id})
+    assert runtime.enrichment_sessions.append(
+        opening_event.model_copy(update={"session": hidden_session})
+    )
+    calls: list[str] = []
+    real_compare_digest = enrichment_module.hmac.compare_digest
+
+    class RecordingAssessment(GraphAssessmentService):
+        def assess(self, snapshot: AssessmentSnapshot) -> AssessmentReport:
+            calls.append("assessment")
+            return super().assess(snapshot)
+
+    real_events = runtime.enrichment_sessions.events_from_transaction
+
+    def record_events(
+        transaction: LocalTransaction,
+        session_id: str,
+    ) -> tuple[EnrichmentEvent, ...]:
+        calls.append("ledger")
+        return real_events(transaction, session_id)
+
+    def record_compare_digest(left: bytes, right: bytes) -> bool:
+        calls.append("compare")
+        return real_compare_digest(left, right)
+
+    monkeypatch.setattr(runtime.enrichment_sessions, "events_from_transaction", record_events)
+    monkeypatch.setattr(enrichment_module.hmac, "compare_digest", record_compare_digest)
+    outsider = GraphEnrichmentService(
+        runtime,
+        actor="local:asha",
+        clock=Clock(),
+        assessment_service=RecordingAssessment(clock=Clock()),
+    )
+    observed: list[tuple[str, ...]] = []
+
+    for session_id in (hidden_id, "refine:" + "f" * 64, "refine:é"):
+        calls.clear()
+        with pytest.raises(GraphEnrichmentError, match="^graph enrichment unavailable$"):
+            outsider.read_status(session_id)
+        observed.append(tuple(calls))
+
+    assert observed == [
+        ("assessment", "ledger", "compare"),
+        ("assessment", "ledger", "compare"),
+        ("assessment", "ledger", "compare"),
+    ]
+
+
+def test_read_projection_rejects_corrupt_ledger_without_recovery_or_writes(
+    runtime: Runtime,
+) -> None:
+    """Catches corrupt session state being repaired, replaced, or partially disclosed."""
+    opened = _service(runtime, Clock()).start(minutes=5)
+    target = runtime.transactions.target_file("enrichment_sessions")
+    try:
+        target.atomic_write(b'{"corrupt":')
+    finally:
+        target.close()
+    before = _durable_bytes(runtime)
+
+    with pytest.raises(GraphEnrichmentError, match="^graph enrichment unavailable$"):
+        _service(runtime, Clock()).read_status(opened.id)
+
+    assert _durable_bytes(runtime) == before
 
 
 def test_answer_revalidates_preimages_and_rolls_back_all_canonical_writes(

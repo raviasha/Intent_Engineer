@@ -705,8 +705,10 @@ def _build_assessment_snapshot_from_transaction(
         _raise_signal(selected)
     if (
         type(transaction) is not LocalTransaction
-        or not runtime.transactions.owns_active_write_transaction(transaction)
-        or transaction._read_only
+        or not (
+            runtime.transactions.owns_active_write_transaction(transaction)
+            or runtime.transactions.owns_active_no_recovery_read_transaction(transaction)
+        )
         or set(transaction._extras) != set(_AUTHORITY_POLICIES)
         or transaction._extra_read_policies != _AUTHORITY_POLICIES
         or {name: transaction._extras[name].lock_key for name in sorted(_AUTHORITY_POLICIES)}

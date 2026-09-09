@@ -21,6 +21,8 @@ from intent_engineering.intent_workflow.enrichment_store import (
     EnrichmentSessionStore,
     EnrichmentStoreError,
 )
+from intent_engineering.storage.secure import SecureDirectory
+from intent_engineering.storage.transaction import LocalTransactionCoordinator
 
 NOW = datetime(2026, 9, 9, tzinfo=UTC)
 SNAPSHOT = "sha256:" + "1" * 64
@@ -108,6 +110,63 @@ def test_store_contains_references_not_answer_plaintext(tmp_path: Path) -> None:
     assert store.latest("refine:1") == answered_session
     assert store.events("refine:1") == (opened, answered)
     store.close()
+
+
+def test_held_no_recovery_read_parses_events_but_cannot_append(tmp_path: Path) -> None:
+    """Catches a nominal read enabling an unjournaled store mutation or lock re-entry."""
+    root = SecureDirectory.open(tmp_path)
+    journal = root.file("journal.json")
+    target = root.file("enrichment-sessions.jsonl")
+    coordinator = LocalTransactionCoordinator(journal, {"enrichment_sessions": target})
+    store = EnrichmentSessionStore(target, transactions=coordinator)
+    opened = _event(0, "opened", _session())
+    store.append(opened)
+    before = store.bytes()
+    paused = _event(
+        1,
+        "paused",
+        _session(status="paused", updated_at=NOW + timedelta(seconds=1)),
+        predecessor_event_digest=opened.digest,
+    )
+    try:
+        with coordinator.read_transaction_without_recovery() as transaction:
+            assert store.events_from_transaction(transaction, "refine:1") == (opened,)
+            with pytest.raises(EnrichmentStoreError):
+                store.append(paused)
+        assert store.bytes() == before
+    finally:
+        store.close()
+        coordinator.close()
+        target.close()
+        journal.close()
+        root.close()
+
+
+def test_held_event_read_rejects_recovering_forged_and_stale_handles(tmp_path: Path) -> None:
+    """Catches session bytes being read through an unauthenticated transaction handle."""
+    root = SecureDirectory.open(tmp_path)
+    journal = root.file("journal.json")
+    target = root.file("enrichment-sessions.jsonl")
+    coordinator = LocalTransactionCoordinator(journal, {"enrichment_sessions": target})
+    store = EnrichmentSessionStore(target, transactions=coordinator)
+    opened = _event(0, "opened", _session())
+    store.append(opened)
+    held = None
+    try:
+        with coordinator.read_transaction() as recovering, pytest.raises(EnrichmentStoreError):
+            store.events_from_transaction(recovering, "refine:1")
+        with coordinator.read_transaction_without_recovery() as transaction:
+            held = transaction
+            assert store.events_from_transaction(transaction, "refine:1") == (opened,)
+        assert held is not None
+        with pytest.raises(EnrichmentStoreError):
+            store.events_from_transaction(held, "refine:1")
+    finally:
+        store.close()
+        coordinator.close()
+        target.close()
+        journal.close()
+        root.close()
 
 
 def test_store_is_idempotent_but_rejects_conflicting_or_noncontiguous_frames(

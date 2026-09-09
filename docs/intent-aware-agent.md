@@ -497,6 +497,36 @@ excluded from rollups, unsupported inputs remain `unassessed`, and a critical re
 and project robustness at 49. See [the assessment guide](assessment.md) for deductions, confidence,
 MCP reads, CI defaults, and exit codes.
 
+### Improve the graph on your schedule
+
+When there is time for stronger intent capture, start a five-, fifteen-, or thirty-minute session
+without waiting for a new requirement prompt:
+
+```bash
+intent refine --project . --minutes 5
+intent refine --project . --session <session-id> --action pause --format json
+intent refine --project . --session <session-id> --action resume --format json
+```
+
+The `intent dev` browser exposes the same workflow under **Improve graph** and shows score
+dimensions, health, gaps, and evidence-backed deductions in its graph and table projections. The
+next question is deterministic for the same authorized snapshot. A human answer is immediately
+captured with its ACL and provenance, while the durable session retains only the evidence reference.
+Restart and resume do not replay the plaintext answer.
+
+The advisor plugin may recommend opening this workflow, but remains advisory: it has no approval,
+graph-mutation, or provider-write authority. For agent integrations, MCP publishes only
+`intent_enrichment_status` and `intent_enrichment_next_question`; lifecycle changes remain explicit
+CLI/browser human actions. Local Markdown/Git assessment and enrichment work offline. Provider
+capture requires that provider's configured connection, and no offline flag creates remote facts.
+
+An enrichment proposal is still only a proposal. Canonical graph changes require the unchanged
+governed review and approval flow. This release includes explainable assessment/visualization,
+resumable enrichment, CLI/browser/read-only-MCP journeys, deterministic validation, and the existing
+guarded enrollment foundation. Automatic second-developer activation/reconciliation beyond guarded
+publication, alternative/simpler-requirement generation, and broader state hardening are deferred
+follow-up work, not shipped features.
+
 ## 6. Add compatible sources
 
 Copy both the reviewed provider profile and one project binding. This Slack example is identical in

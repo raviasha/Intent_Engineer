@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import re
 import traceback
@@ -486,6 +487,50 @@ class GraphEnrichmentService:
         if selected is not None:
             _raise_signal(selected)
 
+    @contextmanager
+    def _read_transaction(self) -> Iterator[LocalTransaction]:
+        """Hold one authenticated no-recovery snapshot without creating a journal."""
+        config: SecureFile | None = None
+        policy: SecureFile | None = None
+        primary: BaseException | None = None
+        cleanups: list[BaseException] = []
+        try:
+            try:
+                config = self._runtime.workspace_directory.file("config.yaml")
+                policy = self._runtime.workspace_directory.file("approvals/policy.yaml")
+                with self._runtime.transactions.read_transaction_without_recovery(
+                    {"config": config, "acl_policy": policy},
+                    extra_read_policies=_AUTHORITY_POLICIES,
+                ) as transaction:
+                    yield transaction
+            except BaseException as caught:  # noqa: BLE001 - clean before re-raising
+                primary = caught
+        finally:
+            cleanups.extend(_close_authority_files(policy, config))
+            config = None
+            policy = None
+        cleanup: BaseException | None
+        for cleanup in cleanups:
+            _scrub_signal(cleanup)
+        cleanup = None
+        cleanup_cancellation = next(
+            (item for item in cleanups if not isinstance(item, Exception)), None
+        )
+        selected: BaseException | None
+        if primary is not None and not isinstance(primary, Exception):
+            selected = primary
+        elif cleanup_cancellation is not None:
+            if primary is not None:
+                _scrub_suspended_signal(primary)
+            selected = cleanup_cancellation
+        else:
+            selected = primary if primary is not None else cleanups[0] if cleanups else None
+        primary = None
+        cleanup_cancellation = None
+        cleanups.clear()
+        if selected is not None:
+            _raise_signal(selected)
+
     def _snapshot(
         self, transaction: LocalTransaction
     ) -> tuple[AssessmentSnapshot, AssessmentReport]:
@@ -572,6 +617,25 @@ class GraphEnrichmentService:
             excluded=frozenset({*session.answered_gap_ids, *session.skipped_gap_ids}),
         )
         return None if not choices else choices[0].question
+
+    def _word_question(self, selected: EnrichmentQuestion) -> EnrichmentQuestion:
+        if self._wording is None:
+            return selected
+        rephrased = self._wording.rephrase(selected)
+        if type(rephrased) is not EnrichmentQuestion:
+            raise ValueError("invalid question wording")
+        if type(rephrased.prompt) is not str or any(
+            not _recursive_type_exact_equal(
+                getattr(selected, field_name), getattr(rephrased, field_name)
+            )
+            for field_name in EnrichmentQuestion.model_fields
+            if field_name != "prompt"
+        ):
+            raise ValueError("invalid question wording")
+        canonical = EnrichmentQuestion.model_validate_json(rephrased.model_dump_json())
+        if not _recursive_type_exact_equal(canonical, rephrased):
+            raise ValueError("invalid question wording")
+        return canonical
 
     def _reassess(
         self,
@@ -688,26 +752,88 @@ class GraphEnrichmentService:
                 or selected.gap_id != session.current_gap_id
             ):
                 raise ValueError("stale enrichment question")
-            if self._wording is None:
-                return selected
-            rephrased = self._wording.rephrase(selected)
-            if type(rephrased) is not EnrichmentQuestion:
-                raise ValueError("invalid question wording")
-            if type(rephrased.prompt) is not str or any(
-                not _recursive_type_exact_equal(
-                    getattr(selected, field_name), getattr(rephrased, field_name)
-                )
-                for field_name in EnrichmentQuestion.model_fields
-                if field_name != "prompt"
-            ):
-                raise ValueError("invalid question wording")
-            canonical = EnrichmentQuestion.model_validate_json(rephrased.model_dump_json())
-            if not _recursive_type_exact_equal(canonical, rephrased):
-                raise ValueError("invalid question wording")
-            return canonical
+            return self._word_question(selected)
 
     def next_question(self, session_id: str) -> EnrichmentQuestion:
         return cast(EnrichmentQuestion, self._public(lambda: self._question(session_id)))
+
+    def _read_projection(
+        self,
+        session_id: str,
+    ) -> tuple[EnrichmentSession, AssessmentSnapshot, AssessmentReport]:
+        with self._read_transaction() as transaction:
+            snapshot, report = self._snapshot(transaction)
+            events = self._runtime.enrichment_sessions.events_from_transaction(
+                transaction,
+                session_id,
+            )
+            now = self._now()
+            opened = None if not events else events[0].session
+            latest = None if not events else events[-1]
+            identity_snapshot_digest = (
+                report.snapshot_digest if opened is None else opened.snapshot_digest
+            )
+            identity_focus = None if opened is None else opened.focus_id
+            identity_budget = None if opened is None else opened.budget_minutes
+            identity_started_at = (
+                now.isoformat() if opened is None else opened.started_at.isoformat()
+            )
+            expected_id = (
+                "refine:"
+                + hashlib.sha256(
+                    _canonical_json(
+                        [
+                            self._actor,
+                            identity_snapshot_digest,
+                            identity_focus,
+                            identity_budget,
+                            identity_started_at,
+                        ]
+                    )
+                ).hexdigest()
+            )
+            identity_matches = hmac.compare_digest(
+                session_id.encode("utf-8"),
+                expected_id.encode("utf-8"),
+            )
+            if (
+                latest is None
+                or not identity_matches
+                or latest.session.snapshot_digest != report.snapshot_digest
+                or (
+                    latest.session.status == "open"
+                    and latest.session.budget_minutes is not None
+                    and self._remaining(latest, now) == 0
+                )
+            ):
+                raise ValueError("stale enrichment read")
+            return latest.session, snapshot, report
+
+    def read_status(self, session_id: str) -> EnrichmentSession:
+        """Read one authorized fresh session without recovery or durable mutation."""
+        return cast(
+            EnrichmentSession,
+            self._public(lambda: self._read_projection(session_id)[0]),
+        )
+
+    def read_next_question(self, session_id: str) -> EnrichmentQuestion:
+        """Read one authorized deterministic question without changing session progress."""
+
+        def operation() -> EnrichmentQuestion:
+            session, snapshot, report = self._read_projection(session_id)
+            selected = self._selected(report, snapshot, session)
+            if (
+                session.status != "open"
+                or selected is None
+                or selected.gap_id != session.current_gap_id
+            ):
+                raise ValueError("no enrichment question")
+            return self._word_question(selected)
+
+        try:
+            return cast(EnrichmentQuestion, self._public(operation))
+        finally:
+            operation = cast(Callable[[], EnrichmentQuestion], None)
 
     @staticmethod
     def _conversation_ref(session_id: str, gap_id: str) -> str:

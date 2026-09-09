@@ -193,12 +193,15 @@ def test_public_alpha_docs_and_bindings_match_the_shipped_operating_model(
     for text in (readme, guide, adoption):
         assert "assessment guide" in text
         assert "intent assess --project ." in text
-    for later_stage in (
-        "are available now",
-        "start an enrichment session",
-        "generate simpler requirement alternatives",
+    for shipped in (
+        "Improve the graph",
+        "intent refine --project . --minutes 5",
+        "intent_enrichment_status",
+        "intent_enrichment_next_question",
     ):
-        assert later_stage not in assessment.casefold()
+        assert shipped in assessment
+    assert "alternative or simpler requirements" in assessment
+    assert "remain deferred" in assessment
 
     clean_project = init_git_repo(tmp_path)
     (clean_project / "docs").mkdir()

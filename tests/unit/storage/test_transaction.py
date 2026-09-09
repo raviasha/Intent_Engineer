@@ -4,17 +4,317 @@ from __future__ import annotations
 
 import base64
 import json
+import traceback
+from collections.abc import Iterator
+from contextlib import contextmanager
 from hashlib import sha256
 from pathlib import Path
 
 import pytest
 
+from intent_engineering.storage import transaction as transaction_module
 from intent_engineering.storage.secure import SecureDirectory, SecureFile, UnsafePathError
 from intent_engineering.storage.transaction import (
+    LocalTransaction,
     LocalTransactionCoordinator,
     LocalTransactionExtraReadPolicy,
     TransactionRecoveryError,
 )
+
+
+def test_only_live_issued_no_recovery_read_handle_is_authenticated(tmp_path: Path) -> None:
+    """Catches forged, stale, recovering, write, or cross-coordinator handles gaining read trust."""
+    coordinator, _paths, _journal = _coordinator(tmp_path)
+    other_root = tmp_path / "other"
+    other_root.mkdir()
+    other, _other_paths, _other_journal = _coordinator(other_root)
+    forged = LocalTransaction(coordinator, read_only=True)
+    held: LocalTransaction | None = None
+    try:
+        assert coordinator.owns_active_no_recovery_read_transaction(forged) is False
+        with coordinator.read_transaction() as recovering:
+            assert coordinator.owns_active_no_recovery_read_transaction(recovering) is False
+        with coordinator.transaction() as writing:
+            assert coordinator.owns_active_no_recovery_read_transaction(writing) is False
+        with coordinator.read_transaction_without_recovery() as issued:
+            held = issued
+            assert coordinator.owns_active_no_recovery_read_transaction(issued) is True
+            assert other.owns_active_no_recovery_read_transaction(issued) is False
+            with pytest.raises(ValueError, match="no-recovery read"):
+                coordinator.recover()
+            with pytest.raises(ValueError, match="no-recovery read"):
+                coordinator.snapshot()
+            with pytest.raises(ValueError, match="read-only snapshot unavailable"):
+                coordinator.snapshot_without_recovery()
+            with (
+                pytest.raises(ValueError, match="no-recovery read"),
+                coordinator.read_transaction(),
+            ):
+                pass
+            with pytest.raises(ValueError, match="no-recovery read"), coordinator.transaction():
+                pass
+            with pytest.raises(ValueError, match="no-recovery read"), coordinator.coordinated():
+                pass
+        assert held is not None
+        assert coordinator.owns_active_no_recovery_read_transaction(held) is False
+    finally:
+        forged._finish()
+        other.close()
+        coordinator.close()
+
+
+def test_no_recovery_read_cancellation_retires_the_exact_handle(tmp_path: Path) -> None:
+    """Catches cancellation leaving a formerly trusted read handle active or registered."""
+
+    class Cancellation(BaseException):
+        pass
+
+    coordinator, _paths, _journal = _coordinator(tmp_path)
+    signal = Cancellation()
+    held: LocalTransaction | None = None
+    try:
+        with (
+            pytest.raises(Cancellation) as caught,
+            coordinator.read_transaction_without_recovery() as issued,
+        ):
+            held = issued
+            assert coordinator.owns_active_no_recovery_read_transaction(issued) is True
+            raise signal
+        assert caught.value is signal
+        assert held is not None
+        assert coordinator.owns_active_no_recovery_read_transaction(held) is False
+    finally:
+        coordinator.close()
+
+
+def test_no_recovery_read_preserves_primary_cancellation_across_lock_cleanup_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catches lock cleanup replacing cancellation or skipping later lock releases."""
+
+    class Cancellation(BaseException):
+        pass
+
+    primary_marker = "PRIVATE-NO-RECOVERY-PRIMARY"
+    cleanup_marker = "PRIVATE-NO-RECOVERY-CLEANUP"
+    primary = Cancellation(primary_marker)
+    primary.secret = primary_marker  # type: ignore[attr-defined]
+    cleanup = Cancellation(cleanup_marker)
+    cleanup.secret = cleanup_marker  # type: ignore[attr-defined]
+    retained: list[object] = []
+    entered: dict[str, int] = {}
+    exited: dict[str, int] = {}
+    original_lock = transaction_module.same_path_lock
+    coordinator, _paths, _journal = _coordinator(tmp_path)
+    held: LocalTransaction | None = None
+
+    @contextmanager
+    def hostile_lock(path: Path | SecureFile) -> Iterator[None]:
+        name = path.name
+        entered[name] = entered.get(name, 0) + 1
+        try:
+            with original_lock(path):
+                yield
+        finally:
+            exited[name] = exited.get(name, 0) + 1
+            if name == "history.jsonl":
+                private_cleanup_material = cleanup_marker
+                try:
+                    if private_cleanup_material:
+                        raise cleanup
+                except BaseException as caught:
+                    retained.append(caught.__traceback__)
+                    raise
+
+    monkeypatch.setattr(transaction_module, "same_path_lock", hostile_lock)
+    try:
+        with (
+            pytest.raises(Cancellation) as caught,
+            coordinator.read_transaction_without_recovery() as transaction,
+        ):
+            held = transaction
+            private_primary_material = primary_marker
+            try:
+                if private_primary_material:
+                    raise primary
+            except BaseException as raised:
+                retained.append(raised.__traceback__)
+                raise
+
+        assert caught.value is primary
+        assert held is not None
+        assert coordinator.owns_active_no_recovery_read_transaction(held) is False
+        assert entered == {
+            ".local-transaction.json": 1,
+            "cases.jsonl": 1,
+            "graph.yaml": 1,
+            "history.jsonl": 1,
+        }
+        assert exited == entered
+        for signal in (primary, cleanup):
+            assert signal.args == ()
+            assert signal.__dict__ == {}
+            assert signal.__cause__ is None
+            assert signal.__context__ is None
+        assert retained
+        assert primary_marker not in "\n".join(
+            repr(frame.f_locals)
+            for old_traceback in retained
+            if old_traceback is not None
+            for frame, _line in traceback.walk_tb(old_traceback)  # type: ignore[arg-type]
+            if "/src/intent_engineering/" in frame.f_code.co_filename
+        )
+        assert cleanup_marker not in "\n".join(
+            repr(frame.f_locals)
+            for old_traceback in retained
+            if old_traceback is not None
+            for frame, _line in traceback.walk_tb(old_traceback)  # type: ignore[arg-type]
+            if "/src/intent_engineering/" in frame.f_code.co_filename
+        )
+    finally:
+        monkeypatch.setattr(transaction_module, "same_path_lock", original_lock)
+        coordinator.close()
+
+
+@pytest.mark.parametrize("cleanup_cancels", (False, True))
+def test_no_recovery_read_selects_and_scrubs_ordinary_body_and_cleanup_failures(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    cleanup_cancels: bool,
+) -> None:
+    """Catches an ordinary primary being replaced or retained by hostile cleanup."""
+
+    class Cancellation(BaseException):
+        pass
+
+    primary = RuntimeError("PRIVATE-NO-RECOVERY-ORDINARY-PRIMARY")
+    primary.secret = "PRIVATE-NO-RECOVERY-ORDINARY-PRIMARY"  # type: ignore[attr-defined]
+    cleanup: BaseException = (
+        Cancellation("PRIVATE-NO-RECOVERY-CANCELLING-CLEANUP")
+        if cleanup_cancels
+        else RuntimeError("PRIVATE-NO-RECOVERY-ORDINARY-CLEANUP")
+    )
+    cleanup.secret = "PRIVATE-NO-RECOVERY-CLEANUP"  # type: ignore[attr-defined]
+    retained: list[object] = []
+    original_lock = transaction_module.same_path_lock
+    coordinator, _paths, _journal = _coordinator(tmp_path)
+    held: LocalTransaction | None = None
+
+    @contextmanager
+    def hostile_lock(path: Path | SecureFile) -> Iterator[None]:
+        try:
+            with original_lock(path):
+                yield
+        finally:
+            if path.name == "history.jsonl":
+                private_cleanup_material = cleanup.secret  # type: ignore[attr-defined]
+                try:
+                    if private_cleanup_material:
+                        raise cleanup
+                except BaseException as caught:
+                    retained.append(caught.__traceback__)
+                    raise
+
+    monkeypatch.setattr(transaction_module, "same_path_lock", hostile_lock)
+    expected = cleanup if cleanup_cancels else primary
+    try:
+        with (
+            pytest.raises(BaseException) as caught,
+            coordinator.read_transaction_without_recovery() as transaction,
+        ):
+            held = transaction
+            private_primary_material = primary.secret  # type: ignore[attr-defined]
+            try:
+                if private_primary_material:
+                    raise primary
+            except BaseException as raised:
+                retained.append(raised.__traceback__)
+                raise
+
+        assert caught.value is expected
+        assert held is not None
+        assert coordinator.owns_active_no_recovery_read_transaction(held) is False
+        for signal in (primary, cleanup):
+            assert signal.args == ()
+            assert signal.__dict__ == {}
+            assert signal.__cause__ is None
+            assert signal.__context__ is None
+        assert retained
+        assert "PRIVATE-NO-RECOVERY" not in "\n".join(
+            repr(frame.f_locals)
+            for old_traceback in retained
+            if old_traceback is not None
+            for frame, _line in traceback.walk_tb(old_traceback)  # type: ignore[arg-type]
+            if "/src/intent_engineering/" in frame.f_code.co_filename
+        )
+    finally:
+        monkeypatch.setattr(transaction_module, "same_path_lock", original_lock)
+        coordinator.close()
+
+
+def test_no_recovery_read_scrubs_acquisition_cancellation_and_releases_prior_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catches partial lock acquisition leaking cancellation or an earlier held lock."""
+
+    class Cancellation(BaseException):
+        pass
+
+    marker = "PRIVATE-NO-RECOVERY-ACQUISITION"
+    signal = Cancellation(marker)
+    signal.secret = marker  # type: ignore[attr-defined]
+    entered: list[str] = []
+    released: list[str] = []
+    retained: list[object] = []
+    original_lock = transaction_module.same_path_lock
+    coordinator, _paths, _journal = _coordinator(tmp_path)
+
+    @contextmanager
+    def hostile_lock(path: Path | SecureFile) -> Iterator[None]:
+        entered.append(path.name)
+        if len(entered) == 2:
+            private_acquisition_material = marker
+            try:
+                if private_acquisition_material:
+                    raise signal
+            except BaseException as caught:
+                retained.append(caught.__traceback__)
+                raise
+        with original_lock(path):
+            try:
+                yield
+            finally:
+                released.append(path.name)
+
+    monkeypatch.setattr(transaction_module, "same_path_lock", hostile_lock)
+    try:
+        with (
+            pytest.raises(Cancellation) as caught,
+            coordinator.read_transaction_without_recovery(),
+        ):
+            raise AssertionError("lock acquisition cancellation reached the body")
+        assert caught.value is signal
+        assert len(entered) == 2
+        assert released == entered[:1]
+        assert signal.args == ()
+        assert signal.__dict__ == {}
+        assert signal.__cause__ is None
+        assert signal.__context__ is None
+        assert retained
+        assert marker not in "\n".join(
+            repr(frame.f_locals)
+            for old_traceback in retained
+            if old_traceback is not None
+            for frame, _line in traceback.walk_tb(old_traceback)  # type: ignore[arg-type]
+            if "/src/intent_engineering/" in frame.f_code.co_filename
+        )
+    finally:
+        monkeypatch.setattr(transaction_module, "same_path_lock", original_lock)
+        with coordinator.read_transaction_without_recovery():
+            pass
+        coordinator.close()
 
 
 def _coordinator(

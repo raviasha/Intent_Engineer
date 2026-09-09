@@ -123,6 +123,64 @@ def test_snapshot_can_consume_one_already_authenticated_write_transaction(
     assert actual == expected
 
 
+def test_snapshot_can_consume_one_authenticated_no_recovery_read_transaction(
+    assessment_runtime,
+) -> None:
+    """Catches MCP-safe assessment reads requiring a recovery-capable or write transaction."""
+    runtime = assessment_runtime.runtime
+    expected = build_assessment_snapshot(runtime, "local:asha")
+    config = runtime.workspace_directory.file("config.yaml")
+    policy = runtime.workspace_directory.file("approvals/policy.yaml")
+    extras = {"config": config, "acl_policy": policy}
+    policies = {
+        name: LocalTransactionExtraReadPolicy(max_bytes=1024 * 1024, nonblocking_regular=True)
+        for name in extras
+    }
+    try:
+        with runtime.transactions.read_transaction_without_recovery(
+            extras,
+            extra_read_policies=policies,
+        ) as transaction:
+            actual = build_assessment_snapshot_from_transaction(
+                runtime,
+                "local:asha",
+                transaction,
+            )
+    finally:
+        policy.close()
+        config.close()
+
+    assert actual == expected
+
+
+def test_snapshot_rejects_recovery_capable_read_transaction(assessment_runtime) -> None:
+    """Catches a read boundary silently allowing recovery writes before assessment."""
+    runtime = assessment_runtime.runtime
+    config = runtime.workspace_directory.file("config.yaml")
+    policy = runtime.workspace_directory.file("approvals/policy.yaml")
+    extras = {"config": config, "acl_policy": policy}
+    policies = {
+        name: LocalTransactionExtraReadPolicy(max_bytes=1024 * 1024, nonblocking_regular=True)
+        for name in extras
+    }
+    try:
+        with (
+            runtime.transactions.read_transaction(
+                extras,
+                extra_read_policies=policies,
+            ) as transaction,
+            pytest.raises(AssessmentUnavailable, match="^assessment unavailable$"),
+        ):
+            build_assessment_snapshot_from_transaction(
+                runtime,
+                "local:asha",
+                transaction,
+            )
+    finally:
+        policy.close()
+        config.close()
+
+
 def test_transaction_snapshot_requires_bounded_authority_extras(assessment_runtime) -> None:
     """Catches an enrichment caller bypassing config and ACL allocation bounds."""
     runtime = assessment_runtime.runtime

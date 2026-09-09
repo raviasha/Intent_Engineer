@@ -44,6 +44,8 @@ _TOOLS = {
     "intent_assessment_summary",
     "intent_assessment_scorecard",
     "intent_assessment_gaps",
+    "intent_enrichment_status",
+    "intent_enrichment_next_question",
     "intent_reconcile_list",
     "intent_reconcile_show",
 }

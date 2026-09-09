@@ -464,6 +464,55 @@ class EnrichmentSessionStore:
             raise EnrichmentStoreError() from None
         return result
 
+    def events_from_transaction(
+        self,
+        transaction: LocalTransaction,
+        session_id: str,
+    ) -> tuple[EnrichmentEvent, ...]:
+        """Read one session from an exact authenticated no-recovery transaction."""
+        result: tuple[EnrichmentEvent, ...] | None = None
+        state: _LedgerState | None = None
+        failed = False
+        signal: BaseException | None = None
+        try:
+            if (
+                type(transaction) is not LocalTransaction
+                or type(session_id) is not str
+                or not session_id
+                or len(session_id) > 256
+                or self._transactions is None
+                or not self._transactions.owns_active_no_recovery_read_transaction(transaction)
+                or not self._transactions.target_matches("enrichment_sessions", self._file)
+            ):
+                raise ValueError("invalid held enrichment read")
+            content = (
+                transaction.read_optional_bounded(
+                    "enrichment_sessions",
+                    max_bytes=_MAX_LEDGER_BYTES,
+                )
+                or b""
+            )
+            state = _parse(content)
+            if state is None:
+                raise ValueError("invalid enrichment ledger")
+            result = state.by_session.get(session_id, ())
+        except Exception as caught:  # noqa: BLE001 - fixed public integrity boundary
+            _scrub_signal(caught)
+            failed = True
+        except BaseException as caught:  # noqa: BLE001 - preserve cancellation identity
+            signal = _scrub_signal(caught)
+        finally:
+            transaction = cast(LocalTransaction, None)
+            session_id = ""
+            state = None
+        if signal is not None:
+            detached = signal
+            signal = None
+            _raise_signal(detached)
+        if failed or result is None:
+            raise EnrichmentStoreError() from None
+        return result
+
     def validate_proposal_binding(
         self,
         binding: EnrichmentProposalBinding,

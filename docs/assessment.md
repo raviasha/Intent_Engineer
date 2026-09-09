@@ -71,6 +71,27 @@ an intent branch is red, both that branch and the project remain red. Robustness
 Each node scorecard lists its worst dimension, failed checks, exact deductions, visible
 references, blocking cases, and recommended next action.
 
+## Improve the graph without applying it
+
+Start a voluntary bounded session from the CLI or choose **Improve graph** in `intent dev`:
+
+```bash
+intent refine --project . --minutes 5
+intent refine --project . --focus req:csv-export
+intent refine --project . --session <session-id> --action pause --format json
+intent refine --project . --session <session-id> --action resume --format json
+```
+
+Questions are selected deterministically from the visible scorecard and show the affected node,
+dimension, rule, reason, and requested fields. An explicit answer is captured immediately as
+authorized evidence. Raw answer text is not copied into the enrichment-session ledger; the ledger
+stores its evidence reference so pause, process restart, and resume retain the provenance.
+
+Enrichment is proposal-only governance. Answering, skipping, pausing, resuming, or asking for a
+proposal does not edit the canonical graph. The proposed ChangeSet must pass the existing review
+and approval boundary before it can become canonical. Scores remain derived projections and are
+recomputed from the accepted graph and currently visible evidence.
+
 ## MCP reads
 
 Start a standalone stdio server when the client manages the process:
@@ -89,6 +110,15 @@ The server exposes three assessment reads:
 
 All three tools are read-only and non-destructive. They use the same assessment service as the CLI,
 return no authority token, and make hidden and unknown references indistinguishable.
+
+Two additional read-only enrichment tools accept one exact `session_id`:
+
+- `intent_enrichment_status` returns the fresh authorized session projection; and
+- `intent_enrichment_next_question` returns its current deterministic question.
+
+They do not recover, advance, pause, resume, answer, skip, propose, or mutate a session or graph.
+Expired, stale, corrupt, hidden, and absent sessions fail closed. Responses are bounded and contain
+neither plaintext answers nor hidden evidence. No enrichment mutation tool is registered over MCP.
 
 ## CI comparison defaults
 
@@ -111,5 +141,7 @@ initial commit has no comparison base, so the workflow publishes its head report
 comparison gate. The later `intent check --require-review` remains a separate assurance decision.
 
 Assessment reports do not approve requirements, resolve conflicts, or authorize changes. Graph
-visualization with health styling, voluntary enrichment sessions, and simpler requirement
-alternatives belong to later release stages and are not part of this assessment foundation.
+visualization with health styling and voluntary enrichment sessions are available projections over
+this foundation. Automatic activation/reconciliation beyond guarded publication, generation of
+alternative or simpler requirements, and the broader state-hardening backlog remain deferred and
+must not be treated as shipped behavior.

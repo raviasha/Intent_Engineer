@@ -6,6 +6,7 @@ import base64
 import json
 import re
 import secrets
+import traceback
 from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
@@ -13,7 +14,7 @@ from hashlib import sha256
 from pathlib import Path
 from threading import local
 from types import MappingProxyType
-from typing import Literal
+from typing import Literal, NoReturn
 
 from pydantic import ConfigDict, Field, ValidationError, model_validator
 
@@ -144,6 +145,59 @@ def _reject_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]
     return result
 
 
+def _scrub_signal(error: BaseException) -> BaseException:
+    old_traceback = error.__traceback__
+    error.args = ()
+    error.__dict__.clear()
+    error.__traceback__ = None
+    error.__cause__ = None
+    error.__context__ = None
+    if old_traceback is not None:
+        traceback.clear_frames(old_traceback)
+    old_traceback = None
+    return error
+
+
+def _signal_chain(error: BaseException) -> tuple[BaseException, ...]:
+    pending = [error]
+    seen: set[int] = set()
+    result: list[BaseException] = []
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        result.append(current)
+        cause = current.__cause__
+        context = current.__context__
+        if cause is not None:
+            pending.append(cause)
+        if context is not None:
+            pending.append(context)
+    pending.clear()
+    seen.clear()
+    return tuple(result)
+
+
+def _scrub_signal_chain(error: BaseException) -> None:
+    for current in _signal_chain(error):
+        _scrub_signal(current)
+
+
+def _raise_signal(error: BaseException) -> NoReturn:
+    try:
+        raise error.with_traceback(None) from None
+    except BaseException as caught:  # noqa: BLE001 - detach the suspended primary context
+        caught.__traceback__ = None
+        caught.__cause__ = None
+        caught.__context__ = None
+        error = BaseException()
+        try:
+            raise caught.with_traceback(None) from None
+        finally:
+            caught = BaseException()
+
+
 class LocalTransaction:
     """The mutation handle yielded while a coordinator owns every target lock."""
 
@@ -241,6 +295,8 @@ class _TransactionThreadState(local):
         self.extra_read_budget: _ExtraReadBudget | None = None
         self.poisoned = False
         self.issued_write_transactions: list[LocalTransaction] = []
+        self.issued_no_recovery_read_transactions: list[LocalTransaction] = []
+        self.no_recovery_read_active = False
 
 
 class LocalTransactionCoordinator:
@@ -275,6 +331,7 @@ class LocalTransactionCoordinator:
         self._legacy_target_sets = frozenset(legacy_sets)
         self._thread_state = _TransactionThreadState()
         self.__transaction_authority = object()
+        self.__no_recovery_read_authority = object()
 
     def close(self) -> None:
         """Release journal and target descriptors after all transactions quiesce."""
@@ -384,6 +441,21 @@ class LocalTransactionCoordinator:
             and self._thread_state.active
             and any(
                 transaction is issued for issued in self._thread_state.issued_write_transactions
+            )
+        )
+
+    def owns_active_no_recovery_read_transaction(self, transaction: object) -> bool:
+        """Authenticate one exact read handle issued without recovery on this thread."""
+        return bool(
+            type(transaction) is LocalTransaction
+            and transaction._owner is self
+            and transaction._issued_by is self.__no_recovery_read_authority
+            and transaction._active
+            and transaction._read_only
+            and self._thread_state.no_recovery_read_active
+            and any(
+                transaction is issued
+                for issued in self._thread_state.issued_no_recovery_read_transactions
             )
         )
 
@@ -509,12 +581,16 @@ class LocalTransactionCoordinator:
 
     def recover(self) -> None:
         """Recover a prepared transaction or finish a committed stale journal."""
+        if self._thread_state.no_recovery_read_active:
+            raise ValueError("recovery unavailable during no-recovery read")
         with self._locks():
             self._recover_unlocked()
 
     @contextmanager
     def coordinated(self) -> Iterator[None]:
         """Recover and serialize one non-transactional target operation."""
+        if self._thread_state.no_recovery_read_active:
+            raise ValueError("coordinated operation unavailable during no-recovery read")
         if self._thread_state.active:
             yield
             return
@@ -551,6 +627,8 @@ class LocalTransactionCoordinator:
         lock_keys = [self._journal.lock_key, *(item.lock_key for item in all_files.values())]
         if len(lock_keys) != len(set(lock_keys)):
             raise ValueError("duplicate local snapshot target")
+        if self._thread_state.no_recovery_read_active:
+            raise ValueError("recovering snapshot unavailable during no-recovery read")
         if self._thread_state.active:
             self._require_nested_extras(extra_files)
             policies, budget = self._nested_extra_read_state(extra_files, policies)
@@ -580,7 +658,11 @@ class LocalTransactionCoordinator:
             raise ValueError("invalid local snapshot target selection")
         if any(not _TARGET_PATTERN.fullmatch(name) for name in extra_files):
             raise ValueError("invalid local snapshot targets")
-        if set(extra_files) & set(self._targets) or self._thread_state.active:
+        if (
+            set(extra_files) & set(self._targets)
+            or self._thread_state.active
+            or self._thread_state.no_recovery_read_active
+        ):
             raise ValueError("read-only snapshot unavailable")
         all_files = {**self._targets, **extra_files}
         selected_files = {
@@ -613,6 +695,8 @@ class LocalTransactionCoordinator:
         lock_keys = [self._journal.lock_key, *(item.lock_key for item in all_files.values())]
         if len(lock_keys) != len(set(lock_keys)):
             raise ValueError("duplicate local transaction target")
+        if self._thread_state.no_recovery_read_active:
+            raise ValueError("recovering read unavailable during no-recovery read")
         if self._thread_state.active:
             self._require_nested_extras(extra_files)
             policies, budget = self._nested_extra_read_state(extra_files, policies)
@@ -653,24 +737,93 @@ class LocalTransactionCoordinator:
         policies = self._extra_read_policies(extra_files, extra_read_policies)
         if any(not _TARGET_PATTERN.fullmatch(name) for name in extra_files):
             raise ValueError("invalid local transaction extras")
-        if set(extra_files) & set(self._targets) or self._thread_state.active:
+        if (
+            set(extra_files) & set(self._targets)
+            or self._thread_state.active
+            or self._thread_state.no_recovery_read_active
+        ):
             raise ValueError("read-only transaction unavailable")
         all_files = {**self._targets, **extra_files}
         lock_keys = [self._journal.lock_key, *(item.lock_key for item in all_files.values())]
         if len(lock_keys) != len(set(lock_keys)):
             raise ValueError("duplicate local transaction target")
-        with self._locks(extra_files):
-            self._require_no_recovery_journal()
-            transaction = LocalTransaction(
-                self,
-                extra_files,
-                read_only=True,
-                extra_read_policies=policies,
-            )
+        transaction: LocalTransaction | None = None
+        primary_signal: BaseException | None = None
+        cleanup_signal: BaseException | None = None
+        try:
             try:
-                yield transaction
-            finally:
-                transaction._finish()
+                with self._locks(extra_files):
+                    self._require_no_recovery_journal()
+                    transaction = LocalTransaction(
+                        self,
+                        extra_files,
+                        read_only=True,
+                        extra_read_policies=policies,
+                        _issued_by=self.__no_recovery_read_authority,
+                    )
+                    self._thread_state.issued_no_recovery_read_transactions.append(transaction)
+                    self._thread_state.no_recovery_read_active = True
+                    try:
+                        yield transaction
+                    except BaseException as caught:  # noqa: BLE001 - defer signal selection
+                        primary_signal = caught
+                    finally:
+                        self._thread_state.no_recovery_read_active = False
+                        try:
+                            self._thread_state.issued_no_recovery_read_transactions.remove(
+                                transaction
+                            )
+                        finally:
+                            transaction._finish()
+            except BaseException as caught:  # noqa: BLE001 - select after every lock cleanup
+                cleanup_signal = caught
+        finally:
+            transaction = None
+            extra_files.clear()
+            policies.clear()
+            all_files.clear()
+        cleanup_cancellation = (
+            next(
+                (
+                    signal
+                    for signal in _signal_chain(cleanup_signal)
+                    if not isinstance(signal, Exception)
+                ),
+                None,
+            )
+            if cleanup_signal is not None
+            else None
+        )
+        selected: BaseException | None
+        scrub = False
+        if primary_signal is not None and not isinstance(primary_signal, Exception):
+            selected = primary_signal
+            scrub = True
+        elif cleanup_cancellation is not None:
+            selected = cleanup_cancellation
+            scrub = True
+        elif primary_signal is not None:
+            selected = primary_signal
+            scrub = cleanup_signal is not None
+        else:
+            selected = cleanup_signal
+            scrub = cleanup_signal is not None and not isinstance(cleanup_signal, Exception)
+        if scrub:
+            if cleanup_signal is not None:
+                _scrub_signal_chain(cleanup_signal)
+            if primary_signal is not None:
+                _scrub_signal_chain(primary_signal)
+        primary_signal = None
+        cleanup_signal = None
+        cleanup_cancellation = None
+        scrubbed = scrub
+        scrub = False
+        if selected is not None:
+            detached = selected
+            selected = None
+            if scrubbed:
+                _raise_signal(detached)
+            raise detached
 
     @contextmanager
     def transaction(
@@ -691,6 +844,8 @@ class LocalTransactionCoordinator:
         lock_keys = [self._journal.lock_key, *(item.lock_key for item in all_files.values())]
         if len(lock_keys) != len(set(lock_keys)):
             raise ValueError("duplicate local transaction target")
+        if self._thread_state.no_recovery_read_active:
+            raise ValueError("write transaction unavailable during no-recovery read")
         if self._thread_state.active:
             self._require_nested_extras(extra_files)
             policies, budget = self._nested_extra_read_state(extra_files, policies)

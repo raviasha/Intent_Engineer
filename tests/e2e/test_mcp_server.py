@@ -308,6 +308,8 @@ async def test_intent_mcp_stdio_is_protocol_clean_and_read_only(tmp_path: Path) 
         "intent_assessment_summary",
         "intent_assessment_scorecard",
         "intent_assessment_gaps",
+        "intent_enrichment_status",
+        "intent_enrichment_next_question",
         "intent_reconcile_list",
         "intent_reconcile_show",
         "intent_changeset_propose",
