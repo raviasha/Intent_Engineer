@@ -13,6 +13,7 @@ import traceback
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from functools import wraps
 from pathlib import PurePosixPath
 from types import MappingProxyType
 from typing import Literal, cast
@@ -116,8 +117,15 @@ from intent_engineering.team_state.keys import (
     keyring_recipient_store,
     restore_recipient,
 )
+from intent_engineering.team_state.models import CanonicalStateSnapshot
 from intent_engineering.team_state.models import RecipientRecord as TeamRecipientRecord
-from intent_engineering.team_state.publication import PublicationService
+from intent_engineering.team_state.publication import PreparedPublicationV2, PublicationService
+from intent_engineering.team_state.reconciliation import (
+    Choice,
+    ReconciliationPreview,
+    ReconciliationService,
+)
+from intent_engineering.team_state.restore import VerifiedReleaseV2
 
 _MAX_AUTHORITY_FILE_BYTES = 1_048_576
 _MAX_AUTHORITY_TOTAL_BYTES = 8_388_608
@@ -142,6 +150,31 @@ class ControlPlaneError(ValueError):
 
     def __init__(self) -> None:
         super().__init__("control plane unavailable")
+
+
+def _team_operation[**P, T](operation: Callable[P, T]) -> Callable[P, T]:
+    """Detach sensitive preview/assertion frames while preserving cancellation identity."""
+
+    @wraps(operation)
+    def guarded(*args: P.args, **kwargs: P.kwargs) -> T:
+        failure: BaseException
+        try:
+            return operation(*args, **kwargs)
+        except BaseException as error:  # noqa: BLE001 - secret-safe cancellation boundary
+            cursor: BaseException | None = error
+            while cursor is not None:
+                next_error = cursor.__context__
+                if cursor.__traceback__ is not None:
+                    traceback.clear_frames(cursor.__traceback__)
+                cursor.args = ()
+                cursor.__dict__.clear()
+                cursor.__traceback__ = cursor.__cause__ = cursor.__context__ = None
+                cursor = next_error
+            failure = ControlPlaneError() if isinstance(error, Exception) else error
+        del args, kwargs
+        raise failure.with_traceback(None) from None
+
+    return guarded
 
 
 class AssessmentNodeUnavailable(LookupError):
@@ -333,6 +366,8 @@ class ControlPlaneService:
         github_identity_verifier: GitHubIdentityVerifier | None = None,
         recipient_key_store_factory: RecipientKeyStoreFactory = keyring_recipient_store,
         publication_service: PublicationService | None = None,
+        reconciliation_service: ReconciliationService | None = None,
+        reconciliation_remote: Callable[[], VerifiedReleaseV2] | None = None,
     ) -> None:
         if type(runtime) is not Runtime:
             raise ValueError("invalid control plane runtime")
@@ -357,17 +392,22 @@ class ControlPlaneService:
         self._plans_file = self._approvals_directory.file("plans.jsonl")
         self._pending_answers: dict[str, _PendingAnswer] = {}
         self._team_repository_id = team_repository_id
-        if self._team_repository_id is None:
-            from intent_engineering.team_state.local_trust import load_local_trust
+        from intent_engineering.team_state.local_trust import LocalTrustConfigV2, LocalTrustProvider
 
-            local_trust = load_local_trust(runtime.root)
-            if local_trust is not None:
-                self._team_repository_id = local_trust.repository_id
+        local_trust = LocalTrustProvider(runtime.root).load_versioned()
+        self._team_trust_v2 = local_trust if isinstance(local_trust, LocalTrustConfigV2) else None
+        if self._team_repository_id is None and local_trust is not None:
+            self._team_repository_id = local_trust.repository_id
         self._github_identity_verifier = github_identity_verifier
         self._recipient_key_store_factory = recipient_key_store_factory
         if publication_service is not None and type(publication_service) is not PublicationService:
             raise TypeError("invalid publication service")
         self._publication_service = publication_service
+        self._reconciliation_service = reconciliation_service
+        self._reconciliation_remote = reconciliation_remote
+        self._team_reconciliations: dict[
+            str, tuple[ReconciliationPreview, HumanDecisionPayload]
+        ] = {}
         self._assessment_service = GraphAssessmentService(clock=self._clock)
         enrichment_proposals = ClarificationCoordinator(
             graph_store=runtime.graph_store,
@@ -407,6 +447,139 @@ class ControlPlaneService:
         )
         self._restore_team_recipient()
 
+    def _team_local_snapshot(self, authority: _Authority) -> CanonicalStateSnapshot:
+        from intent_engineering.team_state.models import CanonicalStateFile, CanonicalStateSnapshot
+
+        names = {
+            "approvals/approvals.jsonl": "approvals",
+            "approvals/plans.jsonl": "authority_plans",
+            "approvals/policy.yaml": "authority_policy",
+            "approvals/receipts.jsonl": "receipts",
+            "config.yaml": "authority_config",
+            "evidence/evidence.jsonl": "evidence",
+            "graph.yaml": "graph",
+            "history/changesets.jsonl": "history",
+            "history/intent-proposals.jsonl": "intent_proposals",
+            "reconciliation/cases.jsonl": "cases",
+        }
+        if self._team_repository_id is None:
+            raise ValueError("team repository unavailable")
+        return CanonicalStateSnapshot(
+            project_id=authority.config.project_id,
+            repository_id=self._team_repository_id,
+            graph_version=self._runtime.graph_store.load().version,
+            files=tuple(
+                CanonicalStateFile(path=p, content=authority.snapshot.content.get(n) or b"")
+                for p, n in sorted(names.items())
+            ),
+        )
+
+    @_team_operation
+    def team_reconciliation_preview(
+        self, *, common: VerifiedReleaseV2, choices: Mapping[str, Choice] | None = None
+    ) -> dict[str, object]:
+        authority: _Authority | None = None
+        try:
+            with self._team_enrollment_guard:
+                service, remote_provider = self._reconciliation_service, self._reconciliation_remote
+                if service is None or remote_provider is None:
+                    raise ValueError("reconciliation unavailable")
+                authority = self._authority()
+                remote = remote_provider()
+                local = self._team_local_snapshot(authority)
+                preview = service.preview(common=common, remote=remote, local=local)
+                result: dict[str, object] = {
+                    "case": preview.case.model_dump(mode="json"),
+                    "conflicts": list(preview.conflicts),
+                }
+                if choices is not None:
+                    preview = service.resolve(preview=preview, choices=choices)
+                if preview.resolved is not None:
+                    at = self._now()
+                    self._team_reconciliations = {
+                        k: v for k, v in self._team_reconciliations.items() if v[1].expires_at >= at
+                    }
+                    if len(self._team_reconciliations) >= 64:
+                        raise ValueError("reconciliation preview limit")
+                    payload = service.decision_payload(
+                        preview=preview,
+                        repository_id=self.repository_id,
+                        actor=service.actor(remote),
+                        challenge=self._nonce(),
+                        now=at,
+                    )
+                    self._team_reconciliations[payload.challenge] = (preview, payload)
+                    result["payload"] = payload.model_dump(mode="json")
+                if not self._authority_matches(authority) or remote_provider() != remote:
+                    raise ValueError("reconciliation preimage changed")
+                return result
+        except Exception:  # noqa: BLE001 - fixed public reconciliation boundary
+            raise ControlPlaneError() from None
+        finally:
+            if authority is not None:
+                authority.close()
+
+    def _team_reconciliation_current(
+        self, payload: HumanDecisionPayload, authority: _Authority
+    ) -> tuple[ReconciliationService, ReconciliationPreview, VerifiedReleaseV2]:
+        service, remote_provider = self._reconciliation_service, self._reconciliation_remote
+        pending = self._team_reconciliations.get(payload.challenge)
+        if service is None or remote_provider is None or pending is None or pending[1] != payload:
+            raise ValueError("reconciliation preview changed")
+        preview = pending[0]
+        remote = remote_provider()
+        if remote != preview.remote or self._team_local_snapshot(authority) != preview.local:
+            raise ValueError("reconciliation preimage changed")
+        if not self._authority_matches(authority):
+            raise ValueError("reconciliation authority changed")
+        return service, preview, remote
+
+    @_team_operation
+    def team_reconciliation_options(self, payload: HumanDecisionPayload) -> bytes:
+        authority: _Authority | None = None
+        try:
+            with self._team_enrollment_guard:
+                authority = self._authority()
+                self._team_reconciliation_current(payload, authority)
+                return self._webauthn.authentication_options(payload, self._origin, self._now())
+        except Exception:  # noqa: BLE001 - fixed public reconciliation boundary
+            raise ControlPlaneError() from None
+        finally:
+            if authority is not None:
+                authority.close()
+
+    @_team_operation
+    def team_reconciliation_prepare(
+        self, assertion: bytes, payload: HumanDecisionPayload
+    ) -> PreparedPublicationV2:
+        authority: _Authority | None = None
+        try:
+            with self._team_enrollment_guard:
+                authority = self._authority()
+                with self._runtime.transactions.transaction(
+                    rollback_base_exceptions=True,
+                    extras=authority.files,
+                    extra_read_policies=authority.policies,
+                ):
+                    authority.snapshot = self._runtime.transactions.snapshot(
+                        authority.files, extra_read_policies=authority.policies
+                    )
+                    service, preview, remote = self._team_reconciliation_current(payload, authority)
+                    decision = self._webauthn.verify(assertion, payload, self._origin, self._now())
+                    self._team_reconciliation_current(payload, authority)
+                    prepared = service.prepare(
+                        preview=preview, decision=decision, current_remote=remote
+                    )
+                    self._team_reconciliation_current(payload, authority)
+                self._team_reconciliations.pop(payload.challenge, None)
+                return prepared
+        except Exception:  # noqa: BLE001 - fixed public reconciliation boundary
+            raise ControlPlaneError() from None
+        finally:
+            assertion = b""
+            if authority is not None:
+                authority.close()
+
     @staticmethod
     def _scrub_enrichment_signal(error: BaseException) -> BaseException:
         old_traceback = error.__traceback__
@@ -439,6 +612,9 @@ class ControlPlaneService:
     def _restore_team_recipient(self) -> None:
         """Recover one complete durable enrollment or block replacement fail-closed."""
         if self._team_repository_id is None:
+            return
+        if self._team_trust_v2 is not None:
+            self._team_enrollment_blocked = True
             return
         authority: _Authority | None = None
         try:
@@ -540,6 +716,14 @@ class ControlPlaneService:
         """Return a credential-free projection of durable team enrollment."""
         try:
             with self._team_enrollment_guard:
+                if self._team_trust_v2 is not None:
+                    return {
+                        "schema_version": 2,
+                        "status": "active",
+                        "repository_id": self._team_trust_v2.repository_id,
+                        "member_id": self._team_trust_v2.member_id,
+                        "device_certificate_id": self._team_trust_v2.device_certificate_id,
+                    }
                 recipient = self._team_recipient
                 if recipient is None:
                     return {

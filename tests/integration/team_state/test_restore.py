@@ -41,6 +41,606 @@ from tests.helpers.shared_state import (
 )
 
 
+def enrolled_candidate(tmp_path):
+    """Real public ceremony, encrypted enrollment, Git objects and B's keyring."""
+    from types import SimpleNamespace
+
+    from intent_engineering.control_plane.webauthn_service import VerifiedHumanDecision
+    from intent_engineering.team_state.authority import authority_digest
+    from intent_engineering.team_state.enrollment import (
+        build_join_decision_payload,
+        build_sponsor_decision_payload,
+    )
+    from intent_engineering.team_state.governance import GovernanceRegistry
+    from intent_engineering.team_state.local_trust import LocalTrustProvider, PendingJoinTrustV2
+    from intent_engineering.team_state.models import (
+        CanonicalStateFile,
+        CanonicalStateSnapshot,
+        TeamStateManifestV2,
+    )
+    from tests.unit.team_state.test_enrollment import (
+        IDENTITY_PROOF,
+        _assertion,
+        _credential,
+        _fixture,
+    )
+    from tests.unit.team_state.test_enrollment import (
+        NOW as at,
+    )
+
+    a, b, state, identity, credential = _fixture(tmp_path)
+    source = _approved_source(tmp_path)
+    files = canonical_files(source)
+    snapshot = CanonicalStateSnapshot(
+        project_id="project",
+        repository_id=state.authority.repository_id,
+        graph_version=1,
+        files=tuple(CanonicalStateFile(path=p, content=c) for p, c in sorted(files.items())),
+    )
+    manifest = TeamStateManifestV2(
+        project_id="project",
+        repository_id=state.authority.repository_id,
+        graph_version=1,
+        parent_bundle_digest="sha256:" + "a" * 64,
+        bundle_digest=state.bundle_digest,
+        bundle_size=100,
+        recipient_key_ids=state.authority.active_recipient_key_ids(),
+        authority_digest=authority_digest(state.authority),
+        authority_epoch=1,
+        root_key_id=state.authority.root.root_key_id,
+        created_at=at,
+    )
+    target = init_repository(tmp_path / "target" / "project")
+    base = install_state_ref(
+        target,
+        restore_module.SharedStateArtifacts(
+            manifest.canonical_bytes(),
+            b"x" * 100,
+            b"{}",
+            "bundles/parent.intent",
+            "signatures/parent.json",
+        ),
+    )
+    state = state.model_copy(update={"state_commit": base})
+    parent = restore_module.VerifiedReleaseV2(
+        manifest, manifest.canonical_bytes(), state.authority, base, snapshot
+    )
+    invite = a.create_invite(state=state, intended_identity=identity, now=at)
+    material = b.device_public_material(invite=invite, local_identity=identity)
+    payload = build_join_decision_payload(
+        invite=invite,
+        identity=identity,
+        material=material,
+        credential=credential,
+        identity_proof=IDENTITY_PROOF,
+        pre_assertion_sign_count=6,
+        challenge=b"j" * 32,
+        now=at,
+    )
+    response = b.create_join_response(
+        invite=invite,
+        local_identity=identity,
+        decision=VerifiedHumanDecision(payload=payload, credential=credential, verified_at=at),
+        identity_proof=IDENTITY_PROOF,
+        pre_assertion_sign_count=6,
+        webauthn_assertion=_assertion(credential),
+        now=at,
+    )
+    preview = a.preview_approval(invite=invite, response=response, current=state, now=at)
+    sponsor = _credential(100, "alice", "github:100")
+    decision = VerifiedHumanDecision(
+        payload=build_sponsor_decision_payload(
+            preview=preview, credential=sponsor, challenge=b"k" * 32, now=at
+        ),
+        credential=sponsor,
+        verified_at=at,
+    )
+    approved = a.approve(
+        preview=preview,
+        sponsor_decision=decision,
+        sponsor_pre_assertion_sign_count=6,
+        sponsor_assertion=_assertion(sponsor),
+        current=state,
+        now=at,
+    )
+    publication = a.prepare_publication(
+        snapshot=snapshot, parent=parent, transition=approved, now=at
+    )
+    release = restore_module.SharedStateArtifacts(
+        publication.manifest_bytes,
+        publication.bundle,
+        publication.signatures,
+        publication.bundle_path,
+        publication.signature_path,
+    )
+    commit = install_state_ref(target, release, parent=base)
+    (target / ".intent").mkdir(mode=0o700)
+    provider = LocalTrustProvider(target)
+    pending = PendingJoinTrustV2(
+        phase="awaiting-merge",
+        invite=invite,
+        response=response,
+        local_recipient_key_id=response.recipient_key_id,
+        local_signature_id=response.signature_id,
+        expected_root_key_id=invite.root.root_key_id,
+        expected_authority_before_digest=invite.authority_digest,
+        external_write_attempted=True,
+    )
+    provider.save_pending_join(pending)
+    return SimpleNamespace(
+        target=target,
+        provider=provider,
+        pending=pending,
+        a=a,
+        b=b,
+        parent=parent,
+        publication=publication,
+        release=release,
+        commit=commit,
+        files=files,
+        at=at,
+        governance=GovernanceRegistry(tmp_path / "governance"),
+    )
+
+
+def test_pending_join_automatically_restores_exact_enrollment_and_activates_trust(tmp_path):
+    """Catches a merged B enrollment remaining unavailable or installing only half its state."""
+    f = enrolled_candidate(tmp_path)
+    restorer = GitSharedStateRestorer(
+        f.provider,
+        clock=lambda: f.at,
+        device_key_store=f.b._device_store,
+        governance_registry=f.governance,
+    )
+    result = restorer.verify_and_restore_approved_baseline(f.target)
+    assert result.status is SharedStateRestoreStatus.VERIFIED
+    assert canonical_files(f.target) == f.files
+    assert f.provider.load_pending_join() is None
+    trust = f.provider.load_versioned()
+    assert trust.member_id == f.pending.response.proposed_member.member_id
+    assert trust.accepted_bundle_digest == f.publication.manifest.bundle_digest
+    assert trust.accepted_authority_sequence == 2
+    marker = json.loads((f.target / ".intent/cache/shared-state.json").read_bytes())
+    assert marker["ref_commit"] == f.commit
+    assert (
+        restorer.verify_and_restore_approved_baseline(f.target).status
+        is SharedStateRestoreStatus.VERIFIED
+    )
+
+
+def test_pending_join_local_divergence_is_reported_without_overwrite(tmp_path):
+    f = enrolled_candidate(tmp_path)
+    (f.target / ".intent/graph.yaml").write_bytes(b"private local disagreement")
+    result = GitSharedStateRestorer(
+        f.provider,
+        clock=lambda: f.at,
+        device_key_store=f.b._device_store,
+        governance_registry=f.governance,
+    ).verify_and_restore_approved_baseline(f.target)
+    assert result.status is SharedStateRestoreStatus.DIVERGED
+    assert (f.target / ".intent/graph.yaml").read_bytes() == b"private local disagreement"
+    assert f.provider.load_pending_join() == f.pending
+    assert f.provider.load_versioned() is None
+
+
+def _reseal_enrollment(f, registry):
+    """Root-signed adversarial transition with valid encryption and device signature."""
+    from intent_engineering.team_state.archive import build_archive_v2
+    from intent_engineering.team_state.authority import (
+        authority_digest,
+        canonical_authority_attestation_preimage,
+        canonical_state_signature_preimage,
+    )
+    from intent_engineering.team_state.crypto import (
+        AuthenticatedBundleContextV2,
+        _encrypt_bundle_for_public_keys,
+        canonical_authenticated_context_bytes,
+        canonical_encrypted_bundle_bytes,
+    )
+
+    original = f.publication
+    manifest = original.manifest.model_copy(update={"authority_digest": authority_digest(registry)})
+    aad = canonical_authenticated_context_bytes(
+        AuthenticatedBundleContextV2(
+            project_id=manifest.project_id,
+            repository_id=manifest.repository_id,
+            graph_version=manifest.graph_version,
+            parent_bundle_digest=manifest.parent_bundle_digest,
+            recipient_key_ids=manifest.recipient_key_ids,
+            authority_digest=manifest.authority_digest,
+            authority_epoch=manifest.authority_epoch,
+            authority_sequence=registry.sequence,
+            root_key_id=manifest.root_key_id,
+            created_at=manifest.created_at,
+        )
+    )
+    public_keys = {
+        c.claims.recipient_key_id: base64.urlsafe_b64decode(c.claims.recipient_public_key + "==")
+        for c in original.authority.device_certificates
+    }
+    public_keys[original.authority.ci_recipient.key_id] = base64.urlsafe_b64decode(
+        original.authority.ci_recipient.public_key + "=="
+    )
+    bundle = canonical_encrypted_bundle_bytes(
+        _encrypt_bundle_for_public_keys(
+            build_archive_v2(f.parent.snapshot, registry), dict(sorted(public_keys.items())), aad
+        )
+    )
+    manifest = manifest.model_copy(
+        update={
+            "bundle_digest": "sha256:" + hashlib.sha256(bundle).hexdigest(),
+            "bundle_size": len(bundle),
+        }
+    )
+    attestation = original.envelope.authority_attestation.model_copy(
+        update={"authority_digest": manifest.authority_digest}
+    )
+    attestation = attestation.model_copy(
+        update={
+            "root_signature": base64.urlsafe_b64encode(
+                f.a._root_store.sign(
+                    manifest.root_key_id, canonical_authority_attestation_preimage(attestation)
+                )
+            )
+            .rstrip(b"=")
+            .decode()
+        }
+    )
+    signed = original.envelope.signatures[0].model_copy(
+        update={
+            "signature": base64.urlsafe_b64encode(
+                f.a._device_store.sign(
+                    original.envelope.signatures[0].signature_id,
+                    canonical_state_signature_preimage(manifest),
+                )
+            )
+            .rstrip(b"=")
+            .decode()
+        }
+    )
+    envelope = original.envelope.model_copy(
+        update={
+            "manifest_digest": "sha256:" + hashlib.sha256(manifest.canonical_bytes()).hexdigest(),
+            "bundle_digest": manifest.bundle_digest,
+            "authority_digest": manifest.authority_digest,
+            "authority_attestation": attestation,
+            "signatures": (signed,),
+        }
+    )
+    name = f"{manifest.graph_version}-{manifest.bundle_digest[7:]}"
+    return restore_module.SharedStateArtifacts(
+        manifest.canonical_bytes(),
+        bundle,
+        envelope.canonical_bytes(),
+        f"bundles/{name}.intent",
+        f"signatures/{name}.json",
+    )
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        "unrelated_root",
+        "non_descendant",
+        "absent_b",
+        "different_certificate",
+        "invalid_b_certificate_signature",
+        "inactive_b",
+        "wrong_ci",
+        "changed_sequence",
+        "changed_existing_member",
+        "invalid_attestation",
+        "changed_response_keys",
+        "extra_artifact",
+    ],
+)
+def test_pending_join_rejects_every_non_exact_enrollment_without_installing(tmp_path, change):
+    from datetime import timedelta
+
+    from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
+
+    from intent_engineering.team_state.authority import issue_device_certificate
+    from intent_engineering.team_state.models import CiRecipientRecord, DeviceRevocationV2
+
+    f = enrolled_candidate(tmp_path)
+    registry = f.publication.authority
+    b_member = f.pending.response.proposed_member
+    if change == "absent_b":
+        registry = registry.model_copy(
+            update={
+                "members": tuple(m for m in registry.members if m != b_member),
+                "device_certificates": tuple(
+                    c
+                    for c in registry.device_certificates
+                    if c.claims.member_id != b_member.member_id
+                ),
+            }
+        )
+    elif change == "different_certificate":
+        cert = issue_device_certificate(
+            f.pending.response.proposed_certificate_claims.model_copy(update={"serial": 99}),
+            f.a._root_store,
+        )
+        registry = registry.model_copy(
+            update={
+                "members": tuple(
+                    m.model_copy(update={"device_certificate_ids": (cert.certificate_id,)})
+                    if m == b_member
+                    else m
+                    for m in registry.members
+                ),
+                "device_certificates": tuple(
+                    sorted(
+                        (
+                            *(
+                                c
+                                for c in registry.device_certificates
+                                if c.claims.member_id != b_member.member_id
+                            ),
+                            cert,
+                        ),
+                        key=lambda c: c.certificate_id,
+                    )
+                ),
+            }
+        )
+    elif change == "inactive_b":
+        registry = registry.model_copy(
+            update={
+                "members": tuple(
+                    m.model_copy(update={"status": "revoked", "revoked_at": f.at})
+                    if m == b_member
+                    else m
+                    for m in registry.members
+                )
+            }
+        )
+        registry = registry.model_copy(
+            update={
+                "revocations": (
+                    DeviceRevocationV2(
+                        certificate_id=b_member.device_certificate_ids[0],
+                        revoked_at=f.at,
+                        reason="member-removed",
+                        sponsor_member_id=f.pending.invite.sponsor_member_id,
+                    ),
+                )
+            }
+        )
+    elif change == "invalid_b_certificate_signature":
+        registry = registry.model_copy(
+            update={
+                "device_certificates": tuple(
+                    c.model_copy(update={"root_signature": "A" * 86})
+                    if c.claims.member_id == b_member.member_id
+                    else c
+                    for c in registry.device_certificates
+                )
+            }
+        )
+    elif change == "wrong_ci":
+        registry = registry.model_copy(
+            update={
+                "ci_recipient": CiRecipientRecord(
+                    project_id="project",
+                    repository_id=registry.repository_id,
+                    runner_id="other-runner",
+                    public_key=base64.urlsafe_b64encode(
+                        X25519PrivateKey.from_private_bytes(b"d" * 32)
+                        .public_key()
+                        .public_bytes_raw()
+                    )
+                    .rstrip(b"=")
+                    .decode(),
+                )
+            }
+        )
+    elif change == "changed_sequence":
+        registry = registry.model_copy(update={"sequence": 3})
+    elif change == "changed_existing_member":
+        registry = registry.model_copy(
+            update={
+                "members": tuple(
+                    m.model_copy(update={"enrolled_at": m.enrolled_at - timedelta(days=1)})
+                    if m != b_member
+                    else m
+                    for m in registry.members
+                )
+            }
+        )
+    release = _reseal_enrollment(f, registry) if registry != f.publication.authority else f.release
+    if change == "unrelated_root":
+        manifest = json.loads(release.manifest)
+        manifest["root_key_id"] = "root:sha256:" + "0" * 64
+        release = replace(
+            release, manifest=json.dumps(manifest, separators=(",", ":"), sort_keys=True).encode()
+        )
+    elif change == "invalid_attestation":
+        envelope = json.loads(release.signatures)
+        envelope["authority_attestation"]["root_signature"] = "A" * 86
+        release = replace(
+            release, signatures=json.dumps(envelope, separators=(",", ":"), sort_keys=True).encode()
+        )
+    elif change == "changed_response_keys":
+        path = f.target / ".intent/team-join-pending.json"
+        doc = json.loads(path.read_bytes())
+        doc["response"]["signing_public_key"] = "A" * 43
+        path.write_bytes(json.dumps(doc, separators=(",", ":"), sort_keys=True).encode())
+    install_state_ref(
+        f.target, release, parent=None if change == "non_descendant" else f.parent.commit
+    )
+    if change == "extra_artifact":
+        git(f.target, "read-tree", restore_module.STATE_REF)
+        blob = git(f.target, "hash-object", "-w", "--stdin", input_bytes=b"{}").decode().strip()
+        git(
+            f.target,
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            "100644",
+            blob,
+            "authority/team-authority.json",
+        )
+        tree = git(f.target, "write-tree").decode().strip()
+        commit = (
+            git(
+                f.target,
+                "commit-tree",
+                tree,
+                "-p",
+                f.parent.commit,
+                input_bytes=b"extra artifact\n",
+            )
+            .decode()
+            .strip()
+        )
+        git(f.target, "update-ref", restore_module.STATE_REF, commit)
+    result = GitSharedStateRestorer(
+        f.provider,
+        clock=lambda: f.at,
+        device_key_store=f.b._device_store,
+        governance_registry=f.governance,
+    ).verify_and_restore_approved_baseline(f.target)
+    assert result.status is SharedStateRestoreStatus.INVALID
+    assert not (f.target / ".intent/team-trust.json").exists()
+    assert not (f.target / ".intent/graph.yaml").exists()
+
+
+@pytest.mark.parametrize(
+    "boundary",
+    [
+        "journal_prepared",
+        "target:state_0",
+        *[f"target:state_{index}" for index in range(1, 10)],
+        "target:shared_state",
+        "target:checkpoints",
+        "target:governance",
+        "target:team_trust",
+        "target:pending_join_trust",
+        "existing_precommit",
+        "journal_committed",
+        "journal_cleaned",
+    ],
+)
+def test_pending_join_process_crash_recovers_complete_state_before_retry(
+    tmp_path, boundary, monkeypatch
+):
+    import keyring
+
+    f = enrolled_candidate(tmp_path)
+    monkeypatch.setattr(keyring, "get_password", f.b._device_store._backend.get_password)
+    pid = os.fork()
+    if pid == 0:
+        restorer = GitSharedStateRestorer(
+            f.provider,
+            clock=lambda: f.at,
+            device_key_store=f.b._device_store,
+            governance_registry=f.governance,
+            fault_hook=lambda stage: os._exit(83) if stage == boundary else None,
+        )
+        restorer.verify_and_restore_approved_baseline(f.target)
+        os._exit(84)
+    _, status = os.waitpid(pid, 0)
+    assert os.waitstatus_to_exitcode(status) == 83
+    result = GitSharedStateRestorer(
+        f.provider,
+        clock=lambda: f.at,
+        governance_registry=f.governance,
+    ).verify_and_restore_approved_baseline(f.target)
+    assert result.status is SharedStateRestoreStatus.VERIFIED
+    assert canonical_files(f.target) == f.files
+    assert f.provider.load_pending_join() is None
+    assert (
+        f.provider.load_versioned().accepted_bundle_digest == f.publication.manifest.bundle_digest
+    )
+    metadata = f.target.stat()
+    record = f.governance.lookup(
+        "github.com/acme/project", (metadata.st_dev, metadata.st_ino)
+    ).record
+    assert record.bundle_digest == f.publication.manifest.bundle_digest
+
+
+def test_pending_join_tree_swap_before_commit_restores_original_complete_tree(tmp_path):
+    f = enrolled_candidate(tmp_path)
+    original = (f.target / ".intent/team-join-pending.json").read_bytes()
+
+    def swap(stage):
+        if stage == "existing_precommit":
+            (f.target / ".intent").rename(f.target / "moved-intent")
+            (f.target / ".intent").mkdir(mode=0o700)
+
+    result = GitSharedStateRestorer(
+        f.provider,
+        clock=lambda: f.at,
+        device_key_store=f.b._device_store,
+        governance_registry=f.governance,
+        fault_hook=swap,
+    ).verify_and_restore_approved_baseline(f.target)
+    assert result.status is SharedStateRestoreStatus.INVALID
+    assert (f.target / ".intent/team-join-pending.json").read_bytes() == original
+    assert not (f.target / ".intent/graph.yaml").exists()
+    assert f.provider.load_pending_join() == f.pending
+    assert f.provider.load_versioned() is None
+
+
+def test_pending_join_uses_its_durable_keyring_binding_without_injected_private_keys(
+    tmp_path, monkeypatch
+):
+    import keyring
+
+    f = enrolled_candidate(tmp_path)
+    backend = f.b._device_store._backend
+    monkeypatch.setattr(keyring, "get_password", backend.get_password)
+    result = GitSharedStateRestorer(
+        f.provider, clock=lambda: f.at, governance_registry=f.governance
+    ).verify_and_restore_approved_baseline(f.target)
+    assert result.status is SharedStateRestoreStatus.VERIFIED
+    assert (
+        GitSharedStateRestorer(f.provider, clock=lambda: f.at, governance_registry=f.governance)
+        .verify_and_restore_approved_baseline(f.target)
+        .status
+        is SharedStateRestoreStatus.VERIFIED
+    )
+
+
+def test_legacy_workspace_without_v2_trust_remains_unavailable_not_invalid(tmp_path):
+    from intent_engineering.team_state.local_trust import LocalTrustProvider
+
+    target = init_repository(tmp_path / "legacy")
+    (target / ".intent").mkdir(mode=0o755)
+    result = GitSharedStateRestorer(
+        LocalTrustProvider(target)
+    ).verify_and_restore_approved_baseline(target)
+    assert result.status is SharedStateRestoreStatus.UNAVAILABLE
+
+
+def test_keyring_decryption_cancellation_is_scrubbed_without_exporting_keys(tmp_path):
+    from intent_engineering.team_state.keys import RecipientKeyStoreError
+
+    f = enrolled_candidate(tmp_path)
+    store = f.b._device_store
+    for bundle, aad in ((b"{}", b"context"), (f.publication.bundle, b"x" * 65537)):
+        with pytest.raises(RecipientKeyStoreError) as invalid:
+            store.decrypt_bundle(f.pending.local_recipient_key_id, bundle, aad)
+        assert invalid.value.__context__ is None
+
+    class Cancelled(BaseException):
+        pass
+
+    signal = Cancelled("private-keyring-context")
+    signal.private = "private-keyring-context"
+
+    def cancel(service, account):
+        raise signal
+
+    store._backend.get_password = cancel
+    with pytest.raises(Cancelled) as caught:
+        store.decrypt_bundle(f.pending.local_recipient_key_id, f.publication.bundle, b"context")
+    assert caught.value is signal
+    assert caught.value.args == ()
+    assert caught.value.__dict__ == {}
+
+
 def _approved_source(path: Path) -> Path:
     source = path / "source" / "project"
     source.mkdir(parents=True)

@@ -206,6 +206,8 @@ class DeviceKeyStore(Protocol):
 
     def sign(self, signature_id: str, preimage: bytes) -> bytes: ...
 
+    def decrypt_bundle(self, recipient_key_id: str, bundle: bytes, aad: bytes) -> bytes: ...
+
     def prove_recipient_possession(
         self, recipient_key_id: str, challenge_public_key: bytes, subject: bytes
     ) -> bytes: ...
@@ -719,6 +721,49 @@ class KeyringDeviceKeyStore:
             signing = b""
         assert failure is not None
         del recipient, signing, signature_id, preimage, self
+        raise failure.with_traceback(None)
+
+    def decrypt_bundle(self, recipient_key_id: str, bundle: bytes, aad: bytes) -> bytes:
+        """Decrypt bounded authenticated bytes without exporting a device key."""
+        from intent_engineering.storage.jsonl.strict import loads_strict_object
+        from intent_engineering.team_state.crypto import (
+            EncryptedBundle,
+            canonical_encrypted_bundle_bytes,
+            decrypt_bundle,
+        )
+        from intent_engineering.team_state.models import MAX_BUNDLE_BYTES
+
+        failure: BaseException | None = None
+        recipient = signing = b""
+        try:
+            if (
+                type(bundle) is not bytes
+                or not bundle
+                or len(bundle) > MAX_BUNDLE_BYTES
+                or type(aad) is not bytes
+                or not aad
+                or len(aad) > 64 * 1024
+            ):
+                raise ValueError("invalid device decryption input")
+            loads_strict_object(bundle.decode("utf-8"))
+            envelope = EncryptedBundle.model_validate_json(bundle)
+            if canonical_encrypted_bundle_bytes(envelope) != bundle:
+                raise ValueError("invalid device decryption input")
+            recipient, signing = self._load_or_create(create=False)
+            if recipient_key_id != self._material(recipient, signing).recipient_key_id:
+                raise ValueError("device recipient key mismatch")
+            return decrypt_bundle(envelope, recipient, aad)
+        except BaseException as error:  # noqa: BLE001 - secret-bearing boundary
+            import traceback
+
+            if error.__traceback__ is not None:
+                traceback.clear_frames(error.__traceback__)
+            error.__dict__.clear()
+            failure = _prepare_device_failure(error)
+        finally:
+            recipient = signing = b""
+        assert failure is not None
+        del self, bundle, aad, recipient_key_id, recipient, signing
         raise failure.with_traceback(None)
 
     def prove_recipient_possession(

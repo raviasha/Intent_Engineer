@@ -7,6 +7,8 @@ import os
 import re
 import secrets
 import stat
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated, Literal
@@ -317,6 +319,52 @@ class GovernanceRegistry:
 
     def __init__(self, root: Path) -> None:
         self._root = Path(os.path.abspath(root))
+
+    @contextmanager
+    def activation_target(self, *, recovering: bool = False) -> Iterator[SecureFile]:
+        """Hold the public registry target for the restore-owned cross-state journal."""
+        directory = _open_registry_root(self._root, create=True)
+        if directory is None:
+            raise UnsafePathError()
+        target = directory.file(_REGISTRY_NAME)
+        try:
+            with same_path_lock(target):
+                if not recovering:
+                    _read_document(directory, target)
+                yield target
+        finally:
+            target.close()
+            directory.close()
+
+    @staticmethod
+    def activation_content(content: bytes | None, record: GovernanceRecord) -> bytes:
+        """Preserve other repositories and checkout identities in an exact transaction."""
+        from intent_engineering.storage.jsonl.strict import loads_strict_object
+
+        if content is not None:
+            if len(content) > _MAX_REGISTRY_BYTES:
+                raise UnsafePathError()
+            loads_strict_object(content.decode("utf-8"))
+            document = _GovernanceRegistryDocument.model_validate_json(content)
+            if document.canonical_bytes() != content:
+                raise UnsafePathError()
+        else:
+            document = _GovernanceRegistryDocument()
+        records = {item.repository_id: item for item in document.records}
+        previous = records.get(record.repository_id)
+        if previous is not None:
+            if previous.project_id != record.project_id:
+                raise UnsafePathError()
+            record = record.model_copy(
+                update={
+                    "checkout_ids": tuple(sorted(set(previous.checkout_ids + record.checkout_ids)))
+                }
+            )
+        records[record.repository_id] = record
+        result = _GovernanceRegistryDocument(records=tuple(records[k] for k in sorted(records)))
+        if len(result.canonical_bytes()) > _MAX_REGISTRY_BYTES:
+            raise UnsafePathError()
+        return result.canonical_bytes()
 
     def lookup(
         self, repository_id: str | None, directory_identity: tuple[int, int]

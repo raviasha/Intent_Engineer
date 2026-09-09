@@ -9,7 +9,7 @@ import re
 import stat
 import traceback
 from collections.abc import Callable, Iterator, Mapping
-from contextlib import ExitStack, contextmanager
+from contextlib import AbstractContextManager, ExitStack, contextmanager, nullcontext
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, NoReturn
 
@@ -25,6 +25,7 @@ from intent_engineering.storage.secure import SecureDirectory, SecureFile
 from intent_engineering.storage.transaction import LocalTransaction, LocalTransactionCoordinator
 from intent_engineering.team_state.enrollment import JoinResponseV2, TeamInviteV2
 from intent_engineering.team_state.keys import (
+    DeviceEnrollmentBinding,
     GitHubIdentity,
     KeyringRecipientKeyStore,
     RecipientEnrollmentBinding,
@@ -154,6 +155,7 @@ class LocalTrustConfigV2(StrictModel):
     accepted_authority_digest: str = Field(pattern=_SHA256.pattern)
     accepted_authority_sequence: int = Field(ge=1, le=2**63 - 1)
     accepted_bundle_digest: str = Field(pattern=_SHA256.pattern)
+    device_binding: DeviceEnrollmentBinding | None = None
 
     @field_validator("schema_version", "accepted_authority_sequence", mode="before")
     @classmethod
@@ -169,6 +171,11 @@ class LocalTrustConfigV2(StrictModel):
         root = self.root
         if root.project_id != self.project_id or root.repository_id != self.repository_id:
             raise ValueError("version two local trust scope changed")
+        if self.device_binding is not None and (
+            self.device_binding.project_id != self.project_id
+            or self.device_binding.repository_id != self.repository_id
+        ):
+            raise ValueError("version two device binding changed")
         return self
 
     def canonical_bytes(self) -> bytes:
@@ -237,6 +244,8 @@ class StateInstallTransaction:
         install_state: Callable[[LocalTransaction], None],
         *,
         fault_hook: Callable[[str], None] | None = None,
+        verify_installed: Callable[[], None] | None = None,
+        install_scope: Callable[[], AbstractContextManager[object]] | None = None,
     ) -> None:
         if not state_targets or any(
             name in {"team_trust", "pending_join_trust"} for name in state_targets
@@ -246,6 +255,8 @@ class StateInstallTransaction:
         self._state_targets = {name: target.duplicate() for name, target in state_targets.items()}
         self._install_state = install_state
         self._fault_hook = fault_hook
+        self._verify_installed = verify_installed
+        self._install_scope = install_scope or nullcontext
 
     def close(self) -> None:
         self._journal.close()
@@ -297,7 +308,11 @@ class StateInstallTransaction:
     ) -> None:
         coordinator = self._coordinator(pending_target, active_target)
         try:
-            with coordinator.transaction(rollback_base_exceptions=True) as transaction:
+            with (
+                coordinator.coordinated(),
+                self._install_scope(),
+                coordinator.transaction(rollback_base_exceptions=True) as transaction,
+            ):
                 if transaction.read_optional("pending_join_trust") != pending_preimage:
                     raise ValueError("pending join trust changed")
                 active = transaction.read_optional("team_trust")
@@ -318,6 +333,8 @@ class StateInstallTransaction:
                     dir_fd=pending_target.parent_fd,
                     follow_symlinks=False,
                 )
+                if self._verify_installed is not None:
+                    self._verify_installed()
         finally:
             try:
                 _harden_owner_target(active_target)
@@ -444,6 +461,7 @@ def _read_pending(directory: SecureDirectory, target: SecureFile) -> PendingJoin
     content, metadata = _read_locked_descriptor(target, max_bytes=MAX_PENDING_JOIN_BYTES)
     if content is None or content == b"":
         return None
+    _require_owner_directory(directory, harden=False)
     assert metadata is not None
     _require_owner_metadata(metadata)
     loads_strict_object(content.decode("utf-8"))
@@ -625,6 +643,22 @@ class LocalTrustProvider:
     def __init__(self, root: Path) -> None:
         self._root = root
 
+    def requires_activation_recovery(self) -> bool:
+        """Check the fixed journal name before parsing potentially interrupted trust."""
+        try:
+            project, workspace = _open_workspace(self._root, harden=None)
+        except FileNotFoundError:
+            return False
+        try:
+            target = workspace.file(_ACTIVATION_JOURNAL_FILENAME)
+            try:
+                return target.exists()
+            finally:
+                target.close()
+        finally:
+            workspace.close()
+            project.close()
+
     def load_versioned(self) -> LocalTrustConfig | LocalTrustConfigV2 | None:
         """Read exact public trust without using it as secret-bearing authority."""
         caught: BaseException
@@ -657,7 +691,7 @@ class LocalTrustProvider:
         """Read a public join receipt; its presence never activates device authority."""
         caught: BaseException
         try:
-            project, workspace = _open_workspace(self._root, harden=False)
+            project, workspace = _open_workspace(self._root, harden=None)
             try:
                 target = workspace.file(_PENDING_FILENAME)
                 try:

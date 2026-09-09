@@ -71,6 +71,124 @@ NOW = datetime(2026, 8, 30, 12, 0, tzinfo=UTC)
 ORIGIN = "http://localhost:43127"
 
 
+def test_restored_member_opens_control_plane_as_active_v2_without_legacy_enrollment(tmp_path):
+    from intent_engineering.team_state.restore import GitSharedStateRestorer
+    from tests.integration.team_state.test_restore import enrolled_candidate
+
+    f = enrolled_candidate(tmp_path)
+    assert (
+        GitSharedStateRestorer(
+            f.provider,
+            clock=lambda: f.at,
+            device_key_store=f.b._device_store,
+            governance_registry=f.governance,
+        )
+        .verify_and_restore_approved_baseline(f.target)
+        .status
+        is SharedStateRestoreStatus.VERIFIED
+    )
+    runtime = load_runtime(f.target)
+    try:
+        service = ControlPlaneService(runtime, origin=ORIGIN, clock=lambda: f.at)
+        try:
+            status = service.team_enrollment_status()
+            assert status["status"] == "active"
+            assert status["member_id"] == f.pending.response.proposed_member.member_id
+            assert status["repository_id"] == "github.com/acme/project"
+        finally:
+            service.close()
+    finally:
+        runtime.close()
+
+
+def test_team_reconciliation_binds_current_local_remote_and_fresh_webauthn(tmp_path):
+    from intent_engineering.team_state.reconciliation import ReconciliationService
+    from tests.unit.team_state.test_reconciliation import _changed, reconciliation_fixture
+
+    f, common, remote, local, authority = reconciliation_fixture(tmp_path)
+    local = _changed(
+        local,
+        "approvals/policy.yaml",
+        yaml.safe_dump(_policy("github:100"), sort_keys=True).encode(),
+    )
+    for name in ("cache", "connectors", "renders"):
+        (f.target / ".intent" / name).mkdir(exist_ok=True)
+    for item in local.files:
+        target = f.target / ".intent" / item.path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(item.content)
+    runtime = load_runtime(f.target)
+    verifier = _Verifier()
+    current = [remote]
+    service = ControlPlaneService(
+        runtime,
+        origin=ORIGIN,
+        clock=lambda: f.at,
+        webauthn_verifier=verifier,
+        team_repository_id=remote.manifest.repository_id,
+        reconciliation_service=ReconciliationService(
+            authority_provider=authority, device_signer=f.a._device_store, clock=lambda: f.at
+        ),
+        reconciliation_remote=lambda: current[0],
+    )
+    runtime.webauthn_credentials.put(
+        CredentialRecord(
+            id="credential:alice",
+            project_id="project",
+            repository_id=service.repository_id,
+            actor="github:100",
+            credential_id="Y29udHJvbC1wbGFuZS1jcmVkZW50aWFs",
+            public_key="cHVibGljLWtleQ",
+            sign_count=0,
+            created_at=f.at,
+        )
+    )
+    try:
+        unresolved = service.team_reconciliation_preview(common=common)
+        assert unresolved["conflicts"] == ["graph.yaml"]
+        assert "payload" not in unresolved
+        preview = service.team_reconciliation_preview(
+            common=common, choices={"graph.yaml": "local"}
+        )
+        assert "private local choice" not in json.dumps(preview)
+        payload = HumanDecisionPayload.model_validate_json(json.dumps(preview["payload"]))
+        with pytest.raises(ControlPlaneError):
+            service.team_reconciliation_prepare(b"signed-assertion", payload)
+
+        class Cancelled(BaseException):
+            pass
+
+        cancellation = Cancelled("private-reconciliation-signal")
+        cancellation.private = "private-reconciliation-signal"
+
+        def cancel():
+            raise cancellation
+
+        service._reconciliation_remote = cancel
+        with pytest.raises(Cancelled) as caught:
+            service.team_reconciliation_preview(common=common)
+        assert caught.value is cancellation
+        assert caught.value.args == ()
+        assert caught.value.__dict__ == {}
+        service._reconciliation_remote = lambda: current[0]
+        service.team_reconciliation_options(payload)
+        assert verifier.authentication_requests[-1].payload_bytes == payload.canonical_bytes()
+        current[0] = common
+        with pytest.raises(ControlPlaneError):
+            service.team_reconciliation_prepare(b"signed-assertion", payload)
+        current[0] = remote
+        prepared = service.team_reconciliation_prepare(b"signed-assertion", payload)
+        assert prepared.manifest.parent_bundle_digest == remote.manifest.bundle_digest
+        assert (f.target / ".intent/graph.yaml").read_bytes() == next(
+            i.content for i in local.files if i.path == "graph.yaml"
+        )
+        with pytest.raises(ControlPlaneError):
+            service.team_reconciliation_prepare(b"signed-assertion", payload)
+    finally:
+        service.close()
+        runtime.close()
+
+
 @dataclass
 class _Verifier(WebAuthnVerifier):
     registration_requests: list[RegistrationRequest] = field(default_factory=list)

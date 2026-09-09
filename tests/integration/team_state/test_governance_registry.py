@@ -23,6 +23,59 @@ MARKER = {
 }
 
 
+def test_join_activation_rejects_permissive_existing_governance_without_hardening_it(tmp_path):
+    from intent_engineering.intent_workflow.check import SharedStateRestoreStatus
+    from intent_engineering.team_state.restore import GitSharedStateRestorer
+    from tests.integration.team_state.test_restore import enrolled_candidate
+
+    f = enrolled_candidate(tmp_path)
+    identity = (f.target.stat().st_dev, f.target.stat().st_ino)
+    f.governance.remember(
+        repository_id=REPOSITORY_ID,
+        project_id="project",
+        directory_identity=identity,
+        marker=MARKER,
+    )
+    path = tmp_path / "governance/governance-v1.json"
+    before = path.read_bytes()
+    path.chmod(0o644)
+    result = GitSharedStateRestorer(
+        f.provider,
+        clock=lambda: f.at,
+        device_key_store=f.b._device_store,
+        governance_registry=f.governance,
+    ).verify_and_restore_approved_baseline(f.target)
+    assert result.status is SharedStateRestoreStatus.INVALID
+    assert path.read_bytes() == before
+    assert stat.S_IMODE(path.stat().st_mode) == 0o644
+    assert f.provider.load_pending_join() == f.pending
+
+
+def test_join_activation_rechecks_governance_at_the_last_transaction_boundary(tmp_path):
+    from intent_engineering.intent_workflow.check import SharedStateRestoreStatus
+    from intent_engineering.team_state.restore import GitSharedStateRestorer
+    from tests.integration.team_state.test_restore import enrolled_candidate
+
+    f = enrolled_candidate(tmp_path)
+    path = tmp_path / "governance/governance-v1.json"
+
+    def change(stage):
+        if stage == "existing_precommit":
+            path.write_bytes(b"{}")
+
+    result = GitSharedStateRestorer(
+        f.provider,
+        clock=lambda: f.at,
+        device_key_store=f.b._device_store,
+        governance_registry=f.governance,
+        fault_hook=change,
+    ).verify_and_restore_approved_baseline(f.target)
+    assert result.status is SharedStateRestoreStatus.INVALID
+    assert not path.exists()
+    assert f.provider.load_pending_join() == f.pending
+    assert f.provider.load_versioned() is None
+
+
 def test_registry_is_canonical_owner_only_and_binds_each_exact_checkout(tmp_path: Path) -> None:
     """Catches secrets, permissive modes, or last-checkout-wins governance records."""
     registry_root = tmp_path / "registry"
