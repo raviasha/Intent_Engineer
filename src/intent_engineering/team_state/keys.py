@@ -16,9 +16,11 @@ from pathlib import Path
 from typing import Annotated, Protocol, cast
 
 import keyring
-from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
+from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from pydantic import ConfigDict, Field, ValidationInfo, field_validator, model_validator
 
 from intent_engineering.core.models._base import StrictModel
@@ -187,8 +189,18 @@ class DevicePublicMaterial:
     signing_public_key: bytes
 
 
+@dataclass(frozen=True, slots=True)
+class DeviceSealedIdentityProof:
+    """Ciphertext-only result of sealing one bounded identity proof to the sponsor."""
+
+    nonce: bytes
+    ciphertext: bytes
+
+
 class DeviceKeyStore(Protocol):
     """Non-exporting device recipient and signing key boundary."""
+
+    def enrollment_binding(self) -> DeviceEnrollmentBinding: ...
 
     def create(self, binding: DeviceEnrollmentBinding) -> DevicePublicMaterial: ...
 
@@ -197,6 +209,14 @@ class DeviceKeyStore(Protocol):
     def prove_recipient_possession(
         self, recipient_key_id: str, challenge_public_key: bytes, subject: bytes
     ) -> bytes: ...
+
+    def seal_identity_proof(
+        self,
+        recipient_key_id: str,
+        challenge_public_key: bytes,
+        plaintext: bytes,
+        aad: bytes,
+    ) -> DeviceSealedIdentityProof: ...
 
 
 def _prepare_device_failure(error: BaseException) -> BaseException:
@@ -654,6 +674,10 @@ class KeyringDeviceKeyStore:
             signing_public_key=signing_public,
         )
 
+    def enrollment_binding(self) -> DeviceEnrollmentBinding:
+        """Return the immutable public slot binding without touching keyring material."""
+        return DeviceEnrollmentBinding.model_validate(self._binding.model_dump(mode="python"))
+
     def create(self, binding: DeviceEnrollmentBinding) -> DevicePublicMaterial:
         """Create both private keys locally and return only their public material."""
         failure: BaseException | None = None
@@ -721,6 +745,56 @@ class KeyringDeviceKeyStore:
         del recipient, signing, recipient_key_id, challenge_public_key, subject, self
         raise failure.with_traceback(None)
 
+    def seal_identity_proof(
+        self,
+        recipient_key_id: str,
+        challenge_public_key: bytes,
+        plaintext: bytes,
+        aad: bytes,
+    ) -> DeviceSealedIdentityProof:
+        """Encrypt an opaque one-time GitHub proof without exporting the recipient key."""
+        failure: BaseException | None = None
+        recipient = signing = shared = key = b""
+        try:
+            if (
+                type(challenge_public_key) is not bytes
+                or len(challenge_public_key) != 32
+                or type(plaintext) is not bytes
+                or not plaintext
+                or len(plaintext) > 16 * 1024
+                or type(aad) is not bytes
+                or not aad
+                or len(aad) > 64 * 1024
+            ):
+                raise ValueError("invalid identity proof sealing input")
+            recipient, signing = self._load_or_create(create=False)
+            if (
+                type(recipient_key_id) is not str
+                or recipient_key_id != self._material(recipient, signing).recipient_key_id
+            ):
+                raise ValueError("device recipient key mismatch")
+            shared = X25519PrivateKey.from_private_bytes(recipient).exchange(
+                X25519PublicKey.from_public_bytes(challenge_public_key)
+            )
+            key = HKDF(
+                algorithm=hashes.SHA256(),
+                length=32,
+                salt=None,
+                info=b"intent.team-enrollment-github-proof.v2\0" + aad,
+            ).derive(shared)
+            nonce = os.urandom(12)
+            return DeviceSealedIdentityProof(
+                nonce=nonce,
+                ciphertext=AESGCM(key).encrypt(nonce, plaintext, aad),
+            )
+        except BaseException as error:  # noqa: BLE001
+            failure = _prepare_device_failure(error)
+        finally:
+            recipient = signing = shared = key = plaintext = b""
+        assert failure is not None
+        del recipient_key_id, challenge_public_key, aad, self
+        raise failure.with_traceback(None)
+
     def __repr__(self) -> str:
         return "KeyringDeviceKeyStore()"
 
@@ -729,6 +803,7 @@ __all__ = [
     "DeviceEnrollmentBinding",
     "DeviceKeyStore",
     "DevicePublicMaterial",
+    "DeviceSealedIdentityProof",
     "GitHubIdentity",
     "GitHubIdentityVerifier",
     "InMemoryRecipientKeyStore",

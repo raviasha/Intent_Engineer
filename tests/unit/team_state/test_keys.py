@@ -363,6 +363,30 @@ def test_device_store_creates_separate_recipient_and_signing_keys(
     assert public.recipient_key_id != public.signature_id
 
 
+def test_device_store_exposes_only_its_public_enrollment_binding(tmp_path: Path) -> None:
+    """Catches enrollment services reaching through the key boundary for private material."""
+    backend = _Backend()
+    binding = DeviceEnrollmentBinding(
+        project_id="alpha",
+        repository_id="github.com/acme/alpha",
+        actor="github:101",
+        github_account_id=101,
+        github_login="asha",
+        device_id="device:" + "1" * 32,
+    )
+    store = KeyringDeviceKeyStore(
+        binding,
+        backend=backend,
+        recipient_private_key_source=lambda: b"x" * 32,
+        signing_private_key_source=lambda: b"s" * 32,
+        lock_root=tmp_path / "device-locks",
+    )
+
+    assert store.enrollment_binding() == binding
+    assert "private" not in repr(store.enrollment_binding()).lower()
+    assert backend.values == {}
+
+
 def test_device_store_rejects_wrong_ids_without_leaking_private_values(tmp_path: Path) -> None:
     """Catches cross-device key selection and secret-bearing backend diagnostics."""
     backend = _Backend()
