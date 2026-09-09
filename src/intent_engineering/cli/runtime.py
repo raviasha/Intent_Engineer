@@ -56,6 +56,7 @@ from intent_engineering.intent_workflow.check import (
     evidence_repository_id,
 )
 from intent_engineering.intent_workflow.dev_observer import DevObserver, TestRunStatus
+from intent_engineering.intent_workflow.enrichment_store import EnrichmentSessionStore
 from intent_engineering.intent_workflow.models import (
     ClarificationEvent,
     IntentProposal,
@@ -255,6 +256,7 @@ class Runtime:
     evidence_store: JsonlEvidenceStore
     case_store: JsonlCaseStore
     intent_proposals: IntentProposalStore
+    enrichment_sessions: EnrichmentSessionStore
     webauthn_credentials: WebAuthnCredentialStore
     webauthn_challenges: WebAuthnChallengeStore
     checkpoint_store: YamlCheckpointStore
@@ -285,6 +287,7 @@ class Runtime:
     def close(self) -> None:
         """Release every descriptor owned by this assembled runtime after it quiesces."""
         self.sync.close()
+        self.enrichment_sessions.close()
         self.intent_proposals.close()
         self.webauthn_credentials.close()
         self.webauthn_challenges.close()
@@ -596,6 +599,7 @@ def load_runtime(root: Path, *, assurance_workspace: Path | None = None) -> Runt
     receipts_file = workspace_directory.file("approvals/receipts.jsonl")
     approvals_file = workspace_directory.file("approvals/approvals.jsonl")
     intent_proposals_file = workspace_directory.file("history/intent-proposals.jsonl")
+    enrichment_sessions_file = workspace_directory.file("history/enrichment-sessions.jsonl")
     webauthn_credentials_file = workspace_directory.file("approvals/webauthn-credentials.jsonl")
     webauthn_challenges_file = workspace_directory.file("approvals/webauthn-challenges.jsonl")
     transactions = LocalTransactionCoordinator(
@@ -608,6 +612,7 @@ def load_runtime(root: Path, *, assurance_workspace: Path | None = None) -> Runt
             "receipts": receipts_file,
             "approvals": approvals_file,
             "intent_proposals": intent_proposals_file,
+            "enrichment_sessions": enrichment_sessions_file,
             "webauthn_credentials": webauthn_credentials_file,
             "webauthn_challenges": webauthn_challenges_file,
         },
@@ -627,6 +632,19 @@ def load_runtime(root: Path, *, assurance_workspace: Path | None = None) -> Runt
                     "webauthn_challenges",
                 }
             ),
+            frozenset(
+                {
+                    "graph",
+                    "history",
+                    "cases",
+                    "evidence",
+                    "receipts",
+                    "approvals",
+                    "intent_proposals",
+                    "webauthn_credentials",
+                    "webauthn_challenges",
+                }
+            ),
         ),
     )
     # Raw preimages must be restored before a torn YAML or JSONL file reaches a parser.
@@ -639,13 +657,19 @@ def load_runtime(root: Path, *, assurance_workspace: Path | None = None) -> Runt
     evidence_store = JsonlEvidenceStore(evidence_file, transactions=transactions)
     case_store = JsonlCaseStore(case_file)
     intent_proposals_target = transactions.target_file("intent_proposals")
+    enrichment_sessions_target = transactions.target_file("enrichment_sessions")
     try:
         intent_proposals = IntentProposalStore(
             intent_proposals_target,
             transactions=transactions,
         )
+        enrichment_sessions = EnrichmentSessionStore(
+            enrichment_sessions_target,
+            transactions=transactions,
+        )
     finally:
         intent_proposals_target.close()
+        enrichment_sessions_target.close()
     credentials_target = transactions.target_file("webauthn_credentials")
     challenges_target = transactions.target_file("webauthn_challenges")
     try:
@@ -686,6 +710,7 @@ def load_runtime(root: Path, *, assurance_workspace: Path | None = None) -> Runt
         evidence_store=evidence_store,
         case_store=case_store,
         intent_proposals=intent_proposals,
+        enrichment_sessions=enrichment_sessions,
         webauthn_credentials=webauthn_credentials,
         webauthn_challenges=webauthn_challenges,
         checkpoint_store=checkpoint_store,
@@ -726,6 +751,7 @@ def load_assessment_runtime(root: Path) -> AssessmentRuntime:
             "receipts": "approvals/receipts.jsonl",
             "approvals": "approvals/approvals.jsonl",
             "intent_proposals": "history/intent-proposals.jsonl",
+            "enrichment_sessions": "history/enrichment-sessions.jsonl",
             "webauthn_credentials": "approvals/webauthn-credentials.jsonl",
             "webauthn_challenges": "approvals/webauthn-challenges.jsonl",
         }
@@ -749,6 +775,19 @@ def load_assessment_runtime(root: Path) -> AssessmentRuntime:
                         "cases",
                         "evidence",
                         "receipts",
+                        "intent_proposals",
+                        "webauthn_credentials",
+                        "webauthn_challenges",
+                    }
+                ),
+                frozenset(
+                    {
+                        "graph",
+                        "history",
+                        "cases",
+                        "evidence",
+                        "receipts",
+                        "approvals",
                         "intent_proposals",
                         "webauthn_credentials",
                         "webauthn_challenges",
