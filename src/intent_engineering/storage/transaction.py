@@ -130,6 +130,8 @@ class _Journal(StrictModel):
     state: Literal["prepared", "committed"]
     transaction_id: str = Field(pattern=r"^[0-9a-f]{64}$")
     preimages: tuple[_Preimage, ...]
+    scope: str | None = None
+    postimages: tuple[_Preimage, ...] = ()
 
 
 def _digest(content: bytes) -> str:
@@ -268,8 +270,9 @@ class LocalTransaction:
 
     def write(self, name: str, content: bytes) -> None:
         """Durably replace one target and expose its deterministic crash stage."""
-        target = self._target(name)
-        target.atomic_write(content)
+        self._target(name)
+        self._owner._record_recovery_write(name, content)
+        self._owner._write_target(name, content)
         self._owner._fault(f"target:{name}")
 
     def append(self, name: str, content: bytes) -> None:
@@ -309,6 +312,13 @@ class LocalTransactionCoordinator:
         *,
         fault_hook: Callable[[str], None] | None = None,
         legacy_target_sets: Sequence[frozenset[str]] = (),
+        recovery_scope: str | None = None,
+        max_recovery_bytes: int | None = None,
+        recovery_merges: Mapping[
+            str, Callable[[bytes | None, bytes | None, bytes | None], bytes | None]
+        ]
+        | None = None,
+        target_writers: Mapping[str, Callable[[SecureFile, bytes], None]] | None = None,
     ) -> None:
         if not targets or any(not _TARGET_PATTERN.fullmatch(name) for name in targets):
             raise ValueError("invalid local transaction targets")
@@ -332,6 +342,13 @@ class LocalTransactionCoordinator:
         self._thread_state = _TransactionThreadState()
         self.__transaction_authority = object()
         self.__no_recovery_read_authority = object()
+        self._recovery_scope = recovery_scope
+        self._max_recovery_bytes = max_recovery_bytes
+        self._recovery_merges = dict(recovery_merges or {})
+        self._target_writers = dict(target_writers or {})
+        if set(self._recovery_merges) - set(targets):
+            raise ValueError("invalid recovery merge target")
+        self._prepared_journal: _Journal | None = None
 
     def close(self) -> None:
         """Release journal and target descriptors after all transactions quiesce."""
@@ -475,7 +492,15 @@ class LocalTransactionCoordinator:
             yield
 
     def _snapshot(self) -> dict[str, bytes | None]:
-        return {name: self._targets[name].read_optional() for name in sorted(self._targets)}
+        if self._max_recovery_bytes is None:
+            return {name: self._targets[name].read_optional() for name in sorted(self._targets)}
+        result: dict[str, bytes | None] = {}
+        remaining = self._max_recovery_bytes
+        for name in sorted(self._targets):
+            result[name] = self._targets[name].read_optional_nonblocking(max_bytes=remaining)
+            if remaining is not None:
+                remaining -= len(result[name] or b"")
+        return result
 
     def _require_no_recovery_journal(self) -> None:
         """Reject any journal entry by held-directory metadata without reading its payload."""
@@ -511,19 +536,61 @@ class LocalTransactionCoordinator:
             state=state,
             transaction_id=transaction_id,
             preimages=tuple(records),
+            scope=self._recovery_scope,
         )
 
-    def _write_journal(self, journal: _Journal) -> None:
-        payload = json.dumps(
-            journal.model_dump(mode="json", by_alias=True),
+    @staticmethod
+    def _journal_bytes(journal: _Journal) -> bytes:
+        document = journal.model_dump(mode="json", by_alias=True)
+        if journal.scope is None:
+            document.pop("scope")
+        if not journal.postimages:
+            document.pop("postimages")
+        return json.dumps(
+            document,
             ensure_ascii=True,
             separators=(",", ":"),
             sort_keys=True,
         ).encode("utf-8")
+
+    def _write_journal(self, journal: _Journal) -> None:
+        if self._max_recovery_bytes is not None:
+            retained = sum(
+                len(record.content or "") * 3 // 4 - (record.content or "").count("=")
+                for record in (*journal.preimages, *journal.postimages)
+            )
+            if retained > self._max_recovery_bytes:
+                raise TransactionRecoveryError()
+        payload = self._journal_bytes(journal)
         self._journal.atomic_write(payload)
 
+    def _record_recovery_write(self, name: str, content: bytes) -> None:
+        if name not in self._recovery_merges:
+            return
+        journal = self._prepared_journal
+        if journal is None:
+            raise TransactionRecoveryError()
+        post = self._journal_for({name: content}, "prepared", journal.transaction_id).preimages[0]
+        records = {p.target: p for p in journal.postimages}
+        records[name] = post
+        updated = journal.model_copy(
+            update={"postimages": tuple(records[n] for n in sorted(records))}
+        )
+        self._write_journal(updated)
+        self._prepared_journal = updated
+
+    def _write_target(self, name: str, content: bytes) -> None:
+        writer = self._target_writers.get(name)
+        if writer is None:
+            self._targets[name].atomic_write(content)
+        else:
+            writer(self._targets[name], content)
+
     def _read_journal(self) -> tuple[_Journal, dict[str, bytes | None]] | None:
-        content = self._journal.read_optional()
+        limit = self._max_recovery_bytes
+        content = self._journal.read_optional_nonblocking(
+            max_bytes=None if limit is None else (limit * 4 // 3) + 65536
+        )
         if content is None:
             return None
         try:
@@ -535,6 +602,10 @@ class LocalTransactionCoordinator:
                 ),
             )
             journal = _Journal.model_validate(loaded)
+            if journal.scope != self._recovery_scope or (
+                self._recovery_scope is not None and content != self._journal_bytes(journal)
+            ):
+                raise ValueError("journal recovery scope changed")
             names = tuple(record.target for record in journal.preimages)
             name_set = frozenset(names)
             if len(names) != len(name_set) or (
@@ -542,6 +613,7 @@ class LocalTransactionCoordinator:
             ):
                 raise ValueError("journal target set mismatch")
             preimages: dict[str, bytes | None] = {}
+            total = 0
             for record in journal.preimages:
                 if record.content is None:
                     decoded = None
@@ -554,17 +626,54 @@ class LocalTransactionCoordinator:
                 if _digest(digest_content) != record.digest:
                     raise ValueError("preimage digest mismatch")
                 preimages[record.target] = decoded
+                total += len(decoded or b"")
+                if limit is not None and total > limit:
+                    raise ValueError("journal recovery size exceeded")
+            post_names = tuple(record.target for record in journal.postimages)
+            if len(set(post_names)) != len(post_names) or set(post_names) - set(
+                self._recovery_merges
+            ):
+                raise ValueError("journal recovery target changed")
+            for record in journal.postimages:
+                decoded = base64.b64decode(record.content or "", validate=True)
+                if (
+                    _digest(decoded) != record.digest
+                    or base64.b64encode(decoded).decode() != record.content
+                ):
+                    raise ValueError("journal recovery postimage changed")
+                total += len(decoded)
+                if limit is not None and total > limit:
+                    raise ValueError("journal recovery size exceeded")
             return journal, preimages
         except (UnicodeError, json.JSONDecodeError, ValidationError, ValueError) as error:
             raise TransactionRecoveryError() from error
 
-    def _restore(self, preimages: Mapping[str, bytes | None]) -> None:
-        for name in sorted(preimages):
-            content = preimages[name]
+    def _restore(
+        self, preimages: Mapping[str, bytes | None], journal: _Journal | None = None
+    ) -> None:
+        restored = dict(preimages)
+        current = (
+            self._snapshot()
+            if self._max_recovery_bytes is not None or self._recovery_merges
+            else {}
+        )
+        if journal is not None:
+            touched = {record.target for record in journal.postimages}
+            for name in self._recovery_merges.keys() - touched:
+                # No write-ahead postimage means this transaction never touched
+                # the shared target; an intervening writer owns its current bytes.
+                restored.pop(name, None)
+            for record in journal.postimages:
+                post = base64.b64decode(record.content or "", validate=True)
+                restored[record.target] = self._recovery_merges[record.target](
+                    preimages[record.target], post, current[record.target]
+                )
+        for name in sorted(restored):
+            content = restored[name]
             if content is None:
                 self._targets[name].unlink(missing_ok=True)
             else:
-                self._targets[name].atomic_write(content)
+                self._write_target(name, content)
 
     def _recover_unlocked(self) -> bool:
         loaded = self._read_journal()
@@ -573,7 +682,7 @@ class LocalTransactionCoordinator:
         journal, preimages = loaded
         try:
             if journal.state == "prepared":
-                self._restore(preimages)
+                self._restore(preimages, journal)
             self._journal.unlink()
         except Exception as error:
             raise TransactionRecoveryError() from error
@@ -872,6 +981,7 @@ class LocalTransactionCoordinator:
             transaction_id = secrets.token_hex(32)
             prepared = self._journal_for(preimages, "prepared", transaction_id)
             self._write_journal(prepared)
+            self._prepared_journal = prepared
             budget = _ExtraReadBudget(policies)
             transaction = LocalTransaction(
                 self,
@@ -891,14 +1001,16 @@ class LocalTransactionCoordinator:
                 yield transaction
                 if self._thread_state.poisoned:
                     raise ValueError("nested local transaction failed")
-                committed = prepared.model_copy(update={"state": "committed"})
+                committed = (self._prepared_journal or prepared).model_copy(
+                    update={"state": "committed"}
+                )
                 self._write_journal(committed)
                 self._fault("journal_committed")
                 self._journal.unlink()
                 self._fault("journal_cleaned")
             except Exception:
                 try:
-                    self._restore(preimages)
+                    self._restore(preimages, self._prepared_journal)
                     self._journal.unlink(missing_ok=True)
                 except Exception as recovery_error:
                     raise TransactionRecoveryError() from recovery_error
@@ -906,7 +1018,7 @@ class LocalTransactionCoordinator:
             except BaseException:
                 if rollback_base_exceptions:
                     try:
-                        self._restore(preimages)
+                        self._restore(preimages, self._prepared_journal)
                         self._journal.unlink(missing_ok=True)
                     except Exception as recovery_error:
                         raise TransactionRecoveryError() from recovery_error
@@ -919,3 +1031,4 @@ class LocalTransactionCoordinator:
                 self._thread_state.extra_read_policies = {}
                 self._thread_state.extra_read_budget = None
                 self._thread_state.poisoned = False
+                self._prepared_journal = None

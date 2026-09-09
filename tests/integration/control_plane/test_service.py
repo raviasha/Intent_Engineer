@@ -101,11 +101,16 @@ def test_restored_member_opens_control_plane_as_active_v2_without_legacy_enrollm
         runtime.close()
 
 
-def test_team_reconciliation_binds_current_local_remote_and_fresh_webauthn(tmp_path):
+@pytest.mark.parametrize("later_remote", [False, True])
+def test_team_reconciliation_binds_current_local_remote_and_fresh_webauthn(tmp_path, later_remote):
     from intent_engineering.team_state.reconciliation import ReconciliationService
     from tests.unit.team_state.test_reconciliation import _changed, reconciliation_fixture
 
     f, common, remote, local, authority = reconciliation_fixture(tmp_path)
+    if later_remote:
+        from tests.integration.team_state.test_restore import ordinary_descendant
+
+        remote = ordinary_descendant(f, ordinary_descendant(f))
     local = _changed(
         local,
         "approvals/policy.yaml",

@@ -22,6 +22,30 @@ from intent_engineering.storage.transaction import (
 )
 
 
+def test_scoped_journal_accounts_for_shared_postimages_before_any_write(tmp_path):
+    directory = SecureDirectory.open(tmp_path)
+    journal, state, shared = (directory.file(name) for name in ("journal.json", "state", "shared"))
+    state.atomic_write(b"123456")
+    coordinator = LocalTransactionCoordinator(
+        journal,
+        {"state": state, "shared": shared},
+        recovery_scope="bounded",
+        max_recovery_bytes=8,
+        recovery_merges={"shared": lambda before, installed, current: before},
+    )
+    try:
+        with pytest.raises(TransactionRecoveryError), coordinator.transaction() as transaction:
+            transaction.write("shared", b"1234")
+        assert state.read_bytes() == b"123456"
+        assert shared.read_optional() is None
+        assert journal.read_optional() is None
+    finally:
+        coordinator.close()
+        for target in (journal, state, shared):
+            target.close()
+        directory.close()
+
+
 def test_only_live_issued_no_recovery_read_handle_is_authenticated(tmp_path: Path) -> None:
     """Catches forged, stale, recovering, write, or cross-coordinator handles gaining read trust."""
     coordinator, _paths, _journal = _coordinator(tmp_path)

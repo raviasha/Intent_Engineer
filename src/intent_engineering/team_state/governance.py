@@ -337,7 +337,75 @@ class GovernanceRegistry:
             directory.close()
 
     @staticmethod
-    def activation_content(content: bytes | None, record: GovernanceRecord) -> bytes:
+    def write_activation(target: SecureFile, content: bytes) -> None:
+        """Use the registry's owner-only atomic writer even at a process-exit boundary."""
+        directory = SecureDirectory.open(target.path.parent)
+        try:
+            held = os.fstat(target.parent_fd)
+            if directory.identity != (held.st_dev, held.st_ino) or target.name != _REGISTRY_NAME:
+                raise UnsafePathError()
+            _atomic_owner_write(directory, content)
+        finally:
+            directory.close()
+
+    @staticmethod
+    def recover_activation(
+        before: bytes | None,
+        installed: bytes | None,
+        current: bytes | None,
+        *,
+        repository_id: str,
+        directory_identity: tuple[int, int],
+        strict_current: bool = True,
+    ) -> bytes | None:
+        """Undo only the activation's exact record generation, preserving later commits."""
+
+        def records(raw: bytes | None) -> dict[str, GovernanceRecord]:
+            if raw is None:
+                return {}
+            if len(raw) > _MAX_REGISTRY_BYTES:
+                raise UnsafePathError()
+            document = _GovernanceRegistryDocument.model_validate_json(raw)
+            if document.canonical_bytes() != raw:
+                raise UnsafePathError()
+            return {r.repository_id: r for r in document.records}
+
+        old, written = records(before), records(installed)
+        changed = {key for key in old.keys() | written.keys() if old.get(key) != written.get(key)}
+        if len(changed) > 1:
+            raise UnsafePathError()
+        for key in changed:
+            if (
+                key != repository_id
+                or key not in written
+                or local_repository_identity(written[key].project_id, directory_identity)
+                not in written[key].checkout_ids
+            ):
+                raise UnsafePathError()
+        try:
+            live = records(current)
+        except ValueError:
+            if strict_current:
+                raise UnsafePathError() from None
+            # An invalid document is not an independently committed registry generation.
+            return before
+        for key in changed:
+            if live.get(key) == written.get(key):
+                if key in old:
+                    live[key] = old[key]
+                else:
+                    live.pop(key, None)
+            # A different valid generation belongs to another committed writer.
+        if not live and before is None:
+            return None
+        return _GovernanceRegistryDocument(
+            records=tuple(live[k] for k in sorted(live))
+        ).canonical_bytes()
+
+    @staticmethod
+    def activation_content(
+        content: bytes | None, record: GovernanceRecord, *, accepted_ancestors: tuple[str, ...] = ()
+    ) -> bytes:
         """Preserve other repositories and checkout identities in an exact transaction."""
         from intent_engineering.storage.jsonl.strict import loads_strict_object
 
@@ -355,6 +423,13 @@ class GovernanceRegistry:
         if previous is not None:
             if previous.project_id != record.project_id:
                 raise UnsafePathError()
+            # A stale/offline checkout cannot overwrite a separately committed
+            # generation unless its verified lineage proves that generation older.
+            if (
+                previous.ref_commit != record.ref_commit
+                and previous.ref_commit not in accepted_ancestors
+            ):
+                record = previous.model_copy(update={"checkout_ids": record.checkout_ids})
             record = record.model_copy(
                 update={
                     "checkout_ids": tuple(sorted(set(previous.checkout_ids + record.checkout_ids)))

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import os
 import re
@@ -246,6 +247,11 @@ class StateInstallTransaction:
         fault_hook: Callable[[str], None] | None = None,
         verify_installed: Callable[[], None] | None = None,
         install_scope: Callable[[], AbstractContextManager[object]] | None = None,
+        recovery_merges: Mapping[
+            str, Callable[[bytes | None, bytes | None, bytes | None], bytes | None]
+        ]
+        | None = None,
+        target_writers: Mapping[str, Callable[[SecureFile, bytes], None]] | None = None,
     ) -> None:
         if not state_targets or any(
             name in {"team_trust", "pending_join_trust"} for name in state_targets
@@ -257,6 +263,8 @@ class StateInstallTransaction:
         self._fault_hook = fault_hook
         self._verify_installed = verify_installed
         self._install_scope = install_scope or nullcontext
+        self._recovery_merges = recovery_merges
+        self._target_writers = target_writers
 
     def close(self) -> None:
         self._journal.close()
@@ -272,6 +280,21 @@ class StateInstallTransaction:
         pending_target: SecureFile,
         active_target: SecureFile,
     ) -> LocalTransactionCoordinator:
+        targets = {
+            **self._state_targets,
+            "pending_join_trust": pending_target,
+            "team_trust": active_target,
+        }
+        scope = (
+            "sha256:"
+            + hashlib.sha256(
+                json.dumps(
+                    {name: str(target.path) for name, target in sorted(targets.items())},
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode()
+            ).hexdigest()
+        )
         return LocalTransactionCoordinator(
             self._journal,
             {
@@ -280,6 +303,10 @@ class StateInstallTransaction:
                 "team_trust": active_target,
             },
             fault_hook=self._fault_hook,
+            recovery_scope=scope,
+            max_recovery_bytes=24 * 1024 * 1024,
+            recovery_merges=self._recovery_merges,
+            target_writers=self._target_writers,
         )
 
     def recover_with_trust(
@@ -303,8 +330,9 @@ class StateInstallTransaction:
         *,
         pending_target: SecureFile,
         active_target: SecureFile,
-        pending_preimage: bytes,
+        pending_preimage: bytes | None,
         trust_content: bytes,
+        active_preimage: bytes | None = None,
     ) -> None:
         coordinator = self._coordinator(pending_target, active_target)
         try:
@@ -316,7 +344,9 @@ class StateInstallTransaction:
                 if transaction.read_optional("pending_join_trust") != pending_preimage:
                     raise ValueError("pending join trust changed")
                 active = transaction.read_optional("team_trust")
-                if active not in {None, trust_content}:
+                if (active_preimage is not None and active != active_preimage) or (
+                    active_preimage is None and active not in {None, trust_content}
+                ):
                     raise ValueError("active local trust changed")
                 self._install_state(transaction)
                 transaction.write("team_trust", trust_content)
@@ -344,8 +374,11 @@ class StateInstallTransaction:
 
 
 def _canonical_bytes(value: StrictModel) -> bytes:
+    document = value.model_dump(mode="json")
+    if isinstance(value, LocalTrustConfigV2) and value.device_binding is None:
+        document.pop("device_binding")
     return json.dumps(
-        value.model_dump(mode="json"),
+        document,
         ensure_ascii=False,
         allow_nan=False,
         separators=(",", ":"),
@@ -743,6 +776,60 @@ class LocalTrustProvider:
                 project.close()
             return
         except BaseException as error:  # noqa: BLE001
+            caught = error
+        _failure(caught)
+
+    def advance_member(
+        self,
+        *,
+        preimage: LocalTrustConfigV2,
+        trust: LocalTrustConfigV2,
+        install: StateInstallTransaction,
+    ) -> None:
+        """CAS an already active member's public pins in the same state transaction."""
+        try:
+            if (
+                trust.model_copy(
+                    update={
+                        "accepted_bundle_digest": preimage.accepted_bundle_digest,
+                        "accepted_authority_digest": preimage.accepted_authority_digest,
+                        "accepted_authority_sequence": preimage.accepted_authority_sequence,
+                    }
+                )
+                != preimage
+                or trust.accepted_authority_sequence < preimage.accepted_authority_sequence
+            ):
+                raise ValueError("active member binding changed")
+            project, workspace = _open_workspace(self._root, harden=False)
+            try:
+                with ExitStack() as stack:
+                    pending = workspace.file(_PENDING_FILENAME)
+                    active = workspace.file(_FILENAME)
+                    journal = workspace.file(_ACTIVATION_JOURNAL_FILENAME)
+                    for target in (pending, active, journal):
+                        stack.callback(target.close)
+                    if not install.matches_journal(journal):
+                        raise ValueError("member journal changed")
+                    install.recover_with_trust(pending_target=pending, active_target=active)
+                    if (
+                        _read_pending(workspace, pending) is not None
+                        or _read_versioned(workspace, active) != preimage
+                    ):
+                        raise ValueError("active member changed")
+                    install.install_with_trust(
+                        pending_target=pending,
+                        active_target=active,
+                        pending_preimage=pending.read_optional_nonblocking(
+                            max_bytes=MAX_PENDING_JOIN_BYTES
+                        ),
+                        active_preimage=preimage.canonical_bytes(),
+                        trust_content=trust.canonical_bytes(),
+                    )
+            finally:
+                workspace.close()
+                project.close()
+            return
+        except BaseException as error:  # noqa: BLE001 - fixed public trust boundary
             caught = error
         _failure(caught)
 

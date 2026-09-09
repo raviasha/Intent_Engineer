@@ -373,6 +373,35 @@ def _v2_trust(state, invite, response):
     )
 
 
+def test_historical_v2_receipt_bytes_without_device_binding_remain_readable(tmp_path):
+    from intent_engineering.team_state.local_trust import LocalTrustConfigV2, LocalTrustProvider
+
+    # Frozen pre-Task-8 wire representation: do not generate this with the current model.
+    historical = (
+        b'{"accepted_authority_digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",'
+        b'"accepted_authority_sequence":2,'
+        b'"accepted_bundle_digest":"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",'
+        b'"device_certificate_id":"certificate:sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",'
+        b'"member_id":"member:sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",'
+        b'"project_id":"project",'
+        b'"recipient_key_id":"recipient:sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",'
+        b'"repository_id":"github.com/acme/project",'
+        b'"root":{"authority_epoch":1,"created_at":"2026-08-30T10:00:00Z",'
+        b'"predecessor_root_key_id":null,"project_id":"project","repository_id":"github.com/acme/project",'
+        b'"root_key_id":"root:sha256:770c4889264d6f6b444a9f1b1d0be5ef1de9984d7e77d962503a62325dd92961",'
+        b'"root_public_key":"W2SJycf9Dc9QVF58FkiG70BJHsBsfxsSMEF5foEXU14","schema_version":2},'
+        b'"schema_version":2,"signature_id":"signer:sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"}'
+    )
+    trust = LocalTrustConfigV2.model_validate_json(historical)
+    workspace = tmp_path / ".intent"
+    workspace.mkdir(mode=0o700, exist_ok=True)
+    target = workspace / "team-trust.json"
+    target.write_bytes(historical)
+    target.chmod(0o600)
+    assert LocalTrustProvider(tmp_path).load_versioned() == trust
+    assert trust.canonical_bytes() == historical
+
+
 def test_version_two_trust_requires_owner_only_workspace_directory(tmp_path: object) -> None:
     """Catches v2 trust inheriting the deliberately permissive v1 directory policy."""
     from pathlib import Path

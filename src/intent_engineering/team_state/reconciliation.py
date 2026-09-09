@@ -16,6 +16,7 @@ from intent_engineering.control_plane.models import (
     TeamStateDivergenceCaseV2,
 )
 from intent_engineering.control_plane.webauthn_service import VerifiedHumanDecision
+from intent_engineering.storage.yaml.graph_store import parse_graph
 from intent_engineering.team_state.models import CanonicalStateFile, CanonicalStateSnapshot
 from intent_engineering.team_state.publication import (
     PreparedPublicationV2,
@@ -81,7 +82,8 @@ class ReconciliationService:
             or common.snapshot is None
             or remote.snapshot is None
             or type(local) is not CanonicalStateSnapshot
-            or remote.manifest.parent_bundle_digest != common.manifest.bundle_digest
+            or (common.commit, common.manifest.bundle_digest, _digest(common.manifest_bytes))
+            not in remote.ancestors
             or remote.manifest.repository_id != common.manifest.repository_id
             or remote.manifest.project_id != common.manifest.project_id
             or local.repository_id != common.manifest.repository_id
@@ -120,7 +122,9 @@ class ReconciliationService:
             else CanonicalStateSnapshot(
                 project_id=local.project_id,
                 repository_id=local.repository_id,
-                graph_version=max(local.graph_version, remote.snapshot.graph_version),
+                graph_version=parse_graph(
+                    next(f.content for f in merged if f.path == "graph.yaml")
+                ).version,
                 files=tuple(merged),
             )
         )
@@ -155,7 +159,9 @@ class ReconciliationService:
         resolved = CanonicalStateSnapshot(
             project_id=original.local.project_id,
             repository_id=original.local.repository_id,
-            graph_version=max(original.local.graph_version, original.remote.manifest.graph_version),
+            graph_version=parse_graph(
+                next(f.content for f in files if f.path == "graph.yaml")
+            ).version,
             files=files,
         )
         return replace(original, resolved=resolved, choices=tuple(sorted(choices.items())))

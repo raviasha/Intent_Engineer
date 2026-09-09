@@ -208,6 +208,27 @@ def test_pending_join_automatically_restores_exact_enrollment_and_activates_trus
     )
 
 
+def test_active_member_noop_verification_preserves_existing_checkpoint_cache(tmp_path):
+    f = enrolled_candidate(tmp_path)
+    restorer = GitSharedStateRestorer(
+        f.provider,
+        clock=lambda: f.at,
+        device_key_store=f.b._device_store,
+        governance_registry=f.governance,
+    )
+    assert (
+        restorer.verify_and_restore_approved_baseline(f.target).status
+        is SharedStateRestoreStatus.VERIFIED
+    )
+    checkpoints = f.target / ".intent/cache/checkpoints.yaml"
+    checkpoints.write_bytes(b"checkpoints: []\n")
+    assert (
+        restorer.verify_and_restore_approved_baseline(f.target).status
+        is SharedStateRestoreStatus.VERIFIED
+    )
+    assert checkpoints.read_bytes() == b"checkpoints: []\n"
+
+
 def test_pending_join_local_divergence_is_reported_without_overwrite(tmp_path):
     f = enrolled_candidate(tmp_path)
     (f.target / ".intent/graph.yaml").write_bytes(b"private local disagreement")
@@ -221,6 +242,163 @@ def test_pending_join_local_divergence_is_reported_without_overwrite(tmp_path):
     assert (f.target / ".intent/graph.yaml").read_bytes() == b"private local disagreement"
     assert f.provider.load_pending_join() == f.pending
     assert f.provider.load_versioned() is None
+
+
+def ordinary_descendant(f, parent=None, *, actor=100):
+    from intent_engineering.team_state.models import CanonicalStateFile
+    from intent_engineering.team_state.publication import (
+        PublicationAuthorityV2,
+        prepare_v2_publication,
+    )
+    from intent_engineering.team_state.restore import verify_v2_release
+
+    if parent is None:
+        parent = verify_v2_release(
+            manifest_bytes=f.publication.manifest_bytes,
+            bundle_bytes=f.publication.bundle,
+            envelope_bytes=f.publication.signatures,
+            parent=f.parent,
+            recipient_key_id=f.parent.authority.ci_recipient.key_id,
+            recipient_private_key=b"c" * 32,
+            commit=f.commit,
+            now=f.at,
+        )
+    member = next(m for m in parent.authority.members if m.github_account_id == actor)
+    snapshot = parent.snapshot.model_copy(
+        update={
+            "files": tuple(
+                CanonicalStateFile(
+                    path=v.path,
+                    content=v.content + b"\n# descendant\n"
+                    if v.path == "graph.yaml"
+                    else v.content,
+                )
+                for v in parent.snapshot.files
+            )
+        }
+    )
+    publication = prepare_v2_publication(
+        snapshot=snapshot,
+        authority=PublicationAuthorityV2(
+            parent.authority,
+            member.member_id,
+            member.device_certificate_ids[0],
+            parent,
+            parent.commit,
+        ),
+        device_signer=f.a._device_store if actor == 100 else f.b._device_store,
+        now=f.at,
+    )
+    artifacts = restore_module.SharedStateArtifacts(
+        publication.manifest_bytes,
+        publication.bundle,
+        publication.signatures,
+        publication.bundle_path,
+        publication.signature_path,
+    )
+    commit = install_state_ref(f.target, artifacts, parent=parent.commit)
+    return verify_v2_release(
+        manifest_bytes=publication.manifest_bytes,
+        bundle_bytes=publication.bundle,
+        envelope_bytes=publication.signatures,
+        parent=parent,
+        recipient_key_id=parent.authority.ci_recipient.key_id,
+        recipient_private_key=b"c" * 32,
+        commit=commit,
+        now=f.at,
+    )
+
+
+@pytest.mark.parametrize(
+    "boundary", ["journal_prepared", "target:governance", "target:team_trust", "journal_committed"]
+)
+def test_active_member_fast_forward_crash_recovers_complete_state(tmp_path, boundary):
+    f = enrolled_candidate(tmp_path)
+    restorer = GitSharedStateRestorer(
+        f.provider,
+        clock=lambda: f.at,
+        device_key_store=f.b._device_store,
+        governance_registry=f.governance,
+    )
+    assert (
+        restorer.verify_and_restore_approved_baseline(f.target).status
+        is SharedStateRestoreStatus.VERIFIED
+    )
+    tip = ordinary_descendant(f)
+    pid = os.fork()
+    if pid == 0:
+        restorer._fault_hook = lambda stage: os._exit(83) if stage == boundary else None
+        restorer.verify_and_restore_approved_baseline(f.target)
+        os._exit(84)
+    assert os.waitstatus_to_exitcode(os.waitpid(pid, 0)[1]) == 83
+    assert (
+        restorer.verify_and_restore_approved_baseline(f.target).status
+        is SharedStateRestoreStatus.VERIFIED
+    )
+    assert f.provider.load_versioned().accepted_bundle_digest == tip.manifest.bundle_digest
+    assert canonical_files(f.target) == {item.path: item.content for item in tip.snapshot.files}
+
+
+def test_delayed_activation_rejects_skipped_signed_parent_without_installing(tmp_path):
+    f = enrolled_candidate(tmp_path)
+    first = ordinary_descendant(f)
+    tip = ordinary_descendant(f, first)
+    tree = git(f.target, "rev-parse", tip.commit + "^{tree}").decode().strip()
+    skipped = (
+        git(f.target, "commit-tree", tree, "-p", f.commit, input_bytes=b"skip parent\n")
+        .decode()
+        .strip()
+    )
+    git(f.target, "update-ref", restore_module.STATE_REF, skipped)
+    result = GitSharedStateRestorer(
+        f.provider,
+        clock=lambda: f.at,
+        device_key_store=f.b._device_store,
+        governance_registry=f.governance,
+    ).verify_and_restore_approved_baseline(f.target)
+    assert result.status is SharedStateRestoreStatus.INVALID
+    assert f.provider.load_versioned() is None
+    assert f.provider.load_pending_join() == f.pending
+
+
+@pytest.mark.parametrize("delayed,diverged", [(True, False), (False, False), (False, True)])
+def test_member_restore_accepts_bounded_descendants_without_overwriting_divergence(
+    tmp_path, delayed, diverged
+):
+    f = enrolled_candidate(tmp_path)
+    restorer = GitSharedStateRestorer(
+        f.provider,
+        clock=lambda: f.at,
+        device_key_store=f.b._device_store,
+        governance_registry=f.governance,
+    )
+    if not delayed:
+        assert (
+            restorer.verify_and_restore_approved_baseline(f.target).status
+            is SharedStateRestoreStatus.VERIFIED
+        )
+    first = ordinary_descendant(f)
+    tip = ordinary_descendant(f, first, actor=200)
+    if diverged:
+        (f.target / ".intent/graph.yaml").write_bytes(b"private local fork")
+    result = restorer.verify_and_restore_approved_baseline(f.target)
+    assert result.status is (
+        SharedStateRestoreStatus.DIVERGED if diverged else SharedStateRestoreStatus.VERIFIED
+    )
+    if diverged:
+        assert (f.target / ".intent/graph.yaml").read_bytes() == b"private local fork"
+        assert (
+            f.provider.load_versioned().accepted_bundle_digest
+            == f.publication.manifest.bundle_digest
+        )
+    else:
+        assert canonical_files(f.target) == {v.path: v.content for v in tip.snapshot.files}
+        assert f.provider.load_versioned().accepted_bundle_digest == tip.manifest.bundle_digest
+        assert f.provider.load_pending_join() is None
+        assert (
+            json.loads((f.target / ".intent/cache/shared-state.json").read_bytes())["ref_commit"]
+            == tip.commit
+        )
 
 
 def _reseal_enrollment(f, registry):
@@ -558,6 +736,77 @@ def test_pending_join_process_crash_recovers_complete_state_before_retry(
         "github.com/acme/project", (metadata.st_dev, metadata.st_ino)
     ).record
     assert record.bundle_digest == f.publication.manifest.bundle_digest
+
+
+@pytest.mark.parametrize("signature_field", ["authority_attestation", "signatures"])
+def test_pending_join_authenticates_before_accessing_recipient_key(tmp_path, signature_field):
+    f = enrolled_candidate(tmp_path)
+    envelope = json.loads(f.release.signatures)
+    if signature_field == "authority_attestation":
+        envelope[signature_field]["root_signature"] = "A" * 86
+    else:
+        envelope[signature_field][0]["signature"] = "A" * 86
+    release = replace(
+        f.release, signatures=json.dumps(envelope, separators=(",", ":"), sort_keys=True).encode()
+    )
+    install_state_ref(f.target, release, parent=f.parent.commit)
+    accesses = []
+    backend = f.b._device_store._backend
+    get_password = backend.get_password
+
+    def read_key(*args):
+        accesses.append(args)
+        return get_password(*args)
+
+    backend.get_password = read_key
+    result = GitSharedStateRestorer(
+        f.provider,
+        clock=lambda: f.at,
+        device_key_store=f.b._device_store,
+        governance_registry=f.governance,
+    ).verify_and_restore_approved_baseline(f.target)
+    assert result.status is SharedStateRestoreStatus.INVALID
+    assert accesses == []
+
+
+@pytest.mark.parametrize(
+    "hostile", ["noncanonical", "oversized", "wrong_scope", "oversized_target"]
+)
+def test_activation_recovery_rejects_hostile_journal_before_writing_state(tmp_path, hostile):
+    f = enrolled_candidate(tmp_path)
+    pid = os.fork()
+    if pid == 0:
+        GitSharedStateRestorer(
+            f.provider,
+            clock=lambda: f.at,
+            device_key_store=f.b._device_store,
+            governance_registry=f.governance,
+            fault_hook=lambda stage: os._exit(83) if stage == "journal_prepared" else None,
+        ).verify_and_restore_approved_baseline(f.target)
+        os._exit(84)
+    assert os.waitstatus_to_exitcode(os.waitpid(pid, 0)[1]) == 83
+    journal = f.target / ".intent/join-activation.json"
+    document = json.loads(journal.read_bytes())
+    if hostile == "noncanonical":
+        journal.write_bytes(json.dumps(document, indent=2).encode())
+    elif hostile == "oversized":
+        journal.write_bytes(b" " * (40 * 1024 * 1024))
+    elif hostile == "wrong_scope":
+        document["scope"] = "sha256:" + "0" * 64
+        journal.write_bytes(json.dumps(document, separators=(",", ":"), sort_keys=True).encode())
+    sentinel = f.target / ".intent/graph.yaml"
+    original = (
+        b"x" * (25 * 1024 * 1024) if hostile == "oversized_target" else b"private-recovery-sentinel"
+    )
+    sentinel.write_bytes(original)
+    result = GitSharedStateRestorer(
+        f.provider,
+        clock=lambda: f.at,
+        device_key_store=f.b._device_store,
+        governance_registry=f.governance,
+    ).verify_and_restore_approved_baseline(f.target)
+    assert result.status is SharedStateRestoreStatus.INVALID
+    assert sentinel.read_bytes() == original
 
 
 def test_pending_join_tree_swap_before_commit_restores_original_complete_tree(tmp_path):

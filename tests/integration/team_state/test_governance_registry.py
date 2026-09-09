@@ -23,6 +23,46 @@ MARKER = {
 }
 
 
+@pytest.mark.parametrize("same_repository", [False, True])
+@pytest.mark.parametrize("boundary", ["journal_prepared", "target:governance"])
+def test_activation_recovery_preserves_independently_committed_governance(
+    tmp_path, same_repository, boundary
+):
+    from intent_engineering.intent_workflow.check import SharedStateRestoreStatus
+    from intent_engineering.team_state.restore import GitSharedStateRestorer
+    from tests.integration.team_state.test_restore import enrolled_candidate
+
+    f = enrolled_candidate(tmp_path)
+    pid = os.fork()
+    if pid == 0:
+        GitSharedStateRestorer(
+            f.provider,
+            clock=lambda: f.at,
+            device_key_store=f.b._device_store,
+            governance_registry=f.governance,
+            fault_hook=lambda stage: os._exit(83) if stage == boundary else None,
+        ).verify_and_restore_approved_baseline(f.target)
+        os._exit(84)
+    assert os.waitstatus_to_exitcode(os.waitpid(pid, 0)[1]) == 83
+    repository_id = REPOSITORY_ID if same_repository else "github.com/acme/other"
+    other = f.governance.remember(
+        repository_id=repository_id,
+        project_id="project" if same_repository else "other",
+        directory_identity=(4, 5),
+        marker=MARKER,
+    )
+    result = GitSharedStateRestorer(
+        f.provider,
+        clock=lambda: f.at,
+        device_key_store=f.b._device_store,
+        governance_registry=f.governance,
+    ).verify_and_restore_approved_baseline(f.target)
+    assert result.status is SharedStateRestoreStatus.VERIFIED
+    recovered = f.governance.lookup(repository_id, (4, 5)).record
+    assert recovered.marker() == other.marker()
+    assert set(other.checkout_ids) <= set(recovered.checkout_ids)
+
+
 def test_join_activation_rejects_permissive_existing_governance_without_hardening_it(tmp_path):
     from intent_engineering.intent_workflow.check import SharedStateRestoreStatus
     from intent_engineering.team_state.restore import GitSharedStateRestorer
@@ -49,6 +89,79 @@ def test_join_activation_rejects_permissive_existing_governance_without_hardenin
     assert path.read_bytes() == before
     assert stat.S_IMODE(path.stat().st_mode) == 0o644
     assert f.provider.load_pending_join() == f.pending
+
+
+def test_recovery_rejects_foreign_record_preimages_even_when_current_registry_is_corrupt(tmp_path):
+    import base64
+    import hashlib
+
+    from intent_engineering.intent_workflow.check import SharedStateRestoreStatus
+    from intent_engineering.team_state.restore import GitSharedStateRestorer
+    from tests.integration.team_state.test_restore import enrolled_candidate
+
+    f = enrolled_candidate(tmp_path)
+    pid = os.fork()
+    if pid == 0:
+        GitSharedStateRestorer(
+            f.provider,
+            clock=lambda: f.at,
+            device_key_store=f.b._device_store,
+            governance_registry=f.governance,
+            fault_hook=lambda stage: os._exit(83) if stage == "target:governance" else None,
+        ).verify_and_restore_approved_baseline(f.target)
+        os._exit(84)
+    assert os.waitstatus_to_exitcode(os.waitpid(pid, 0)[1]) == 83
+    journal = f.target / ".intent/join-activation.json"
+    document = json.loads(journal.read_bytes())
+    postimage = document["postimages"][0]
+    registry = json.loads(base64.b64decode(postimage["content"]))
+    registry["records"][0]["repository_id"] = "github.com/acme/foreign"
+    content = json.dumps(registry, sort_keys=True, separators=(",", ":")).encode()
+    postimage["content"] = base64.b64encode(content).decode()
+    postimage["digest"] = "sha256:" + hashlib.sha256(content).hexdigest()
+    journal.write_bytes(json.dumps(document, sort_keys=True, separators=(",", ":")).encode())
+    (tmp_path / "governance/governance-v1.json").write_bytes(b"{}")
+    original = (f.target / ".intent/graph.yaml").read_bytes()
+    result = GitSharedStateRestorer(
+        f.provider,
+        clock=lambda: f.at,
+        device_key_store=f.b._device_store,
+        governance_registry=f.governance,
+    ).verify_and_restore_approved_baseline(f.target)
+    assert result.status is SharedStateRestoreStatus.INVALID
+    assert journal.exists()
+    assert (f.target / ".intent/graph.yaml").read_bytes() == original
+
+
+@pytest.mark.parametrize("content", [b"{}", b" " * (129 * 1024)], ids=["noncanonical", "oversized"])
+def test_crash_recovery_rejects_noncanonical_or_oversized_shared_target(tmp_path, content):
+    from intent_engineering.intent_workflow.check import SharedStateRestoreStatus
+    from intent_engineering.team_state.restore import GitSharedStateRestorer
+    from tests.integration.team_state.test_restore import enrolled_candidate
+
+    f = enrolled_candidate(tmp_path)
+    pid = os.fork()
+    if pid == 0:
+        GitSharedStateRestorer(
+            f.provider,
+            clock=lambda: f.at,
+            device_key_store=f.b._device_store,
+            governance_registry=f.governance,
+            fault_hook=lambda stage: os._exit(83) if stage == "target:governance" else None,
+        ).verify_and_restore_approved_baseline(f.target)
+        os._exit(84)
+    assert os.waitstatus_to_exitcode(os.waitpid(pid, 0)[1]) == 83
+    path = tmp_path / "governance/governance-v1.json"
+    path.write_bytes(content)
+    result = GitSharedStateRestorer(
+        f.provider,
+        clock=lambda: f.at,
+        device_key_store=f.b._device_store,
+        governance_registry=f.governance,
+    ).verify_and_restore_approved_baseline(f.target)
+    assert result.status is SharedStateRestoreStatus.INVALID
+    assert path.read_bytes() == content
+    assert (f.target / ".intent/join-activation.json").exists()
 
 
 def test_join_activation_rechecks_governance_at_the_last_transaction_boundary(tmp_path):

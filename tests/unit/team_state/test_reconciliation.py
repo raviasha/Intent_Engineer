@@ -95,6 +95,54 @@ def test_three_way_preview_is_bounded_secret_free_and_requires_explicit_conflict
     assert remote.snapshot != local
 
 
+@pytest.mark.parametrize("choice,expected", [("local", 3), ("remote", 2)])
+def test_reconciliation_graph_version_follows_the_selected_graph(tmp_path, choice, expected):
+    import yaml
+
+    from intent_engineering.team_state.reconciliation import ReconciliationService
+
+    f, common, remote, local, authority = reconciliation_fixture(tmp_path)
+
+    def versioned(snapshot, version):
+        graph = yaml.safe_load(next(v.content for v in snapshot.files if v.path == "graph.yaml"))
+        graph["version"] = version
+        changed = _changed(snapshot, "graph.yaml", yaml.safe_dump(graph).encode())
+        return changed.model_copy(update={"graph_version": version})
+
+    local = versioned(local, 3)
+    remote = replace(
+        remote,
+        snapshot=versioned(remote.snapshot, 2),
+        manifest=remote.manifest.model_copy(update={"graph_version": 2}),
+        manifest_bytes=remote.manifest.model_copy(update={"graph_version": 2}).canonical_bytes(),
+    )
+    service = ReconciliationService(
+        authority_provider=authority, device_signer=f.a._device_store, clock=lambda: f.at
+    )
+    result = service.resolve(
+        preview=service.preview(common=common, remote=remote, local=local),
+        choices={"graph.yaml": choice},
+    )
+    assert result.resolved.graph_version == expected
+
+
+def test_reconciliation_accepts_a_later_verified_remote_descendant(tmp_path):
+    from intent_engineering.team_state.reconciliation import ReconciliationService
+    from tests.integration.team_state.test_restore import ordinary_descendant
+
+    f, common, _remote, local, authority = reconciliation_fixture(tmp_path)
+    first = ordinary_descendant(f)
+    later = ordinary_descendant(f, first)
+    service = ReconciliationService(
+        authority_provider=authority, device_signer=f.a._device_store, clock=lambda: f.at
+    )
+    preview = service.preview(common=common, remote=later, local=local)
+    assert preview.conflicts == ("graph.yaml",)
+    assert preview.case.remote_commit == later.commit
+    with pytest.raises(ValueError, match="reconciliation"):
+        service.preview(common=replace(common, commit="8" * 40), remote=later, local=local)
+
+
 def test_reconciliation_requires_fresh_exact_decision_and_current_remote_then_builds_descendant(
     tmp_path,
 ):

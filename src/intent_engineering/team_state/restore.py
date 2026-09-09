@@ -69,8 +69,10 @@ from intent_engineering.team_state.archive import (
 from intent_engineering.team_state.authority import (
     VerifiedEnvelopeV2,
     authority_digest,
+    canonical_authority_attestation_preimage,
     canonical_authority_bytes,
     canonical_certificate_signing_preimage,
+    canonical_state_signature_preimage,
     verify_v2_envelope,
 )
 from intent_engineering.team_state.crypto import (
@@ -349,8 +351,13 @@ class VerifiedReleaseV2:
     authority: TeamAuthorityRegistryV2
     commit: str
     snapshot: CanonicalStateSnapshot | None = None
+    ancestors: tuple[tuple[str, str, str], ...] = ()
 
     def __post_init__(self) -> None:
+        if len(self.ancestors) > MAX_ANCESTRY_COMMITS or len({a[0] for a in self.ancestors}) != len(
+            self.ancestors
+        ):
+            raise ValueError("invalid verified ancestry")
         if (
             type(self.manifest) is not TeamStateManifestV2
             or type(self.authority) is not TeamAuthorityRegistryV2
@@ -519,6 +526,10 @@ def verify_v2_release(
             authority=restored.authority,
             commit=commit,
             snapshot=restored.snapshot,
+            ancestors=(
+                *parent.ancestors,
+                (parent.commit, parent.manifest.bundle_digest, _digest(parent.manifest_bytes)),
+            )[-MAX_ANCESTRY_COMMITS:],
         )
     except BaseException as error:  # noqa: BLE001 - fixed secret-bearing boundary
         error_traceback = error.__traceback__
@@ -2687,11 +2698,149 @@ def read_approved_baseline(
     return {**files, "cache/shared-state.json": _marker_bytes(lineage.tip.manifest, commit)}
 
 
+def _v2_descendant_commits(reader: _GitRefReader, base: str, tip: str) -> tuple[str, ...]:
+    """Walk only immutable single-parent objects, under the established ancestry bound."""
+    commits: list[str] = []
+    cursor = tip
+    for _ in range(MAX_ANCESTRY_COMMITS + 1):
+        if cursor == base:
+            return tuple(reversed(commits))
+        if cursor in commits or len(commits) == MAX_ANCESTRY_COMMITS:
+            break
+        commits.append(cursor)
+        parents = reader.parents(cursor)
+        if len(parents) != 1:
+            break
+        cursor = parents[0]
+    raise ValueError("version two ancestry unavailable")
+
+
+def _device_release(
+    reader: _GitRefReader,
+    commit: str,
+    store: DeviceKeyStore,
+    recipient: str,
+    root: TeamRootTrustV2,
+    sequence: int,
+    now: datetime,
+    *,
+    parent: VerifiedReleaseV2 | None = None,
+) -> VerifiedReleaseV2:
+    """Authenticate a descendant before invoking the non-exporting key boundary."""
+    manifest_bytes = reader.blob(commit, "manifest.json", MAX_MANIFEST_BYTES)
+    manifest = parse_team_manifest(manifest_bytes)
+    if (
+        type(manifest) is not TeamStateManifestV2
+        or manifest.repository_id != root.repository_id
+        or manifest.project_id != root.project_id
+        or manifest.root_key_id != root.root_key_id
+        or manifest.authority_epoch != root.authority_epoch
+        or manifest.migration is not None
+        or manifest.parent_bundle_digest is None
+    ):
+        raise ValueError("version two release scope changed")
+    name = f"{manifest.graph_version}-{manifest.bundle_digest.removeprefix('sha256:')}"
+    reader.require_release_tree(commit, name)
+    envelope = parse_signature_envelope(
+        reader.blob(commit, f"signatures/{name}.json", MAX_SIGNATURE_BYTES)
+    )
+    if type(envelope) is not StateSignatureEnvelopeV2:
+        raise ValueError("version two envelope changed")
+    same_authority = parent is None or manifest.authority_digest == parent.manifest.authority_digest
+    if parent is not None:
+        if (
+            reader.parents(commit) != (parent.commit,)
+            or manifest.parent_bundle_digest != parent.manifest.bundle_digest
+            or manifest.graph_version < parent.manifest.graph_version
+            or envelope.migration_proof is not None
+        ):
+            raise ValueError("version two ancestry changed")
+        verify_v2_envelope(manifest, envelope, root, parent.authority, now)
+        sequence = parent.authority.sequence + (0 if same_authority else 1)
+    bundle = reader.blob(commit, f"bundles/{name}.intent", MAX_BUNDLE_BYTES)
+    if len(bundle) != manifest.bundle_size or _digest(bundle) != manifest.bundle_digest:
+        raise ValueError("version two bundle changed")
+    aad = canonical_authenticated_context_bytes(
+        AuthenticatedBundleContextV2(
+            project_id=manifest.project_id,
+            repository_id=manifest.repository_id,
+            graph_version=manifest.graph_version,
+            parent_bundle_digest=manifest.parent_bundle_digest,
+            recipient_key_ids=manifest.recipient_key_ids,
+            authority_digest=manifest.authority_digest,
+            authority_epoch=manifest.authority_epoch,
+            authority_sequence=sequence,
+            root_key_id=manifest.root_key_id,
+            created_at=manifest.created_at,
+        )
+    )
+    restored = validate_archive_v2(store.decrypt_bundle(recipient, bundle, aad))
+    registry = restored.authority
+    if (
+        registry.root != root
+        or registry.sequence != sequence
+        or authority_digest(registry) != manifest.authority_digest
+        or manifest.recipient_key_ids != registry.active_recipient_key_ids()
+        or recipient not in registry.active_recipient_key_ids()
+        or (
+            parent is not None
+            and (
+                (same_authority and registry != parent.authority)
+                or (
+                    not same_authority
+                    and (
+                        registry.previous_authority_digest != parent.manifest.authority_digest
+                        or registry.ci_recipient != parent.authority.ci_recipient
+                    )
+                )
+            )
+        )
+    ):
+        raise ValueError("version two registry changed")
+    _validate_v2_snapshot(restored.snapshot, manifest)
+    ancestors = (
+        ()
+        if parent is None
+        else (
+            *parent.ancestors,
+            (parent.commit, parent.manifest.bundle_digest, _digest(parent.manifest_bytes)),
+        )[-MAX_ANCESTRY_COMMITS:]
+    )
+    return VerifiedReleaseV2(
+        manifest, manifest_bytes, registry, commit, restored.snapshot, ancestors
+    )
+
+
 def _pending_release(
     reader: _GitRefReader,
     pending: PendingJoinTrustV2,
     store: DeviceKeyStore,
     now: datetime,
+) -> VerifiedReleaseV2:
+    commits = _v2_descendant_commits(reader, pending.invite.base_state_commit, reader.commit())
+    if not commits:
+        raise ValueError("pending enrollment unavailable")
+    release = _pending_enrollment_release(reader, pending, store, now, commits[0])
+    for commit in commits[1:]:
+        release = _device_release(
+            reader,
+            commit,
+            store,
+            pending.local_recipient_key_id,
+            pending.invite.root,
+            release.authority.sequence,
+            now,
+            parent=release,
+        )
+    return release
+
+
+def _pending_enrollment_release(
+    reader: _GitRefReader,
+    pending: PendingJoinTrustV2,
+    store: DeviceKeyStore,
+    now: datetime,
+    commit: str,
 ) -> VerifiedReleaseV2:
     """Bootstrap B by subtracting only its exact signed addition from the archive."""
     from intent_engineering.team_state.enrollment import (
@@ -2702,7 +2851,6 @@ def _pending_release(
 
     invite = parse_team_invite(export_team_invite(pending.invite))
     response = pending.response
-    commit = reader.commit()
     manifest_bytes = reader.blob(commit, "manifest.json", MAX_MANIFEST_BYTES)
     manifest = parse_team_manifest(manifest_bytes)
     if (
@@ -2729,6 +2877,45 @@ def _pending_release(
         or _digest(bundle) != manifest.bundle_digest
     ):
         raise ValueError("pending enrollment changed")
+    attestation = envelope.authority_attestation
+    if (
+        attestation is None
+        or attestation.operation != "enroll"
+        or attestation.previous_authority_digest != invite.authority_digest
+        or attestation.authority_digest != manifest.authority_digest
+        or attestation.parent_bundle_digest != invite.base_bundle_digest
+        or attestation.project_id != invite.project_id
+        or attestation.repository_id != invite.repository_id
+        or attestation.authority_epoch != invite.root.authority_epoch
+        or attestation.root_key_id != invite.root.root_key_id
+        or attestation.subject_digest != _digest(export_join_response(response))
+        or attestation.sponsor_member_id != invite.sponsor_member_id
+        or attestation.sponsor_device_certificate_id != invite.sponsor_certificate.certificate_id
+        or envelope.manifest_digest != _digest(manifest_bytes)
+        or envelope.bundle_digest != manifest.bundle_digest
+        or envelope.authority_digest != manifest.authority_digest
+        or invite.sponsor_certificate not in envelope.certificates
+    ):
+        raise ValueError("pending envelope changed")
+    Ed25519PublicKey.from_public_bytes(
+        _b64decode(invite.root.root_public_key, expected_size=32)
+    ).verify(
+        _b64decode(attestation.root_signature, expected_size=64),
+        canonical_authority_attestation_preimage(attestation),
+    )
+    for signer, signature in zip(envelope.certificates, envelope.signatures, strict=True):
+        Ed25519PublicKey.from_public_bytes(
+            _b64decode(invite.root.root_public_key, expected_size=32)
+        ).verify(
+            _b64decode(signer.root_signature, expected_size=64),
+            canonical_certificate_signing_preimage(signer.claims),
+        )
+        Ed25519PublicKey.from_public_bytes(
+            _b64decode(signer.claims.signing_public_key, expected_size=32)
+        ).verify(
+            _b64decode(signature.signature, expected_size=64),
+            canonical_state_signature_preimage(manifest),
+        )
     aad = canonical_authenticated_context_bytes(
         AuthenticatedBundleContextV2(
             project_id=manifest.project_id,
@@ -2784,13 +2971,13 @@ def _pending_release(
             ancestor_name = (
                 f"{ancestor.graph_version}-{ancestor.bundle_digest.removeprefix('sha256:')}"
             )
-            signature = parse_signature_envelope(
+            ancestor_envelope = parse_signature_envelope(
                 reader.blob(cursor, f"signatures/{ancestor_name}.json", MAX_SIGNATURE_BYTES)
             )
-            if type(signature) is not StateSignatureEnvelopeV2:
+            if type(ancestor_envelope) is not StateSignatureEnvelopeV2:
                 raise ValueError("pending authority ancestry changed")
-            if signature.authority_attestation is not None:
-                previous = signature.authority_attestation.previous_authority_digest
+            if ancestor_envelope.authority_attestation is not None:
+                previous = ancestor_envelope.authority_attestation.previous_authority_digest
                 break
             parents = reader.parents(cursor)
             if len(parents) != 1:
@@ -2917,7 +3104,29 @@ class GitSharedStateRestorer:
             pending_target = workspace.file("team-join-pending.json")
             stack.callback(active_target.close)
             stack.callback(pending_target.close)
-            recovery = StateInstallTransaction(journal, targets, lambda transaction: None)
+            recovery_repository = _origin_repository(root)
+            if recovery_repository is None:
+                raise ValueError("member repository unavailable")
+
+            def recover_governance(
+                before: bytes | None, installed: bytes | None, current: bytes | None
+            ) -> bytes | None:
+                return registry.recover_activation(
+                    before,
+                    installed,
+                    current,
+                    repository_id=recovery_repository,
+                    directory_identity=project.identity,
+                    strict_current=recovering,
+                )
+
+            recovery = StateInstallTransaction(
+                journal,
+                targets,
+                lambda transaction: None,
+                recovery_merges={"governance": recover_governance},
+                target_writers={"governance": registry.write_activation},
+            )
             stack.callback(recovery.close)
             recovery.recover_with_trust(pending_target=pending_target, active_target=active_target)
             # Recovery may have recreated the external public registry inode.
@@ -2954,81 +3163,82 @@ class GitSharedStateRestorer:
                 _refresh_state_ref(repository_id) if self._refresh_remote else _GitRefReader(root)
             )
             stack.callback(reader.close)
+            baseline_files: dict[str, bytes] | None = None
             if pending is None:
                 if not isinstance(active, LocalTrustConfigV2):
                     raise ValueError("member trust unavailable")
-                commit = reader.commit()
+                marker = _read_local_marker(workspace)
+                if marker is None:
+                    raise _Diverged("member baseline unavailable")
+                commit = str(marker["ref_commit"])
                 manifest = parse_team_manifest(
                     reader.blob(commit, "manifest.json", MAX_MANIFEST_BYTES)
                 )
-                marker = _read_local_marker(workspace)
                 if (
                     type(manifest) is not TeamStateManifestV2
                     or manifest.parent_bundle_digest is None
-                    or marker is None
-                    or marker["ref_commit"] != commit
                     or manifest.bundle_digest != active.accepted_bundle_digest
                     or manifest.authority_digest != active.accepted_authority_digest
                 ):
                     raise _Diverged("member state requires reconciliation")
-                name = f"{manifest.graph_version}-{manifest.bundle_digest.removeprefix('sha256:')}"
-                reader.require_release_tree(commit, name)
-                bundle = reader.blob(commit, f"bundles/{name}.intent", MAX_BUNDLE_BYTES)
-                if (
-                    _digest(bundle) != active.accepted_bundle_digest
-                    or len(bundle) != manifest.bundle_size
-                ):
-                    raise ValueError("member state changed")
-                aad = canonical_authenticated_context_bytes(
-                    AuthenticatedBundleContextV2(
-                        project_id=manifest.project_id,
-                        repository_id=manifest.repository_id,
-                        graph_version=manifest.graph_version,
-                        parent_bundle_digest=manifest.parent_bundle_digest,
-                        recipient_key_ids=manifest.recipient_key_ids,
-                        authority_digest=manifest.authority_digest,
-                        authority_epoch=manifest.authority_epoch,
-                        authority_sequence=active.accepted_authority_sequence,
-                        root_key_id=manifest.root_key_id,
-                        created_at=manifest.created_at,
+                release = _device_release(
+                    reader,
+                    commit,
+                    store,
+                    active.recipient_key_id,
+                    active.root,
+                    active.accepted_authority_sequence,
+                    self._clock(),
+                )
+                assert release.snapshot is not None
+                baseline_files = {f.path: f.content for f in release.snapshot.files}
+                descendants = _v2_descendant_commits(reader, commit, reader.commit())
+                if not descendants:
+                    try:
+                        _PinnedState(workspace, baseline_files).verify(project)
+                    except UnsafePathError:
+                        raise _Diverged("member state requires reconciliation") from None
+                    return SharedStateRestoreResult(status=SharedStateRestoreStatus.VERIFIED)
+                for descendant in descendants:
+                    release = _device_release(
+                        reader,
+                        descendant,
+                        store,
+                        active.recipient_key_id,
+                        active.root,
+                        release.authority.sequence,
+                        self._clock(),
+                        parent=release,
                     )
+                trust = active.model_copy(
+                    update={
+                        "accepted_authority_digest": release.manifest.authority_digest,
+                        "accepted_authority_sequence": release.authority.sequence,
+                        "accepted_bundle_digest": release.manifest.bundle_digest,
+                    }
                 )
-                restored = validate_archive_v2(
-                    store.decrypt_bundle(active.recipient_key_id, bundle, aad)
+            else:
+                release = _pending_release(reader, pending, store, self._clock())
+                certificate = next(
+                    c
+                    for c in release.authority.device_certificates
+                    if c.claims == pending.response.proposed_certificate_claims
                 )
-                _validate_v2_snapshot(restored.snapshot, manifest)
-                if (
-                    authority_digest(restored.authority) != active.accepted_authority_digest
-                    or restored.authority.root != active.root
-                ):
-                    raise ValueError("member trust changed")
-                files = {f.path: f.content for f in restored.snapshot.files}
-                try:
-                    _PinnedState(workspace, files).verify(project)
-                except UnsafePathError:
-                    raise _Diverged("member state requires reconciliation") from None
-                return SharedStateRestoreResult(status=SharedStateRestoreStatus.VERIFIED)
-            release = _pending_release(reader, pending, store, self._clock())
+                trust = LocalTrustConfigV2(
+                    project_id=release.manifest.project_id,
+                    repository_id=repository_id,
+                    root=release.authority.root,
+                    member_id=pending.response.proposed_member.member_id,
+                    device_certificate_id=certificate.certificate_id,
+                    recipient_key_id=pending.local_recipient_key_id,
+                    signature_id=pending.local_signature_id,
+                    accepted_authority_digest=release.manifest.authority_digest,
+                    accepted_authority_sequence=release.authority.sequence,
+                    accepted_bundle_digest=release.manifest.bundle_digest,
+                    device_binding=binding,
+                )
             assert release.snapshot is not None
             files = {f.path: f.content for f in release.snapshot.files}
-            certificate = next(
-                c
-                for c in release.authority.device_certificates
-                if c.claims == pending.response.proposed_certificate_claims
-            )
-            trust = LocalTrustConfigV2(
-                project_id=release.manifest.project_id,
-                repository_id=repository_id,
-                root=release.authority.root,
-                member_id=pending.response.proposed_member.member_id,
-                device_certificate_id=certificate.certificate_id,
-                recipient_key_id=pending.local_recipient_key_id,
-                signature_id=pending.local_signature_id,
-                accepted_authority_digest=release.manifest.authority_digest,
-                accepted_authority_sequence=release.authority.sequence,
-                accepted_bundle_digest=release.manifest.bundle_digest,
-                device_binding=binding,
-            )
             marker_bytes = _canonical_json(
                 {
                     "schema_version": 1,
@@ -3060,7 +3270,12 @@ class GitSharedStateRestorer:
                 nonlocal diverged, governance_content
                 with _RestorePreimage(project, workspace, targets, paths) as preimage:
                     current = {p: preimage.content[p] for p in CANONICAL_STATE_PATHS}
-                    if any(value is not None and value != files[p] for p, value in current.items()):
+                    if (baseline_files is not None and current != baseline_files) or (
+                        baseline_files is None
+                        and any(
+                            value is not None and value != files[p] for p, value in current.items()
+                        )
+                    ):
                         diverged = True
                         raise _Diverged("pending local state requires reconciliation")
                     self._fault_hook("validated")
@@ -3071,7 +3286,9 @@ class GitSharedStateRestorer:
                             raise ValueError("pending state changed")
                         transaction.write(paths[path], value)
                     content = registry.activation_content(
-                        transaction.read_optional("governance"), record
+                        transaction.read_optional("governance"),
+                        record,
+                        accepted_ancestors=tuple(a[0] for a in release.ancestors),
                     )
                     governance_content = content
                     transaction.write("governance", content)
@@ -3111,6 +3328,8 @@ class GitSharedStateRestorer:
                 install_state,
                 fault_hook=self._fault_hook,
                 verify_installed=verify_installed,
+                recovery_merges={"governance": recover_governance},
+                target_writers={"governance": registry.write_activation},
                 install_scope=lambda: _RestorePreimage(
                     project,
                     workspace,
@@ -3124,7 +3343,11 @@ class GitSharedStateRestorer:
             )
             stack.callback(install.close)
             try:
-                provider.activate_join(pending_preimage=pending, trust=trust, install=install)
+                if pending is not None:
+                    provider.activate_join(pending_preimage=pending, trust=trust, install=install)
+                else:
+                    assert isinstance(active, LocalTrustConfigV2)
+                    provider.advance_member(preimage=active, trust=trust, install=install)
             except LocalTrustError:
                 if diverged:
                     return SharedStateRestoreResult(status=SharedStateRestoreStatus.DIVERGED)
