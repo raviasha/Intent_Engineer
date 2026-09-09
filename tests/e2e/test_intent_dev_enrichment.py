@@ -10,6 +10,7 @@ import pytest
 import yaml  # type: ignore[import-untyped]
 from starlette.testclient import TestClient
 
+import intent_engineering.control_plane.service as control_plane_service_module
 from intent_engineering.cli.runtime import load_runtime
 from intent_engineering.control_plane import ControlPlaneService, build_control_plane_app
 from intent_engineering.core.models import ProjectConfig
@@ -270,6 +271,56 @@ def test_packaged_browser_exposes_separate_safe_enrichment_controls() -> None:
     assert "innerHTML" not in script
     assert "localStorage" not in script
     assert "console." not in script
+
+
+def test_default_control_plane_clock_can_start_enrichment(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The production clock must satisfy enrichment's whole-second boundary."""
+
+    class _DefaultClockSource:
+        @staticmethod
+        def now(timezone: object) -> object:
+            del timezone
+            return NOW.replace(microsecond=123_456)
+
+    project = tmp_path / "project"
+    project.mkdir()
+    initialized = initialize_project(project)
+    config = ProjectConfig(project_id="project:default-clock", local_actor="local:asha")
+    initialized.config_path.write_text(
+        yaml.safe_dump(config.model_dump(mode="json"), sort_keys=True), encoding="utf-8"
+    )
+    evidence = _evidence()
+    initialized.graph_path.write_bytes(serialize_graph(_graph(evidence.id)))
+    (initialized.workspace / "evidence/evidence.jsonl").write_bytes(_evidence_bytes(evidence))
+    (initialized.workspace / "approvals/policy.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "schema_version": 1,
+                "contributors": ["local:asha"],
+                "approvers": ["local:asha"],
+                "executors": ["local:asha"],
+                "identities": {"local:asha": ["local:asha"]},
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(control_plane_service_module, "datetime", _DefaultClockSource)
+
+    runtime = load_runtime(project)
+    control: ControlPlaneService | None = None
+    try:
+        control = ControlPlaneService(runtime, origin=ORIGIN)
+        started = control.enrichment_start(5, None)
+        session = cast(dict[str, object], started["session"])
+        assert session["status"] == "open"
+    finally:
+        if control is not None:
+            control.close()
+        runtime.close()
 
 
 def test_five_minute_answer_pause_restart_resume_keeps_only_evidence_reference(

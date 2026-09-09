@@ -347,7 +347,7 @@ class ControlPlaneService:
             raise TypeError("invalid recipient key store factory")
         self._runtime = runtime
         self._origin = origin
-        self._clock = clock or (lambda: datetime.now(UTC))
+        self._clock = clock or (lambda: datetime.now(UTC).replace(microsecond=0))
         self._challenge_source = challenge_source or (lambda: secrets.token_bytes(32))
         self.repository_id = _repository_id(runtime)
         self._config_file = runtime.workspace_directory.file("config.yaml")
