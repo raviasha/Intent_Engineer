@@ -80,6 +80,7 @@ def test_public_alpha_docs_and_bindings_match_the_shipped_operating_model(
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     guide = (ROOT / "docs/mcp.md").read_text(encoding="utf-8")
     adoption = (ROOT / "docs/intent-aware-agent.md").read_text(encoding="utf-8")
+    assessment = (ROOT / "docs/assessment.md").read_text(encoding="utf-8")
     github = (ROOT / "docs/github.md").read_text(encoding="utf-8")
     guided_spec = (
         ROOT / "docs/superpowers/specs/2026-08-28-guided-onboarding-plugin-design.md"
@@ -171,6 +172,33 @@ def test_public_alpha_docs_and_bindings_match_the_shipped_operating_model(
     assert "not a claim" in profiles
     assert "copy both" in examples
     assert "profiles/mcp/slack.yaml" in examples
+    for truth in (
+        "derived",
+        "explainable",
+        "ACL-filtered",
+        "non-canonical",
+        "model-independent",
+        "intent assess --project . --format json",
+        "intent_assessment_summary",
+        "intent_assessment_scorecard",
+        "intent_assessment_gaps",
+        "N/A",
+        "unassessed",
+        "capped at 49",
+        "exit code `0`",
+        "exit code `1`",
+        "exit code `5`",
+    ):
+        assert truth in assessment
+    for text in (readme, guide, adoption):
+        assert "assessment guide" in text
+        assert "intent assess --project ." in text
+    for later_stage in (
+        "are available now",
+        "start an enrichment session",
+        "generate simpler requirement alternatives",
+    ):
+        assert later_stage not in assessment.casefold()
 
     clean_project = init_git_repo(tmp_path)
     (clean_project / "docs").mkdir()

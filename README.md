@@ -188,6 +188,20 @@ The workflow deliberately fails with `onboarding_required` on a clean checkout u
 `.intent` baseline is restored first or the job runs in a persistent/self-hosted workspace. It
 never initializes and reports a clean graph version 0.
 
+Inspect the current visible graph's deterministic robustness without changing it:
+
+```bash
+intent assess --project . --format json
+intent assess --project . --focus <node-or-branch-id> --format json
+```
+
+The scorecard is derived, explainable, ACL-filtered, non-canonical, and model-independent. Green
+requires a score and confidence of at least 75 with no blocking conflict; orange covers scores
+50–74 or insufficient confidence; red is below 50 or blocked. Non-applicable dimensions are `N/A`,
+unsupported inputs remain `unassessed`, and a critical red path caps branch and project robustness
+at 49. The CLI, read-only MCP tools, and CI comparison share the same semantic report digest. See
+[the assessment guide](docs/assessment.md) for dimensions, exact exit codes, and CI defaults.
+
 For team conversations and external requirements, configure GitHub and/or a compatible MCP source,
 then schedule capture independently from reconciliation:
 

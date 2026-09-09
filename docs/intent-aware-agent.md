@@ -479,6 +479,24 @@ Scheduled semantic inference is optional and may only propose grounded review ca
 not a claim of truth and never approves a proposal, resolves a conflict, or authorizes a canonical
 or provider write.
 
+### Inspect robustness without changing the graph
+
+Run assessment whenever a developer has time to inspect gaps; it does not require a new prompt or
+the advisor plugin:
+
+```bash
+intent assess --project . --format json
+intent assess --project . --focus <node-or-branch-id> --format markdown
+```
+
+The report is derived, explainable, ACL-filtered, non-canonical, and model-independent. Its node,
+intent-branch, and project scorecards use the same deterministic rubric and semantic digest as the
+MCP reads and CI gate. Green requires at least 75 score and confidence and no blocking conflict;
+orange covers 50–74 or confidence below 75; red is below 50 or blocked. `N/A` dimensions are
+excluded from rollups, unsupported inputs remain `unassessed`, and a critical red path caps branch
+and project robustness at 49. See [the assessment guide](assessment.md) for deductions, confidence,
+MCP reads, CI defaults, and exit codes.
+
 ## 6. Add compatible sources
 
 Copy both the reviewed provider profile and one project binding. This Slack example is identical in
