@@ -171,23 +171,94 @@ class AuthenticatedBundleContext(_EnvelopeModel):
         return value
 
 
-def canonical_authenticated_context_bytes(context: AuthenticatedBundleContext) -> bytes:
+class AuthenticatedBundleContextV2(_EnvelopeModel):
+    """Final authority-bound AAD for version-two state archives."""
+
+    schema_version: Literal[2] = 2
+    project_id: Annotated[str, Field(pattern=_PROJECT_ID.pattern)]
+    repository_id: Annotated[str, Field(pattern=_REPOSITORY_ID.pattern)]
+    graph_version: Annotated[int, Field(ge=1)]
+    parent_bundle_digest: Annotated[str, Field(pattern=_SHA256.pattern)]
+    encryption_algorithm: Literal["x25519-hkdf-sha256-aes256gcm-v1"] = ALGORITHM
+    recipient_key_ids: Annotated[tuple[str, ...], Field(min_length=2, max_length=MAX_RECIPIENTS)]
+    authority_digest: Annotated[str, Field(pattern=_SHA256.pattern)]
+    authority_epoch: Annotated[int, Field(ge=1, le=2**31 - 1)]
+    authority_sequence: Annotated[int, Field(ge=1, le=2**63 - 1)]
+    root_key_id: Annotated[str, Field(pattern=_KEY_ID.pattern)]
+    created_at: datetime
+
+    @field_validator("graph_version", "authority_epoch", "authority_sequence", mode="before")
+    @classmethod
+    def require_integer(cls, value: object) -> object:
+        if type(value) is not int:
+            raise ValueError("invalid authenticated bundle integer")
+        return value
+
+    @field_validator("recipient_key_ids", mode="before")
+    @classmethod
+    def require_identifier_tuple(cls, value: object, info: ValidationInfo) -> object:
+        return _json_tuple(value, info)
+
+    @field_validator("recipient_key_ids")
+    @classmethod
+    def require_sorted_unique_ids(cls, values: tuple[str, ...]) -> tuple[str, ...]:
+        if (
+            values != tuple(sorted(values))
+            or len(values) != len(set(values))
+            or any(_KEY_ID.fullmatch(value) is None for value in values)
+        ):
+            raise ValueError("authenticated bundle identifiers must be sorted and unique")
+        return values
+
+    @field_validator("created_at")
+    @classmethod
+    def require_utc(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() != timedelta(0) or value.microsecond != 0:
+            raise ValueError("authenticated bundle time must be UTC-second precision")
+        return value.astimezone(UTC)
+
+    @field_validator("repository_id")
+    @classmethod
+    def require_canonical_repository_id(cls, value: str) -> str:
+        _host, owner, repository = value.split("/")
+        if owner in {".", ".."} or repository in {".", ".."} or repository.endswith(".git"):
+            raise ValueError("invalid authenticated bundle repository identity")
+        return value
+
+
+AuthenticatedContext = AuthenticatedBundleContext | AuthenticatedBundleContextV2
+
+
+def canonical_authenticated_context_bytes(context: AuthenticatedContext) -> bytes:
     """Return the only AAD encoding accepted by public encryption boundaries."""
-    if not isinstance(context, AuthenticatedBundleContext):
-        raise TypeError("context must be an AuthenticatedBundleContext")
-    validated = AuthenticatedBundleContext.model_validate(context.model_dump(mode="python"))
+    if type(context) is AuthenticatedBundleContext:
+        validated: AuthenticatedContext = AuthenticatedBundleContext.model_validate(
+            context.model_dump(mode="python")
+        )
+    elif type(context) is AuthenticatedBundleContextV2:
+        validated = AuthenticatedBundleContextV2.model_validate(context.model_dump(mode="python"))
+    else:
+        raise TypeError("context must be a supported AuthenticatedBundleContext")
     content = _canonical_json(validated.model_dump(mode="json"))
     if not content or len(content) > MAX_MANIFEST_BYTES:
         raise ValueError("invalid encrypted bundle AAD")
     return content
 
 
-def _parse_authenticated_context(aad: bytes) -> AuthenticatedBundleContext:
+def _parse_authenticated_context(aad: bytes) -> AuthenticatedContext:
     if type(aad) is not bytes or not aad or len(aad) > MAX_MANIFEST_BYTES:
         raise ValueError("invalid encrypted bundle AAD")
     try:
-        loads_strict_object(aad.decode("utf-8"))
-        context = AuthenticatedBundleContext.model_validate_json(aad)
+        raw = loads_strict_object(aad.decode("utf-8"))
+        schema_version = raw.get("schema_version")
+        if type(schema_version) is not int:
+            raise ValueError("invalid encrypted bundle AAD")
+        if schema_version == 1:
+            context: AuthenticatedContext = AuthenticatedBundleContext.model_validate_json(aad)
+        elif schema_version == 2:
+            context = AuthenticatedBundleContextV2.model_validate_json(aad)
+        else:
+            raise ValueError("invalid encrypted bundle AAD")
     except (TypeError, UnicodeError, ValueError, ValidationError) as error:
         raise ValueError("invalid encrypted bundle AAD") from error
     if canonical_authenticated_context_bytes(context) != aad:
@@ -393,7 +464,7 @@ class _InvalidAuthenticatedContext(ValueError):
     pass
 
 
-def _validate_inputs(plaintext: bytes, aad: bytes) -> AuthenticatedBundleContext:
+def _validate_inputs(plaintext: bytes, aad: bytes) -> AuthenticatedContext:
     if type(plaintext) is not bytes or len(plaintext) > MAX_BUNDLE_BYTES - 16:
         raise ValueError("invalid encrypted bundle plaintext")
     try:
@@ -606,6 +677,7 @@ def decrypt_bundle(bundle: EncryptedBundle, private_key: bytes, aad: bytes) -> b
 __all__ = [
     "ALGORITHM",
     "AuthenticatedBundleContext",
+    "AuthenticatedBundleContextV2",
     "EncryptedBundle",
     "EncryptedStateBundle",
     "WrappedContentKey",

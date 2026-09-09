@@ -16,11 +16,12 @@ import subprocess
 import sys
 import tempfile
 import time
+import traceback
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Protocol
+from typing import Protocol, cast
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
 
@@ -42,21 +43,23 @@ from intent_engineering.team_state.archive import build_archive, build_archive_v
 from intent_engineering.team_state.authority import (
     authority_digest,
     canonical_authority_attestation_preimage,
+    canonical_authority_bytes,
     canonical_certificate_signing_preimage,
     canonical_state_signature_preimage,
     derive_member_id,
     issue_device_certificate,
+    verify_v2_envelope,
 )
 from intent_engineering.team_state.crypto import (
-    AuthenticatedBundleContext,
+    AuthenticatedBundleContextV2,
     EncryptedBundle,
     _encrypt_bundle_for_public_keys,
     canonical_authenticated_context_bytes,
     canonical_encrypted_bundle_bytes,
     decrypt_bundle,
 )
-from intent_engineering.team_state.keys import DeviceEnrollmentBinding
-from intent_engineering.team_state.local_trust import LocalTrustConfig
+from intent_engineering.team_state.keys import DeviceEnrollmentBinding, KeyringDeviceKeyStore
+from intent_engineering.team_state.local_trust import LocalTrustConfig, LocalTrustConfigV2
 from intent_engineering.team_state.models import (
     CANONICAL_STATE_PATHS,
     AuthorityAttestationV2,
@@ -84,9 +87,11 @@ from intent_engineering.team_state.models import (
 )
 from intent_engineering.team_state.restore import (
     StateSignatureEnvelope,
+    VerifiedReleaseV2,
     VerifiedV1Release,
     _git_executable_token,
     _manifest_aad,
+    _validate_v2_snapshot,
     seal_state_payload,
     verify_v1_migration,
 )
@@ -140,6 +145,66 @@ class PublicationAuthority:
     publication_base_commit: str | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class PublicationAuthorityV2:
+    """Registry-derived authority for an ordinary v2 release."""
+
+    registry: TeamAuthorityRegistryV2
+    local_member_id: str
+    local_device_certificate_id: str
+    remote_state: VerifiedReleaseV2
+    publication_base_commit: str
+
+
+def authority_from_verified_state(
+    restored: VerifiedReleaseV2,
+    local_trust: LocalTrustConfigV2,
+) -> PublicationAuthorityV2:
+    """Derive effective recipients and signer identity from one verified parent."""
+    try:
+        if type(restored) is not VerifiedReleaseV2 or type(local_trust) is not LocalTrustConfigV2:
+            raise ValueError("invalid version two publication authority")
+        registry = TeamAuthorityRegistryV2.model_validate(
+            restored.authority.model_dump(mode="python")
+        )
+        trust = LocalTrustConfigV2.model_validate(local_trust.model_dump(mode="python"))
+        digest = authority_digest(registry)
+        certificates = {item.certificate_id: item for item in registry.device_certificates}
+        certificate = certificates.get(trust.device_certificate_id)
+        members = {item.member_id: item for item in registry.members}
+        member = members.get(trust.member_id)
+        revoked = {item.certificate_id for item in registry.revocations}
+        if (
+            restored.manifest.authority_digest != digest
+            or restored.manifest.recipient_key_ids != registry.active_recipient_key_ids()
+            or trust.project_id != registry.project_id
+            or trust.repository_id != registry.repository_id
+            or trust.root != registry.root
+            or trust.accepted_authority_digest != digest
+            or trust.accepted_authority_sequence != registry.sequence
+            or trust.accepted_bundle_digest != restored.manifest.bundle_digest
+            or certificate is None
+            or member is None
+            or member.status != "active"
+            or certificate.certificate_id in revoked
+            or certificate.claims.member_id != trust.member_id
+            or certificate.claims.recipient_key_id != trust.recipient_key_id
+            or certificate.claims.signature_id != trust.signature_id
+            or certificate.claims.issued_at > restored.manifest.created_at + timedelta(minutes=5)
+            or certificate.claims.expires_at < restored.manifest.created_at - timedelta(minutes=5)
+        ):
+            raise ValueError("invalid version two publication authority")
+        return PublicationAuthorityV2(
+            registry=registry,
+            local_member_id=trust.member_id,
+            local_device_certificate_id=trust.device_certificate_id,
+            remote_state=restored,
+            publication_base_commit=restored.commit,
+        )
+    except (AttributeError, TypeError, ValueError):
+        raise ValueError("version two publication authority unavailable") from None
+
+
 class LegacyMigrationSigner(Protocol):
     """Existing v1 authority used only for the one-time bridge signature."""
 
@@ -185,6 +250,223 @@ class PreparedV1Migration:
             or authority_digest(self.authority) != self.manifest.authority_digest
         ):
             raise ValueError("prepared migration artifacts are not exactly bound")
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedPublicationV2:
+    """Exact ordinary v2 artifacts derived from the verified parent registry."""
+
+    repository_id: str
+    branch: str
+    manifest: TeamStateManifestV2
+    manifest_bytes: bytes
+    bundle: bytes
+    envelope: StateSignatureEnvelopeV2
+    signatures: bytes
+    bundle_path: str
+    signature_path: str
+    authority: TeamAuthorityRegistryV2
+
+    def __post_init__(self) -> None:
+        digest_hex = self.manifest.bundle_digest.removeprefix("sha256:")
+        release = f"{self.manifest.graph_version}-{digest_hex}"
+        if (
+            self.repository_id != self.manifest.repository_id
+            or self.branch != f"intent-publication/{digest_hex}"
+            or self.manifest_bytes != canonical_manifest_bytes(self.manifest)
+            or self.signatures != self.envelope.canonical_bytes()
+            or len(self.bundle) != self.manifest.bundle_size
+            or "sha256:" + hashlib.sha256(self.bundle).hexdigest() != self.manifest.bundle_digest
+            or self.bundle_path != f"bundles/{release}.intent"
+            or self.signature_path != f"signatures/{release}.json"
+            or authority_digest(self.authority) != self.manifest.authority_digest
+            or self.manifest.recipient_key_ids != self.authority.active_recipient_key_ids()
+            or self.manifest.migration is not None
+            or self.envelope.manifest_digest
+            != "sha256:" + hashlib.sha256(self.manifest_bytes).hexdigest()
+            or self.envelope.bundle_digest != self.manifest.bundle_digest
+            or self.envelope.authority_digest != self.manifest.authority_digest
+            or len(self.envelope.certificates) != 1
+            or self.envelope.certificates[0] not in self.authority.device_certificates
+            or self.envelope.authority_attestation is not None
+            or self.envelope.migration_proof is not None
+        ):
+            raise ValueError("prepared version two artifacts are not exactly bound")
+
+
+class V2DeviceSigner(Protocol):
+    """Non-exporting local device signing boundary."""
+
+    def sign(self, signature_id: str, preimage: bytes) -> bytes: ...
+
+
+def _prepare_v2_publication(
+    *,
+    snapshot: CanonicalStateSnapshot,
+    authority: PublicationAuthorityV2,
+    device_signer: V2DeviceSigner,
+    now: datetime,
+) -> PreparedPublicationV2:
+    """Prepare an ordinary release without caller-controlled policy or root authority."""
+    signature = b""
+    try:
+        if (
+            type(snapshot) is not CanonicalStateSnapshot
+            or type(authority) is not PublicationAuthorityV2
+            or type(now) is not datetime
+            or now.tzinfo is None
+            or now.utcoffset() != timedelta(0)
+            or now.microsecond != 0
+        ):
+            raise ValueError("version two publication input changed")
+        snapshot = CanonicalStateSnapshot.model_validate(snapshot.model_dump(mode="python"))
+        registry = TeamAuthorityRegistryV2.model_validate(
+            authority.registry.model_dump(mode="python")
+        )
+        parent = authority.remote_state
+        if (
+            type(parent) is not VerifiedReleaseV2
+            or authority.publication_base_commit != parent.commit
+            or parent.authority != registry
+            or snapshot.project_id != registry.project_id
+            or snapshot.repository_id != registry.repository_id
+            or snapshot.graph_version < parent.manifest.graph_version
+        ):
+            raise ValueError("version two publication parent changed")
+        certificates = {item.certificate_id: item for item in registry.device_certificates}
+        certificate = certificates.get(authority.local_device_certificate_id)
+        member = {item.member_id: item for item in registry.members}.get(authority.local_member_id)
+        if (
+            certificate is None
+            or member is None
+            or member.status != "active"
+            or certificate.claims.member_id != member.member_id
+            or certificate.certificate_id in {item.certificate_id for item in registry.revocations}
+            or certificate.claims.issued_at > now + timedelta(minutes=5)
+            or certificate.claims.expires_at < now - timedelta(minutes=5)
+        ):
+            raise ValueError("version two publication signer unavailable")
+        recipient_ids = registry.active_recipient_key_ids()
+        recipient_public_keys = {
+            item.claims.recipient_key_id: _decode_public_key(item.claims.recipient_public_key)
+            for item in registry.device_certificates
+            if item.claims.recipient_key_id in recipient_ids
+        }
+        recipient_public_keys[registry.ci_recipient.key_id] = _decode_public_key(
+            registry.ci_recipient.public_key
+        )
+        recipient_public_keys = dict(sorted(recipient_public_keys.items()))
+        if tuple(recipient_public_keys) != recipient_ids:
+            raise ValueError("version two publication recipients changed")
+        archive = build_archive_v2(snapshot, registry)
+        aad = _v2_authenticated_aad(
+            project_id=snapshot.project_id,
+            repository_id=snapshot.repository_id,
+            graph_version=snapshot.graph_version,
+            parent_bundle_digest=parent.manifest.bundle_digest,
+            recipient_key_ids=recipient_ids,
+            authority=registry,
+            created_at=now.astimezone(UTC),
+        )
+        bundle = canonical_encrypted_bundle_bytes(
+            _encrypt_bundle_for_public_keys(archive, recipient_public_keys, aad)
+        )
+        manifest = TeamStateManifestV2(
+            project_id=snapshot.project_id,
+            repository_id=snapshot.repository_id,
+            graph_version=snapshot.graph_version,
+            parent_bundle_digest=parent.manifest.bundle_digest,
+            bundle_digest="sha256:" + hashlib.sha256(bundle).hexdigest(),
+            bundle_size=len(bundle),
+            recipient_key_ids=recipient_ids,
+            authority_digest=authority_digest(registry),
+            authority_epoch=registry.authority_epoch,
+            root_key_id=registry.root.root_key_id,
+            created_at=now.astimezone(UTC),
+        )
+        _validate_v2_snapshot(snapshot, manifest)
+        signature = device_signer.sign(
+            certificate.claims.signature_id,
+            canonical_state_signature_preimage(manifest),
+        )
+        if type(signature) is not bytes or len(signature) != 64:
+            raise ValueError("version two publication signature unavailable")
+        envelope = StateSignatureEnvelopeV2(
+            manifest_digest="sha256:" + hashlib.sha256(manifest.canonical_bytes()).hexdigest(),
+            bundle_digest=manifest.bundle_digest,
+            authority_digest=manifest.authority_digest,
+            certificates=(certificate,),
+            signatures=(
+                CertifiedStateSignatureV2(
+                    certificate_id=certificate.certificate_id,
+                    signature_id=certificate.claims.signature_id,
+                    signature=base64.urlsafe_b64encode(signature).rstrip(b"=").decode(),
+                ),
+            ),
+        )
+        verify_v2_envelope(manifest, envelope, registry.root, registry, now)
+        digest_hex = manifest.bundle_digest.removeprefix("sha256:")
+        release = f"{manifest.graph_version}-{digest_hex}"
+        return PreparedPublicationV2(
+            repository_id=snapshot.repository_id,
+            branch=f"intent-publication/{digest_hex}",
+            manifest=manifest,
+            manifest_bytes=manifest.canonical_bytes(),
+            bundle=bundle,
+            envelope=envelope,
+            signatures=envelope.canonical_bytes(),
+            bundle_path=f"bundles/{release}.intent",
+            signature_path=f"signatures/{release}.json",
+            authority=registry,
+        )
+    finally:
+        signature = b""
+        device_signer = None  # type: ignore[assignment]
+
+
+def prepare_v2_publication(
+    *,
+    snapshot: CanonicalStateSnapshot,
+    authority: PublicationAuthorityV2,
+    device_signer: V2DeviceSigner,
+    now: datetime,
+) -> PreparedPublicationV2:
+    """Public fixed-error and cancellation-safe v2 preparation boundary."""
+    result: PreparedPublicationV2 | None = None
+    failure: BaseException | None = None
+    try:
+        result = _prepare_v2_publication(
+            snapshot=snapshot,
+            authority=authority,
+            device_signer=device_signer,
+            now=now,
+        )
+    except BaseException as error:  # noqa: BLE001 - scrub and preserve cancellation
+        error_traceback = error.__traceback__
+        if error_traceback is not None:
+            traceback.clear_frames(error_traceback)
+        error_traceback = None
+        error.args = ()
+        error.__dict__.clear()
+        error.__traceback__ = None
+        error.__cause__ = None
+        error.__context__ = None
+        failure = (
+            error
+            if not isinstance(error, Exception)
+            else ValueError("version two publication preparation failed")
+        )
+    finally:
+        snapshot = None  # type: ignore[assignment]
+        authority = None  # type: ignore[assignment]
+        device_signer = None  # type: ignore[assignment]
+        now = None  # type: ignore[assignment]
+    if failure is not None:
+        detached = failure
+        failure = None
+        raise detached.with_traceback(None) from None
+    assert result is not None
+    return result
 
 
 @dataclass(frozen=True, slots=True)
@@ -318,6 +600,20 @@ class PublicationPreview:
     manifest: TeamStateManifest
     snapshot_digest: str
     recipient_key_ids: tuple[str, ...]
+    branch: str
+
+
+@dataclass(frozen=True, slots=True)
+class PublicationPreviewV2:
+    """Credential-free projection of one registry-preserving v2 release."""
+
+    payload: HumanDecisionPayload
+    manifest: TeamStateManifestV2
+    snapshot_digest: str
+    authority_digest: str
+    authority_sequence: int
+    recipient_key_ids: tuple[str, ...]
+    local_device_certificate_id: str
     branch: str
 
 
@@ -566,8 +862,35 @@ class TemporaryWorktreePublisher:
         except OSError as error:
             raise PublicationCleanupError("publication cleanup refused") from error
 
-    def publish(self, publication: PreparedPublication, *, base_commit: str | None) -> None:
-        publication = PreparedPublication.model_validate(publication.model_dump(mode="python"))
+    def publish(
+        self,
+        publication: PreparedPublication | PreparedPublicationV2,
+        *,
+        base_commit: str | None,
+    ) -> None:
+        if type(publication) is PreparedPublication:
+            publication = PreparedPublication.model_validate(publication.model_dump(mode="python"))
+        elif type(publication) is PreparedPublicationV2:
+            publication = PreparedPublicationV2(
+                repository_id=publication.repository_id,
+                branch=publication.branch,
+                manifest=TeamStateManifestV2.model_validate(
+                    publication.manifest.model_dump(mode="python")
+                ),
+                manifest_bytes=publication.manifest_bytes,
+                bundle=publication.bundle,
+                envelope=StateSignatureEnvelopeV2.model_validate(
+                    publication.envelope.model_dump(mode="python")
+                ),
+                signatures=publication.signatures,
+                bundle_path=publication.bundle_path,
+                signature_path=publication.signature_path,
+                authority=TeamAuthorityRegistryV2.model_validate(
+                    publication.authority.model_dump(mode="python")
+                ),
+            )
+        else:
+            raise ValueError("publication artifacts unavailable")
         owner = Path(tempfile.mkdtemp(prefix="intent-publication-", dir=self._temp_root))
         owner_stat = os.lstat(owner)
         owner_identity = (owner_stat.st_dev, owner_stat.st_ino)
@@ -707,25 +1030,28 @@ def _default_migration_authorities(
     )
 
 
-def _transitional_v1_migration_aad(
+def _v2_authenticated_aad(
     *,
     project_id: str,
     repository_id: str,
     graph_version: int,
     parent_bundle_digest: str,
     recipient_key_ids: tuple[str, ...],
-    signature_id: str,
+    authority: TeamAuthorityRegistryV2,
     created_at: datetime,
 ) -> bytes:
-    """Task-5 bridge only; Task 6 replaces this v1-shaped AAD with v2 authority AAD."""
+    """Return final AAD bound to the exact registry used by the archive."""
     return canonical_authenticated_context_bytes(
-        AuthenticatedBundleContext(
+        AuthenticatedBundleContextV2(
             project_id=project_id,
             repository_id=repository_id,
             graph_version=graph_version,
             parent_bundle_digest=parent_bundle_digest,
             recipient_key_ids=recipient_key_ids,
-            required_signature_ids=(signature_id,),
+            authority_digest=authority_digest(authority),
+            authority_epoch=authority.authority_epoch,
+            authority_sequence=authority.sequence,
+            root_key_id=authority.root.root_key_id,
             created_at=created_at,
         )
     )
@@ -856,13 +1182,13 @@ def preview_v1_migration(
         )
         archive = build_archive_v2(current.snapshot, authority)
         recipient_ids = authority.active_recipient_key_ids()
-        aad = _transitional_v1_migration_aad(
+        aad = _v2_authenticated_aad(
             project_id=legacy_trust.project_id,
             repository_id=legacy_trust.repository_id,
             graph_version=current.snapshot.graph_version,
             parent_bundle_digest=current.manifest.bundle_digest,
             recipient_key_ids=recipient_ids,
-            signature_id=material.signature_id,
+            authority=authority,
             created_at=now.astimezone(UTC),
         )
         bundle = canonical_encrypted_bundle_bytes(
@@ -1202,13 +1528,13 @@ def prepare_v1_migration(
             previous_authority_digest=None,
         )
         archive = build_archive_v2(current.snapshot, authority)
-        aad = _transitional_v1_migration_aad(
+        aad = _v2_authenticated_aad(
             project_id=preview.project_id,
             repository_id=preview.repository_id,
             graph_version=preview.graph_version,
             parent_bundle_digest=preview.legacy_parent_bundle_digest,
             recipient_key_ids=authority.active_recipient_key_ids(),
-            signature_id=material.signature_id,
+            authority=authority,
             created_at=payload.issued_at,
         )
         parsed_bundle = EncryptedBundle.model_validate_json(preview.bundle)
@@ -1432,8 +1758,9 @@ class PublicationService:
         *,
         repository_id: str,
         decision_repository_id: str,
-        authority: Callable[[], PublicationAuthority],
+        authority: Callable[[], PublicationAuthority | PublicationAuthorityV2],
         publisher: PublicationPublisher,
+        device_signer: V2DeviceSigner | None = None,
         challenge_source: Callable[[], bytes] = lambda: secrets.token_bytes(32),
     ) -> None:
         self._runtime = runtime
@@ -1441,12 +1768,13 @@ class PublicationService:
         self._decision_repository_id = decision_repository_id
         self._authority = authority
         self._publisher = publisher
+        self._device_signer = device_signer
         self._challenge_source = challenge_source
         self._publication_base_commit: str | None = None
         self._pending: (
             tuple[
-                PublicationPreview,
-                PreparedPublication,
+                PublicationPreview | PublicationPreviewV2,
+                PreparedPublication | PreparedPublicationV2,
                 bytes,
                 bytes,
                 str | None,
@@ -1464,10 +1792,16 @@ class PublicationService:
             raise ValueError("publication parent binding changed")
         self._publication_base_commit = commit
 
-    def _current_authority(self) -> PublicationAuthority:
+    def _current_authority(self) -> PublicationAuthority | PublicationAuthorityV2:
         authority = self._authority()
         if self._publication_base_commit is None:
             return authority
+        if type(authority) is PublicationAuthorityV2:
+            if authority.publication_base_commit != self._publication_base_commit:
+                raise ValueError("publication parent binding changed")
+            return authority
+        if type(authority) is not PublicationAuthority:
+            raise ValueError("publication authority unavailable")
         if (
             authority.publication_base_commit is not None
             and authority.publication_base_commit != self._publication_base_commit
@@ -1613,13 +1947,98 @@ class PublicationService:
             canonical,
         )
 
-    def preview(self, *, now: datetime) -> PublicationPreview:
+    def _v2_signer(self, authority: PublicationAuthorityV2) -> V2DeviceSigner:
+        if self._device_signer is not None:
+            return self._device_signer
+        certificate = {
+            item.certificate_id: item for item in authority.registry.device_certificates
+        }.get(authority.local_device_certificate_id)
+        member = {item.member_id: item for item in authority.registry.members}.get(
+            authority.local_member_id
+        )
+        if certificate is None or member is None:
+            raise ValueError("version two publication signer unavailable")
+        return KeyringDeviceKeyStore(
+            DeviceEnrollmentBinding(
+                project_id=authority.registry.project_id,
+                repository_id=authority.registry.repository_id,
+                actor=member.actor,
+                github_account_id=member.github_account_id,
+                github_login=member.github_login,
+                device_id=certificate.claims.device_id,
+            )
+        )
+
+    def _preview_v2(
+        self,
+        snapshot: CanonicalStateSnapshot,
+        authority: PublicationAuthorityV2,
+        *,
+        now: datetime,
+    ) -> PublicationPreviewV2:
+        prepared = prepare_v2_publication(
+            snapshot=snapshot,
+            authority=authority,
+            device_signer=self._v2_signer(authority),
+            now=now,
+        )
+        archive = build_archive_v2(snapshot, authority.registry)
+        authority_bytes = canonical_authority_bytes(authority.registry)
+        challenge = self._challenge_source()
+        if type(challenge) is not bytes or len(challenge) < 16:
+            raise ValueError("publication challenge unavailable")
+        parent_digest = prepared.manifest.parent_bundle_digest
+        if parent_digest is None:
+            raise ValueError("publication parent binding changed")
+        snapshot_digest = self._digest(archive)
+        payload = HumanDecisionPayload(
+            project_id=snapshot.project_id,
+            repository_id=self._decision_repository_id,
+            actor=self._runtime.config.local_actor,
+            action=DecisionAction.PUBLISH_STATE,
+            graph_version=snapshot.graph_version,
+            parent_bundle_digest=parent_digest,
+            subject=DecisionSubject(
+                kind="publication",
+                id=f"publication:{snapshot_digest.removeprefix('sha256:')}",
+            ),
+            subject_digest=self._digest(authority_bytes + archive),
+            result_digest=prepared.manifest.bundle_digest,
+            challenge=f"challenge:{hashlib.sha256(challenge).hexdigest()}",
+            issued_at=now.astimezone(UTC),
+            expires_at=now.astimezone(UTC) + _DECISION_LIFETIME,
+        )
+        preview = PublicationPreviewV2(
+            payload=payload,
+            manifest=prepared.manifest,
+            snapshot_digest=snapshot_digest,
+            authority_digest=prepared.manifest.authority_digest,
+            authority_sequence=authority.registry.sequence,
+            recipient_key_ids=prepared.manifest.recipient_key_ids,
+            local_device_certificate_id=authority.local_device_certificate_id,
+            branch=prepared.branch,
+        )
+        self._pending = (
+            preview,
+            prepared,
+            archive,
+            authority_bytes,
+            authority.publication_base_commit,
+        )
+        return preview
+
+    def preview(self, *, now: datetime) -> PublicationPreview | PublicationPreviewV2:
         if now.tzinfo is None or now.utcoffset() != timedelta(0):
             raise ValueError("publication time must be UTC")
         snapshot, archive = self._capture()
+        current_authority = self._current_authority()
+        if type(current_authority) is PublicationAuthorityV2:
+            return self._preview_v2(snapshot, current_authority, now=now.astimezone(UTC))
+        if type(current_authority) is not PublicationAuthority:
+            raise ValueError("publication authority unavailable")
         recipients, signing, parent_digest, parent_commit, authority_bytes = (
             self._authority_material(
-                self._current_authority(),
+                current_authority,
                 project_id=snapshot.project_id,
                 repository_id=snapshot.repository_id,
             )
@@ -1692,7 +2111,8 @@ class PublicationService:
         """Return only the encrypted draft; it carries no human authority."""
         if self._pending is None:
             raise ValueError("publication draft unavailable")
-        return self._pending[1]
+        # Task 7 broadens the transport/receipt model; retain its v1 static seam meanwhile.
+        return cast(PreparedPublication, self._pending[1])
 
     def recover_preview(
         self,
@@ -1707,6 +2127,8 @@ class PublicationService:
         try:
             prepared = PreparedPublication.model_validate(prepared.model_dump(mode="python"))
             current = self.preview(now=now)
+            if type(current) is not PublicationPreview:
+                raise ValueError("publication draft changed")
             pending = self._pending
             assert pending is not None
             _, _, archive, authority_bytes, parent_commit = pending
@@ -1738,8 +2160,11 @@ class PublicationService:
                 != manifest.required_signature_ids
             ):
                 raise ValueError("publication draft signatures changed")
+            current_authority = self._current_authority()
+            if type(current_authority) is not PublicationAuthority:
+                raise ValueError("publication authority changed")
             _, signing, _, _, _ = self._authority_material(
-                self._current_authority(),
+                current_authority,
                 project_id=manifest.project_id,
                 repository_id=manifest.repository_id,
             )
@@ -1798,6 +2223,44 @@ class PublicationService:
         if pending is None or type(decision) is not VerifiedHumanDecision:
             raise ValueError("publication decision unavailable")
         preview, prepared, expected_archive, expected_authority, parent_commit = pending
+        if type(preview) is PublicationPreviewV2 and type(prepared) is PreparedPublicationV2:
+            credential = decision.credential
+            if (
+                decision.payload != preview.payload
+                or decision.verified_at < preview.payload.issued_at
+                or decision.verified_at > preview.payload.expires_at
+                or now < decision.verified_at
+                or now > preview.payload.expires_at
+                or credential.local_only
+            ):
+                raise ValueError("publication decision changed")
+            snapshot, _archive_v1 = self._capture()
+            current = self._current_authority()
+            if type(current) is not PublicationAuthorityV2:
+                raise ValueError("publication authority changed")
+            certificate = {
+                item.certificate_id: item for item in current.registry.device_certificates
+            }.get(current.local_device_certificate_id)
+            if (
+                certificate is None
+                or credential.github_account_id != str(certificate.claims.github_account_id)
+                or credential.github_login != certificate.claims.github_login
+                or "sha256:" + hashlib.sha256(credential.canonical_bytes()).hexdigest()
+                != certificate.claims.webauthn_credential_digest
+                or build_archive_v2(snapshot, current.registry) != expected_archive
+                or canonical_authority_bytes(current.registry) != expected_authority
+                or current.publication_base_commit != parent_commit
+                or current.remote_state.manifest.bundle_digest
+                != prepared.manifest.parent_bundle_digest
+                or snapshot.graph_version != prepared.manifest.graph_version
+            ):
+                raise ValueError("publication state changed")
+            self._publisher.publish(cast(PreparedPublication, prepared), base_commit=parent_commit)
+            self._pending = None
+            self._publication_base_commit = None
+            return cast(PreparedPublication, prepared)
+        if type(preview) is not PublicationPreview or type(prepared) is not PreparedPublication:
+            raise ValueError("publication draft unavailable")
         credential = decision.credential
         if (
             decision.payload != preview.payload
@@ -1812,9 +2275,12 @@ class PublicationService:
         ):
             raise ValueError("publication decision changed")
         snapshot, archive = self._capture()
+        current_authority = self._current_authority()
+        if type(current_authority) is not PublicationAuthority:
+            raise ValueError("publication authority changed")
         recipients, _signing, current_parent, current_commit, authority_bytes = (
             self._authority_material(
-                self._current_authority(),
+                current_authority,
                 project_id=snapshot.project_id,
                 repository_id=snapshot.repository_id,
             )

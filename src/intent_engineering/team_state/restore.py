@@ -64,18 +64,23 @@ from intent_engineering.team_state.archive import (
     ARCHIVE_MAGIC,
     ARCHIVE_V2_MAGIC,
     validate_archive,
+    validate_archive_v2,
 )
 from intent_engineering.team_state.authority import (
     VerifiedEnvelopeV2,
     authority_digest,
+    canonical_authority_bytes,
     verify_v2_envelope,
 )
 from intent_engineering.team_state.crypto import (
     ALGORITHM,
+    AuthenticatedBundleContextV2,
     EncryptedBundle,
     EncryptedStateBundle,
     _encrypt_bundle_for_public_keys,
+    canonical_authenticated_context_bytes,
     canonical_encrypted_bundle_bytes,
+    decrypt_bundle,
     decrypt_bundle_for_recipient,
 )
 from intent_engineering.team_state.keys import RecipientKeyStore, RecipientKeyStoreError
@@ -320,6 +325,314 @@ class VerifiedV1Release:
             or self.snapshot.graph_version != manifest.graph_version
         ):
             raise ValueError("invalid verified version one snapshot")
+
+
+@dataclass(frozen=True)
+class VerifiedReleaseV2:
+    """One fully verified v2 release used as publication authority.
+
+    The authority is retained as the exact canonical public object recovered
+    from this release's encrypted archive.  No private material is represented.
+    """
+
+    manifest: TeamStateManifestV2
+    manifest_bytes: bytes
+    authority: TeamAuthorityRegistryV2
+    commit: str
+    snapshot: CanonicalStateSnapshot | None = None
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.manifest) is not TeamStateManifestV2
+            or type(self.authority) is not TeamAuthorityRegistryV2
+            or type(self.manifest_bytes) is not bytes
+            or type(self.commit) is not str
+            or _GIT_COMMIT.fullmatch(self.commit) is None
+        ):
+            raise ValueError("invalid verified version two release")
+        manifest = TeamStateManifestV2.model_validate(self.manifest.model_dump(mode="python"))
+        registry = TeamAuthorityRegistryV2.model_validate(self.authority.model_dump(mode="python"))
+        if (
+            self.manifest_bytes != canonical_manifest_bytes(manifest)
+            or manifest.project_id != registry.project_id
+            or manifest.repository_id != registry.repository_id
+            or manifest.authority_epoch != registry.authority_epoch
+            or manifest.root_key_id != registry.root.root_key_id
+            or manifest.authority_digest != authority_digest(registry)
+            or manifest.recipient_key_ids != registry.active_recipient_key_ids()
+            or not canonical_authority_bytes(registry)
+        ):
+            raise ValueError("invalid verified version two release")
+        if self.snapshot is not None and (
+            type(self.snapshot) is not CanonicalStateSnapshot
+            or self.snapshot.project_id != manifest.project_id
+            or self.snapshot.repository_id != manifest.repository_id
+            or self.snapshot.graph_version != manifest.graph_version
+        ):
+            raise ValueError("invalid verified version two release")
+
+
+def _validate_v2_snapshot(
+    snapshot: CanonicalStateSnapshot,
+    manifest: TeamStateManifestV2,
+) -> None:
+    """Apply the established canonical semantic checks to decrypted v2 state."""
+    if type(snapshot) is not CanonicalStateSnapshot or type(manifest) is not TeamStateManifestV2:
+        raise ValueError("restored shared state is invalid")
+    files = {item.path: item.content for item in snapshot.files}
+    report = validate_canonical_snapshot(_validation_snapshot(files))
+    if (
+        not report.valid
+        or report.graph_version != manifest.graph_version
+        or snapshot.project_id != manifest.project_id
+        or snapshot.repository_id != manifest.repository_id
+        or snapshot.graph_version != manifest.graph_version
+    ):
+        raise ValueError("restored shared state is invalid")
+    loaded = yaml.safe_load(files["config.yaml"].decode("utf-8"))
+    config = ProjectConfig.model_validate(loaded)
+    if (
+        config.project_id != manifest.project_id
+        or str(configured_graph_relative(config.graph_path)) != "graph.yaml"
+    ):
+        raise ValueError("restored project identity mismatch")
+    parse_immutable_records(files["approvals/plans.jsonl"], WritePlan)
+    parse_immutable_records(files["approvals/approvals.jsonl"], ApprovalRecord)
+    policy = files["approvals/policy.yaml"]
+    if policy:
+        MutationPolicy.model_validate(load_strict_yaml_mapping_bytes(policy))
+
+
+def verify_v2_release(
+    *,
+    manifest_bytes: bytes,
+    bundle_bytes: bytes,
+    envelope_bytes: bytes,
+    parent: VerifiedReleaseV2,
+    recipient_key_id: str,
+    recipient_private_key: bytes,
+    commit: str,
+    now: datetime,
+) -> VerifiedReleaseV2:
+    """Verify and decrypt one ordinary v2 child against its exact parent authority."""
+    plaintext = b""
+    try:
+        if (
+            type(parent) is not VerifiedReleaseV2
+            or type(recipient_key_id) is not str
+            or recipient_key_id not in parent.authority.active_recipient_key_ids()
+            or type(recipient_private_key) is not bytes
+            or len(recipient_private_key) != 32
+            or type(commit) is not str
+            or _GIT_COMMIT.fullmatch(commit) is None
+            or type(now) is not datetime
+            or now.tzinfo is None
+            or now.utcoffset() != timedelta(0)
+            or now.microsecond != 0
+        ):
+            raise ValueError("invalid version two release")
+        manifest = parse_team_manifest(manifest_bytes)
+        envelope = parse_signature_envelope(envelope_bytes)
+        if (
+            type(manifest) is not TeamStateManifestV2
+            or type(envelope) is not StateSignatureEnvelopeV2
+        ):
+            raise ValueError("invalid version two release")
+        bundle = EncryptedBundle.model_validate_json(bundle_bytes)
+        same_authority = manifest.authority_digest == authority_digest(parent.authority)
+        if (
+            canonical_encrypted_bundle_bytes(bundle) != bundle_bytes
+            or len(bundle_bytes) != manifest.bundle_size
+            or _digest(bundle_bytes) != manifest.bundle_digest
+            or manifest.project_id != parent.manifest.project_id
+            or manifest.repository_id != parent.manifest.repository_id
+            or manifest.parent_bundle_digest != parent.manifest.bundle_digest
+            or manifest.authority_epoch != parent.authority.authority_epoch
+            or manifest.root_key_id != parent.authority.root.root_key_id
+            or manifest.migration is not None
+            or (same_authority and envelope.authority_attestation is not None)
+            or (not same_authority and envelope.authority_attestation is None)
+            or envelope.migration_proof is not None
+        ):
+            raise ValueError("invalid version two release")
+        aad = canonical_authenticated_context_bytes(
+            AuthenticatedBundleContextV2(
+                project_id=manifest.project_id,
+                repository_id=manifest.repository_id,
+                graph_version=manifest.graph_version,
+                parent_bundle_digest=manifest.parent_bundle_digest,
+                recipient_key_ids=manifest.recipient_key_ids,
+                authority_digest=manifest.authority_digest,
+                authority_epoch=manifest.authority_epoch,
+                authority_sequence=(
+                    parent.authority.sequence if same_authority else parent.authority.sequence + 1
+                ),
+                root_key_id=manifest.root_key_id,
+                created_at=manifest.created_at,
+            )
+        )
+        plaintext = decrypt_bundle(bundle, recipient_private_key, aad)
+        restored = validate_archive_v2(plaintext)
+        _validate_v2_snapshot(restored.snapshot, manifest)
+        if (
+            authority_digest(restored.authority) != manifest.authority_digest
+            or manifest.recipient_key_ids != restored.authority.active_recipient_key_ids()
+            or (
+                same_authority
+                and canonical_authority_bytes(restored.authority)
+                != canonical_authority_bytes(parent.authority)
+            )
+            or (
+                not same_authority
+                and (
+                    restored.authority.root != parent.authority.root
+                    or restored.authority.sequence != parent.authority.sequence + 1
+                    or restored.authority.previous_authority_digest
+                    != authority_digest(parent.authority)
+                    or restored.authority.ci_recipient != parent.authority.ci_recipient
+                )
+            )
+            or restored.snapshot.project_id != manifest.project_id
+            or restored.snapshot.repository_id != manifest.repository_id
+            or restored.snapshot.graph_version != manifest.graph_version
+        ):
+            raise ValueError("invalid version two release")
+        verify_v2_envelope(
+            manifest,
+            envelope,
+            parent.authority.root,
+            parent.authority,
+            now,
+        )
+        return VerifiedReleaseV2(
+            manifest=manifest,
+            manifest_bytes=manifest_bytes,
+            authority=restored.authority,
+            commit=commit,
+            snapshot=restored.snapshot,
+        )
+    except BaseException as error:  # noqa: BLE001 - fixed secret-bearing boundary
+        error_traceback = error.__traceback__
+        if error_traceback is not None:
+            traceback.clear_frames(error_traceback)
+        error_traceback = None
+        error.args = ()
+        error.__dict__.clear()
+        error.__traceback__ = None
+        error.__cause__ = None
+        error.__context__ = None
+        if not isinstance(error, Exception):
+            raise error.with_traceback(None)
+        raise ValueError("version two release verification failed") from None
+    finally:
+        plaintext = b""
+        recipient_private_key = b""
+
+
+def verify_v2_migration_release(
+    *,
+    manifest_bytes: bytes,
+    bundle_bytes: bytes,
+    envelope_bytes: bytes,
+    current: VerifiedV1Release,
+    recipient_key_id: str,
+    recipient_private_key: bytes,
+    commit: str,
+    now: datetime,
+) -> VerifiedReleaseV2:
+    """Verify the dual-signed first-v2 release with unchanged v1 CI material."""
+    plaintext = b""
+    try:
+        if (
+            type(current) is not VerifiedV1Release
+            or current.snapshot is None
+            or type(recipient_private_key) is not bytes
+            or len(recipient_private_key) != 32
+            or type(commit) is not str
+            or _GIT_COMMIT.fullmatch(commit) is None
+        ):
+            raise ValueError("invalid version two migration")
+        manifest = parse_team_manifest(manifest_bytes)
+        envelope = parse_signature_envelope(envelope_bytes)
+        if (
+            type(manifest) is not TeamStateManifestV2
+            or type(envelope) is not StateSignatureEnvelopeV2
+            or manifest.migration is None
+            or manifest.parent_bundle_digest != current.manifest.bundle_digest
+            or recipient_key_id not in manifest.recipient_key_ids
+        ):
+            raise ValueError("invalid version two migration")
+        bundle = EncryptedBundle.model_validate_json(bundle_bytes)
+        if (
+            canonical_encrypted_bundle_bytes(bundle) != bundle_bytes
+            or len(bundle_bytes) != manifest.bundle_size
+            or _digest(bundle_bytes) != manifest.bundle_digest
+        ):
+            raise ValueError("invalid version two migration")
+        aad = canonical_authenticated_context_bytes(
+            AuthenticatedBundleContextV2(
+                project_id=manifest.project_id,
+                repository_id=manifest.repository_id,
+                graph_version=manifest.graph_version,
+                parent_bundle_digest=manifest.parent_bundle_digest,
+                recipient_key_ids=manifest.recipient_key_ids,
+                authority_digest=manifest.authority_digest,
+                authority_epoch=manifest.authority_epoch,
+                authority_sequence=1,
+                root_key_id=manifest.root_key_id,
+                created_at=manifest.created_at,
+            )
+        )
+        plaintext = decrypt_bundle(bundle, recipient_private_key, aad)
+        restored = validate_archive_v2(plaintext)
+        _validate_v2_snapshot(restored.snapshot, manifest)
+        public = (
+            X25519PrivateKey.from_private_bytes(recipient_private_key)
+            .public_key()
+            .public_bytes_raw()
+        )
+        expected_public = base64.urlsafe_b64encode(public).rstrip(b"=").decode()
+        if (
+            authority_digest(restored.authority) != manifest.authority_digest
+            or restored.authority.sequence != 1
+            or restored.authority.previous_authority_digest is not None
+            or restored.authority.ci_recipient.key_id != recipient_key_id
+            or restored.authority.ci_recipient.public_key != expected_public
+            or restored.snapshot != current.snapshot
+        ):
+            raise ValueError("invalid version two migration")
+        verify_v1_migration(
+            current=current,
+            manifest=manifest,
+            envelope=envelope,
+            root=restored.authority.root,
+            authority=restored.authority,
+            expected_ci_recipient=restored.authority.ci_recipient,
+            now=now,
+        )
+        return VerifiedReleaseV2(
+            manifest=manifest,
+            manifest_bytes=manifest_bytes,
+            authority=restored.authority,
+            commit=commit,
+            snapshot=restored.snapshot,
+        )
+    except BaseException as error:  # noqa: BLE001 - fixed secret-bearing boundary
+        error_traceback = error.__traceback__
+        if error_traceback is not None:
+            traceback.clear_frames(error_traceback)
+        error_traceback = None
+        error.args = ()
+        error.__dict__.clear()
+        error.__traceback__ = None
+        error.__cause__ = None
+        error.__context__ = None
+        if not isinstance(error, Exception):
+            raise error.with_traceback(None)
+        raise ValueError("version two migration verification failed") from None
+    finally:
+        plaintext = b""
+        recipient_private_key = b""
 
 
 def rejects_schema1_after_v2(
@@ -2565,7 +2878,11 @@ __all__ = [
     "TeamStateRestoreRuntime",
     "TeamStateRestorer",
     "TrustedSigningKey",
+    "VerifiedReleaseV2",
+    "VerifiedV1Release",
     "build_state_payload",
     "read_approved_baseline",
     "seal_state_payload",
+    "verify_v2_migration_release",
+    "verify_v2_release",
 ]

@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import subprocess
 import time
+import traceback
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -104,6 +105,456 @@ def _service(
     )
 
 
+def test_v2_publication_authority_is_derived_from_verified_parent_and_local_trust() -> None:
+    """Catches callers replacing registry recipient or signer policy."""
+    from intent_engineering.team_state.authority import authority_digest
+    from intent_engineering.team_state.local_trust import LocalTrustConfigV2
+    from intent_engineering.team_state.publication import (
+        PublicationAuthorityV2,
+        authority_from_verified_state,
+    )
+    from intent_engineering.team_state.restore import VerifiedReleaseV2
+    from tests.unit.team_state.test_authority import (
+        NOW as AUTHORITY_NOW,
+    )
+    from tests.unit.team_state.test_authority import (
+        _real_certificate,
+        _RootStore,
+        _verified_authority,
+    )
+
+    root_store = _RootStore(b"r" * 32)
+    certificate, _private = _real_certificate(root_store, signing_private=b"s" * 32)
+    registry = _verified_authority(root_store, (certificate,), roles=("sponsor",))
+    manifest = publication_module.TeamStateManifestV2(
+        project_id="project",
+        repository_id=REPOSITORY_ID,
+        graph_version=2,
+        parent_bundle_digest="sha256:" + "1" * 64,
+        bundle_digest="sha256:" + "2" * 64,
+        bundle_size=100,
+        recipient_key_ids=registry.active_recipient_key_ids(),
+        authority_digest=authority_digest(registry),
+        authority_epoch=registry.authority_epoch,
+        root_key_id=registry.root.root_key_id,
+        created_at=AUTHORITY_NOW,
+    )
+    restored = VerifiedReleaseV2(
+        manifest=manifest,
+        manifest_bytes=manifest.canonical_bytes(),
+        authority=registry,
+        commit="a" * 40,
+    )
+    trust = LocalTrustConfigV2(
+        project_id="project",
+        repository_id=REPOSITORY_ID,
+        root=registry.root,
+        member_id=certificate.claims.member_id,
+        device_certificate_id=certificate.certificate_id,
+        recipient_key_id=certificate.claims.recipient_key_id,
+        signature_id=certificate.claims.signature_id,
+        accepted_authority_digest=authority_digest(registry),
+        accepted_authority_sequence=registry.sequence,
+        accepted_bundle_digest=manifest.bundle_digest,
+    )
+
+    result = authority_from_verified_state(restored, trust)
+
+    assert type(result) is PublicationAuthorityV2
+    assert result.registry == registry
+    assert result.local_member_id == certificate.claims.member_id
+    assert result.local_device_certificate_id == certificate.certificate_id
+    assert result.remote_state is restored
+    assert result.publication_base_commit == "a" * 40
+    stale = trust.model_copy(update={"accepted_authority_sequence": registry.sequence + 1})
+    with pytest.raises(ValueError, match="version two publication authority unavailable"):
+        authority_from_verified_state(restored, stale)
+
+
+def test_prepare_v2_publication_uses_exact_registry_recipients_and_local_certificate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catches omitted/extra recipients, caller signer policy, or root-key use."""
+    from intent_engineering.team_state import restore as restore_module
+    from intent_engineering.team_state.authority import (
+        authority_digest,
+        derive_recipient_key_id,
+        issue_device_certificate,
+    )
+    from intent_engineering.team_state.local_trust import LocalTrustConfigV2
+    from intent_engineering.team_state.models import DeviceRevocationV2, RestoredSnapshotV2
+    from intent_engineering.team_state.publication import (
+        authority_from_verified_state,
+        prepare_v2_publication,
+    )
+    from intent_engineering.team_state.restore import VerifiedReleaseV2, verify_v2_release
+    from tests.unit.team_state.test_authority import (
+        NOW as AUTHORITY_NOW,
+    )
+    from tests.unit.team_state.test_authority import (
+        _real_certificate,
+        _RootStore,
+        _verified_authority,
+    )
+
+    source = tmp_path / "project"
+    source.mkdir()
+    ready_project(source)
+    files = canonical_files(source)
+    snapshot = CanonicalStateSnapshot(
+        project_id="project",
+        repository_id=REPOSITORY_ID,
+        graph_version=1,
+        files=tuple(CanonicalStateFile(path=path, content=files[path]) for path in sorted(files)),
+    )
+    root_store = _RootStore(b"r" * 32)
+    a_certificate, _a_private = _real_certificate(
+        root_store, signing_private=b"a" * 32, serial=1, device_digit="1"
+    )
+    b_certificate, b_private = _real_certificate(
+        root_store,
+        signing_private=b"b" * 32,
+        account_id=5678,
+        login="bob-dev",
+        serial=2,
+        device_digit="2",
+    )
+    a_recipient = X25519PrivateKey.from_private_bytes(b"A" * 32)
+    b_recipient = X25519PrivateKey.from_private_bytes(b"B" * 32)
+    ci_recipient = X25519PrivateKey.from_private_bytes(b"C" * 32)
+
+    def bind_recipient(certificate, private):
+        public = _b64(private.public_key().public_bytes_raw())
+        values = certificate.claims.model_dump(mode="python")
+        values.update(
+            recipient_public_key=public,
+            recipient_key_id=derive_recipient_key_id("project", REPOSITORY_ID, public),
+        )
+        return issue_device_certificate(
+            publication_module.DeviceCertificateClaimsV2(**values), root_store
+        )
+
+    a_certificate = bind_recipient(a_certificate, a_recipient)
+    b_certificate = bind_recipient(b_certificate, b_recipient)
+    registry = _verified_authority(
+        root_store, (a_certificate, b_certificate), roles=("sponsor", "member")
+    )
+    ci = CiRecipientRecord(
+        project_id="project",
+        repository_id=REPOSITORY_ID,
+        runner_id="intent-state",
+        public_key=_b64(ci_recipient.public_key().public_bytes_raw()),
+    )
+    registry = publication_module.TeamAuthorityRegistryV2(
+        **{**registry.model_dump(mode="python"), "ci_recipient": ci}
+    )
+    parent = publication_module.TeamStateManifestV2(
+        project_id="project",
+        repository_id=REPOSITORY_ID,
+        graph_version=1,
+        parent_bundle_digest="sha256:" + "1" * 64,
+        bundle_digest="sha256:" + "2" * 64,
+        bundle_size=100,
+        recipient_key_ids=registry.active_recipient_key_ids(),
+        authority_digest=authority_digest(registry),
+        authority_epoch=registry.authority_epoch,
+        root_key_id=registry.root.root_key_id,
+        created_at=AUTHORITY_NOW,
+    )
+    restored = VerifiedReleaseV2(
+        manifest=parent,
+        manifest_bytes=parent.canonical_bytes(),
+        authority=registry,
+        commit="a" * 40,
+    )
+    trust = LocalTrustConfigV2(
+        project_id="project",
+        repository_id=REPOSITORY_ID,
+        root=registry.root,
+        member_id=b_certificate.claims.member_id,
+        device_certificate_id=b_certificate.certificate_id,
+        recipient_key_id=b_certificate.claims.recipient_key_id,
+        signature_id=b_certificate.claims.signature_id,
+        accepted_authority_digest=authority_digest(registry),
+        accepted_authority_sequence=registry.sequence,
+        accepted_bundle_digest=parent.bundle_digest,
+    )
+
+    class DeviceSigner:
+        def sign(self, signature_id: str, preimage: bytes) -> bytes:
+            assert signature_id == b_certificate.claims.signature_id
+            return Ed25519PrivateKey.from_private_bytes(b_private).sign(preimage)
+
+    prepared = prepare_v2_publication(
+        snapshot=snapshot,
+        authority=authority_from_verified_state(restored, trust),
+        device_signer=DeviceSigner(),
+        now=AUTHORITY_NOW,
+    )
+
+    assert prepared.manifest.recipient_key_ids == registry.active_recipient_key_ids()
+    assert prepared.manifest.authority_digest == authority_digest(registry)
+    assert prepared.authority == registry
+    assert prepared.envelope.certificates == (b_certificate,)
+    assert prepared.manifest.parent_bundle_digest == parent.bundle_digest
+    for key_id, private in (
+        (a_certificate.claims.recipient_key_id, a_recipient),
+        (b_certificate.claims.recipient_key_id, b_recipient),
+        (ci.key_id, ci_recipient),
+    ):
+        verified = verify_v2_release(
+            manifest_bytes=prepared.manifest_bytes,
+            bundle_bytes=prepared.bundle,
+            envelope_bytes=prepared.signatures,
+            parent=restored,
+            recipient_key_id=key_id,
+            recipient_private_key=private.private_bytes_raw(),
+            commit="b" * 40,
+            now=AUTHORITY_NOW,
+        )
+        assert verified.authority == registry
+        assert verified.snapshot == snapshot
+
+    import inspect
+
+    assert tuple(inspect.signature(prepare_v2_publication).parameters) == (
+        "snapshot",
+        "authority",
+        "device_signer",
+        "now",
+    )
+    for caller_policy in (
+        {"recipients": ()},
+        {"signing_private_keys": {}},
+    ):
+        with pytest.raises(TypeError):
+            prepare_v2_publication(
+                **{
+                    "snapshot": snapshot,
+                    "authority": authority_from_verified_state(restored, trust),
+                    "device_signer": DeviceSigner(),
+                    "now": AUTHORITY_NOW,
+                    **caller_policy,
+                }
+            )
+
+    wrong_parent_manifest = parent.model_copy(update={"bundle_digest": "sha256:" + "3" * 64})
+    wrong_parent = VerifiedReleaseV2(
+        manifest=wrong_parent_manifest,
+        manifest_bytes=wrong_parent_manifest.canonical_bytes(),
+        authority=registry,
+        commit="a" * 40,
+    )
+    with pytest.raises(ValueError, match="version two release verification failed"):
+        verify_v2_release(
+            manifest_bytes=prepared.manifest_bytes,
+            bundle_bytes=prepared.bundle,
+            envelope_bytes=prepared.signatures,
+            parent=wrong_parent,
+            recipient_key_id=ci.key_id,
+            recipient_private_key=ci_recipient.private_bytes_raw(),
+            commit="b" * 40,
+            now=AUTHORITY_NOW,
+        )
+
+    changed_ci_private = X25519PrivateKey.from_private_bytes(b"D" * 32)
+    changed_ci = CiRecipientRecord(
+        project_id="project",
+        repository_id=REPOSITORY_ID,
+        runner_id=ci.runner_id,
+        public_key=_b64(changed_ci_private.public_key().public_bytes_raw()),
+    )
+    changed_ci_registry = publication_module.TeamAuthorityRegistryV2(
+        **{**registry.model_dump(mode="python"), "ci_recipient": changed_ci}
+    )
+    changed_ci_manifest = parent.model_copy(
+        update={
+            "recipient_key_ids": changed_ci_registry.active_recipient_key_ids(),
+            "authority_digest": authority_digest(changed_ci_registry),
+        }
+    )
+    changed_ci_parent = VerifiedReleaseV2(
+        manifest=changed_ci_manifest,
+        manifest_bytes=changed_ci_manifest.canonical_bytes(),
+        authority=changed_ci_registry,
+        commit="a" * 40,
+    )
+    with pytest.raises(ValueError, match="version two release verification failed"):
+        verify_v2_release(
+            manifest_bytes=prepared.manifest_bytes,
+            bundle_bytes=prepared.bundle,
+            envelope_bytes=prepared.signatures,
+            parent=changed_ci_parent,
+            recipient_key_id=a_certificate.claims.recipient_key_id,
+            recipient_private_key=a_recipient.private_bytes_raw(),
+            commit="b" * 40,
+            now=AUTHORITY_NOW,
+        )
+
+    revoked_member = next(
+        item for item in registry.members if item.member_id == b_certificate.claims.member_id
+    ).model_copy(update={"status": "revoked", "revoked_at": AUTHORITY_NOW})
+    unchanged_members = tuple(
+        revoked_member if item.member_id == revoked_member.member_id else item
+        for item in registry.members
+    )
+    revoked_registry = publication_module.TeamAuthorityRegistryV2(
+        **{
+            **registry.model_dump(mode="python"),
+            "sequence": registry.sequence + 1,
+            "previous_authority_digest": authority_digest(registry),
+            "members": unchanged_members,
+            "revocations": (
+                DeviceRevocationV2(
+                    certificate_id=b_certificate.certificate_id,
+                    revoked_at=AUTHORITY_NOW,
+                    reason="member-removed",
+                    sponsor_member_id=a_certificate.claims.member_id,
+                ),
+            ),
+        }
+    )
+    revoked_manifest = parent.model_copy(
+        update={
+            "recipient_key_ids": revoked_registry.active_recipient_key_ids(),
+            "authority_digest": authority_digest(revoked_registry),
+        }
+    )
+    revoked_parent = VerifiedReleaseV2(
+        manifest=revoked_manifest,
+        manifest_bytes=revoked_manifest.canonical_bytes(),
+        authority=revoked_registry,
+        commit="a" * 40,
+    )
+    revoked_trust = trust.model_copy(
+        update={
+            "accepted_authority_digest": authority_digest(revoked_registry),
+            "accepted_authority_sequence": revoked_registry.sequence,
+        }
+    )
+    with pytest.raises(ValueError, match="version two publication authority unavailable"):
+        authority_from_verified_state(revoked_parent, revoked_trust)
+
+    malformed = CanonicalStateSnapshot(
+        project_id=snapshot.project_id,
+        repository_id=snapshot.repository_id,
+        graph_version=snapshot.graph_version,
+        files=tuple(
+            item.model_copy(update={"content": b"not: [valid"})
+            if item.path == "graph.yaml"
+            else item
+            for item in snapshot.files
+        ),
+    )
+    monkeypatch.setattr(
+        restore_module,
+        "validate_archive_v2",
+        lambda _content: RestoredSnapshotV2(snapshot=malformed, authority=registry),
+    )
+    with pytest.raises(ValueError, match="version two release verification failed"):
+        verify_v2_release(
+            manifest_bytes=prepared.manifest_bytes,
+            bundle_bytes=prepared.bundle,
+            envelope_bytes=prepared.signatures,
+            parent=restored,
+            recipient_key_id=ci.key_id,
+            recipient_private_key=ci_recipient.private_bytes_raw(),
+            commit="b" * 40,
+            now=AUTHORITY_NOW,
+        )
+
+    monkeypatch.setattr(
+        restore_module,
+        "validate_archive_v2",
+        lambda _content: RestoredSnapshotV2(
+            snapshot=snapshot,
+            authority=changed_ci_registry,
+        ),
+    )
+    with pytest.raises(ValueError, match="version two release verification failed"):
+        verify_v2_release(
+            manifest_bytes=prepared.manifest_bytes,
+            bundle_bytes=prepared.bundle,
+            envelope_bytes=prepared.signatures,
+            parent=restored,
+            recipient_key_id=ci.key_id,
+            recipient_private_key=ci_recipient.private_bytes_raw(),
+            commit="b" * 40,
+            now=AUTHORITY_NOW,
+        )
+    monkeypatch.undo()
+
+    from dataclasses import replace
+    from datetime import timedelta
+
+    with pytest.raises(ValueError, match="version two publication preparation failed"):
+        prepare_v2_publication(
+            snapshot=snapshot,
+            authority=authority_from_verified_state(restored, trust),
+            device_signer=DeviceSigner(),
+            now=b_certificate.claims.expires_at + timedelta(minutes=6),
+        )
+    forged_registry = publication_module.TeamAuthorityRegistryV2(
+        **{
+            **registry.model_dump(mode="python"),
+            "sequence": registry.sequence + 1,
+            "previous_authority_digest": authority_digest(registry),
+        }
+    )
+    forged = replace(authority_from_verified_state(restored, trust), registry=forged_registry)
+    with pytest.raises(ValueError, match="version two publication preparation failed"):
+        prepare_v2_publication(
+            snapshot=snapshot,
+            authority=forged,
+            device_signer=DeviceSigner(),
+            now=AUTHORITY_NOW,
+        )
+
+    class Cancelled(BaseException):
+        pass
+
+    marker = "PRIVATE-V2-PUBLICATION-CANCEL-7219"
+    cancellation = Cancelled(marker)
+    cancellation.private = marker
+    cancellation.__cause__ = RuntimeError(marker)
+    retained_tracebacks = []
+
+    class CancellingSigner:
+        secret = marker
+
+        def sign(self, _signature_id: str, _preimage: bytes) -> bytes:
+            _secret = marker
+            try:
+                raise cancellation
+            except BaseException as caught:
+                retained_tracebacks.append(caught.__traceback__)
+                raise
+
+    with pytest.raises(Cancelled) as caught:
+        prepare_v2_publication(
+            snapshot=snapshot,
+            authority=authority_from_verified_state(restored, trust),
+            device_signer=CancellingSigner(),
+            now=AUTHORITY_NOW,
+        )
+    assert caught.value is cancellation
+    assert caught.value.args == ()
+    assert caught.value.__dict__ == {}
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+    assert len(retained_tracebacks) == 1
+    for frame, _line in traceback.walk_tb(retained_tracebacks[0]):
+        assert marker not in repr(frame.f_locals)
+    for frame, _line in traceback.walk_tb(caught.value.__traceback__):
+        if frame.f_globals.get("__name__") != "intent_engineering.team_state.publication":
+            continue
+        assert frame.f_locals.get("snapshot") is None
+        assert frame.f_locals.get("authority") is None
+        assert frame.f_locals.get("device_signer") is None
+        assert marker not in repr(frame.f_locals)
+
+
 def test_prepare_v1_migration_is_dual_signed_and_does_not_advance_local_trust(
     tmp_path: Path,
 ) -> None:
@@ -116,21 +567,25 @@ def test_prepare_v1_migration_is_dual_signed_and_does_not_advance_local_trust(
         derive_signature_id,
     )
     from intent_engineering.team_state.keys import _key_id
-    from intent_engineering.team_state.local_trust import LocalTrustConfig
+    from intent_engineering.team_state.local_trust import LocalTrustConfig, LocalTrustConfigV2
     from intent_engineering.team_state.models import TeamStateManifest, canonical_manifest_bytes
     from intent_engineering.team_state.publication import (
         MigrationKeyAuthorities,
+        authority_from_verified_state,
         prepare_v1_migration,
+        prepare_v2_publication,
         preview_v1_migration,
     )
     from intent_engineering.team_state.restore import (
         TrustedSigningKey,
         VerifiedV1Release,
         verify_v1_migration,
+        verify_v2_migration_release,
+        verify_v2_release,
     )
     from tests.unit.team_state.test_authority import _RootStore
 
-    source = tmp_path / "source"
+    source = tmp_path / "project"
     source.mkdir()
     ready_project(source)
     files = canonical_files(source)
@@ -177,13 +632,12 @@ def test_prepare_v1_migration_is_dual_signed_and_does_not_advance_local_trust(
         signing_keys=(TrustedSigningKey("signer:legacy", legacy_public),),
         snapshot=snapshot,
     )
+    ci_private = X25519PrivateKey.from_private_bytes(b"c" * 32)
     ci = CiRecipientRecord(
         project_id="project",
         repository_id=REPOSITORY_ID,
         runner_id="intent-runner",
-        public_key=_b64(
-            X25519PrivateKey.from_private_bytes(b"c" * 32).public_key().public_bytes_raw()
-        ),
+        public_key=_b64(ci_private.public_key().public_bytes_raw()),
     )
     credential = _credential()
     root_store = _RootStore(b"r" * 32)
@@ -366,6 +820,63 @@ def test_prepare_v1_migration_is_dual_signed_and_does_not_advance_local_trust(
     assert hashlib.sha256(
         prepared.bundle
     ).hexdigest() == prepared.manifest.bundle_digest.removeprefix("sha256:")
+    migrated = verify_v2_migration_release(
+        manifest_bytes=prepared.manifest_bytes,
+        bundle_bytes=prepared.bundle,
+        envelope_bytes=prepared.signatures,
+        current=current,
+        recipient_key_id=ci.key_id,
+        recipient_private_key=ci_private.private_bytes_raw(),
+        commit="c" * 40,
+        now=NOW,
+    )
+    assert migrated.authority == prepared.authority
+    assert migrated.snapshot == snapshot
+
+    v2_trust = LocalTrustConfigV2(
+        project_id="project",
+        repository_id=REPOSITORY_ID,
+        root=migrated.authority.root,
+        member_id=preview.certificate.claims.member_id,
+        device_certificate_id=preview.certificate.certificate_id,
+        recipient_key_id=preview.certificate.claims.recipient_key_id,
+        signature_id=preview.certificate.claims.signature_id,
+        accepted_authority_digest=migrated.manifest.authority_digest,
+        accepted_authority_sequence=migrated.authority.sequence,
+        accepted_bundle_digest=migrated.manifest.bundle_digest,
+    )
+    ordinary = prepare_v2_publication(
+        snapshot=snapshot,
+        authority=authority_from_verified_state(migrated, v2_trust),
+        device_signer=DeviceSigner(),
+        now=NOW,
+    )
+    assert ordinary.authority == migrated.authority
+    assert ordinary.manifest.authority_digest == migrated.manifest.authority_digest
+    assert ordinary.manifest.recipient_key_ids == migrated.manifest.recipient_key_ids
+    assert ordinary.manifest.parent_bundle_digest == migrated.manifest.bundle_digest
+    accepted_by_ci = verify_v2_release(
+        manifest_bytes=ordinary.manifest_bytes,
+        bundle_bytes=ordinary.bundle,
+        envelope_bytes=ordinary.signatures,
+        parent=migrated,
+        recipient_key_id=ci.key_id,
+        recipient_private_key=ci_private.private_bytes_raw(),
+        commit="d" * 40,
+        now=NOW,
+    )
+    accepted_by_device = verify_v2_release(
+        manifest_bytes=ordinary.manifest_bytes,
+        bundle_bytes=ordinary.bundle,
+        envelope_bytes=ordinary.signatures,
+        parent=migrated,
+        recipient_key_id=preview.certificate.claims.recipient_key_id,
+        recipient_private_key=recipient_private.private_bytes_raw(),
+        commit="d" * 40,
+        now=NOW,
+    )
+    assert accepted_by_ci.snapshot == snapshot
+    assert accepted_by_device.snapshot == snapshot
 
     with pytest.raises(ValueError, match="version one migration preview failed"):
         preview_v1_migration(

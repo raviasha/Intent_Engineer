@@ -2037,3 +2037,56 @@ def test_fresh_rollback_reserves_another_container_when_its_recovery_name_is_occ
         b"preserve occupied recovery name"
     ]
     assert any(path.read_bytes() == b"unverified decision\n" for path in target.rglob("graph.yaml"))
+
+
+def test_v2_encryption_context_authenticates_exact_authority_sequence_and_digest() -> None:
+    """Catches a valid bundle being replayed under different authority bytes."""
+    from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
+
+    from intent_engineering.team_state.crypto import (
+        AuthenticatedBundleContextV2,
+        _encrypt_bundle_for_public_keys,
+        canonical_authenticated_context_bytes,
+        decrypt_bundle,
+    )
+
+    private = X25519PrivateKey.from_private_bytes(b"v" * 32)
+    device_id = "recipient:device:sha256:" + "1" * 64
+    ci_id = "recipient:ci:sha256:" + "3" * 64
+    context = AuthenticatedBundleContextV2(
+        project_id="project",
+        repository_id="github.com/acme/project",
+        graph_version=3,
+        parent_bundle_digest="sha256:" + "2" * 64,
+        recipient_key_ids=tuple(sorted((device_id, ci_id))),
+        authority_digest="sha256:" + "4" * 64,
+        authority_epoch=1,
+        authority_sequence=2,
+        root_key_id="root:sha256:" + "5" * 64,
+        created_at=NOW,
+    )
+    aad = canonical_authenticated_context_bytes(context)
+    bundle = _encrypt_bundle_for_public_keys(
+        b"archive",
+        {
+            key: value
+            for key, value in sorted(
+                {
+                    device_id: private.public_key().public_bytes_raw(),
+                    ci_id: X25519PrivateKey.from_private_bytes(b"c" * 32)
+                    .public_key()
+                    .public_bytes_raw(),
+                }.items()
+            )
+        },
+        aad,
+    )
+
+    assert decrypt_bundle(bundle, private.private_bytes_raw(), aad) == b"archive"
+    changed = context.model_copy(update={"authority_sequence": 3})
+    with pytest.raises(ValueError, match="unable to decrypt encrypted bundle"):
+        decrypt_bundle(
+            bundle,
+            private.private_bytes_raw(),
+            canonical_authenticated_context_bytes(changed),
+        )
