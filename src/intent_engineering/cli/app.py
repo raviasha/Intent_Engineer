@@ -7,6 +7,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import traceback
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import cast
@@ -15,6 +16,7 @@ import anyio
 import structlog
 import typer
 
+from intent_engineering.assessment.service import GraphAssessmentService
 from intent_engineering.capture.base import Connector
 from intent_engineering.cli.assessment import assess_command, assessment_gate_command
 from intent_engineering.cli.connectors import (
@@ -37,10 +39,12 @@ from intent_engineering.cli.intent_workflow import (
 )
 from intent_engineering.cli.output import OutputFormat, emit
 from intent_engineering.cli.runtime import (
+    AssessmentRuntime,
     CheckRuntimeAdapter,
     GitHubConfigurationError,
     Runtime,
     github_repository_scope,
+    load_assessment_runtime,
     load_runtime,
     new_run_id,
     parse_sources,
@@ -829,25 +833,208 @@ def reconcile_resolve_command(
 def render_command(
     project: Path = typer.Option(Path("."), "--project"),
     output: Path | None = typer.Option(None, "--output"),
+    assessment: bool = typer.Option(
+        False,
+        "--assessment",
+        help="Add a detached, non-canonical assessment overlay.",
+    ),
     output_format: OutputFormat = typer.Option(OutputFormat.TEXT, "--format"),
 ) -> None:
     """Render non-canonical Markdown and Mermaid graph views through the safe renderer."""
-    runtime = _runtime(project)
-    principals = _authorized_principals(runtime)
-    output_dir = output if output is not None else runtime.workspace / "cache" / "render"
+    if assessment:
+        _render_assessed(project, output, output_format)
+        return
+    _render_legacy(_runtime(project), output, output_format)
+
+
+def _scrub_render_signal(error: BaseException) -> BaseException:
+    old_traceback = error.__traceback__
+    error.args = ()
+    error.__dict__.clear()
+    error.__traceback__ = None
+    error.__cause__ = None
+    error.__context__ = None
+    if old_traceback is not None:
+        traceback.clear_frames(old_traceback)
+    old_traceback = None
+    return error
+
+
+def _render_legacy(
+    runtime: Runtime,
+    output: Path | None,
+    output_format: OutputFormat,
+) -> None:
+    """Render the established projection while deterministically owning its runtime."""
+    principals: frozenset[str] = frozenset()
+    output_dir = Path()
+    markdown: Path | None = None
+    mermaid: Path | None = None
+    signal: BaseException | None = None
+    cleanup_signal: BaseException | None = None
+    failed = False
     try:
+        principals = _authorized_principals(runtime)
+        output_dir = output if output is not None else runtime.workspace / "cache" / "render"
 
         class _ProjectionStore:
             def load(self) -> Graph:
+                if runtime is None:
+                    raise ValueError("local runtime unavailable")
                 return _authorized_graph(runtime, principals)
 
         markdown, mermaid = GraphRenderer(
             cast(GraphStore, _ProjectionStore()), _authorized_cases(runtime, principals)
         ).render_all(output_dir)
-    except Exception as error:
-        _runtime_error(error)
-        raise typer.Exit(1) from error
-    emit({"markdown": str(markdown), "mermaid": str(mermaid)}, output_format)
+    except Exception:  # noqa: BLE001 - one fixed legacy-render failure boundary
+        failed = True
+    except BaseException as error:  # noqa: BLE001 - preserve cancellation identity
+        signal = _scrub_render_signal(error)
+    finally:
+        try:
+            runtime.close()
+        except Exception:  # noqa: BLE001 - closing failure is a fixed public failure
+            failed = True
+            markdown = None
+            mermaid = None
+        except BaseException as error:  # noqa: BLE001 - preserve cancellation identity
+            cleanup_signal = _scrub_render_signal(error)
+            if signal is None:
+                signal = cleanup_signal
+            cleanup_signal = None
+        runtime = None  # type: ignore[assignment]
+        principals = frozenset()
+        output_dir = Path()
+        output = None
+
+    if signal is not None:
+        detached = signal
+        signal = None
+        markdown = None
+        mermaid = None
+        raise detached.with_traceback(None)
+    if failed or markdown is None or mermaid is None:
+        markdown = None
+        mermaid = None
+        typer.echo("intent error: local operation failed", err=True)
+        raise typer.Exit(1) from None
+
+    try:
+        emit({"markdown": str(markdown), "mermaid": str(mermaid)}, output_format)
+    except Exception:  # noqa: BLE001 - one fixed legacy-render output failure
+        failed = True
+    except BaseException as error:  # noqa: BLE001 - preserve cancellation identity
+        signal = _scrub_render_signal(error)
+    finally:
+        markdown = None
+        mermaid = None
+    if signal is not None:
+        detached = signal
+        signal = None
+        raise detached.with_traceback(None)
+    if failed:
+        typer.echo("intent error: local operation failed", err=True)
+        raise typer.Exit(1) from None
+
+
+def _render_assessed(
+    project: Path,
+    output: Path | None,
+    output_format: OutputFormat,
+) -> None:
+    """Render one descriptor-held assessment snapshot without recovery."""
+    runtime: AssessmentRuntime | None = None
+    snapshot = None
+    assessment_report = None
+    projection = None
+    cases: tuple[ReconciliationCase, ...] = ()
+    output_dir = Path()
+    markdown: Path | None = None
+    mermaid: Path | None = None
+    signal: BaseException | None = None
+    cleanup_signal: BaseException | None = None
+    failed = False
+    try:
+        runtime = load_assessment_runtime(project)
+        snapshot = runtime.assessment_snapshot(runtime.config.local_actor)
+        assessment_report = GraphAssessmentService().assess(snapshot)
+        if (
+            assessment_report.project_id != snapshot.project_id
+            or assessment_report.graph_id != snapshot.graph.id
+            or assessment_report.graph_version != snapshot.graph.version
+            or assessment_report.graph_digest != snapshot.graph_digest
+            or assessment_report.snapshot_digest != snapshot.aggregate_digest
+            or assessment_report.principal_projection_digest != snapshot.principal_projection_digest
+        ):
+            raise ValueError("assessment projection mismatch")
+        projection = snapshot.graph
+        cases = snapshot.cases
+        output_dir = output if output is not None else runtime.root / ".intent/cache/render"
+
+        class _AssessmentProjectionStore:
+            def load(self) -> Graph:
+                if projection is None:
+                    raise ValueError("assessment projection unavailable")
+                return projection
+
+        markdown, mermaid = GraphRenderer(
+            cast(GraphStore, _AssessmentProjectionStore()),
+            cases,
+            assessment=assessment_report,
+        ).render_all(output_dir)
+    except Exception:  # noqa: BLE001 - one fixed assessed-render failure boundary
+        failed = True
+    except BaseException as error:  # noqa: BLE001 - preserve cancellation identity
+        signal = _scrub_render_signal(error)
+    finally:
+        if runtime is not None:
+            try:
+                runtime.close()
+            except Exception:  # noqa: BLE001 - closing failure is a fixed public failure
+                failed = True
+                markdown = None
+                mermaid = None
+            except BaseException as error:  # noqa: BLE001 - preserve cancellation identity
+                cleanup_signal = _scrub_render_signal(error)
+                if signal is None:
+                    signal = cleanup_signal
+                cleanup_signal = None
+        runtime = None
+        snapshot = None
+        assessment_report = None
+        projection = None
+        cases = ()
+        output_dir = Path()
+        project = Path()
+        output = None
+
+    if signal is not None:
+        detached = signal
+        signal = None
+        markdown = None
+        mermaid = None
+        raise detached.with_traceback(None)
+    if failed or markdown is None or mermaid is None:
+        markdown = None
+        mermaid = None
+        typer.echo("intent error: assessment unavailable", err=True)
+        raise typer.Exit(1) from None
+    try:
+        emit({"markdown": str(markdown), "mermaid": str(mermaid)}, output_format)
+    except Exception:  # noqa: BLE001 - one fixed assessed-render output failure
+        failed = True
+    except BaseException as error:  # noqa: BLE001 - preserve cancellation identity
+        signal = _scrub_render_signal(error)
+    finally:
+        markdown = None
+        mermaid = None
+    if signal is not None:
+        detached = signal
+        signal = None
+        raise detached.with_traceback(None)
+    if failed:
+        typer.echo("intent error: assessment unavailable", err=True)
+        raise typer.Exit(1) from None
 
 
 @doctor_app.callback(invoke_without_command=True)

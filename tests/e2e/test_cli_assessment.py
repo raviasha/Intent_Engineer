@@ -3,18 +3,23 @@
 from __future__ import annotations
 
 import json
+import traceback
 from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
 import structlog
+import typer
 import yaml  # type: ignore[import-untyped]
 from typer.testing import CliRunner
 
+import intent_engineering.cli.app as app_cli
 from intent_engineering.cli import assessment as assessment_cli
 from intent_engineering.cli.app import app
-from intent_engineering.cli.runtime import load_runtime
+from intent_engineering.cli.runtime import load_assessment_runtime, load_runtime
 from intent_engineering.core.models import EvidenceRecord, Graph
+from intent_engineering.render.markdown import render_markdown
+from intent_engineering.render.mermaid import render_mermaid
 from intent_engineering.storage.secure import SecureDirectory
 from intent_engineering.storage.transaction import LocalTransactionCoordinator
 from intent_engineering.storage.yaml.graph_store import serialize_graph
@@ -313,3 +318,513 @@ def test_assess_closes_runtime_on_post_load_failure(
     assert result.stderr == "intent error: assessment unavailable\n"
     assert "PRIVATE-HIDDEN" not in str(result.exception)
     assert closed is True
+
+
+def test_render_assessment_is_stable_read_only_and_keeps_default_bytes(
+    initialized_project: Path,
+) -> None:
+    """Catches the optional overlay mutating state or changing legacy render output."""
+    before = _durable_bytes(initialized_project)
+    legacy_one = initialized_project / "legacy-one"
+    legacy_two = initialized_project / "legacy-two"
+    assessed_one = initialized_project / "assessed-one"
+    assessed_two = initialized_project / "assessed-two"
+
+    first_legacy = run_intent(
+        initialized_project,
+        "render",
+        "--output",
+        str(legacy_one),
+        "--format",
+        "json",
+    )
+    first_assessed = run_intent(
+        initialized_project,
+        "render",
+        "--assessment",
+        "--output",
+        str(assessed_one),
+        "--format",
+        "json",
+    )
+    second_assessed = run_intent(
+        initialized_project,
+        "render",
+        "--assessment",
+        "--output",
+        str(assessed_two),
+        "--format",
+        "json",
+    )
+    second_legacy = run_intent(
+        initialized_project,
+        "render",
+        "--output",
+        str(legacy_two),
+        "--format",
+        "json",
+    )
+
+    assert first_legacy.returncode == second_legacy.returncode == 0
+    assert first_assessed.returncode == second_assessed.returncode == 0
+    assert (legacy_one / "graph.md").read_bytes() == (legacy_two / "graph.md").read_bytes()
+    assert (legacy_one / "graph.mmd").read_bytes() == (legacy_two / "graph.mmd").read_bytes()
+    assert (assessed_one / "graph.md").read_bytes() == (assessed_two / "graph.md").read_bytes()
+    assert (assessed_one / "graph.mmd").read_bytes() == (assessed_two / "graph.mmd").read_bytes()
+    assessed = (assessed_one / "graph.md").read_text(encoding="utf-8") + (
+        assessed_one / "graph.mmd"
+    ).read_text(encoding="utf-8")
+    assert "Assessment (non-canonical)" in assessed
+    assert "classDef health_" in assessed
+    assert "Worst dimension" in assessed
+    assert "snapshot: sha256:" in assessed
+    assert "principal projection: sha256:" in assessed
+    assert _durable_bytes(initialized_project) == before
+
+
+@pytest.mark.parametrize("stage", ("journal_prepared", "journal_committed"))
+def test_render_assessment_never_recovers_or_removes_an_incomplete_transaction(
+    initialized_project: Path,
+    stage: str,
+) -> None:
+    """Catches assessed rendering entering the normal recovering runtime."""
+    _leave_transaction_journal(initialized_project, stage)
+    before = _durable_bytes(initialized_project)
+
+    result = run_intent(
+        initialized_project,
+        "render",
+        "--assessment",
+        "--format",
+        "json",
+    )
+
+    assert result.returncode == 1
+    assert result.stdout == ""
+    assert result.stderr == "intent error: assessment unavailable\n"
+    assert _durable_bytes(initialized_project) == before
+
+
+@pytest.mark.parametrize("fail_render", (False, True))
+def test_render_assessment_closes_descriptor_runtime_on_success_or_failure(
+    initialized_project: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    fail_render: bool,
+) -> None:
+    """Catches assessed render descriptors surviving either ordinary outcome."""
+    runtime = load_assessment_runtime(initialized_project)
+    close_count = 0
+    original_close = runtime.close
+
+    def close() -> None:
+        nonlocal close_count
+        close_count += 1
+        original_close()
+
+    object.__setattr__(runtime, "close", close)
+    monkeypatch.setattr(app_cli, "load_assessment_runtime", lambda _project: runtime, raising=False)
+    if fail_render:
+        marker = "PRIVATE-RENDER-FAILURE-7391"
+
+        def fail(*_args: object, **_kwargs: object) -> tuple[Path, Path]:
+            raise ValueError(marker)
+
+        monkeypatch.setattr(app_cli.GraphRenderer, "render_all", fail)
+
+    failure: typer.Exit | None = None
+    if fail_render:
+        with pytest.raises(typer.Exit) as caught:
+            app_cli.render_command(
+                project=initialized_project,
+                output=None,
+                assessment=True,
+                output_format=app_cli.OutputFormat.JSON,
+            )
+        failure = caught.value
+    else:
+        app_cli.render_command(
+            project=initialized_project,
+            output=None,
+            assessment=True,
+            output_format=app_cli.OutputFormat.JSON,
+        )
+
+    assert close_count == 1
+    if fail_render:
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert captured.err == "intent error: assessment unavailable\n"
+        assert failure is not None
+        assert failure.__cause__ is None
+        assert failure.__context__ is None
+        assert marker not in str(failure)
+    else:
+        assert json.loads(capsys.readouterr().out)["version"] == "1"
+
+
+def test_render_assessment_cancellation_is_identity_preserving_and_scrubbed(
+    initialized_project: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catches cancellation leaking report state or skipping descriptor cleanup."""
+
+    class Cancelled(BaseException):
+        pass
+
+    marker = "PRIVATE-RENDER-CANCELLATION-4207"
+    cancellation = Cancelled(marker)
+    cancellation.private = marker
+    cancellation.__cause__ = RuntimeError(marker)
+    runtime = load_assessment_runtime(initialized_project)
+    close_count = 0
+    original_close = runtime.close
+
+    def close() -> None:
+        nonlocal close_count
+        close_count += 1
+        original_close()
+
+    def cancel(*_args: object, **_kwargs: object) -> tuple[Path, Path]:
+        raise cancellation
+
+    object.__setattr__(runtime, "close", close)
+    monkeypatch.setattr(app_cli, "load_assessment_runtime", lambda _project: runtime, raising=False)
+    monkeypatch.setattr(app_cli.GraphRenderer, "render_all", cancel)
+
+    with pytest.raises(Cancelled) as caught:
+        app_cli.render_command(
+            project=initialized_project,
+            output=None,
+            assessment=True,
+            output_format=app_cli.OutputFormat.JSON,
+        )
+
+    assert caught.value is cancellation
+    assert type(caught.value) is Cancelled
+    assert caught.value.args == ()
+    assert caught.value.__dict__ == {}
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+    assert close_count == 1
+    for frame, _line in traceback.walk_tb(caught.value.__traceback__):
+        if frame.f_globals.get("__name__") != "intent_engineering.cli.app":
+            continue
+        assert frame.f_locals.get("runtime") is None
+        assert frame.f_locals.get("snapshot") is None
+        assert frame.f_locals.get("assessment_report") is None
+        if "output_dir" in frame.f_locals:
+            assert frame.f_locals["output_dir"] == Path()
+        assert marker not in repr(frame.f_locals)
+
+
+def test_render_assessment_emit_failure_is_fixed_unchained_and_closes_once(
+    initialized_project: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Catches assessed output serialization escaping its fixed failure boundary."""
+    marker = "PRIVATE-ASSESSMENT-EMIT-FAILURE-1742"
+    runtime = load_assessment_runtime(initialized_project)
+    close_count = 0
+    original_close = runtime.close
+
+    def close() -> None:
+        nonlocal close_count
+        close_count += 1
+        original_close()
+
+    def fail_emit(*_args: object, **_kwargs: object) -> None:
+        raise ValueError(marker)
+
+    object.__setattr__(runtime, "close", close)
+    monkeypatch.setattr(app_cli, "load_assessment_runtime", lambda _project: runtime, raising=False)
+    monkeypatch.setattr(app_cli, "emit", fail_emit)
+
+    with pytest.raises(typer.Exit) as caught:
+        app_cli.render_command(
+            project=initialized_project,
+            output=None,
+            assessment=True,
+            output_format=app_cli.OutputFormat.JSON,
+        )
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == "intent error: assessment unavailable\n"
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+    assert marker not in str(caught.value)
+    assert close_count == 1
+
+
+def test_render_assessment_emit_cancellation_is_identity_preserving_and_scrubbed(
+    initialized_project: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catches assessed output cancellation retaining paths or descriptor state."""
+
+    class Cancelled(BaseException):
+        pass
+
+    marker = "PRIVATE-ASSESSMENT-EMIT-CANCELLATION-6038"
+    cancellation = Cancelled(marker)
+    cancellation.private = marker
+    cancellation.__cause__ = RuntimeError(marker)
+    runtime = load_assessment_runtime(initialized_project)
+    close_count = 0
+    original_close = runtime.close
+
+    def close() -> None:
+        nonlocal close_count
+        close_count += 1
+        original_close()
+
+    def cancel_emit(*_args: object, **_kwargs: object) -> None:
+        raise cancellation
+
+    object.__setattr__(runtime, "close", close)
+    monkeypatch.setattr(app_cli, "load_assessment_runtime", lambda _project: runtime, raising=False)
+    monkeypatch.setattr(app_cli, "emit", cancel_emit)
+
+    with pytest.raises(Cancelled) as caught:
+        app_cli.render_command(
+            project=initialized_project,
+            output=None,
+            assessment=True,
+            output_format=app_cli.OutputFormat.JSON,
+        )
+
+    assert caught.value is cancellation
+    assert type(caught.value) is Cancelled
+    assert caught.value.args == ()
+    assert caught.value.__dict__ == {}
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+    assert close_count == 1
+    for frame, _line in traceback.walk_tb(caught.value.__traceback__):
+        if frame.f_globals.get("__name__") != "intent_engineering.cli.app":
+            continue
+        if frame.f_code.co_name == "_render_assessed":
+            assert frame.f_locals.get("runtime") is None
+            assert frame.f_locals.get("project") == Path()
+            assert frame.f_locals.get("output") is None
+            assert frame.f_locals.get("markdown") is None
+            assert frame.f_locals.get("mermaid") is None
+        assert marker not in repr(frame.f_locals)
+
+
+@pytest.mark.parametrize("assessment", (False, True))
+def test_render_cancellation_clears_retained_frames_and_scrubs_secondary_close_signal(
+    initialized_project: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    assessment: bool,
+) -> None:
+    """Catches retained tracebacks or a discarded cleanup signal exposing private state."""
+
+    class Cancelled(BaseException):
+        pass
+
+    primary_marker = "PRIVATE-RENDER-PRIMARY-4178"
+    close_marker = "PRIVATE-RENDER-CLOSE-9526"
+    primary = Cancelled(primary_marker)
+    primary.private = primary_marker
+    primary.__cause__ = RuntimeError(primary_marker)
+    cleanup = Cancelled(close_marker)
+    cleanup.private = close_marker
+    cleanup.__cause__ = RuntimeError(close_marker)
+    retained_primary: list[object] = []
+    retained_cleanup: list[object] = []
+    runtime = (
+        load_assessment_runtime(initialized_project)
+        if assessment
+        else load_runtime(initialized_project)
+    )
+    close_count = 0
+    original_close = runtime.close
+
+    def close() -> None:
+        nonlocal close_count
+        close_count += 1
+        original_close()
+        private_close_material = close_marker
+        try:
+            raise cleanup
+        except Cancelled as error:
+            retained_cleanup.append(error.__traceback__)
+            assert private_close_material
+            raise
+
+    def cancel_render(*_args: object, **_kwargs: object) -> tuple[Path, Path]:
+        private_render_material = primary_marker
+        try:
+            raise primary
+        except Cancelled as error:
+            retained_primary.append(error.__traceback__)
+            assert private_render_material
+            raise
+
+    object.__setattr__(runtime, "close", close)
+    if assessment:
+        monkeypatch.setattr(
+            app_cli, "load_assessment_runtime", lambda _project: runtime, raising=False
+        )
+    else:
+        monkeypatch.setattr(app_cli, "_runtime", lambda _project: runtime)
+    monkeypatch.setattr(app_cli.GraphRenderer, "render_all", cancel_render)
+
+    with pytest.raises(Cancelled) as caught:
+        app_cli.render_command(
+            project=initialized_project,
+            output=None,
+            assessment=assessment,
+            output_format=app_cli.OutputFormat.JSON,
+        )
+
+    assert caught.value is primary
+    assert type(caught.value) is Cancelled
+    assert close_count == 1
+    for signal in (primary, cleanup):
+        assert signal.args == ()
+        assert signal.__dict__ == {}
+        assert signal.__cause__ is None
+        assert signal.__context__ is None
+    assert len(retained_primary) == len(retained_cleanup) == 1
+    for retained in (*retained_primary, *retained_cleanup):
+        for frame, _line in traceback.walk_tb(retained):  # type: ignore[arg-type]
+            material = repr(frame.f_locals)
+            assert primary_marker not in material
+            assert close_marker not in material
+
+
+@pytest.mark.parametrize("fail_render", (False, True))
+def test_render_legacy_closes_runtime_and_preserves_bytes_or_fixed_failure(
+    initialized_project: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    fail_render: bool,
+) -> None:
+    """Catches legacy rendering leaking runtime ownership or changing its projection."""
+    runtime = load_runtime(initialized_project)
+    principals = app_cli._authorized_principals(runtime)
+    expected_markdown = render_markdown(
+        app_cli._authorized_graph(runtime, principals),
+        app_cli._authorized_cases(runtime, principals),
+    ).encode()
+    expected_mermaid = render_mermaid(app_cli._authorized_graph(runtime, principals)).encode()
+    close_count = 0
+    original_close = runtime.close
+
+    def close() -> None:
+        nonlocal close_count
+        close_count += 1
+        original_close()
+
+    object.__setattr__(runtime, "close", close)
+    monkeypatch.setattr(app_cli, "_runtime", lambda _project: runtime)
+    marker = "PRIVATE-LEGACY-RENDER-FAILURE-2941"
+    if fail_render:
+
+        def fail(*_args: object, **_kwargs: object) -> tuple[Path, Path]:
+            raise ValueError(marker)
+
+        monkeypatch.setattr(app_cli.GraphRenderer, "render_all", fail)
+
+    output = initialized_project / "legacy-owned-runtime"
+    failure: typer.Exit | None = None
+    try:
+        if fail_render:
+            with pytest.raises(typer.Exit) as caught:
+                app_cli.render_command(
+                    project=initialized_project,
+                    output=output,
+                    assessment=False,
+                    output_format=app_cli.OutputFormat.JSON,
+                )
+            failure = caught.value
+        else:
+            app_cli.render_command(
+                project=initialized_project,
+                output=output,
+                assessment=False,
+                output_format=app_cli.OutputFormat.JSON,
+            )
+
+        assert close_count == 1
+        if fail_render:
+            captured = capsys.readouterr()
+            assert captured.out == ""
+            assert captured.err == "intent error: local operation failed\n"
+            assert failure is not None
+            assert failure.__cause__ is None
+            assert failure.__context__ is None
+            assert marker not in str(failure)
+        else:
+            assert json.loads(capsys.readouterr().out)["version"] == "1"
+            assert (output / "graph.md").read_bytes() == expected_markdown
+            assert (output / "graph.mmd").read_bytes() == expected_mermaid
+    finally:
+        if close_count == 0:
+            original_close()
+
+
+@pytest.mark.parametrize("cancel_at", ("render", "emit"))
+def test_render_legacy_cancellation_closes_once_and_scrubs_command_state(
+    initialized_project: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    cancel_at: str,
+) -> None:
+    """Catches legacy render cancellation retaining runtime state or private errors."""
+
+    class Cancelled(BaseException):
+        pass
+
+    marker = "PRIVATE-LEGACY-RENDER-CANCELLATION-8317"
+    cancellation = Cancelled(marker)
+    cancellation.private = marker
+    cancellation.__cause__ = RuntimeError(marker)
+    runtime = load_runtime(initialized_project)
+    close_count = 0
+    original_close = runtime.close
+
+    def close() -> None:
+        nonlocal close_count
+        close_count += 1
+        original_close()
+
+    def cancel(*_args: object, **_kwargs: object) -> tuple[Path, Path]:
+        raise cancellation
+
+    object.__setattr__(runtime, "close", close)
+    monkeypatch.setattr(app_cli, "_runtime", lambda _project: runtime)
+    if cancel_at == "render":
+        monkeypatch.setattr(app_cli.GraphRenderer, "render_all", cancel)
+    else:
+        monkeypatch.setattr(app_cli, "emit", cancel)
+
+    try:
+        with pytest.raises(Cancelled) as caught:
+            app_cli.render_command(
+                project=initialized_project,
+                output=None,
+                assessment=False,
+                output_format=app_cli.OutputFormat.JSON,
+            )
+
+        assert caught.value is cancellation
+        assert type(caught.value) is Cancelled
+        assert caught.value.args == ()
+        assert caught.value.__dict__ == {}
+        assert caught.value.__cause__ is None
+        assert caught.value.__context__ is None
+        assert close_count == 1
+        for frame, _line in traceback.walk_tb(caught.value.__traceback__):
+            if frame.f_globals.get("__name__") != "intent_engineering.cli.app":
+                continue
+            assert frame.f_locals.get("runtime") is None
+            if "principals" in frame.f_locals:
+                assert frame.f_locals["principals"] == frozenset()
+            assert marker not in repr(frame.f_locals)
+    finally:
+        if close_count == 0:
+            original_close()
