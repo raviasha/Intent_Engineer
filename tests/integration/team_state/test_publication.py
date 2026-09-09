@@ -18,6 +18,9 @@ from intent_engineering.control_plane.service import ControlPlaneService
 from intent_engineering.control_plane.webauthn_service import VerifiedHumanDecision
 from intent_engineering.team_state import publication as publication_module
 from intent_engineering.team_state.models import (
+    CanonicalStateFile,
+    CanonicalStateSnapshot,
+    CiRecipientRecord,
     PreparedPublication,
     RecipientRecord,
     RemoteStateSnapshot,
@@ -99,6 +102,285 @@ def _service(
         publisher=publisher,  # type: ignore[arg-type]
         challenge_source=lambda: b"p" * 32,
     )
+
+
+def test_prepare_v1_migration_is_dual_signed_and_does_not_advance_local_trust(
+    tmp_path: Path,
+) -> None:
+    """Catches an in-place v1 trust edit or first-v2 release lacking either authority."""
+    import hashlib
+
+    from intent_engineering.team_state.authority import (
+        canonical_state_signature_preimage,
+        derive_recipient_key_id,
+        derive_signature_id,
+    )
+    from intent_engineering.team_state.keys import _key_id
+    from intent_engineering.team_state.local_trust import LocalTrustConfig
+    from intent_engineering.team_state.models import TeamStateManifest, canonical_manifest_bytes
+    from intent_engineering.team_state.publication import (
+        MigrationKeyAuthorities,
+        prepare_v1_migration,
+        preview_v1_migration,
+    )
+    from intent_engineering.team_state.restore import (
+        TrustedSigningKey,
+        VerifiedV1Release,
+        verify_v1_migration,
+    )
+    from tests.unit.team_state.test_authority import _RootStore
+
+    source = tmp_path / "source"
+    source.mkdir()
+    ready_project(source)
+    files = canonical_files(source)
+    snapshot = CanonicalStateSnapshot(
+        project_id="project",
+        repository_id=REPOSITORY_ID,
+        graph_version=1,
+        files=tuple(CanonicalStateFile(path=path, content=files[path]) for path in sorted(files)),
+    )
+    legacy_private = Ed25519PrivateKey.from_private_bytes(b"l" * 32)
+    legacy_public = legacy_private.public_key().public_bytes_raw()
+    recipient_private = X25519PrivateKey.from_private_bytes(b"a" * 32)
+    recipient = _recipient(recipient_private)
+    temporary_trust = LocalTrustConfig.model_construct(
+        project_id="project",
+        repository_id=REPOSITORY_ID,
+        recipient_key_id=recipient.key_id,
+        recipient=recipient,
+        signing_public_keys={"signer:legacy": _b64(legacy_public) + "="},
+    )
+    recipient = recipient.model_copy(
+        update={"key_id": _key_id(temporary_trust.enrollment_binding())}
+    )
+    legacy_trust = LocalTrustConfig(
+        project_id="project",
+        repository_id=REPOSITORY_ID,
+        recipient_key_id=recipient.key_id,
+        recipient=recipient,
+        signing_public_keys={"signer:legacy": _b64(legacy_public) + "="},
+    )
+    legacy_manifest = TeamStateManifest(
+        project_id="project",
+        repository_id=REPOSITORY_ID,
+        graph_version=1,
+        bundle_digest="sha256:" + "a" * 64,
+        bundle_size=100,
+        recipient_key_ids=(recipient.key_id,),
+        required_signature_ids=("signer:legacy",),
+        created_at=NOW,
+    )
+    current = VerifiedV1Release(
+        manifest=legacy_manifest,
+        manifest_bytes=canonical_manifest_bytes(legacy_manifest),
+        signing_keys=(TrustedSigningKey("signer:legacy", legacy_public),),
+        snapshot=snapshot,
+    )
+    ci = CiRecipientRecord(
+        project_id="project",
+        repository_id=REPOSITORY_ID,
+        runner_id="intent-runner",
+        public_key=_b64(
+            X25519PrivateKey.from_private_bytes(b"c" * 32).public_key().public_bytes_raw()
+        ),
+    )
+    credential = _credential()
+    root_store = _RootStore(b"r" * 32)
+    root_signatures: list[bytes] = []
+    root_sign = root_store.sign
+
+    def record_root_signature(root_key_id: str, preimage: bytes) -> bytes:
+        root_signatures.append(preimage)
+        return root_sign(root_key_id, preimage)
+
+    root_store.sign = record_root_signature  # type: ignore[method-assign]
+    device_private = Ed25519PrivateKey.from_private_bytes(b"s" * 32)
+    device_signatures: list[bytes] = []
+    legacy_signatures: list[bytes] = []
+
+    class DeviceSigner:
+        def create_for_existing_recipient(self, binding, recipient_public_key):
+            from intent_engineering.team_state.keys import DevicePublicMaterial
+
+            signing_public = device_private.public_key().public_bytes_raw()
+            return DevicePublicMaterial(
+                device_id=binding.device_id,
+                recipient_key_id=derive_recipient_key_id(
+                    binding.project_id, binding.repository_id, _b64(recipient_public_key)
+                ),
+                recipient_public_key=recipient_public_key,
+                signature_id=derive_signature_id(
+                    binding.project_id, binding.repository_id, _b64(signing_public)
+                ),
+                signing_public_key=signing_public,
+            )
+
+        def sign(self, signature_id, preimage):
+            assert signature_id == derive_signature_id(
+                "project", REPOSITORY_ID, _b64(device_private.public_key().public_bytes_raw())
+            )
+            device_signatures.append(preimage)
+            return device_private.sign(preimage)
+
+    class LegacySigner:
+        def public_keys(self):
+            return {"signer:legacy": legacy_public}
+
+        def sign(self, signature_id, preimage):
+            assert signature_id == "signer:legacy"
+            legacy_signatures.append(preimage)
+            return legacy_private.sign(preimage)
+
+    authorities = MigrationKeyAuthorities(
+        root_store=root_store,
+        device_signer=DeviceSigner(),
+        legacy_signer=LegacySigner(),
+    )
+    before = legacy_trust.model_dump(mode="python")
+    preview = preview_v1_migration(
+        current=current,
+        legacy_trust=legacy_trust,
+        ci_recipient=ci,
+        sponsor_credential=credential,
+        challenge="challenge:" + "f" * 64,
+        now=NOW,
+        authorities=authorities,
+    )
+    assert preview.project_id == "project"
+    assert preview.repository_id == REPOSITORY_ID
+    assert preview.graph_version == snapshot.graph_version
+    assert preview.legacy_parent_bundle_digest == legacy_manifest.bundle_digest
+    assert preview.legacy_signature_ids == ("signer:legacy",)
+    assert preview.ci_recipient_key_id == ci.key_id
+    assert preview.root_key_id == preview.authority.root.root_key_id
+    assert preview.device_signature_id == preview.certificate.claims.signature_id
+    assert preview.device_certificate_id == preview.certificate.certificate_id
+    assert preview.authority_digest == preview.manifest.authority_digest
+    assert preview.bundle_digest == preview.manifest.bundle_digest
+    assert preview.result_digest == preview.payload.result_digest
+    assert preview.subject == preview.payload.subject
+    assert preview.subject_digest == preview.payload.subject_digest
+    assert preview.canonical_bytes() == preview.canonical_bytes()
+    assert len(root_signatures) == 1
+    wrong_action = preview.payload.model_copy(
+        update={"action": DecisionAction.APPROVE_EXTERNAL_WRITE}
+    )
+    with pytest.raises(ValueError, match="version one migration preparation failed"):
+        prepare_v1_migration(
+            current=current,
+            legacy_trust=legacy_trust,
+            ci_recipient=ci,
+            preview=preview,
+            sponsor_decision=VerifiedHumanDecision(wrong_action, credential, NOW),
+            now=NOW,
+            authorities=authorities,
+        )
+    assert device_signatures == []
+    assert legacy_signatures == []
+    assert len(root_signatures) == 1
+    from dataclasses import replace
+
+    from intent_engineering.control_plane.models import DecisionSubject
+
+    forged_subject_digest = "sha256:" + "9" * 64
+    forged_subject = DecisionSubject(
+        kind="publication",
+        id="publication:v1-migration:" + "9" * 64,
+    )
+    forged_preview = replace(
+        preview,
+        subject=forged_subject,
+        subject_digest=forged_subject_digest,
+        payload=preview.payload.model_copy(
+            update={
+                "subject": forged_subject,
+                "subject_digest": forged_subject_digest,
+            }
+        ),
+    )
+    with pytest.raises(ValueError, match="version one migration preparation failed"):
+        prepare_v1_migration(
+            current=current,
+            legacy_trust=legacy_trust,
+            ci_recipient=ci,
+            preview=forged_preview,
+            sponsor_decision=VerifiedHumanDecision(forged_preview.payload, credential, NOW),
+            now=NOW,
+            authorities=authorities,
+        )
+    assert device_signatures == []
+    assert legacy_signatures == []
+    assert len(root_signatures) == 1
+    decision = VerifiedHumanDecision(preview.payload, credential, NOW)
+    prepared = prepare_v1_migration(
+        current=current,
+        legacy_trust=legacy_trust,
+        ci_recipient=ci,
+        preview=preview,
+        sponsor_decision=decision,
+        now=NOW,
+        authorities=authorities,
+    )
+    assert len(device_signatures) == 1
+    assert len(legacy_signatures) == 1
+    assert len(root_signatures) == 3
+
+    from datetime import timedelta
+
+    with pytest.raises(ValueError, match="version one migration preparation failed"):
+        prepare_v1_migration(
+            current=current,
+            legacy_trust=legacy_trust,
+            ci_recipient=ci,
+            preview=preview,
+            sponsor_decision=decision,
+            now=preview.payload.expires_at + timedelta(seconds=1),
+            authorities=authorities,
+        )
+    assert len(root_signatures) == 3
+    assert len(device_signatures) == 1
+    assert len(legacy_signatures) == 1
+
+    assert legacy_trust.model_dump(mode="python") == before
+    assert prepared.manifest.schema_version == 2
+    assert prepared.manifest.parent_bundle_digest == legacy_manifest.bundle_digest
+    assert prepared.manifest.migration.legacy_signature_ids == ("signer:legacy",)
+    assert (
+        prepared.envelope.signatures[0].signature
+        != prepared.envelope.migration_proof.legacy_signatures[0].signature
+    )
+    assert prepared.envelope.signatures[0].signature == _b64(
+        device_private.sign(canonical_state_signature_preimage(prepared.manifest))
+    )
+    verified = verify_v1_migration(
+        current=current,
+        manifest=prepared.manifest,
+        envelope=prepared.envelope,
+        root=prepared.authority.root,
+        authority=prepared.authority,
+        expected_ci_recipient=ci,
+        now=NOW,
+    )
+    assert verified.authority_digest == prepared.manifest.authority_digest
+    assert hashlib.sha256(
+        prepared.bundle
+    ).hexdigest() == prepared.manifest.bundle_digest.removeprefix("sha256:")
+
+    with pytest.raises(ValueError, match="version one migration preview failed"):
+        preview_v1_migration(
+            current=current,
+            legacy_trust=legacy_trust,
+            ci_recipient=ci,
+            sponsor_credential=credential,
+            challenge="challenge:" + "1" * 64,
+            now=NOW,
+            authorities=MigrationKeyAuthorities(
+                root_store=_RootStore(b"s" * 32),
+                device_signer=DeviceSigner(),
+                legacy_signer=LegacySigner(),
+            ),
+        )
 
 
 def _prepared(root: Path) -> PreparedPublication:

@@ -21,8 +21,18 @@ from pydantic import ConfigDict, Field, field_validator, model_validator
 
 from intent_engineering.core.models._base import StrictModel
 from intent_engineering.storage._atomic import same_path_lock
-from intent_engineering.team_state.authority import derive_root_key_id
-from intent_engineering.team_state.models import TeamRootTrustV2
+from intent_engineering.team_state.authority import (
+    derive_recipient_key_id,
+    derive_root_key_id,
+    derive_signature_id,
+)
+from intent_engineering.team_state.keys import DeviceEnrollmentBinding, DevicePublicMaterial
+from intent_engineering.team_state.models import (
+    TeamRootTrustV2,
+    TeamStateManifest,
+    TeamStateManifestV2,
+    canonical_manifest_bytes,
+)
 
 _PROJECT_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _ACTOR = re.compile(r"^[a-z][a-z0-9._:-]{0,127}$")
@@ -269,6 +279,172 @@ class TeamRootKeyStore(Protocol):
     def root_trust(self) -> TeamRootTrustV2: ...
 
 
+class ExistingRecipientDeviceSigner(Protocol):
+    """Non-exporting v2 signer paired with a separately held legacy recipient."""
+
+    def create_for_existing_recipient(
+        self,
+        binding: DeviceEnrollmentBinding,
+        recipient_public_key: bytes,
+    ) -> DevicePublicMaterial: ...
+
+    def sign(self, signature_id: str, preimage: bytes) -> bytes: ...
+
+
+class KeyringExistingRecipientDeviceSigner:
+    """Create only a new v2 Ed25519 signer while reusing a public X25519 recipient."""
+
+    def __init__(
+        self,
+        binding: DeviceEnrollmentBinding,
+        *,
+        backend: _KeyringBackend = keyring,
+        private_key_source: Callable[[], bytes] = _private_key_bytes,
+        lock_root: Path | None = None,
+    ) -> None:
+        self._binding = DeviceEnrollmentBinding.model_validate(binding.model_dump(mode="python"))
+        self._backend = backend
+        self._private_key_source = private_key_source
+        self._service = f"intent-engineering-device-signing-v2/{binding.project_id}"
+        account_binding = json.dumps(
+            {
+                **binding.model_dump(mode="json"),
+                "schema": "intent.migration-device-signing-storage.v2",
+            },
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode()
+        self._account = f"migration-device:sha256:{hashlib.sha256(account_binding).hexdigest()}"
+        self._lock_target = _lock_target(
+            lock_root if lock_root is not None else _default_lock_root(),
+            self._service,
+            self._account,
+        )
+
+    def _private(self) -> bytes:
+        with same_path_lock(self._lock_target):
+            stored = self._backend.get_password(self._service, self._account)
+            if stored is None:
+                private = self._private_key_source()
+                if type(private) is not bytes or len(private) != 32:
+                    raise ValueError("invalid device signing key source")
+                Ed25519PrivateKey.from_private_bytes(private)
+                encoded = _b64url(private)
+                self._backend.set_password(self._service, self._account, encoded)
+                if self._backend.get_password(self._service, self._account) != encoded:
+                    raise ValueError("device signing key write mismatch")
+                return private
+            return _decode_private(stored)
+
+    def create_for_existing_recipient(
+        self,
+        binding: DeviceEnrollmentBinding,
+        recipient_public_key: bytes,
+    ) -> DevicePublicMaterial:
+        failure: BaseException | None = None
+        private = b""
+        try:
+            value = DeviceEnrollmentBinding.model_validate(binding.model_dump(mode="python"))
+            if (
+                value != self._binding
+                or type(recipient_public_key) is not bytes
+                or len(recipient_public_key) != 32
+            ):
+                raise ValueError("migration device binding changed")
+            private = self._private()
+            signing_public = (
+                Ed25519PrivateKey.from_private_bytes(private).public_key().public_bytes_raw()
+            )
+            return DevicePublicMaterial(
+                device_id=value.device_id,
+                recipient_key_id=derive_recipient_key_id(
+                    value.project_id, value.repository_id, _b64url(recipient_public_key)
+                ),
+                recipient_public_key=recipient_public_key,
+                signature_id=derive_signature_id(
+                    value.project_id, value.repository_id, _b64url(signing_public)
+                ),
+                signing_public_key=signing_public,
+            )
+        except BaseException as error:  # noqa: BLE001
+            failure = _prepare_root_failure(error)
+        finally:
+            private = b""
+        assert failure is not None
+        raise failure.with_traceback(None)
+
+    def sign(self, signature_id: str, preimage: bytes) -> bytes:
+        failure: BaseException | None = None
+        private = b""
+        try:
+            if type(preimage) is not bytes or not preimage or len(preimage) > 256 * 1024:
+                raise ValueError("invalid device signing preimage")
+            private = self._private()
+            public = Ed25519PrivateKey.from_private_bytes(private).public_key().public_bytes_raw()
+            expected = derive_signature_id(
+                self._binding.project_id,
+                self._binding.repository_id,
+                _b64url(public),
+            )
+            if signature_id != expected:
+                raise ValueError("device signer binding changed")
+            return Ed25519PrivateKey.from_private_bytes(private).sign(preimage)
+        except BaseException as error:  # noqa: BLE001
+            failure = _prepare_root_failure(error)
+        finally:
+            private = b""
+        assert failure is not None
+        raise failure.with_traceback(None)
+
+    def __repr__(self) -> str:
+        return "KeyringExistingRecipientDeviceSigner()"
+
+
+class LegacyMigrationRelease(Protocol):
+    """Public portion of the exact verified v1 release being bridged."""
+
+    @property
+    def manifest(self) -> TeamStateManifest: ...
+
+    @property
+    def manifest_bytes(self) -> bytes: ...
+
+
+def canonical_v1_migration_preimage(
+    current: LegacyMigrationRelease,
+    manifest: TeamStateManifestV2,
+) -> bytes:
+    """Bind legacy approval to one exact first-v2 manifest under a distinct domain."""
+    if type(current.manifest) is not TeamStateManifest or type(manifest) is not TeamStateManifestV2:
+        raise TypeError("invalid migration release")
+    legacy = TeamStateManifest.model_validate(current.manifest.model_dump(mode="python"))
+    next_manifest = TeamStateManifestV2.model_validate(manifest.model_dump(mode="python"))
+    legacy_bytes = canonical_manifest_bytes(legacy)
+    if type(current.manifest_bytes) is not bytes or current.manifest_bytes != legacy_bytes:
+        raise ValueError("legacy manifest binding changed")
+    return json.dumps(
+        {
+            "authority_digest": next_manifest.authority_digest,
+            "bundle_digest": next_manifest.bundle_digest,
+            "domain": "intent.team-state-v1-migration.v2",
+            "manifest_digest": "sha256:"
+            + hashlib.sha256(next_manifest.canonical_bytes()).hexdigest(),
+            "parent_bundle_digest": next_manifest.parent_bundle_digest,
+            "prior_manifest_digest": "sha256:" + hashlib.sha256(legacy_bytes).hexdigest(),
+            "project_id": next_manifest.project_id,
+            "repository_id": next_manifest.repository_id,
+            "root_key_id": next_manifest.root_key_id,
+            "schema_version": 2,
+        },
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+
+
 def _prepare_root_failure(error: BaseException) -> BaseException:
     error.__traceback__ = None
     error.__cause__ = None
@@ -411,9 +587,13 @@ class KeyringTeamRootKeyStore:
 
 
 __all__ = [
+    "ExistingRecipientDeviceSigner",
+    "KeyringExistingRecipientDeviceSigner",
     "KeyringTeamRootKeyStore",
+    "LegacyMigrationRelease",
     "RootEnrollmentBinding",
     "SigningKeyStore",
     "SigningKeyStoreError",
     "TeamRootKeyStore",
+    "canonical_v1_migration_preimage",
 ]

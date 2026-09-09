@@ -23,6 +23,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import traceback
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -64,6 +65,11 @@ from intent_engineering.team_state.archive import (
     ARCHIVE_V2_MAGIC,
     validate_archive,
 )
+from intent_engineering.team_state.authority import (
+    VerifiedEnvelopeV2,
+    authority_digest,
+    verify_v2_envelope,
+)
 from intent_engineering.team_state.crypto import (
     ALGORITHM,
     EncryptedBundle,
@@ -82,11 +88,15 @@ from intent_engineering.team_state.models import (
     MAX_STATE_BYTES,
     MAX_STATE_FILES,
     STATE_REF,
+    CanonicalStateSnapshot,
+    CiRecipientRecord,
     RemoteStateSnapshot,
     SignatureEnvelope,
     StateSignature,
     StateSignatureEnvelopeV2,
+    TeamAuthorityRegistryV2,
     TeamManifest,
+    TeamRootTrustV2,
     TeamStateManifest,
     TeamStateManifestV2,
     canonical_manifest_bytes,
@@ -94,6 +104,7 @@ from intent_engineering.team_state.models import (
 from intent_engineering.team_state.models import (
     StateSignatureEnvelope as _StateSignatureEnvelope,
 )
+from intent_engineering.team_state.signing import canonical_v1_migration_preimage
 from intent_engineering.validation import validate_canonical_snapshot
 
 # Explicit v1 compatibility re-export used by the publication module.
@@ -282,6 +293,111 @@ class TrustedSigningKey:
         if _KEY_ID.fullmatch(self.signature_id) is None or len(self.public_key) != 32:
             raise ValueError("invalid trusted signing key")
         Ed25519PublicKey.from_public_bytes(self.public_key)
+
+
+@dataclass(frozen=True)
+class VerifiedV1Release:
+    """Exact public v1 release and signer pins accepted before migration."""
+
+    manifest: TeamStateManifest
+    manifest_bytes: bytes
+    signing_keys: tuple[TrustedSigningKey, ...]
+    snapshot: CanonicalStateSnapshot | None = None
+
+    def __post_init__(self) -> None:
+        if type(self.manifest) is not TeamStateManifest:
+            raise ValueError("invalid verified version one release")
+        manifest = TeamStateManifest.model_validate(self.manifest.model_dump(mode="python"))
+        if self.manifest_bytes != canonical_manifest_bytes(manifest):
+            raise ValueError("invalid verified version one manifest")
+        ids = tuple(item.signature_id for item in self.signing_keys)
+        if ids != manifest.required_signature_ids or ids != tuple(sorted(set(ids))):
+            raise ValueError("invalid verified version one signer policy")
+        if self.snapshot is not None and (
+            type(self.snapshot) is not CanonicalStateSnapshot
+            or self.snapshot.project_id != manifest.project_id
+            or self.snapshot.repository_id != manifest.repository_id
+            or self.snapshot.graph_version != manifest.graph_version
+        ):
+            raise ValueError("invalid verified version one snapshot")
+
+
+def rejects_schema1_after_v2(
+    *, accepted_schema_version: int, candidate_schema_version: int
+) -> bool:
+    """Return the one-way rollback decision used by version-dispatched restore."""
+    if type(accepted_schema_version) is not int or type(candidate_schema_version) is not int:
+        raise ValueError("invalid shared-state schema transition")
+    if accepted_schema_version not in {1, 2} or candidate_schema_version not in {1, 2}:
+        raise ValueError("invalid shared-state schema transition")
+    return accepted_schema_version == 2 and candidate_schema_version == 1
+
+
+def verify_v1_migration(
+    *,
+    current: VerifiedV1Release,
+    manifest: TeamStateManifestV2,
+    envelope: StateSignatureEnvelopeV2,
+    root: TeamRootTrustV2,
+    authority: TeamAuthorityRegistryV2,
+    expected_ci_recipient: CiRecipientRecord,
+    now: datetime,
+) -> VerifiedEnvelopeV2:
+    """Verify the sole dual-signed v1-to-v2 authority bridge."""
+    try:
+        if type(current) is not VerifiedV1Release:
+            raise ValueError("invalid legacy release")
+        manifest = TeamStateManifestV2.model_validate(manifest.model_dump(mode="python"))
+        envelope = StateSignatureEnvelopeV2.model_validate(envelope.model_dump(mode="python"))
+        migration = manifest.migration
+        proof = envelope.migration_proof
+        prior_digest = _digest(current.manifest_bytes)
+        signer_ids = tuple(item.signature_id for item in current.signing_keys)
+        if (
+            migration is None
+            or proof is None
+            or current.manifest.project_id != manifest.project_id
+            or current.manifest.repository_id != manifest.repository_id
+            or manifest.parent_bundle_digest != current.manifest.bundle_digest
+            or migration.prior_manifest_digest != prior_digest
+            or proof.prior_manifest_digest != prior_digest
+            or migration.legacy_signature_ids != signer_ids
+            or tuple(item.signature_id for item in proof.legacy_signatures) != signer_ids
+        ):
+            raise ValueError("migration binding changed")
+        public_keys = {item.signature_id: item.public_key for item in current.signing_keys}
+        preimage = canonical_v1_migration_preimage(current, manifest)
+        for signature in proof.legacy_signatures:
+            Ed25519PublicKey.from_public_bytes(public_keys[signature.signature_id]).verify(
+                _b64decode(signature.signature, expected_size=64),
+                preimage,
+            )
+        root = TeamRootTrustV2.model_validate(root.model_dump(mode="python"))
+        authority = TeamAuthorityRegistryV2.model_validate(authority.model_dump(mode="python"))
+        expected_ci_recipient = CiRecipientRecord.model_validate(
+            expected_ci_recipient.model_dump(mode="python")
+        )
+        if (
+            authority.root != root
+            or authority.ci_recipient != expected_ci_recipient
+            or authority_digest(authority) != manifest.authority_digest
+            or authority.active_recipient_key_ids() != manifest.recipient_key_ids
+        ):
+            raise ValueError("migration binding changed")
+        return verify_v2_envelope(manifest, envelope, root, None, now)
+    except BaseException as error:  # noqa: BLE001 - fixed migration verification boundary
+        error_traceback = error.__traceback__
+        if error_traceback is not None:
+            traceback.clear_frames(error_traceback)
+        error_traceback = None
+        error.args = ()
+        error.__dict__.clear()
+        error.__traceback__ = None
+        error.__cause__ = None
+        error.__context__ = None
+        if not isinstance(error, Exception):
+            raise error.with_traceback(None)
+        raise ValueError("version one migration verification failed") from None
 
 
 @dataclass(frozen=True)

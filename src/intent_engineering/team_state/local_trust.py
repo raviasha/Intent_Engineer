@@ -5,7 +5,11 @@ from __future__ import annotations
 import base64
 import json
 import os
-from collections.abc import Mapping
+import re
+import stat
+import traceback
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, NoReturn
 
@@ -18,13 +22,15 @@ from intent_engineering.core.models._base import StrictModel
 from intent_engineering.storage._atomic import same_path_lock
 from intent_engineering.storage.jsonl.strict import loads_strict_object
 from intent_engineering.storage.secure import SecureDirectory, SecureFile
+from intent_engineering.storage.transaction import LocalTransaction, LocalTransactionCoordinator
+from intent_engineering.team_state.enrollment import JoinResponseV2, TeamInviteV2
 from intent_engineering.team_state.keys import (
     GitHubIdentity,
     KeyringRecipientKeyStore,
     RecipientEnrollmentBinding,
     _key_id,
 )
-from intent_engineering.team_state.models import RecipientRecord
+from intent_engineering.team_state.models import RecipientRecord, TeamRootTrustV2
 from intent_engineering.team_state.restore import (
     TRUST_ENVIRONMENT_VARIABLE,
     EnvironmentTrustProvider,
@@ -38,7 +44,16 @@ if TYPE_CHECKING:
     from intent_engineering.cli.runtime import Runtime
 
 MAX_LOCAL_TRUST_BYTES = 32 * 1024
+MAX_PENDING_JOIN_BYTES = 128 * 1024
 _FILENAME = "team-trust.json"
+_PENDING_FILENAME = "team-join-pending.json"
+_ACTIVATION_JOURNAL_FILENAME = "join-activation.json"
+_SHA256 = re.compile(r"^sha256:[0-9a-f]{64}$")
+_ROOT_ID = re.compile(r"^root:sha256:[0-9a-f]{64}$")
+_MEMBER_ID = re.compile(r"^member:sha256:[0-9a-f]{64}$")
+_CERTIFICATE_ID = re.compile(r"^certificate:sha256:[0-9a-f]{64}$")
+_RECIPIENT_ID = re.compile(r"^recipient:sha256:[0-9a-f]{64}$")
+_SIGNATURE_ID = re.compile(r"^signer:sha256:[0-9a-f]{64}$")
 
 
 class LocalTrustError(ValueError):
@@ -49,6 +64,12 @@ class LocalTrustError(ValueError):
 
 
 def _failure(caught: BaseException) -> NoReturn:
+    caught_traceback = caught.__traceback__
+    if caught_traceback is not None:
+        traceback.clear_frames(caught_traceback)
+    caught_traceback = None
+    caught.args = ()
+    caught.__dict__.clear()
     caught.__traceback__ = None
     caught.__cause__ = None
     caught.__context__ = None
@@ -117,12 +138,402 @@ class LocalTrustConfig(StrictModel):
         return self
 
 
+class LocalTrustConfigV2(StrictModel):
+    """Public stable-root trust activated only with an installed v2 release."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    schema_version: Literal[2] = 2
+    project_id: str
+    repository_id: str
+    root: TeamRootTrustV2
+    member_id: str = Field(pattern=_MEMBER_ID.pattern)
+    device_certificate_id: str = Field(pattern=_CERTIFICATE_ID.pattern)
+    recipient_key_id: str = Field(pattern=_RECIPIENT_ID.pattern)
+    signature_id: str = Field(pattern=_SIGNATURE_ID.pattern)
+    accepted_authority_digest: str = Field(pattern=_SHA256.pattern)
+    accepted_authority_sequence: int = Field(ge=1, le=2**63 - 1)
+    accepted_bundle_digest: str = Field(pattern=_SHA256.pattern)
+
+    @field_validator("schema_version", "accepted_authority_sequence", mode="before")
+    @classmethod
+    def require_integer(cls, value: object) -> object:
+        if type(value) is not int:
+            raise ValueError("invalid version two local trust integer")
+        return value
+
+    @model_validator(mode="after")
+    def require_scope(self) -> LocalTrustConfigV2:
+        if type(self.root) is not TeamRootTrustV2:
+            raise ValueError("invalid version two root trust")
+        root = self.root
+        if root.project_id != self.project_id or root.repository_id != self.repository_id:
+            raise ValueError("version two local trust scope changed")
+        return self
+
+    def canonical_bytes(self) -> bytes:
+        return _canonical_bytes(self)
+
+
+class PendingJoinTrustV2(StrictModel):
+    """Public-only local join receipt; never sufficient publication authority."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    schema_version: Literal[2] = 2
+    phase: Literal["response-ready", "awaiting-merge"]
+    invite: TeamInviteV2
+    response: JoinResponseV2
+    local_recipient_key_id: str = Field(pattern=_RECIPIENT_ID.pattern)
+    local_signature_id: str = Field(pattern=_SIGNATURE_ID.pattern)
+    expected_root_key_id: str = Field(pattern=_ROOT_ID.pattern)
+    expected_authority_before_digest: str = Field(pattern=_SHA256.pattern)
+    external_write_attempted: bool
+
+    @field_validator("schema_version", mode="before")
+    @classmethod
+    def require_integer(cls, value: object) -> object:
+        if type(value) is not int:
+            raise ValueError("invalid pending join version")
+        return value
+
+    @field_validator("external_write_attempted", mode="before")
+    @classmethod
+    def require_boolean(cls, value: object) -> object:
+        if type(value) is not bool:
+            raise ValueError("invalid pending join write marker")
+        return value
+
+    @model_validator(mode="after")
+    def require_public_bindings(self) -> PendingJoinTrustV2:
+        if type(self.invite) is not TeamInviteV2 or type(self.response) is not JoinResponseV2:
+            raise ValueError("invalid pending join receipt")
+        invite = self.invite
+        response = self.response
+        if (
+            response.invite_id != invite.invite_id
+            or response.project_id != invite.project_id
+            or response.repository_id != invite.repository_id
+            or self.local_recipient_key_id != response.recipient_key_id
+            or self.local_signature_id != response.signature_id
+            or self.expected_root_key_id != invite.root.root_key_id
+            or self.expected_authority_before_digest != invite.authority_digest
+            or (self.phase == "response-ready" and self.external_write_attempted)
+        ):
+            raise ValueError("pending join binding changed")
+        return self
+
+    def canonical_bytes(self) -> bytes:
+        return _canonical_bytes(self)
+
+
+class StateInstallTransaction:
+    """One journaled mutation spanning canonical state and public trust activation."""
+
+    def __init__(
+        self,
+        journal: SecureFile,
+        state_targets: Mapping[str, SecureFile],
+        install_state: Callable[[LocalTransaction], None],
+        *,
+        fault_hook: Callable[[str], None] | None = None,
+    ) -> None:
+        if not state_targets or any(
+            name in {"team_trust", "pending_join_trust"} for name in state_targets
+        ):
+            raise ValueError("invalid state install targets")
+        self._journal = journal.duplicate()
+        self._state_targets = {name: target.duplicate() for name, target in state_targets.items()}
+        self._install_state = install_state
+        self._fault_hook = fault_hook
+
+    def close(self) -> None:
+        self._journal.close()
+        for target in self._state_targets.values():
+            target.close()
+
+    def matches_journal(self, target: SecureFile) -> bool:
+        """Confirm restore and provider share the one canonical activation journal."""
+        return self._journal.lock_key == target.lock_key
+
+    def _coordinator(
+        self,
+        pending_target: SecureFile,
+        active_target: SecureFile,
+    ) -> LocalTransactionCoordinator:
+        return LocalTransactionCoordinator(
+            self._journal,
+            {
+                **self._state_targets,
+                "pending_join_trust": pending_target,
+                "team_trust": active_target,
+            },
+            fault_hook=self._fault_hook,
+        )
+
+    def recover_with_trust(
+        self,
+        *,
+        pending_target: SecureFile,
+        active_target: SecureFile,
+    ) -> None:
+        """Recover an interrupted commit before strict trust metadata is parsed."""
+        coordinator = self._coordinator(pending_target, active_target)
+        try:
+            recovered = coordinator.snapshot(target_names=()).recovered
+            if recovered:
+                _harden_owner_target(active_target)
+                _harden_owner_target(pending_target)
+        finally:
+            coordinator.close()
+
+    def install_with_trust(
+        self,
+        *,
+        pending_target: SecureFile,
+        active_target: SecureFile,
+        pending_preimage: bytes,
+        trust_content: bytes,
+    ) -> None:
+        coordinator = self._coordinator(pending_target, active_target)
+        try:
+            with coordinator.transaction(rollback_base_exceptions=True) as transaction:
+                if transaction.read_optional("pending_join_trust") != pending_preimage:
+                    raise ValueError("pending join trust changed")
+                active = transaction.read_optional("team_trust")
+                if active not in {None, trust_content}:
+                    raise ValueError("active local trust changed")
+                self._install_state(transaction)
+                transaction.write("team_trust", trust_content)
+                os.chmod(
+                    active_target.name,
+                    0o600,
+                    dir_fd=active_target.parent_fd,
+                    follow_symlinks=False,
+                )
+                transaction.write("pending_join_trust", b"")
+                os.chmod(
+                    pending_target.name,
+                    0o600,
+                    dir_fd=pending_target.parent_fd,
+                    follow_symlinks=False,
+                )
+        finally:
+            try:
+                _harden_owner_target(active_target)
+                _harden_owner_target(pending_target)
+            finally:
+                coordinator.close()
+
+
+def _canonical_bytes(value: StrictModel) -> bytes:
+    return json.dumps(
+        value.model_dump(mode="json"),
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+
+
+@contextmanager
+def _locked_files(*targets: SecureFile) -> Iterator[None]:
+    with ExitStack() as stack:
+        for target in sorted(targets, key=lambda item: item.lock_key):
+            stack.enter_context(same_path_lock(target))
+        yield
+
+
+def _read_locked_descriptor(
+    target: SecureFile,
+    *,
+    max_bytes: int,
+) -> tuple[bytes | None, os.stat_result | None]:
+    descriptor = -1
+    with same_path_lock(target):
+        try:
+            try:
+                descriptor = os.open(
+                    target.name,
+                    os.O_RDONLY
+                    | getattr(os, "O_NOFOLLOW", 0)
+                    | getattr(os, "O_CLOEXEC", 0)
+                    | getattr(os, "O_NONBLOCK", 0),
+                    dir_fd=target.parent_fd,
+                )
+            except FileNotFoundError:
+                return None, None
+            before = os.fstat(descriptor)
+            if not stat.S_ISREG(before.st_mode):
+                raise ValueError("unsafe local trust file")
+            retained = bytearray()
+            while chunk := os.read(descriptor, min(64 * 1024, max_bytes + 1 - len(retained))):
+                retained.extend(chunk)
+                if len(retained) > max_bytes:
+                    raise ValueError("local trust file oversized")
+            after = os.fstat(descriptor)
+            path_metadata = os.stat(
+                target.name,
+                dir_fd=target.parent_fd,
+                follow_symlinks=False,
+            )
+            if _security_metadata(before) != _security_metadata(after) or _security_metadata(
+                after
+            ) != _security_metadata(path_metadata):
+                raise ValueError("local trust file changed")
+            return bytes(retained), after
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+
+
+def _security_metadata(metadata: os.stat_result) -> tuple[int, ...]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_uid,
+        metadata.st_nlink,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
+def _require_owner_metadata(metadata: os.stat_result) -> None:
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != os.getuid()
+        or metadata.st_nlink != 1
+        or stat.S_IMODE(metadata.st_mode) != 0o600
+    ):
+        raise ValueError("unsafe local trust file")
+
+
 def _read(target: SecureFile) -> LocalTrustConfig | None:
     content = target.read_optional_nonblocking(max_bytes=MAX_LOCAL_TRUST_BYTES)
     if content is None:
         return None
     loads_strict_object(content.decode("utf-8"))
     return LocalTrustConfig.model_validate_json(content)
+
+
+def _read_versioned(
+    directory: SecureDirectory,
+    target: SecureFile,
+) -> LocalTrustConfig | LocalTrustConfigV2 | None:
+    content, metadata = _read_locked_descriptor(target, max_bytes=MAX_LOCAL_TRUST_BYTES)
+    if content is None or content == b"":
+        return None
+    assert metadata is not None
+    loaded = loads_strict_object(content.decode("utf-8"))
+    version = loaded.get("schema_version")
+    if type(version) is not int or version not in {1, 2}:
+        raise ValueError("invalid local trust version")
+    if version == 1:
+        return LocalTrustConfig.model_validate_json(content)
+    _require_owner_directory(directory, harden=False)
+    _require_owner_metadata(metadata)
+    parsed = LocalTrustConfigV2.model_validate_json(content)
+    if content != _canonical_bytes(parsed):
+        raise ValueError("noncanonical local trust")
+    return parsed
+
+
+def _read_pending(directory: SecureDirectory, target: SecureFile) -> PendingJoinTrustV2 | None:
+    content, metadata = _read_locked_descriptor(target, max_bytes=MAX_PENDING_JOIN_BYTES)
+    if content is None or content == b"":
+        return None
+    assert metadata is not None
+    _require_owner_metadata(metadata)
+    loads_strict_object(content.decode("utf-8"))
+    parsed = PendingJoinTrustV2.model_validate_json(content)
+    if content != parsed.canonical_bytes():
+        raise ValueError("noncanonical pending join trust")
+    return parsed
+
+
+def _require_owner_directory(directory: SecureDirectory, *, harden: bool | None) -> None:
+    metadata = os.fstat(directory.descriptor)
+    if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != os.getuid():
+        raise ValueError("unsafe local trust directory")
+    if harden is None:
+        return
+    if stat.S_IMODE(metadata.st_mode) != 0o700:
+        if not harden:
+            raise ValueError("unsafe local trust directory")
+        os.fchmod(directory.descriptor, 0o700)
+        os.fsync(directory.descriptor)
+        metadata = os.fstat(directory.descriptor)
+        if stat.S_IMODE(metadata.st_mode) != 0o700:
+            raise ValueError("unsafe local trust directory")
+
+
+def _require_owner_file(directory: SecureDirectory, name: str) -> None:
+    descriptor = -1
+    try:
+        descriptor = os.open(
+            name,
+            os.O_RDONLY
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NONBLOCK", 0),
+            dir_fd=directory.descriptor,
+        )
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.getuid()
+            or metadata.st_nlink != 1
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+        ):
+            raise ValueError("unsafe local trust file")
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def _harden_owner_target(target: SecureFile) -> None:
+    descriptor = -1
+    try:
+        descriptor = os.open(
+            target.name,
+            os.O_RDONLY
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NONBLOCK", 0),
+            dir_fd=target.parent_fd,
+        )
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.getuid()
+            or metadata.st_nlink != 1
+        ):
+            raise ValueError("unsafe local trust file")
+        os.fchmod(descriptor, 0o600)
+        os.fsync(descriptor)
+    except FileNotFoundError:
+        return
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def _open_workspace(root: Path, *, harden: bool | None) -> tuple[SecureDirectory, SecureDirectory]:
+    project = SecureDirectory.open(root)
+    try:
+        workspace = project.subdirectory(".intent")
+    except BaseException:
+        project.close()
+        raise
+    try:
+        _require_owner_directory(workspace, harden=harden)
+    except BaseException:
+        workspace.close()
+        project.close()
+        raise
+    return project, workspace
 
 
 def _check_project(directory: SecureDirectory, project_id: str) -> None:
@@ -214,12 +625,167 @@ class LocalTrustProvider:
     def __init__(self, root: Path) -> None:
         self._root = root
 
+    def load_versioned(self) -> LocalTrustConfig | LocalTrustConfigV2 | None:
+        """Read exact public trust without using it as secret-bearing authority."""
+        caught: BaseException
+        try:
+            project, workspace = _open_workspace(self._root, harden=None)
+            try:
+                target = workspace.file(_FILENAME)
+                journal = workspace.file(_ACTIVATION_JOURNAL_FILENAME)
+                try:
+                    with _locked_files(journal, target):
+                        if journal.exists():
+                            raise ValueError("join activation recovery required")
+                        config = _read_versioned(workspace, target)
+                        if config is not None:
+                            _check_project(workspace, config.project_id)
+                        return config
+                finally:
+                    journal.close()
+                    target.close()
+            finally:
+                workspace.close()
+                project.close()
+        except FileNotFoundError:
+            return None
+        except BaseException as error:  # noqa: BLE001
+            caught = error
+        _failure(caught)
+
+    def load_pending_join(self) -> PendingJoinTrustV2 | None:
+        """Read a public join receipt; its presence never activates device authority."""
+        caught: BaseException
+        try:
+            project, workspace = _open_workspace(self._root, harden=False)
+            try:
+                target = workspace.file(_PENDING_FILENAME)
+                try:
+                    pending = _read_pending(workspace, target)
+                    if pending is not None:
+                        _check_project(workspace, pending.invite.project_id)
+                    return pending
+                finally:
+                    target.close()
+            finally:
+                workspace.close()
+                project.close()
+        except FileNotFoundError:
+            return None
+        except BaseException as error:  # noqa: BLE001
+            caught = error
+        _failure(caught)
+
+    def save_pending_join(self, receipt: PendingJoinTrustV2) -> None:
+        """Persist one canonical public receipt without replacing a different ceremony."""
+        caught: BaseException
+        try:
+            receipt = PendingJoinTrustV2.model_validate_json(receipt.canonical_bytes())
+            content = receipt.canonical_bytes()
+            if len(content) > MAX_PENDING_JOIN_BYTES:
+                raise ValueError("pending join trust oversized")
+            project, workspace = _open_workspace(self._root, harden=True)
+            try:
+                _check_project(workspace, receipt.invite.project_id)
+                target = workspace.file(_PENDING_FILENAME)
+                try:
+                    with same_path_lock(target):
+                        old = _read_pending(workspace, target)
+                        if old is not None and old != receipt:
+                            raise ValueError("pending join trust changed")
+                        if old is None:
+                            target.atomic_write(content, reject_target_races=True)
+                            os.chmod(
+                                target.name,
+                                0o600,
+                                dir_fd=workspace.descriptor,
+                                follow_symlinks=False,
+                            )
+                            _require_owner_file(workspace, target.name)
+                finally:
+                    target.close()
+            finally:
+                workspace.close()
+                project.close()
+            return
+        except BaseException as error:  # noqa: BLE001
+            caught = error
+        _failure(caught)
+
+    def activate_join(
+        self,
+        *,
+        pending_preimage: PendingJoinTrustV2,
+        trust: LocalTrustConfigV2,
+        install: StateInstallTransaction,
+    ) -> None:
+        """Delegate the exact state/trust commit to one restore-owned transaction."""
+        caught: BaseException
+        try:
+            pending_preimage = PendingJoinTrustV2.model_validate_json(
+                pending_preimage.canonical_bytes()
+            )
+            trust = LocalTrustConfigV2.model_validate_json(trust.canonical_bytes())
+            if (
+                pending_preimage.phase != "awaiting-merge"
+                or pending_preimage.expected_root_key_id != trust.root.root_key_id
+                or pending_preimage.invite.project_id != trust.project_id
+                or pending_preimage.invite.repository_id != trust.repository_id
+                or pending_preimage.response.proposed_member.member_id != trust.member_id
+                or pending_preimage.local_recipient_key_id != trust.recipient_key_id
+                or pending_preimage.local_signature_id != trust.signature_id
+            ):
+                raise ValueError("join activation binding changed")
+            project, workspace = _open_workspace(self._root, harden=False)
+            try:
+                pending_target = workspace.file(_PENDING_FILENAME)
+                active_target = workspace.file(_FILENAME)
+                journal_target = workspace.file(_ACTIVATION_JOURNAL_FILENAME)
+                try:
+                    if not install.matches_journal(journal_target):
+                        raise ValueError("join activation journal changed")
+                    install.recover_with_trust(
+                        pending_target=pending_target,
+                        active_target=active_target,
+                    )
+                    current = _read_pending(workspace, pending_target)
+                    existing = _read_versioned(workspace, active_target)
+                    if current is None and existing == trust:
+                        return
+                    if current != pending_preimage:
+                        raise ValueError("pending join trust changed")
+                    if existing is not None and existing != trust:
+                        raise ValueError("active local trust changed")
+                    install.install_with_trust(
+                        pending_target=pending_target,
+                        active_target=active_target,
+                        pending_preimage=pending_preimage.canonical_bytes(),
+                        trust_content=trust.canonical_bytes(),
+                    )
+                    if _read_versioned(workspace, active_target) != trust:
+                        raise ValueError("join activation unavailable")
+                    if _read_pending(workspace, pending_target) is not None:
+                        raise ValueError("join activation incomplete")
+                finally:
+                    journal_target.close()
+                    pending_target.close()
+                    active_target.close()
+            finally:
+                workspace.close()
+                project.close()
+            return
+        except BaseException as error:  # noqa: BLE001
+            caught = error
+        _failure(caught)
+
     def load(self) -> SharedStateTrust | None:
         caught: BaseException
         trust = None
         try:
-            config = load_local_trust(self._root)
+            config = self.load_versioned()
             if config is None:
+                return None
+            if isinstance(config, LocalTrustConfigV2):
                 return None
             provider = RecipientKeyStoreTrustProvider(
                 project_id=config.project_id,
@@ -261,9 +827,13 @@ def local_or_environment_trust(
 
 
 __all__ = [
+    "MAX_PENDING_JOIN_BYTES",
     "LocalTrustConfig",
+    "LocalTrustConfigV2",
     "LocalTrustError",
     "LocalTrustProvider",
+    "PendingJoinTrustV2",
+    "StateInstallTransaction",
     "load_local_trust",
     "local_or_environment_trust",
     "save_local_trust",
