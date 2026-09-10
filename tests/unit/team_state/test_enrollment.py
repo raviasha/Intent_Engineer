@@ -422,6 +422,74 @@ def test_certificate_identity_survives_counter_updates_but_not_key_substitution(
     assert credential_identity_digest(before) != credential_identity_digest(substituted)
 
 
+def test_migrated_sponsor_uses_certificate_bound_legacy_actor(tmp_path: object) -> None:
+    """A migration must preserve the credential actor committed by the certificate."""
+    from intent_engineering.control_plane.models import credential_identity_digest
+
+    sponsor, _member, state, invite, response = _join(tmp_path)
+    preview = sponsor.preview_approval(invite=invite, response=response, current=state, now=NOW)
+    credential = _credential(100, "alice", "local")
+    certificate = preview.invite.sponsor_certificate
+    changed_claims = certificate.claims.model_copy(
+        update={"webauthn_credential_digest": credential_identity_digest(credential)}
+    )
+    from intent_engineering.team_state.authority import issue_device_certificate
+
+    rebound = issue_device_certificate(changed_claims, sponsor._root_store)
+    sponsor._sponsor_certificate_id = rebound.certificate_id
+    members = tuple(
+        member.model_copy(update={"device_certificate_ids": (rebound.certificate_id,)})
+        if member.member_id == rebound.claims.member_id
+        else member
+        for member in state.authority.members
+    )
+    authority = state.authority.model_copy(
+        update={"members": members, "device_certificates": (rebound,)}
+    )
+    state = state.model_copy(update={"authority": authority})
+    invite = sponsor.create_invite(
+        state=state,
+        intended_identity=GitHubIdentity(account_id="200", login="bob"),
+        now=NOW,
+    )
+    # The existing response is tied to the former invite, so use the normal helper again.
+    _a, member_service, _old_state, identity, member_credential = _fixture(tmp_path)
+    material = member_service.device_public_material(invite=invite, local_identity=identity)
+    join_payload = build_join_decision_payload(
+        invite=invite,
+        identity=identity,
+        material=material,
+        credential=member_credential,
+        identity_proof=IDENTITY_PROOF,
+        pre_assertion_sign_count=6,
+        challenge=b"j" * 32,
+        now=NOW,
+    )
+    response = member_service.create_join_response(
+        invite=invite,
+        local_identity=identity,
+        decision=VerifiedHumanDecision(join_payload, member_credential, NOW),
+        identity_proof=IDENTITY_PROOF,
+        pre_assertion_sign_count=6,
+        webauthn_assertion=_assertion(member_credential),
+        now=NOW,
+    )
+    preview = sponsor.preview_approval(invite=invite, response=response, current=state, now=NOW)
+    payload = build_sponsor_decision_payload(
+        preview=preview, credential=credential, challenge=b"s" * 32, now=NOW
+    )
+    assert payload.actor == "local"
+    approved = sponsor.approve(
+        preview=preview,
+        sponsor_decision=VerifiedHumanDecision(payload, credential, NOW),
+        sponsor_pre_assertion_sign_count=6,
+        sponsor_assertion=_assertion(credential),
+        current=state,
+        now=NOW,
+    )
+    assert approved.authority.sequence == state.authority.sequence + 1
+
+
 def test_join_decision_expires_with_a_nearly_expired_invitation(tmp_path: object) -> None:
     """Catches a decision lifetime extending past the public invitation it authorizes."""
     a_service, b_service, state, identity, credential = _fixture(tmp_path)

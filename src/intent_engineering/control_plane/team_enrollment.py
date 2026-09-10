@@ -19,7 +19,7 @@ import anyio
 from pydantic import ConfigDict, Field, model_validator
 
 from intent_engineering.cli.runtime import Runtime
-from intent_engineering.control_plane.models import HumanDecisionPayload
+from intent_engineering.control_plane.models import CredentialRecord, HumanDecisionPayload
 from intent_engineering.core.models._base import StrictModel
 from intent_engineering.storage._atomic import same_path_lock
 from intent_engineering.storage.jsonl.strict import loads_strict_object
@@ -46,6 +46,11 @@ if TYPE_CHECKING:
     from intent_engineering.team_state.setup import EnrollmentApprovalRequest, GitHubSetupBridge
 
 _SESSION_FILE = "team-enrollment-session.json"
+_APPROVAL_FILE = "team-enrollment-approval.json"
+_SESSION_JOURNAL_FILE = "team-enrollment-session-transaction.json"
+_PUBLICATION_FILE = "team-publication.json"
+_RECEIPT_FILE = "team-enrollment-receipt.json"
+_DISCARDED_PUBLICATION_STATE = b'{"discarded":true}'
 _MAX_SESSION_BYTES = 128 * 1024
 
 
@@ -90,37 +95,77 @@ class EnrollmentRequest(StrictModel):
         return self
 
 
-def load_enrollment_request(runtime: Runtime) -> EnrollmentRequest | None:
-    from intent_engineering.cli.team import discover_github_repository
+def _recover_enrollment_session_state(runtime: Runtime) -> None:
+    from intent_engineering.storage.transaction import LocalTransactionCoordinator
 
+    session = runtime.workspace_directory.file(_SESSION_FILE)
+    approval = runtime.workspace_directory.file(_APPROVAL_FILE)
+    draft = runtime.workspace_directory.file(_PUBLICATION_FILE)
+    receipt = runtime.workspace_directory.file(_RECEIPT_FILE)
+    journal = runtime.workspace_directory.file(_SESSION_JOURNAL_FILE)
+    coordinator: LocalTransactionCoordinator | None = None
+    try:
+        coordinator = LocalTransactionCoordinator(
+            journal,
+            {
+                "session": session,
+                "approval": approval,
+                "draft": draft,
+                "receipt": receipt,
+            },
+            legacy_target_sets=(frozenset({"session", "approval"}),),
+        )
+        coordinator.recover()
+    finally:
+        if coordinator is not None:
+            coordinator.close()
+        journal.close()
+        receipt.close()
+        draft.close()
+        approval.close()
+        session.close()
+
+
+def _read_enrollment_request(runtime: Runtime, target: object) -> EnrollmentRequest | None:
+    from intent_engineering.cli.team import discover_github_repository
+    from intent_engineering.storage.secure import SecureFile
+
+    if type(target) is not SecureFile:
+        raise ValueError("team enrollment unavailable")
+    content = target.read_optional_nonblocking(max_bytes=_MAX_SESSION_BYTES)
+    if content is None:
+        return None
+    metadata = os.stat(target.name, dir_fd=target.parent_fd, follow_symlinks=False)
+    if metadata.st_uid != os.getuid() or stat.S_IMODE(metadata.st_mode) != 0o600:
+        raise ValueError("team enrollment unavailable")
+    loads_strict_object(content.decode())
+    request = EnrollmentRequest.model_validate_json(content)
+    if (
+        content != request.model_dump_json().encode()
+        or request.project_id != runtime.config.project_id
+        or request.repository_id != "github.com/" + discover_github_repository(runtime.root)
+    ):
+        raise ValueError("team enrollment unavailable")
+    return request
+
+
+def load_enrollment_request(runtime: Runtime) -> EnrollmentRequest | None:
+    _recover_enrollment_session_state(runtime)
     target = runtime.workspace_directory.file(_SESSION_FILE)
     try:
-        content = target.read_optional_nonblocking(max_bytes=_MAX_SESSION_BYTES)
-        if content is None:
-            return None
-        metadata = os.stat(target.name, dir_fd=target.parent_fd, follow_symlinks=False)
-        if metadata.st_uid != os.getuid() or stat.S_IMODE(metadata.st_mode) != 0o600:
-            raise ValueError("team enrollment unavailable")
-        loads_strict_object(content.decode())
-        request = EnrollmentRequest.model_validate_json(content)
-        if (
-            content != request.model_dump_json().encode()
-            or request.project_id != runtime.config.project_id
-            or request.repository_id != "github.com/" + discover_github_repository(runtime.root)
-        ):
-            raise ValueError("team enrollment unavailable")
-        return request
+        return _read_enrollment_request(runtime, target)
     finally:
         target.close()
 
 
 def save_enrollment_request(runtime: Runtime, **fields: object) -> EnrollmentRequest:
     request = EnrollmentRequest.model_validate({"session_id": secrets.token_hex(32), **fields})
+    _recover_enrollment_session_state(runtime)
     target = runtime.workspace_directory.file(_SESSION_FILE)
     try:
         with same_path_lock(target):
             if target.exists():
-                previous = load_enrollment_request(runtime)
+                previous = _read_enrollment_request(runtime, target)
                 if previous is not None and previous.model_dump(
                     exclude={"session_id", "created_invite"}
                 ) == (request.model_dump(exclude={"session_id", "created_invite"})):
@@ -131,7 +176,7 @@ def save_enrollment_request(runtime: Runtime, **fields: object) -> EnrollmentReq
                     and request.action == "approve-join"
                     and request.response is not None
                     and request.response.invite_id == previous.created_invite.invite_id
-                    and enrollment_status(runtime).get("can_cancel") is True
+                    and _enrollment_can_cancel(runtime, previous)
                 ):
                     target.atomic_write(
                         request.model_dump_json().encode(), reject_target_races=True
@@ -162,6 +207,21 @@ def save_enrollment_request(runtime: Runtime, **fields: object) -> EnrollmentReq
             return request
     finally:
         target.close()
+
+
+def _enrollment_can_cancel(runtime: Runtime, request: EnrollmentRequest) -> bool:
+    from intent_engineering.team_state.local_trust import LocalTrustConfigV2, LocalTrustProvider
+    from intent_engineering.team_state.setup import _draft, _enrollment_receipt
+
+    draft = _draft(runtime)
+    pending = LocalTrustProvider(runtime.root).load_pending_join()
+    active = LocalTrustProvider(runtime.root).load_versioned()
+    return (
+        draft is None
+        and _enrollment_receipt(runtime) is None
+        and pending is None
+        and not (isinstance(active, LocalTrustConfigV2) and request.action == "join")
+    )
 
 
 def enrollment_status(runtime: Runtime) -> dict[str, object]:
@@ -202,12 +262,7 @@ def enrollment_status(runtime: Runtime) -> dict[str, object]:
         "state": state,
         "project_id": request.project_id,
         "repository_id": request.repository_id,
-        "can_cancel": (
-            not attempted
-            and receipt is None
-            and pending is None
-            and not (isinstance(active, LocalTrustConfigV2) and request.action == "join")
-        ),
+        "can_cancel": (_enrollment_can_cancel(runtime, request)),
     }
     if request.identity is not None:
         result["identity"] = request.identity.model_dump(mode="json")
@@ -240,34 +295,150 @@ def enrollment_status(runtime: Runtime) -> dict[str, object]:
 
 
 def cancel_enrollment(runtime: Runtime, session_id: str) -> dict[str, object]:
-    target = runtime.workspace_directory.file(_SESSION_FILE)
+    request = load_enrollment_request(runtime)
+    state = enrollment_status(runtime)
+    if request is None or request.session_id != session_id or state.get("can_cancel") is not True:
+        raise ValueError("team enrollment unavailable")
+    _retire_enrollment_request(runtime, request)
+    return {"state": "cancelled"}
+
+
+def _read_approval_content(
+    content: bytes | None, request: EnrollmentRequest
+) -> EnrollmentApprovalRequest | None:
+    from intent_engineering.team_state.models import MAX_BUNDLE_BYTES
+    from intent_engineering.team_state.setup import EnrollmentApprovalRequest
+
+    if content is None:
+        return None
+    if len(content) > MAX_BUNDLE_BYTES * 2 + 256 * 1024:
+        raise ValueError("team enrollment unavailable")
+    loads_strict_object(content.decode())
+    approval = EnrollmentApprovalRequest.model_validate_json(content)
+    if content != approval.canonical_bytes() or approval.preview.response != request.response:
+        raise ValueError("team enrollment unavailable")
+    return approval
+
+
+def _retire_enrollment_request(runtime: Runtime, request: EnrollmentRequest) -> None:
+    """Atomically remove one exact session and its exact matching approval metadata."""
+    from intent_engineering.storage.transaction import LocalTransactionCoordinator
+    from intent_engineering.team_state.models import MAX_BUNDLE_BYTES
+
+    session = runtime.workspace_directory.file(_SESSION_FILE)
+    approval = runtime.workspace_directory.file(_APPROVAL_FILE)
+    draft = runtime.workspace_directory.file(_PUBLICATION_FILE)
+    receipt = runtime.workspace_directory.file(_RECEIPT_FILE)
+    journal = runtime.workspace_directory.file(_SESSION_JOURNAL_FILE)
+    coordinator: LocalTransactionCoordinator | None = None
     try:
-        with same_path_lock(target):
-            state = enrollment_status(runtime)
-            if state.get("session_id") != session_id or state.get("can_cancel") is not True:
+        coordinator = LocalTransactionCoordinator(
+            journal,
+            {
+                "session": session,
+                "approval": approval,
+                "draft": draft,
+                "receipt": receipt,
+            },
+            legacy_target_sets=(frozenset({"session", "approval"}),),
+        )
+        with coordinator.transaction(rollback_base_exceptions=True) as transaction:
+            session_content = transaction.read_optional_bounded(
+                "session", max_bytes=_MAX_SESSION_BYTES
+            )
+            if session_content != request.model_dump_json().encode():
                 raise ValueError("team enrollment unavailable")
-            target.unlink()
-            return {"state": "cancelled"}
+            approval_content = transaction.read_optional_bounded(
+                "approval", max_bytes=MAX_BUNDLE_BYTES * 2 + 256 * 1024
+            )
+            _read_approval_content(approval_content, request)
+            if transaction.read_optional("draft") not in {
+                None,
+                _DISCARDED_PUBLICATION_STATE,
+            } or transaction.read_optional("receipt") not in {
+                None,
+                _DISCARDED_PUBLICATION_STATE,
+            }:
+                raise ValueError("team enrollment unavailable")
+            transaction.delete("session")
+            if approval_content is not None:
+                transaction.delete("approval")
     finally:
-        target.close()
+        if coordinator is not None:
+            coordinator.close()
+        journal.close()
+        receipt.close()
+        draft.close()
+        approval.close()
+        session.close()
+
+
+def _retire_closed_enrollment_request(
+    runtime: Runtime,
+    request: EnrollmentRequest,
+    approval_request: EnrollmentApprovalRequest,
+    draft_value: object,
+    receipt_value: object,
+) -> None:
+    """Atomically retire the exact closed enrollment workflow after remote proof."""
+    from intent_engineering.storage.transaction import LocalTransactionCoordinator
+    from intent_engineering.team_state.setup import EncryptedPublicationDraft, EnrollmentReceiptV2
+
+    if (
+        type(draft_value) is not EncryptedPublicationDraft
+        or type(receipt_value) is not EnrollmentReceiptV2
+        or receipt_value.phase != "closed"
+    ):
+        raise ValueError("team enrollment requires reconciliation")
+    session = runtime.workspace_directory.file(_SESSION_FILE)
+    approval = runtime.workspace_directory.file(_APPROVAL_FILE)
+    draft = runtime.workspace_directory.file(_PUBLICATION_FILE)
+    receipt = runtime.workspace_directory.file(_RECEIPT_FILE)
+    journal = runtime.workspace_directory.file(_SESSION_JOURNAL_FILE)
+    coordinator: LocalTransactionCoordinator | None = None
+    try:
+        coordinator = LocalTransactionCoordinator(
+            journal,
+            {
+                "session": session,
+                "approval": approval,
+                "draft": draft,
+                "receipt": receipt,
+            },
+            legacy_target_sets=(frozenset({"session", "approval"}),),
+        )
+        with coordinator.transaction(rollback_base_exceptions=True) as transaction:
+            if (
+                transaction.read_optional("session") != request.model_dump_json().encode()
+                or transaction.read_optional("approval") != approval_request.canonical_bytes()
+                or transaction.read_optional("draft") != draft_value.model_dump_json().encode()
+                or transaction.read_optional("receipt") != receipt_value.canonical_bytes()
+            ):
+                raise ValueError("team enrollment requires reconciliation")
+            transaction.write("draft", _DISCARDED_PUBLICATION_STATE)
+            transaction.write("receipt", _DISCARDED_PUBLICATION_STATE)
+            transaction.delete("approval")
+            transaction.delete("session")
+    finally:
+        if coordinator is not None:
+            coordinator.close()
+        journal.close()
+        receipt.close()
+        draft.close()
+        approval.close()
+        session.close()
 
 
 def load_approval_request(
     runtime: Runtime, request: EnrollmentRequest
 ) -> EnrollmentApprovalRequest | None:
     from intent_engineering.team_state.models import MAX_BUNDLE_BYTES
-    from intent_engineering.team_state.setup import EnrollmentApprovalRequest
 
-    target = runtime.workspace_directory.file("team-enrollment-approval.json")
+    _recover_enrollment_session_state(runtime)
+    target = runtime.workspace_directory.file(_APPROVAL_FILE)
     try:
         content = target.read_optional_nonblocking(max_bytes=MAX_BUNDLE_BYTES * 2 + 256 * 1024)
-        if content is None:
-            return None
-        loads_strict_object(content.decode())
-        approval = EnrollmentApprovalRequest.model_validate_json(content)
-        if content != approval.canonical_bytes() or approval.preview.response != request.response:
-            raise ValueError("team enrollment unavailable")
-        return approval
+        return _read_approval_content(content, request)
     finally:
         target.close()
 
@@ -275,6 +446,7 @@ def load_approval_request(
 def save_approval_request(
     runtime: Runtime, request: EnrollmentRequest, approval: EnrollmentApprovalRequest
 ) -> None:
+    from intent_engineering.team_state.models import MAX_BUNDLE_BYTES
     from intent_engineering.team_state.setup import EnrollmentApprovalRequest
 
     if (
@@ -282,14 +454,21 @@ def save_approval_request(
         or approval.preview.response != request.response
     ):
         raise ValueError("team enrollment unavailable")
-    target = runtime.workspace_directory.file("team-enrollment-approval.json")
+    encoded = approval.canonical_bytes()
+    if len(encoded) > MAX_BUNDLE_BYTES * 2 + 256 * 1024:
+        raise ValueError("team enrollment unavailable")
+    _recover_enrollment_session_state(runtime)
+    target = runtime.workspace_directory.file(_APPROVAL_FILE)
     try:
         with same_path_lock(target):
-            previous = load_approval_request(runtime, request)
+            previous = _read_approval_content(
+                target.read_optional_nonblocking(max_bytes=MAX_BUNDLE_BYTES * 2 + 256 * 1024),
+                request,
+            )
             if previous is not None and previous != approval:
                 raise ValueError("team enrollment unavailable")
             if previous is None:
-                target.atomic_write(approval.canonical_bytes(), reject_target_races=True)
+                target.atomic_write(encoded, reject_target_races=True)
     finally:
         target.close()
 
@@ -363,6 +542,7 @@ class SponsorContext:
     trust: LocalTrustConfigV2
     store: DeviceKeyStore
     protection: GitHubProtectionPreview
+    credential: CredentialRecord
 
 
 class MembershipSession:
@@ -419,15 +599,19 @@ class MembershipSession:
         self.proof = b""
         self.identity: GitHubIdentity | None = None
         self.enrollment: TeamEnrollmentService | None = None
+        self.publication_context: SponsorContext | None = None
         self.pre_counter: int | None = None
         self.guard = anyio.Lock()
 
     def close(self) -> None:
         self.proof = b""
         self.pending_payload = None
+        self.publication_context = None
         self.resources.close()
 
-    async def _sponsor(self, *, require_sponsor: bool = True) -> SponsorContext:
+    async def _sponsor(
+        self, *, require_sponsor: bool = True, preflight: bool = True
+    ) -> SponsorContext:
         from intent_engineering.team_state.authority import derive_recipient_key_id
         from intent_engineering.team_state.github import GitHubTeamStateClient
         from intent_engineering.team_state.keys import (
@@ -585,14 +769,35 @@ class MembershipSession:
                 default_branch_commit=status.default_branch_commit,
                 tooling_digest=_digest(tooling.model_dump(mode="json")),
             )
-            _, _, protection = await bridge._member_preflight(
-                api,
-                current,
-                trust.device_certificate_id,
-                require_sponsor=require_sponsor,
-            )
+            if preflight:
+                _, _, protection = await bridge._member_preflight(
+                    api,
+                    current,
+                    trust.device_certificate_id,
+                    require_sponsor=require_sponsor,
+                )
+            else:
+                protection = client.protection_preview()
         finally:
             await api.aclose()
+        certificate = next(
+            item
+            for item in parent.authority.device_certificates
+            if item.certificate_id == trust.device_certificate_id
+        )
+        from intent_engineering.control_plane.models import credential_matches_digest
+
+        matches = {
+            credential.canonical_bytes(): (webauthn, credential)
+            for webauthn in (self.service._webauthn, self.webauthn)
+            for actor in {member.actor, self.runtime.config.local_actor}
+            for credential in webauthn.registered_credentials(actor, self.service._origin)
+            if credential_matches_digest(credential, certificate.claims.webauthn_credential_digest)
+        }
+        if len(matches) != 1:
+            raise ValueError("team enrollment unavailable")
+        selected_webauthn, selected_credential = next(iter(matches.values()))
+        self.approval_webauthn = selected_webauthn
         enrollment: TeamEnrollmentService | None = None
         if require_sponsor:
             root = trust.root
@@ -634,14 +839,11 @@ class MembershipSession:
         publication = PublicationService(
             self.runtime,
             repository_id=trust.repository_id,
-            decision_repository_id=(
-                self.webauthn._repository_id
-                if self.request.action == "join"
-                else self.service._webauthn._repository_id
-            ),
+            decision_repository_id=selected_credential.repository_id,
             authority=lambda: authority,
             publisher=bridge.transport,
             device_signer=store,
+            decision_actor=selected_credential.actor,
         )
         snapshot, _ = publication._capture()
         return SponsorContext(
@@ -654,6 +856,7 @@ class MembershipSession:
             trust,
             store,
             protection,
+            selected_credential,
         )
 
     def _join(self) -> tuple[TeamInviteV2, GitHubIdentity, DevicePublicMaterial]:
@@ -707,6 +910,7 @@ class MembershipSession:
         except BaseException as error:  # noqa: BLE001 - fixed secret-bearing ceremony boundary
             self.proof = b""
             self.pending_payload = None
+            self.publication_context = None
             failure = _prepared_failure(error, "team enrollment unavailable")
             response = b""
             del error
@@ -763,11 +967,10 @@ class MembershipSession:
                 write_public_file(output, invite)
             return enrollment_status(self.runtime)
         if self.request.action == "approve-join":
-            from intent_engineering.control_plane.models import credential_matches_digest
             from intent_engineering.team_state.enrollment import build_sponsor_decision_payload
-            from intent_engineering.team_state.setup import _enrollment_receipt
+            from intent_engineering.team_state.setup import _draft, _enrollment_receipt
 
-            context = await self._sponsor()
+            context = await self._sponsor(preflight=action not in {"reconcile", "restart"})
             enrollment = context.enrollment
             if enrollment is None:
                 raise ValueError("team enrollment unavailable")
@@ -776,11 +979,19 @@ class MembershipSession:
             if action in {"reconcile", "restart"}:
                 if approval is None or receipt is None:
                     raise ValueError("team enrollment unavailable")
+                draft = _draft(self.runtime)
                 result = await context.bridge.reconcile_member_approval(
                     request=approval, current=context.current, restart_closed=action == "restart"
                 )
                 if action == "restart" and result.state == "bootstrap_required":
-                    return cancel_enrollment(self.runtime, self.request.session_id)
+                    _retire_closed_enrollment_request(
+                        self.runtime,
+                        self.request,
+                        approval,
+                        draft,
+                        receipt,
+                    )
+                    return {"state": "cancelled"}
                 return enrollment_status(self.runtime)
             if receipt is not None or self.request.response is None:
                 raise ValueError("team enrollment unavailable")
@@ -801,25 +1012,7 @@ class MembershipSession:
                     save_approval_request(self.runtime, self.request, approval)
                 if not enrollment._state_matches_invite(context.current, approval.preview.invite):
                     raise ValueError("team enrollment changed")
-                sponsor = next(
-                    m
-                    for m in context.current.authority.members
-                    if m.member_id == approval.preview.invite.sponsor_member_id
-                )
-                digest = (
-                    approval.preview.invite.sponsor_certificate.claims.webauthn_credential_digest
-                )
-                matches = [
-                    (webauthn, credential)
-                    for webauthn in (self.service._webauthn, self.webauthn)
-                    for credential in webauthn.registered_credentials(
-                        sponsor.actor, self.service._origin
-                    )
-                    if credential_matches_digest(credential, digest)
-                ]
-                if len(matches) != 1:
-                    raise ValueError("team enrollment unavailable")
-                self.approval_webauthn, credential = matches[0]
+                credential = context.credential
                 self.pre_counter = credential.sign_count
                 self.pending_payload = build_sponsor_decision_payload(
                     preview=approval.preview,
@@ -873,8 +1066,16 @@ class MembershipSession:
             )
             from intent_engineering.team_state.setup import _draft
 
-            context = await self._sponsor(require_sponsor=False)
+            if action in {"publish-reconcile", "publish-restart"}:
+                context = await self._sponsor(require_sponsor=False, preflight=False)
+                publication_result = await context.bridge.reconcile_member_publication(
+                    current=context.current,
+                    certificate_id=context.trust.device_certificate_id,
+                    restart_closed=action == "publish-restart",
+                )
+                return {**enrollment_status(self.runtime), **publication_result}
             if action == "publish-preview":
+                context = await self._sponsor(require_sponsor=False)
                 durable = _draft(self.runtime)
                 if durable is None:
                     preview = context.publication.preview(now=now)
@@ -895,7 +1096,7 @@ class MembershipSession:
                     if (
                         type(prepared_value) is not PreparedPublicationV2
                         or durable.anchor != context.current.state_commit
-                        or durable.external_write_attempted
+                        or durable.pull_request_number is not None
                     ):
                         raise ValueError("team enrollment unavailable")
                     prepared = prepared_value
@@ -905,7 +1106,7 @@ class MembershipSession:
                         now=now,
                     )
                 self.pending_payload = preview.payload
-                self.approval_webauthn = self.webauthn
+                self.publication_context = context
                 return {
                     **enrollment_status(self.runtime),
                     "state": "publication_preview",
@@ -918,7 +1119,8 @@ class MembershipSession:
                     },
                     "payload": preview.payload.model_dump(mode="json"),
                 }
-            if self.pending_payload is None:
+            active_context = self.publication_context
+            if self.pending_payload is None or active_context is None:
                 raise ValueError("team enrollment unavailable")
             if action == "publish-options":
                 return cast(
@@ -936,20 +1138,22 @@ class MembershipSession:
 
                 def verify_local() -> None:
                     if (
-                        LocalTrustProvider(self.runtime.root).load_versioned() != context.trust
+                        LocalTrustProvider(self.runtime.root).load_versioned()
+                        != active_context.trust
                         or load_enrollment_request(self.runtime) != self.request
                     ):
                         raise ValueError("team enrollment changed")
 
-                publication_result = await context.bridge.publish_member_state(
-                    publication=context.publication,
+                publication_result = await active_context.bridge.publish_member_state(
+                    publication=active_context.publication,
                     decision=decision,
-                    current=context.current,
-                    certificate_id=context.trust.device_certificate_id,
-                    protection=context.protection,
+                    current=active_context.current,
+                    certificate_id=active_context.trust.device_certificate_id,
+                    protection=active_context.protection,
                     verify_local=verify_local,
                 )
                 self.pending_payload = None
+                self.publication_context = None
                 return publication_result
             raise ValueError("team enrollment unavailable")
         if existing_pending is not None:

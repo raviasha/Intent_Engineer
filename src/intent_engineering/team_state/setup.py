@@ -647,11 +647,26 @@ def _draft(
 
 
 def _recover_enrollment_publication_state(runtime: Runtime) -> None:
+    session_target = runtime.workspace_directory.file("team-enrollment-session.json")
+    approval_target = runtime.workspace_directory.file("team-enrollment-approval.json")
     draft_target = runtime.workspace_directory.file("team-publication.json")
     receipt_target = runtime.workspace_directory.file("team-enrollment-receipt.json")
+    session_journal = runtime.workspace_directory.file("team-enrollment-session-transaction.json")
     journal = runtime.workspace_directory.file("team-enrollment-restart-transaction.json")
+    session_coordinator: LocalTransactionCoordinator | None = None
     coordinator: LocalTransactionCoordinator | None = None
     try:
+        session_coordinator = LocalTransactionCoordinator(
+            session_journal,
+            {
+                "session": session_target,
+                "approval": approval_target,
+                "draft": draft_target,
+                "receipt": receipt_target,
+            },
+            legacy_target_sets=(frozenset({"session", "approval"}),),
+        )
+        session_coordinator.recover()
         coordinator = LocalTransactionCoordinator(
             journal,
             {"draft": draft_target, "receipt": receipt_target},
@@ -660,9 +675,14 @@ def _recover_enrollment_publication_state(runtime: Runtime) -> None:
     finally:
         if coordinator is not None:
             coordinator.close()
+        if session_coordinator is not None:
+            session_coordinator.close()
         journal.close()
+        session_journal.close()
         receipt_target.close()
         draft_target.close()
+        approval_target.close()
+        session_target.close()
 
 
 def _stage_enrollment_approval(
@@ -723,41 +743,25 @@ def _stage_enrollment_approval(
         draft_target.close()
 
 
-def _discard_enrollment_publication_state(
-    runtime: Runtime,
-    *,
-    draft: EncryptedPublicationDraft,
-    receipt: EnrollmentReceiptV2,
+def _discard_member_publication_state(
+    runtime: Runtime, *, draft: EncryptedPublicationDraft
 ) -> None:
-    """Atomically tombstone the exact closed enrollment receipt and publication draft."""
-    draft_target = runtime.workspace_directory.file("team-publication.json")
-    receipt_target = runtime.workspace_directory.file("team-enrollment-receipt.json")
-    journal = runtime.workspace_directory.file("team-enrollment-restart-transaction.json")
-    coordinator: LocalTransactionCoordinator | None = None
-    try:
-        coordinator = LocalTransactionCoordinator(
-            journal,
-            {"draft": draft_target, "receipt": receipt_target},
-        )
-        with coordinator.transaction(rollback_base_exceptions=True) as transaction:
-            if (
-                transaction.read_optional_bounded(
-                    "draft", max_bytes=MAX_BUNDLE_BYTES * 2 + 2 * 1024 * 1024
-                )
-                != draft.model_dump_json().encode()
-                or transaction.read_optional_bounded("receipt", max_bytes=128 * 1024)
-                != receipt.canonical_bytes()
-                or receipt.phase != "closed"
-            ):
-                raise ValueError("team enrollment requires reconciliation")
-            transaction.write("draft", _DISCARDED_ENROLLMENT_STATE)
-            transaction.write("receipt", _DISCARDED_ENROLLMENT_STATE)
-    finally:
-        if coordinator is not None:
-            coordinator.close()
-        journal.close()
-        receipt_target.close()
-        draft_target.close()
+    """Retire only the exact ordinary member publication draft."""
+    publication = draft.publication()
+    if type(publication) is not PreparedPublicationV2 or draft.transition_proof is not None:
+        raise ValueError("team publication changed")
+    discarded = _draft(
+        runtime,
+        prepared=publication,
+        anchor=draft.anchor,
+        external_write_attempted=draft.external_write_attempted,
+        publication_commit=draft.publication_commit,
+        pull_request_number=draft.pull_request_number,
+        pull_request_url=draft.pull_request_url,
+        discard=True,
+    )
+    if discarded is not None:
+        raise ValueError("team publication changed")
 
 
 def save_setup_request(runtime: Runtime, preview: GitHubEnablePreview) -> None:
@@ -1028,9 +1032,10 @@ class GitHubSetupBridge:
             request = persisted
         if request is None:
             raise ValueError("GitHub setup unavailable")
-        if (
-            request.preview.project_id != service._runtime.config.project_id
-            or request.preview.repository_id != service._team_repository_id
+        configured_repository = getattr(service, "_team_repository_id", None)
+        if request.preview.project_id != service._runtime.config.project_id or (
+            configured_repository is not None
+            and request.preview.repository_id != configured_repository
         ):
             raise ValueError("GitHub setup changed")
         self.service = service
@@ -1395,6 +1400,127 @@ class GitHubSetupBridge:
                     try:
                         await api.aclose()
                     except BaseException as close_error:  # noqa: BLE001 - fixed provider-close boundary
+                        if active_error is None:
+                            failure = _setup_failure(close_error, "team enrollment unavailable")
+                            raise failure.with_traceback(None) from None
+
+    async def reconcile_member_publication(
+        self,
+        *,
+        current: VerifiedRemoteStateV2,
+        certificate_id: str,
+        restart_closed: bool = False,
+    ) -> dict[str, object]:
+        """Inspect, complete, or explicitly retire one exact ordinary member PR."""
+        from intent_engineering.team_state.publication import PreparedPublicationV2
+
+        api: _CloseOnceApi | None = None
+        try:
+            if type(restart_closed) is not bool:
+                raise ValueError("team publication requires reconciliation")
+            draft = _draft(self.service._runtime)
+            if draft is None:
+                return {"state": "member-active"}
+            publication = draft.publication()
+            if type(publication) is not PreparedPublicationV2 or draft.transition_proof is not None:
+                raise ValueError("team publication changed")
+            certificate = next(
+                item
+                for item in current.authority.device_certificates
+                if item.certificate_id == certificate_id
+            )
+            api = _CloseOnceApi(github_api())
+            client = GitHubTeamStateClient(
+                api,
+                expected_account_id=str(certificate.claims.github_account_id),
+                expected_login=certificate.claims.github_login,
+            )
+            status = await client.inspect(self.repository)
+            if status.repository_id != current.authority.repository_id:
+                raise ValueError("team publication changed")
+            if status.branch_commit != draft.anchor:
+                if (
+                    restart_closed
+                    or draft.publication_commit is None
+                    or draft.pull_request_number is None
+                    or draft.pull_request_url is None
+                ):
+                    raise ValueError("team publication requires reconciliation")
+                merged = await client.confirm_publication_merge(
+                    publication,
+                    expected_head_commit=draft.publication_commit,
+                    expected_base_commit=draft.anchor,
+                    pull_request_number=draft.pull_request_number,
+                )
+                if merged.branch_commit is None:
+                    raise ValueError("team publication requires reconciliation")
+                _discard_member_publication_state(self.service._runtime, draft=draft)
+                return {
+                    "state": "published",
+                    "repository_id": status.repository_id,
+                    "pull_request_url": draft.pull_request_url,
+                }
+            if (
+                draft.publication_commit is None
+                or draft.pull_request_number is None
+                or draft.pull_request_url is None
+            ):
+                if restart_closed:
+                    raise ValueError("team publication requires reconciliation")
+                return {"state": "publication_recovery_required"}
+            _, _, protection = await self._member_preflight(
+                api, current, certificate_id, require_sponsor=False
+            )
+            if protection.requires_change or protection.branch_creation_required:
+                raise ValueError("team publication changed")
+            state = await client.publication_pull_request_state(
+                publication,
+                expected_head_commit=draft.publication_commit,
+                expected_base_commit=draft.anchor,
+                pull_request_number=draft.pull_request_number,
+            )
+            if state == "merged":
+                merged = await client.confirm_publication_merge(
+                    publication,
+                    expected_head_commit=draft.publication_commit,
+                    expected_base_commit=draft.anchor,
+                    pull_request_number=draft.pull_request_number,
+                )
+                if merged.branch_commit is None:
+                    raise ValueError("team publication requires reconciliation")
+                _discard_member_publication_state(self.service._runtime, draft=draft)
+                return {
+                    "state": "published",
+                    "repository_id": status.repository_id,
+                    "pull_request_url": draft.pull_request_url,
+                }
+            if state == "closed":
+                if restart_closed:
+                    _discard_member_publication_state(self.service._runtime, draft=draft)
+                    return {"state": "member-active", "repository_id": status.repository_id}
+                return {
+                    "state": "publication_closed",
+                    "repository_id": status.repository_id,
+                    "pull_request_url": draft.pull_request_url,
+                }
+            if restart_closed:
+                raise ValueError("team publication requires reconciliation")
+            return {
+                "state": "publication_pending",
+                "repository_id": status.repository_id,
+                "pull_request_url": draft.pull_request_url,
+            }
+        except BaseException as error:  # noqa: BLE001 - fixed member recovery boundary
+            failure = _setup_failure(error, "team enrollment unavailable")
+            del error, self, current
+            raise failure.with_traceback(None) from None
+        finally:
+            if api is not None:
+                active_error = sys.exc_info()[1]
+                with anyio.CancelScope(shield=True):
+                    try:
+                        await api.aclose()
+                    except BaseException as close_error:  # noqa: BLE001 - fixed close boundary
                         if active_error is None:
                             failure = _setup_failure(close_error, "team enrollment unavailable")
                             raise failure.with_traceback(None) from None
@@ -1871,11 +1997,6 @@ class GitHubSetupBridge:
                 )
                 if state != "closed":
                     raise ValueError("team enrollment changed")
-                _discard_enrollment_publication_state(
-                    self.service._runtime,
-                    draft=draft,
-                    receipt=receipt,
-                )
                 return GitHubEnableResult(
                     state="bootstrap_required",
                     repository_id=status.repository_id,

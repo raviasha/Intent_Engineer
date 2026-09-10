@@ -112,8 +112,9 @@ class _Enrollment:
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize("resolution", ["merged", "closed"])
 async def test_normal_v2_member_publication_uses_guarded_existing_draft_lifecycle(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, resolution
 ):
     """B publishes normally without sponsor/root authority or another CLI command."""
     from intent_engineering.cli.runtime import load_runtime
@@ -161,6 +162,7 @@ async def test_normal_v2_member_publication_uses_guarded_existing_draft_lifecycl
         tooling_digest="sha256:" + "d" * 64,
     )
     status = _status().model_copy(update={"branch_commit": parent.commit})
+    pr_state = "open"
     preflight_count = []
 
     async def preflight(_self, _api, _current, _certificate_id, *, require_sponsor=True):
@@ -198,6 +200,22 @@ async def test_normal_v2_member_publication_uses_guarded_existing_draft_lifecycl
                 created=True,
             )
 
+        async def publication_pull_request_state(self, *_args, **_kwargs):
+            return pr_state
+
+        async def confirm_publication_merge(
+            self,
+            _publication,
+            *,
+            expected_head_commit,
+            expected_base_commit,
+            pull_request_number,
+        ):
+            assert expected_head_commit == "4" * 40
+            assert expected_base_commit == parent.commit
+            assert pull_request_number == 9
+            return status
+
     monkeypatch.setattr(setup_state_module, "github_api", _Api)
     monkeypatch.setattr(setup_state_module, "GitHubTeamStateClient", _Client)
     monkeypatch.setattr(github_publication_module, "GitHubApiPublisher", _Publisher)
@@ -223,6 +241,32 @@ async def test_normal_v2_member_publication_uses_guarded_existing_draft_lifecycl
         assert result["state"] == "publication_pending"
         assert _draft(runtime).pull_request_number == 9
         assert len(preflight_count) >= 3
+        recovered = await bridge.reconcile_member_publication(
+            current=current,
+            certificate_id=preview.certificate.certificate_id,
+        )
+        assert recovered["state"] == "publication_pending"
+        if resolution == "merged":
+            status = status.model_copy(update={"branch_commit": "5" * 40})
+            recovered = await bridge.reconcile_member_publication(
+                current=current,
+                certificate_id=preview.certificate.certificate_id,
+            )
+            assert recovered["state"] == "published"
+        else:
+            pr_state = "closed"
+            recovered = await bridge.reconcile_member_publication(
+                current=current,
+                certificate_id=preview.certificate.certificate_id,
+            )
+            assert recovered["state"] == "publication_closed"
+            recovered = await bridge.reconcile_member_publication(
+                current=current,
+                certificate_id=preview.certificate.certificate_id,
+                restart_closed=True,
+            )
+            assert recovered["state"] == "member-active"
+        assert _draft(runtime) is None
     finally:
         runtime.close()
 
@@ -592,8 +636,10 @@ async def test_restart_resumes_exact_approved_draft_without_replacing_authority(
             restart_closed=True,
         )
         assert restarted.state == "bootstrap_required"
-        assert _enrollment_receipt(runtime) is None
-        assert _draft(runtime) is None
+        # The browser adapter atomically retires these together with its exact
+        # session and approval metadata after this remote proof succeeds.
+        assert _enrollment_receipt(runtime).phase == "closed"
+        assert _draft(runtime).pull_request_number == 7
     finally:
         directory.close()
 

@@ -17,13 +17,17 @@ button("Authorize join with WebAuthn").click(); await settle();
 respond(take("/api/v1/team/membership/options"),{publicKey:{challenge:"Y2hhbGxlbmdl",allowCredentials:[],userVerification:"preferred"}}); await settle();
 const verification=take("/api/v1/team/membership/verify");
 respond(verification,{state:"response-ready",action:"join",session_id:"opaque-session",can_cancel:false}); await settle();
-process.stdout.write(JSON.stringify({createCount,getCount,body:JSON.parse(verification.init.body),registration:JSON.parse(registrationCall.init.body),text:app.textContent}));
+button("Retry public response export").click(); await settle();
+const retry=take("/api/v1/team/membership/reconcile");
+respond(retry,{state:"response-ready",action:"join",session_id:"opaque-session",can_cancel:false}); await settle();
+process.stdout.write(JSON.stringify({createCount,getCount,body:JSON.parse(verification.init.body),registration:JSON.parse(registrationCall.init.body),retry:JSON.parse(retry.init.body),text:app.textContent}));
 """)
     assert result["createCount"] == 1
     assert result["getCount"] == 1
     assert set(result["body"]) == {"session_id", "response"}
     assert result["body"]["session_id"] == "opaque-session"
     assert set(result["registration"]) == {"session_id", "response"}
+    assert result["retry"] == {"session_id": "opaque-session"}
     assert "response-ready" in result["text"]
     assert "Cancel enrollment" not in result["text"]
     assert "assertion-secret" not in result["text"]
@@ -69,3 +73,29 @@ process.stdout.write(JSON.stringify({getCount,preview:JSON.parse(preview.init.bo
     assert result["verification"]["session_id"] == "opaque-session"
     assert "publication_pending" in result["text"]
     assert "assertion-secret" not in result["text"]
+
+
+def test_restarted_member_publication_recovers_preview_before_webauthn_options():
+    result = _run(r"""
+respond(take("/api/v1/status"),projection); await settle();
+nav.find((item)=>item.dataset.view==="team_state").click(); await settle();
+respond(take("/api/v1/team/membership"),{state:"publication_draft",action:"join",session_id:"opaque-session",can_cancel:false}); await settle();
+button("Review team-state publication").click(); await settle();
+const preview=take("/api/v1/team/membership/publish-preview");
+respond(preview,{state:"publication_preview",action:"join",session_id:"opaque-session",can_cancel:false,preview:{bundle_digest:"sha256:bundle"}}); await settle();
+button("Authorize team-state publication with WebAuthn").click(); await settle();
+const options=take("/api/v1/team/membership/publish-options");
+respond(options,{publicKey:{challenge:"Y2hhbGxlbmdl",allowCredentials:[],userVerification:"preferred"}}); await settle();
+const verification=take("/api/v1/team/membership/publish-verify");
+respond(verification,{state:"publication_pending",repository_id:"github.com/acme/project",pull_request_url:"https://github.com/acme/project/pull/9"}); await settle();
+button("Refresh publication progress").click(); await settle();
+const reconcile=take("/api/v1/team/membership/publish-reconcile");
+respond(reconcile,{state:"publication_closed",action:"join",session_id:"opaque-session",can_cancel:false}); await settle();
+button("Discard closed publication and review again").click(); await settle();
+const restart=take("/api/v1/team/membership/publish-restart");
+process.stdout.write(JSON.stringify({preview:JSON.parse(preview.init.body),options:JSON.parse(options.init.body),reconcile:JSON.parse(reconcile.init.body),restart:JSON.parse(restart.init.body)}));
+""")
+    assert result["preview"] == {"session_id": "opaque-session"}
+    assert result["options"] == {"session_id": "opaque-session"}
+    assert result["reconcile"] == {"session_id": "opaque-session"}
+    assert result["restart"] == {"session_id": "opaque-session"}

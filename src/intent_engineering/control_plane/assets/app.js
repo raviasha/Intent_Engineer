@@ -1502,17 +1502,27 @@
     if (membership.state === "member-active") {
       section.append(actionButton("Review team-state publication", () => reviewMembership("publish-preview")));
     }
-    if (membership.state === "publication_preview" || membership.state === "publication_draft") {
+    if (membership.action === "join" && (membership.state === "publication_draft" || membership.state === "publication_recovery_required")) {
+      section.append(actionButton("Review team-state publication", () => reviewMembership("publish-preview")));
+    }
+    if (membership.state === "publication_preview") {
       section.append(actionButton("Authorize team-state publication with WebAuthn", authorizeMemberPublication, "danger"));
     }
-    if (["approved", "publication-pending", "publication_pending", "pr-pending", "publication_recovery_required"].includes(membership.state)) {
+    if (["approved", "publication-pending", "pr-pending"].includes(membership.state) || (membership.action === "approve-join" && membership.state === "publication_recovery_required")) {
       section.append(actionButton("Refresh enrollment progress", () => reviewMembership("reconcile")));
+    }
+    if (membership.state === "publication_pending") {
+      section.append(actionButton("Refresh publication progress", () => reviewMembership("publish-reconcile")));
+    }
+    if (membership.state === "publication_closed") {
+      section.append(actionButton("Discard closed publication and review again", () => reviewMembership("publish-restart")));
     }
     if (membership.state === "closed") {
       section.append(actionButton("Discard closed enrollment and start fresh", () => reviewMembership("restart")));
     }
     if (membership.state === "response-ready") {
       addText(section, "p", "Your public response is ready. Share it with your sponsor. After approval merges, continue your normal development workflow to restore shared state.");
+      section.append(actionButton("Retry public response export", () => reviewMembership("reconcile")));
     }
     if (membership.can_cancel === true) {
       section.append(actionButton("Cancel enrollment", () => reviewMembership("cancel")));

@@ -275,6 +275,12 @@ class LocalTransaction:
         self._owner._write_target(name, content)
         self._owner._fault(f"target:{name}")
 
+    def delete(self, name: str) -> None:
+        """Durably remove one target while retaining its journaled preimage."""
+        target = self._target(name)
+        target.unlink(missing_ok=True)
+        self._owner._fault(f"target:{name}")
+
     def append(self, name: str, content: bytes) -> None:
         """Durably append to one target and expose its deterministic crash stage."""
         target = self._target(name)

@@ -82,6 +82,8 @@ def test_enrollment_posts_reject_foreign_origin_and_missing_csrf_without_mutatio
             "publish-preview",
             "publish-options",
             "publish-verify",
+            "publish-reconcile",
+            "publish-restart",
         ):
             for headers in ({"Origin": "https://attacker.example"}, {"Origin": ORIGIN}):
                 response = client.post(
@@ -139,6 +141,108 @@ def test_exact_approval_request_rehydrates_without_exposing_response_body(tmp_pa
         )
         assert preview.response.github_identity_proof_ciphertext not in str(visible)
         assert preview.response.webauthn_assertion not in str(visible)
+    finally:
+        harness.service.close()
+        harness.runtime.close()
+
+
+def test_live_http_service_replaces_cached_session_after_next_cli_command(tmp_path, monkeypatch):
+    """The long-running control plane must observe the authoritative replacement session."""
+    from intent_engineering.control_plane import team_enrollment as journey
+    from intent_engineering.team_state.keys import GitHubIdentity
+    from tests.unit.team_state.test_enrollment import _join
+
+    fixtures = tmp_path / "fixtures"
+    fixtures.mkdir()
+    _sponsor, _member, state, invite, response = _join(fixtures)
+    local = tmp_path / "local"
+    local.mkdir()
+    harness = _harness(local)
+    git(harness.project, "init", "--initial-branch=main")
+    git(harness.project, "remote", "add", "origin", "https://github.com/acme/project.git")
+    first = journey.save_enrollment_request(
+        harness.runtime,
+        action="invite",
+        project_id="project",
+        repository_id=state.authority.repository_id,
+        identity=GitHubIdentity(account_id="200", login="bob"),
+        output=str(tmp_path / "invite.json"),
+        created_invite=invite,
+    )
+
+    async def action(self, _action, session_id, *, response=b""):
+        assert session_id == self.request.session_id
+        return {"state": "observed", "action": self.request.action}
+
+    monkeypatch.setattr(journey.MembershipSession, "action", action)
+    try:
+        client = TestClient(
+            build_control_plane_app(harness.service, origin=ORIGIN, csrf_secret=CSRF),
+            base_url=ORIGIN,
+        )
+        assert (
+            client.post(
+                "/api/v1/team/membership/create-invite",
+                json={"session_id": first.session_id},
+                headers=_headers(),
+            ).json()["action"]
+            == "invite"
+        )
+        second = journey.save_enrollment_request(
+            harness.runtime,
+            action="approve-join",
+            project_id="project",
+            repository_id=state.authority.repository_id,
+            response=response,
+        )
+        observed = client.post(
+            "/api/v1/team/membership/preview",
+            json={"session_id": second.session_id},
+            headers=_headers(),
+        )
+        assert observed.status_code == 200
+        assert observed.json()["action"] == "approve-join"
+    finally:
+        harness.service.close()
+        harness.runtime.close()
+
+
+def test_cancel_retires_exact_approval_before_a_fresh_invitation(tmp_path):
+    """Cancellation must not leave approval metadata that poisons the next workflow."""
+    from intent_engineering.control_plane import team_enrollment as journey
+    from intent_engineering.team_state.keys import GitHubIdentity
+    from tests.unit.team_state.test_setup import _prepared
+
+    fixtures = tmp_path / "fixtures"
+    fixtures.mkdir()
+    state, preview, _publication, _proof, approval = _prepared(fixtures)
+    local = tmp_path / "local"
+    local.mkdir()
+    harness = _harness(local)
+    git(harness.project, "init", "--initial-branch=main")
+    git(harness.project, "remote", "add", "origin", "https://github.com/acme/project.git")
+    try:
+        request = journey.save_enrollment_request(
+            harness.runtime,
+            action="approve-join",
+            project_id="project",
+            repository_id=state.authority.repository_id,
+            response=preview.response,
+        )
+        journey.save_approval_request(harness.runtime, request, approval)
+        assert journey.cancel_enrollment(harness.runtime, request.session_id) == {
+            "state": "cancelled"
+        }
+        fresh = journey.save_enrollment_request(
+            harness.runtime,
+            action="invite",
+            project_id="project",
+            repository_id=state.authority.repository_id,
+            identity=GitHubIdentity(account_id="201", login="carol"),
+            output=str(tmp_path / "fresh-invite.json"),
+        )
+        assert journey.enrollment_status(harness.runtime)["session_id"] == fresh.session_id
+        assert not (harness.project / ".intent" / "team-enrollment-approval.json").exists()
     finally:
         harness.service.close()
         harness.runtime.close()

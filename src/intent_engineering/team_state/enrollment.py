@@ -1482,15 +1482,10 @@ def build_sponsor_decision_payload(
         )
     ):
         raise ValueError("invalid decision challenge")
-    sponsor = next(
-        member
-        for member in preview.authority_after.members
-        if member.member_id == preview.invite.sponsor_member_id
-    )
     return HumanDecisionPayload(
         project_id=preview.invite.project_id,
         repository_id=credential.repository_id,
-        actor=sponsor.actor,
+        actor=credential.actor,
         action=DecisionAction.APPROVE_EXTERNAL_WRITE,
         graph_version=preview.authority_after.sequence,
         parent_bundle_digest=preview.base_bundle_digest,
@@ -2302,7 +2297,7 @@ class TeamEnrollmentService:
                 or credential.local_only
                 or credential.project_id != preview.invite.project_id
                 or sponsor_decision.payload.repository_id != credential.repository_id
-                or credential.actor != sponsor.actor
+                or credential.actor != sponsor_decision.payload.actor
                 or credential.github_account_id != str(sponsor.github_account_id)
                 or credential.github_login != sponsor.github_login
                 or live_sponsor is None

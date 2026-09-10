@@ -1765,6 +1765,7 @@ class PublicationService:
         authority: Callable[[], PublicationAuthority | PublicationAuthorityV2],
         publisher: PublicationPublisher,
         device_signer: V2DeviceSigner | None = None,
+        decision_actor: str | None = None,
         challenge_source: Callable[[], bytes] = lambda: secrets.token_bytes(32),
     ) -> None:
         self._runtime = runtime
@@ -1773,6 +1774,9 @@ class PublicationService:
         self._authority = authority
         self._publisher = publisher
         self._device_signer = device_signer
+        if decision_actor is not None and (type(decision_actor) is not str or not decision_actor):
+            raise ValueError("publication decision actor unavailable")
+        self._decision_actor = decision_actor
         self._challenge_source = challenge_source
         self._publication_base_commit: str | None = None
         self._pending: (
@@ -2001,7 +2005,7 @@ class PublicationService:
         payload = HumanDecisionPayload(
             project_id=snapshot.project_id,
             repository_id=self._decision_repository_id,
-            actor=member.actor,
+            actor=self._decision_actor or member.actor,
             action=DecisionAction.PUBLISH_STATE,
             graph_version=snapshot.graph_version,
             parent_bundle_digest=parent_digest,
@@ -2318,8 +2322,8 @@ class PublicationService:
                 or member is None
                 or member.status != "active"
                 or certificate.claims.member_id != member.member_id
-                or credential.actor != member.actor
-                or decision.payload.actor != member.actor
+                or credential.actor != preview.payload.actor
+                or decision.payload.actor != preview.payload.actor
                 or credential.project_id != snapshot.project_id
                 or credential.repository_id != self._decision_repository_id
                 or credential.github_account_id != str(certificate.claims.github_account_id)

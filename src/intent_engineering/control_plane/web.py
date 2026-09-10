@@ -10,6 +10,7 @@ from collections.abc import Awaitable, Callable
 from typing import Any, cast
 from urllib.parse import quote, unquote_to_bytes, urlsplit
 
+import anyio
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
 from starlette.requests import Request
@@ -89,6 +90,8 @@ _STATIC_METHODS = {
             "publish-preview",
             "publish-options",
             "publish-verify",
+            "publish-reconcile",
+            "publish-restart",
         )
     },
     "/api/v1/assessment": "GET",
@@ -780,6 +783,8 @@ def _end_handler(
 def _make_handlers(
     service: ControlPlaneService,
 ) -> dict[str, Callable[[Request], Awaitable[Response]]]:
+    membership_guard = anyio.Lock()
+
     async def status_endpoint(request: Request) -> Response:
         response: Response | None = None
         signal: BaseException | None = None
@@ -1128,45 +1133,50 @@ def _make_handlers(
     async def membership_endpoint(request: Request) -> Response:
         from intent_engineering.control_plane.team_enrollment import (
             MembershipSession,
-            cancel_enrollment,
             enrollment_status,
+            load_enrollment_request,
         )
 
         response: Response | None = None
         signal: BaseException | None = None
         body = None
         try:
-            if request.url.path == "/api/v1/team/membership":
-                result = enrollment_status(service._runtime)
-            else:
-                from intent_engineering.storage.jsonl.strict import loads_strict_object
-
-                body = loads_strict_object(_request_bytes(request).decode())
-                action = request.url.path.rsplit("/", 1)[-1]
-                if set(body) not in ({"session_id"}, {"session_id", "response"}) or not isinstance(
-                    body["session_id"], str
-                ):
-                    raise _HandlerRequestError()
-                if re.fullmatch(r"[0-9a-f]{64}", body["session_id"]) is None:
-                    raise _HandlerRequestError()
-                if action == "cancel":
-                    if set(body) != {"session_id"}:
-                        raise _HandlerRequestError()
-                    result = cancel_enrollment(service._runtime, body["session_id"])
-                    if service._membership_session is not None:
-                        service._membership_session.close()
-                        service._membership_session = None
+            async with membership_guard:
+                if request.url.path == "/api/v1/team/membership":
+                    result = enrollment_status(service._runtime)
                 else:
+                    from intent_engineering.storage.jsonl.strict import loads_strict_object
+
+                    body = loads_strict_object(_request_bytes(request).decode())
+                    action = request.url.path.rsplit("/", 1)[-1]
+                    if set(body) not in (
+                        {"session_id"},
+                        {"session_id", "response"},
+                    ) or not isinstance(body["session_id"], str):
+                        raise _HandlerRequestError()
+                    if re.fullmatch(r"[0-9a-f]{64}", body["session_id"]) is None:
+                        raise _HandlerRequestError()
                     if ("response" in body) != (
                         action in {"verify", "register-verify", "publish-verify"}
                     ):
                         raise _HandlerRequestError()
-                    encoded = canonical_json_object(body["response"]) if "response" in body else b""
+                    authoritative = load_enrollment_request(service._runtime)
+                    active = service._membership_session
+                    if active is not None and active.request != authoritative:
+                        active.close()
+                        service._membership_session = None
                     if service._membership_session is None:
                         service._membership_session = MembershipSession(service)
                     result = await service._membership_session.action(
-                        action, body["session_id"], response=encoded
+                        action,
+                        body["session_id"],
+                        response=(
+                            canonical_json_object(body["response"]) if "response" in body else b""
+                        ),
                     )
+                    if action == "cancel":
+                        service._membership_session.close()
+                        service._membership_session = None
             response = _json_response(result)
         except _HandlerRequestError:
             response = _fixed_response(400)
@@ -1456,6 +1466,8 @@ def build_control_plane_app(
                     "publish-preview",
                     "publish-options",
                     "publish-verify",
+                    "publish-reconcile",
+                    "publish-restart",
                 )
             ],
             Route("/api/v1/assessment", handlers["assessment"], methods=["GET"]),

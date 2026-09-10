@@ -73,7 +73,7 @@ def test_sponsor_invite_session_finishes_public_handoff_and_allows_next_command(
         output=str(output),
     )
 
-    async def context(self):
+    async def context(self, **_kwargs):
         return SimpleNamespace(enrollment=sponsor, current=state)
 
     monkeypatch.setattr(journey.MembershipSession, "_sponsor", context)
@@ -262,8 +262,10 @@ def test_sponsor_preview_rehydrates_exact_approval_after_restart(tmp_path, monke
     target.atomic_write(credential.canonical_bytes())
     target.close()
 
-    async def context(self):
-        return SimpleNamespace(enrollment=sponsor, current=state, bridge=None)
+    async def context(self, **_kwargs):
+        return SimpleNamespace(
+            enrollment=sponsor, current=state, bridge=None, credential=credential
+        )
 
     monkeypatch.setattr(journey.MembershipSession, "_sponsor", context)
 
@@ -283,6 +285,100 @@ def test_sponsor_preview_rehydrates_exact_approval_after_restart(tmp_path, monke
 
     try:
         anyio.run(run)
+    finally:
+        service.close()
+        runtime.close()
+
+
+def test_closed_enrollment_restart_retires_all_local_metadata_atomically(tmp_path, monkeypatch):
+    """A remotely proven closed PR must leave no orphan session or approval."""
+    from intent_engineering.control_plane import team_enrollment as journey
+    from intent_engineering.team_state.setup import (
+        GitHubSetupBridge,
+        _draft,
+        _enrollment_receipt,
+        _stage_enrollment_approval,
+    )
+    from tests.unit.team_state.test_setup import _prepared, _sponsor_decision
+
+    state, preview, publication, proof, approval = _prepared(tmp_path)
+    project = tmp_path / "publication" / "project"
+    git(project, "init", "--initial-branch=main")
+    git(project, "remote", "add", "origin", "https://github.com/acme/project.git")
+    runtime = load_runtime(project)
+    service = ControlPlaneService(
+        runtime, origin=ORIGIN, clock=lambda: NOW, webauthn_verifier=_BrowserVerifier()
+    )
+    request = journey.save_enrollment_request(
+        runtime,
+        action="approve-join",
+        project_id="project",
+        repository_id=state.authority.repository_id,
+        response=preview.response,
+    )
+    journey.save_approval_request(runtime, request, approval)
+    receipt = GitHubSetupBridge._enrollment_receipt_for(
+        approval,
+        publication,
+        sponsor_decision=_sponsor_decision(preview, approval),
+        transition_proof=proof,
+        phase="approved",
+    )
+    _stage_enrollment_approval(
+        runtime,
+        publication=publication,
+        transition_proof=proof,
+        anchor=state.state_commit,
+        receipt=receipt,
+    )
+    _draft(
+        runtime,
+        prepared=publication,
+        transition_proof=proof,
+        anchor=state.state_commit,
+        external_write_attempted=True,
+        publication_commit="3" * 40,
+        pull_request_number=7,
+        pull_request_url="https://github.com/acme/project/pull/7",
+    )
+    receipt = receipt.model_copy(
+        update={"phase": "publication-pending", "publication_commit": "3" * 40}
+    )
+    _enrollment_receipt(runtime, receipt=receipt)
+    receipt = receipt.model_copy(
+        update={
+            "phase": "pr-pending",
+            "pull_request_number": 7,
+            "pull_request_url": "https://github.com/acme/project/pull/7",
+        }
+    )
+    _enrollment_receipt(runtime, receipt=receipt)
+    receipt = receipt.model_copy(update={"phase": "closed"})
+    _enrollment_receipt(runtime, receipt=receipt)
+
+    class Bridge:
+        async def reconcile_member_approval(self, **kwargs):
+            assert kwargs["restart_closed"] is True
+            return SimpleNamespace(state="bootstrap_required")
+
+    async def context(self, **_kwargs):
+        return SimpleNamespace(enrollment=object(), current=state, bridge=Bridge())
+
+    monkeypatch.setattr(journey.MembershipSession, "_sponsor", context)
+
+    async def run():
+        session = journey.MembershipSession(service)
+        try:
+            assert (await session.action("restart", request.session_id))["state"] == "cancelled"
+        finally:
+            session.close()
+
+    try:
+        anyio.run(run)
+        assert journey.load_enrollment_request(runtime) is None
+        assert _draft(runtime) is None
+        assert _enrollment_receipt(runtime) is None
+        assert not (project / ".intent" / "team-enrollment-approval.json").exists()
     finally:
         service.close()
         runtime.close()
@@ -358,14 +454,32 @@ def test_enrolled_member_opens_normal_publication_without_another_command(tmp_pa
         publisher=SimpleNamespace(publish=lambda *_a, **_kw: None),
         device_signer=member._device_store,
     )
+    context_calls = []
+
+    class Bridge:
+        async def publish_member_state(self, **kwargs):
+            assert kwargs["publication"] is publication
+            assert kwargs["current"].state_commit == parent.commit
+            kwargs["verify_local"]()
+            return {
+                "state": "publication_pending",
+                "repository_id": response.repository_id,
+                "pull_request_url": "https://github.com/acme/project/pull/9",
+            }
+
+    bridge = Bridge()
 
     async def context(self, *, require_sponsor=True):
         assert require_sponsor is False
+        context_calls.append(1)
         return SimpleNamespace(
             publication=publication,
             trust=trust,
             store=member._device_store,
             current=SimpleNamespace(authority=enrolled.authority, state_commit=parent.commit),
+            bridge=bridge,
+            protection=SimpleNamespace(),
+            credential=response.credential,
         )
 
     monkeypatch.setattr(journey.MembershipSession, "_sponsor", context)
@@ -380,6 +494,22 @@ def test_enrolled_member_opens_normal_publication_without_another_command(tmp_pa
             assert (await session.action("publish-options", request.session_id))["publicKey"][
                 "userVerification"
             ] == "required"
+            assert len(context_calls) == 1
+            result = await session.action(
+                "publish-verify",
+                request.session_id,
+                response=json.dumps(
+                    {
+                        "credential_id": response.credential.credential_id,
+                        "new_sign_count": response.credential.sign_count + 1,
+                        "origin": ORIGIN,
+                        "rp_id": "localhost",
+                        "user_verified": True,
+                    }
+                ).encode(),
+            )
+            assert result["state"] == "publication_pending"
+            assert len(context_calls) == 1
         finally:
             session.close()
 
