@@ -100,6 +100,7 @@ from intent_engineering.team_state.models import (
     MAX_STATE_BYTES,
     MAX_STATE_FILES,
     STATE_REF,
+    CanonicalStateFile,
     CanonicalStateSnapshot,
     CiRecipientRecord,
     RemoteStateSnapshot,
@@ -411,7 +412,7 @@ def _validate_v2_snapshot(
     ):
         raise ValueError("restored shared state is invalid")
     loaded = yaml.safe_load(files["config.yaml"].decode("utf-8"))
-    config = ProjectConfig.model_validate(loaded)
+    config = ProjectConfig.model_validate_json(json.dumps(loaded))
     if (
         config.project_id != manifest.project_id
         or str(configured_graph_relative(config.graph_path)) != "graph.yaml"
@@ -421,7 +422,7 @@ def _validate_v2_snapshot(
     parse_immutable_records(files["approvals/approvals.jsonl"], ApprovalRecord)
     policy = files["approvals/policy.yaml"]
     if policy:
-        MutationPolicy.model_validate(load_strict_yaml_mapping_bytes(policy))
+        MutationPolicy.model_validate_json(json.dumps(load_strict_yaml_mapping_bytes(policy)))
 
 
 def verify_v2_release(
@@ -2486,7 +2487,7 @@ def _validate_authenticated_state(
         raise ValueError("restored shared state is invalid")
     raw_config = files["config.yaml"]
     loaded = yaml.safe_load(raw_config.decode("utf-8"))
-    config = ProjectConfig.model_validate(loaded)
+    config = ProjectConfig.model_validate_json(json.dumps(loaded))
     if (
         config.project_id != trust.project_id
         or config.project_id != manifest.project_id
@@ -2497,7 +2498,7 @@ def _validate_authenticated_state(
     parse_immutable_records(files["approvals/approvals.jsonl"], ApprovalRecord)
     policy = files["approvals/policy.yaml"]
     if policy:
-        MutationPolicy.model_validate(load_strict_yaml_mapping_bytes(policy))
+        MutationPolicy.model_validate_json(json.dumps(load_strict_yaml_mapping_bytes(policy)))
 
 
 def _replace_existing_state(
@@ -2807,6 +2808,57 @@ def load_installed_device_migration(
         raise ValueError("installed migration snapshot changed")
     trust_from_verified_migration(legacy, release)
     return release
+
+
+def load_accepted_v1_release(
+    reader: _GitRefReader,
+    commit: str,
+    legacy: LocalTrustConfig,
+    store: DeviceBundleDecryptor,
+    now: datetime,
+) -> VerifiedV1Release:
+    """Load the exact signed v1 tip through a non-exporting recipient-key boundary."""
+    verification_trust = SharedStateTrust(
+        project_id=legacy.project_id,
+        repository_id=legacy.repository_id,
+        recipient_key_id=legacy.recipient_key_id,
+        recipient_private_key=b"\0" * 32,
+        signing_keys=legacy.trusted_signing_keys(),
+    )
+    lineage = _verify_release_lineage(reader, commit, verification_trust, now, None)
+    manifest = lineage.tip.manifest
+    if (
+        lineage.tip.commit != commit
+        or manifest.project_id != legacy.project_id
+        or manifest.repository_id != legacy.repository_id
+        or legacy.recipient_key_id not in manifest.recipient_key_ids
+    ):
+        raise ValueError("accepted version one release changed")
+    bundle = reader.blob(commit, f"bundles/{_release_name(manifest)}.intent", MAX_BUNDLE_BYTES)
+    if len(bundle) != manifest.bundle_size or _digest(bundle) != manifest.bundle_digest:
+        raise ValueError("accepted version one release changed")
+    aad = _manifest_aad(
+        project_id=manifest.project_id,
+        repository_id=manifest.repository_id,
+        graph_version=manifest.graph_version,
+        parent_bundle_digest=manifest.parent_bundle_digest,
+        created_at=manifest.created_at,
+        recipient_key_ids=manifest.recipient_key_ids,
+        required_signature_ids=manifest.required_signature_ids,
+    )
+    files = _parse_payload(store.decrypt_bundle(legacy.recipient_key_id, bundle, aad), manifest)
+    snapshot = CanonicalStateSnapshot(
+        project_id=manifest.project_id,
+        repository_id=manifest.repository_id,
+        graph_version=manifest.graph_version,
+        files=tuple(CanonicalStateFile(path=path, content=files[path]) for path in sorted(files)),
+    )
+    return VerifiedV1Release(
+        manifest=manifest,
+        manifest_bytes=reader.blob(commit, "manifest.json", MAX_MANIFEST_BYTES),
+        signing_keys=legacy.trusted_signing_keys(),
+        snapshot=snapshot,
+    )
 
 
 def _load_device_migration(
@@ -3750,6 +3802,7 @@ __all__ = [
     "VerifiedReleaseV2",
     "VerifiedV1Release",
     "build_state_payload",
+    "load_accepted_v1_release",
     "read_approved_baseline",
     "seal_state_payload",
     "verify_v2_migration_release",

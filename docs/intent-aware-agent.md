@@ -427,9 +427,11 @@ rewinds or directly updates the protected ref.
 Back up the stable root using the operating-system/keyring policy before migration. Ordinary
 publication never loads it. Root loss has no software bypass: existing members can continue
 ordinary work, but membership and authority changes stop until an independently designed recovery
-path exists. Root compromise requires a separately reviewed old-root-authorized rotation and
-revocation. To remove B, a sponsor performs the fresh WebAuthn/root-authorized revocation; future B
-publications are then rejected and B is removed from the active recipient set.
+path exists. The validator already requires and enforces root- and sponsor-authorized revocation
+descendants, removes revoked devices from the active recipient set, and rejects their later
+publications. This release does not expose the operator ceremony that produces that descendant;
+member removal and root-compromise rotation therefore require a separately reviewed follow-up and
+must not be simulated by editing the registry or updating the protected ref directly.
 
 Competing A/B children are never overwritten or auto-merged. The control plane shows a bounded,
 secret-free three-way preview; reviewed reconciliation requires explicit choices, fresh WebAuthn,

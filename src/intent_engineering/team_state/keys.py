@@ -915,6 +915,61 @@ class MigrationRecipientDecryptor:
             private = b""
 
 
+class LegacyRecipientDecryptor:
+    """Decrypt the exact v1 recipient slot without exporting its private key to callers."""
+
+    def __init__(
+        self,
+        binding: RecipientEnrollmentBinding,
+        *,
+        recipient_store: RecipientKeyStore,
+    ) -> None:
+        self._binding = _validated_binding(binding)
+        self._recipient_key_id = _key_id(self._binding)
+        self._recipient_store = recipient_store
+
+    def decrypt_bundle(self, recipient_key_id: str, bundle: bytes, aad: bytes) -> bytes:
+        import traceback
+
+        from intent_engineering.storage.jsonl.strict import loads_strict_object
+        from intent_engineering.team_state.crypto import (
+            EncryptedBundle,
+            canonical_encrypted_bundle_bytes,
+            decrypt_bundle,
+        )
+        from intent_engineering.team_state.models import MAX_BUNDLE_BYTES
+
+        private = b""
+        try:
+            if (
+                recipient_key_id != self._recipient_key_id
+                or type(bundle) is not bytes
+                or not bundle
+                or len(bundle) > MAX_BUNDLE_BYTES
+                or type(aad) is not bytes
+                or not aad
+                or len(aad) > 64 * 1024
+            ):
+                raise RecipientKeyStoreError()
+            loads_strict_object(bundle.decode())
+            encrypted = EncryptedBundle.model_validate_json(bundle)
+            if canonical_encrypted_bundle_bytes(encrypted) != bundle:
+                raise RecipientKeyStoreError()
+            private = self._recipient_store.private_key(self._recipient_key_id)
+            if _record(self._binding, private).key_id != recipient_key_id:
+                raise RecipientKeyStoreError()
+            return decrypt_bundle(encrypted, private, aad)
+        except BaseException as error:  # noqa: BLE001 - private recipient never escapes boundary
+            if error.__traceback__ is not None:
+                traceback.clear_frames(error.__traceback__)
+            error.__dict__.clear()
+            failure = _prepare_device_failure(error)
+            del error, self, bundle, aad, recipient_key_id
+            raise failure.with_traceback(None) from None
+        finally:
+            private = b""
+
+
 class MigratedDeviceKeyStore(KeyringDeviceKeyStore):
     """Reuse the legacy recipient slot; never copy it into the new device keyring."""
 
@@ -993,6 +1048,8 @@ __all__ = [
     "InMemoryRecipientKeyStore",
     "KeyringDeviceKeyStore",
     "KeyringRecipientKeyStore",
+    "LegacyRecipientDecryptor",
+    "MigrationRecipientDecryptor",
     "RecipientEnrollmentBinding",
     "RecipientKeyStore",
     "RecipientKeyStoreError",

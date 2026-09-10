@@ -67,6 +67,7 @@ from intent_engineering.team_state.models import (
 )
 from intent_engineering.team_state.publication import (
     PreparedPublicationV2,
+    PreparedV1Migration,
     PublicationAuthority,
     PublicationService,
 )
@@ -80,7 +81,10 @@ if TYPE_CHECKING:
 
 
 PreparedStatePublication = (
-    PreparedPublication | PreparedPublicationV2 | PreparedEnrollmentPublicationV2
+    PreparedPublication
+    | PreparedV1Migration
+    | PreparedPublicationV2
+    | PreparedEnrollmentPublicationV2
 )
 _DISCARDED_ENROLLMENT_STATE = b'{"discarded":true}'
 
@@ -343,6 +347,8 @@ class EncryptedPublicationDraft(StrictModel):
             PreparedEnrollmentPublicationV2
             if envelope.authority_attestation is not None
             and envelope.authority_attestation.operation == "enroll"
+            else PreparedV1Migration
+            if envelope.migration_proof is not None
             else PreparedPublicationV2
         )
         publication = publication_type(
@@ -573,11 +579,17 @@ def _draft(
                     manifest=prepared.manifest,
                     authority=(
                         cast(
-                            PreparedPublicationV2 | PreparedEnrollmentPublicationV2,
+                            PreparedV1Migration
+                            | PreparedPublicationV2
+                            | PreparedEnrollmentPublicationV2,
                             prepared,
                         ).authority
                         if type(prepared)
-                        in {PreparedPublicationV2, PreparedEnrollmentPublicationV2}
+                        in {
+                            PreparedV1Migration,
+                            PreparedPublicationV2,
+                            PreparedEnrollmentPublicationV2,
+                        }
                         else None
                     ),
                     transition_proof=effective_proof,
@@ -1285,7 +1297,6 @@ class GitHubSetupBridge:
             status.repository_id != current.authority.repository_id
             or status.branch_commit != current.state_commit
             or status.default_branch != current.default_branch
-            or status.default_branch_commit != current.default_branch_commit
             or not status.protection_compatible
         ):
             raise ValueError("team enrollment changed")
@@ -1299,7 +1310,10 @@ class GitHubSetupBridge:
                 else ""
             ),
         )
-        if _digest(tooling.model_dump(mode="json")) != current.tooling_digest:
+        if (
+            tooling.commit != current.default_branch_commit
+            or _digest(tooling.model_dump(mode="json")) != current.tooling_digest
+        ):
             raise ValueError("team enrollment changed")
         protection = client.protection_preview()
         if protection.requires_change or protection.branch_creation_required:

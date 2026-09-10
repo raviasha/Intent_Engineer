@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import subprocess
 from collections.abc import AsyncIterator
-from dataclasses import replace
 from pathlib import Path
 
 import httpx
@@ -18,13 +18,21 @@ from intent_engineering.capture.github.client import GitHubClient
 from intent_engineering.capture.github.errors import GitHubProtocolError
 from intent_engineering.control_plane.webauthn_service import VerifiedHumanDecision
 from intent_engineering.intent_workflow.check import SharedStateRestoreStatus
-from intent_engineering.team_state.authority import authority_digest
+from intent_engineering.team_state.authority import (
+    authority_digest,
+    canonical_authority_attestation_preimage,
+    canonical_state_signature_preimage,
+)
 from intent_engineering.team_state.enrollment import export_join_response, export_team_invite
 from intent_engineering.team_state.models import (
+    AuthorityAttestationV2,
     CanonicalStateFile,
     CanonicalStateSnapshot,
+    CertifiedStateSignatureV2,
     DeviceRevocationV2,
+    StateSignatureEnvelopeV2,
     TeamAuthorityRegistryV2,
+    TeamStateManifestV2,
 )
 from intent_engineering.team_state.publication import (
     PublicationAuthorityV2,
@@ -92,6 +100,126 @@ def _accept(
         recipient_private_key=private_key,
         commit=commit,
         now=now,  # type: ignore[arg-type]
+    )
+
+
+def _accept_root_authorized_revocation(
+    fixture: object,
+    parent: VerifiedReleaseV2,
+    registry: TeamAuthorityRegistryV2,
+    *,
+    recipient_key_id: str,
+    recipient_private_key: bytes,
+    commit: str,
+) -> VerifiedReleaseV2:
+    """Build and verify the exact root- and sponsor-signed revocation descendant."""
+    from intent_engineering.team_state.archive import build_archive_v2
+    from intent_engineering.team_state.crypto import (
+        _encrypt_bundle_for_public_keys,
+        canonical_encrypted_bundle_bytes,
+    )
+    from intent_engineering.team_state.publication import _v2_authenticated_aad
+
+    sponsor = next(
+        item
+        for item in parent.authority.device_certificates
+        if item.claims.github_account_id == 100
+    )
+    archive = build_archive_v2(parent.snapshot, registry)
+    aad = _v2_authenticated_aad(
+        project_id=parent.manifest.project_id,
+        repository_id=parent.manifest.repository_id,
+        graph_version=parent.manifest.graph_version,
+        parent_bundle_digest=parent.manifest.bundle_digest,
+        recipient_key_ids=registry.active_recipient_key_ids(),
+        authority=registry,
+        created_at=fixture.at,
+    )
+    public_keys = {
+        item.claims.recipient_key_id: base64.urlsafe_b64decode(
+            item.claims.recipient_public_key + "=" * (-len(item.claims.recipient_public_key) % 4)
+        )
+        for item in registry.device_certificates
+        if item.claims.recipient_key_id in registry.active_recipient_key_ids()
+    }
+    ci = registry.ci_recipient
+    public_keys[ci.key_id] = base64.urlsafe_b64decode(
+        ci.public_key + "=" * (-len(ci.public_key) % 4)
+    )
+    bundle = canonical_encrypted_bundle_bytes(
+        _encrypt_bundle_for_public_keys(archive, dict(sorted(public_keys.items())), aad)
+    )
+    manifest = TeamStateManifestV2(
+        project_id=parent.manifest.project_id,
+        repository_id=parent.manifest.repository_id,
+        graph_version=parent.manifest.graph_version,
+        parent_bundle_digest=parent.manifest.bundle_digest,
+        bundle_digest="sha256:" + hashlib.sha256(bundle).hexdigest(),
+        bundle_size=len(bundle),
+        recipient_key_ids=registry.active_recipient_key_ids(),
+        authority_digest=authority_digest(registry),
+        authority_epoch=registry.authority_epoch,
+        root_key_id=registry.root.root_key_id,
+        created_at=fixture.at,
+    )
+    subject_digest = (
+        "sha256:"
+        + hashlib.sha256(b"intent.test.revocation\0" + manifest.canonical_bytes()).hexdigest()
+    )
+    attestation = AuthorityAttestationV2(
+        project_id=manifest.project_id,
+        repository_id=manifest.repository_id,
+        authority_epoch=manifest.authority_epoch,
+        previous_authority_digest=authority_digest(parent.authority),
+        authority_digest=manifest.authority_digest,
+        parent_bundle_digest=manifest.parent_bundle_digest,
+        operation="revoke",
+        subject_digest=subject_digest,
+        sponsor_member_id=sponsor.claims.member_id,
+        sponsor_device_certificate_id=sponsor.certificate_id,
+        sponsor_decision_digest=subject_digest,
+        decided_at=fixture.at,
+        root_key_id=manifest.root_key_id,
+        root_signature=base64.urlsafe_b64encode(b"\0" * 64).rstrip(b"=").decode(),
+    )
+    attestation = attestation.model_copy(
+        update={
+            "root_signature": base64.urlsafe_b64encode(
+                fixture.a._root_store.sign(
+                    manifest.root_key_id,
+                    canonical_authority_attestation_preimage(attestation),
+                )
+            )
+            .rstrip(b"=")
+            .decode()
+        }
+    )
+    signature = fixture.a._device_store.sign(
+        sponsor.claims.signature_id, canonical_state_signature_preimage(manifest)
+    )
+    envelope = StateSignatureEnvelopeV2(
+        manifest_digest="sha256:" + hashlib.sha256(manifest.canonical_bytes()).hexdigest(),
+        bundle_digest=manifest.bundle_digest,
+        authority_digest=manifest.authority_digest,
+        certificates=(sponsor,),
+        signatures=(
+            CertifiedStateSignatureV2(
+                certificate_id=sponsor.certificate_id,
+                signature_id=sponsor.claims.signature_id,
+                signature=base64.urlsafe_b64encode(signature).rstrip(b"=").decode(),
+            ),
+        ),
+        authority_attestation=attestation,
+    )
+    return verify_v2_release(
+        manifest_bytes=manifest.canonical_bytes(),
+        bundle_bytes=bundle,
+        envelope_bytes=envelope.canonical_bytes(),
+        parent=parent,
+        recipient_key_id=recipient_key_id,
+        recipient_private_key=recipient_private_key,
+        commit=commit,
+        now=fixture.at,
     )
 
 
@@ -272,17 +400,42 @@ def test_two_independent_developers_enroll_restore_publish_reconcile_and_revoke(
             ),
         }
     )
-    revoked_manifest = final.manifest.model_copy(
+    revoked_for_a = _accept_root_authorized_revocation(
+        fixture,
+        final,
+        revoked,
+        recipient_key_id=a_cert.claims.recipient_key_id,
+        recipient_private_key=b"a" * 32,
+        commit="7" * 40,
+    )
+    revoked_for_ci = _accept_root_authorized_revocation(
+        fixture,
+        final,
+        revoked,
+        recipient_key_id=ci.key_id,
+        recipient_private_key=b"c" * 32,
+        commit="7" * 40,
+    )
+    assert revoked_for_a.authority == revoked_for_ci.authority == revoked
+
+    stale_manifest = revoked_for_a.manifest.model_copy(
         update={
-            "authority_digest": authority_digest(revoked),
-            "recipient_key_ids": revoked.active_recipient_key_ids(),
+            "authority_digest": authority_digest(final.authority),
+            "recipient_key_ids": final.authority.active_recipient_key_ids(),
         }
     )
-    revoked_parent = replace(
-        final,
-        authority=revoked,
-        manifest=revoked_manifest,
-        manifest_bytes=revoked_manifest.canonical_bytes(),
+    stale_parent = VerifiedReleaseV2(
+        manifest=stale_manifest,
+        manifest_bytes=stale_manifest.canonical_bytes(),
+        authority=final.authority,
+        commit=revoked_for_a.commit,
+        snapshot=revoked_for_a.snapshot,
+    )
+    post_revocation_b = prepare_v2_publication(
+        snapshot=_snapshot_with_comment(final.snapshot, b"bob after revocation"),
+        authority=_authority_for(stale_parent, 200),
+        device_signer=fixture.b._device_store,
+        now=fixture.at,
     )
     b_trust = fixture.provider.load_versioned().model_copy(
         update={
@@ -291,7 +444,17 @@ def test_two_independent_developers_enroll_restore_publish_reconcile_and_revoke(
         }
     )
     with pytest.raises(ValueError, match="publication authority unavailable"):
-        authority_from_verified_state(revoked_parent, b_trust)
+        authority_from_verified_state(revoked_for_a, b_trust)
+    for accepted in (revoked_for_a, revoked_for_ci):
+        with pytest.raises(ValueError, match="version two release verification failed"):
+            _accept(
+                post_revocation_b,
+                parent=accepted,
+                key_id=(a_cert.claims.recipient_key_id if accepted is revoked_for_a else ci.key_id),
+                private_key=b"a" * 32 if accepted is revoked_for_a else b"c" * 32,
+                commit="8" * 40,
+                now=fixture.at,
+            )
 
     invite_bytes = export_team_invite(fixture.pending.invite)
     response_bytes = export_join_response(fixture.pending.response)

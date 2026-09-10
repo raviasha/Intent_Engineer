@@ -19,7 +19,7 @@ from intent_engineering.team_state.github import (
     GitHubTeamStateStatus,
 )
 from intent_engineering.team_state.models import PreparedPublication
-from intent_engineering.team_state.publication import PreparedPublicationV2
+from intent_engineering.team_state.publication import PreparedPublicationV2, PreparedV1Migration
 
 _COMMIT = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?\Z")
 _REPOSITORY_ID = re.compile(
@@ -38,7 +38,12 @@ class GitHubStatusInspector(Protocol):
     async def inspect(self, repository: str) -> GitHubTeamStateStatus: ...
 
 
-PublicationArtifacts = PreparedPublication | PreparedPublicationV2 | PreparedEnrollmentPublicationV2
+PublicationArtifacts = (
+    PreparedPublication
+    | PreparedV1Migration
+    | PreparedPublicationV2
+    | PreparedEnrollmentPublicationV2
+)
 
 
 def _validated_publication(
@@ -54,6 +59,21 @@ def _validated_publication(
             if transition_proof is not None:
                 raise GitHubPublicationError()
             return PreparedPublicationV2(
+                repository_id=publication.repository_id,
+                branch=publication.branch,
+                manifest=publication.manifest,
+                manifest_bytes=publication.manifest_bytes,
+                bundle=publication.bundle,
+                envelope=publication.envelope,
+                signatures=publication.signatures,
+                bundle_path=publication.bundle_path,
+                signature_path=publication.signature_path,
+                authority=publication.authority,
+            )
+        if type(publication) is PreparedV1Migration:
+            if transition_proof is not None:
+                raise GitHubPublicationError()
+            return PreparedV1Migration(
                 repository_id=publication.repository_id,
                 branch=publication.branch,
                 manifest=publication.manifest,

@@ -470,7 +470,8 @@ The shipped release proof composes the complete customer journey over independen
 keyring namespaces plus the unchanged CI recipient. It covers the one-way v1 migration, public
 invite/response/sponsor approval, pending protected publication, automatic B activation after a
 linear merge rewrite, B publication accepted by A and CI, competing A/B children, fresh reviewed
-reconciliation, and rejection after B revocation. Recovery coverage retains attempted-write
+reconciliation, a cryptographically valid root- and sponsor-authorized revocation descendant, and
+rejection of B's later publication by both A and CI. Recovery coverage retains attempted-write
 receipts across lost responses and cancellation, supports explicit closed-unmerged restart, and
 streams valid bundles above the generic JSON limit while stopping at the explicit raw-media bound.
 
@@ -478,5 +479,7 @@ The operating guide is normative for the supported path: organization-owned repo
 GitHub plan, short-lived classic `repo + admin:org` setup token, exact restricted runner group/name
 and workflow bindings, and the three local `invite`, `join`, and `approve-join` commands. It forbids
 direct state-ref updates, reusable setup tokens, personal runners as sufficient isolation, and all
-private-key export. Root loss, revocation, migration permanence, reviewed reconciliation, and safe
-closed-PR recovery are documented as explicit operator boundaries.
+private-key export. Root loss, migration permanence, reviewed reconciliation, and safe closed-PR
+recovery are documented as explicit operator boundaries. Revocation enforcement ships in the
+validator, but its operator-facing producer remains a separately reviewed follow-up rather than an
+undocumented registry-edit path.

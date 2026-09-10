@@ -9,6 +9,7 @@ import traceback
 from datetime import UTC, datetime
 from pathlib import Path
 
+import anyio
 import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
@@ -724,6 +725,7 @@ def test_prepare_v1_migration_is_dual_signed_and_does_not_advance_local_trust(
         sponsor_credential=credential,
         challenge="challenge:" + "f" * 64,
         now=NOW,
+        external_preflight_digest="sha256:" + "8" * 64,
         authorities=authorities,
     )
     assert preview.project_id == "project"
@@ -740,6 +742,7 @@ def test_prepare_v1_migration_is_dual_signed_and_does_not_advance_local_trust(
     assert preview.result_digest == preview.payload.result_digest
     assert preview.subject == preview.payload.subject
     assert preview.subject_digest == preview.payload.subject_digest
+    assert preview.external_preflight_digest == "sha256:" + "8" * 64
     assert preview.canonical_bytes() == preview.canonical_bytes()
     assert len(root_signatures) == 1
     wrong_action = preview.payload.model_copy(
@@ -791,6 +794,19 @@ def test_prepare_v1_migration_is_dual_signed_and_does_not_advance_local_trust(
     assert device_signatures == []
     assert legacy_signatures == []
     assert len(root_signatures) == 1
+    with pytest.raises(ValueError, match="version one migration preparation failed"):
+        prepare_v1_migration(
+            current=current,
+            legacy_trust=legacy_trust,
+            ci_recipient=ci,
+            preview=replace(preview, external_preflight_digest="sha256:" + "7" * 64),
+            sponsor_decision=VerifiedHumanDecision(preview.payload, credential, NOW),
+            now=NOW,
+            authorities=authorities,
+        )
+    assert device_signatures == []
+    assert legacy_signatures == []
+    assert len(root_signatures) == 1
     decision = VerifiedHumanDecision(preview.payload, credential, NOW)
     prepared = prepare_v1_migration(
         current=current,
@@ -801,6 +817,39 @@ def test_prepare_v1_migration_is_dual_signed_and_does_not_advance_local_trust(
         now=NOW,
         authorities=authorities,
     )
+    from intent_engineering.team_state.github_publication import _validated_publication
+    from intent_engineering.team_state.setup import EncryptedPublicationDraft
+
+    durable = EncryptedPublicationDraft(
+        manifest=prepared.manifest,
+        authority=prepared.authority,
+        bundle=base64.b64encode(prepared.bundle).decode("ascii"),
+        signatures=base64.b64encode(prepared.signatures).decode("ascii"),
+        anchor="1" * 40,
+    )
+    assert durable.publication() == prepared
+    assert _validated_publication(prepared) == prepared
+    from intent_engineering.team_state.github_publication import GitHubApiPublisher
+    from tests.unit.team_state.test_github_publication import (
+        ANCHOR,
+        InspectClient,
+        RecordingApi,
+        _status,
+        _success_responses,
+    )
+
+    async def publish_migration() -> str:
+        api = RecordingApi(_success_responses(prepared))
+        commit = await GitHubApiPublisher(api, InspectClient([_status()] * 6), _status()).publish(
+            prepared, base_commit=ANCHOR
+        )
+        assert all(
+            path != "/repos/acme/project/git/refs/heads/intent-state"
+            for _method, path, _payload in api.calls
+        )
+        return commit
+
+    assert anyio.run(publish_migration) == "f" * 40
     assert len(device_signatures) == 1
     assert len(legacy_signatures) == 1
     assert len(root_signatures) == 3
@@ -993,9 +1042,9 @@ def test_prepare_v1_migration_is_dual_signed_and_does_not_advance_local_trust(
         json.dumps(
             {
                 "schema_version": 1,
-                "bundle_digest": migrated.manifest.bundle_digest,
+                "bundle_digest": current.manifest.bundle_digest,
                 "graph_version": migrated.manifest.graph_version,
-                "ref_commit": migrated.commit,
+                "ref_commit": "b" * 40,
             },
             sort_keys=True,
             separators=(",", ":"),
@@ -1005,12 +1054,21 @@ def test_prepare_v1_migration_is_dual_signed_and_does_not_advance_local_trust(
         activate_installed_migration(source, legacy_trust, migrated, merged_state_commit="d" * 40)
     assert LocalTrustProvider(source).load_versioned() == legacy_trust
     activate_installed_migration(
-        source, legacy_trust, migrated, merged_state_commit=migrated.commit
+        source,
+        legacy_trust,
+        migrated,
+        merged_state_commit=migrated.commit,
+        prior_state_commit="b" * 40,
     )
     activate_installed_migration(
-        source, legacy_trust, migrated, merged_state_commit=migrated.commit
+        source,
+        legacy_trust,
+        migrated,
+        merged_state_commit=migrated.commit,
+        prior_state_commit="b" * 40,
     )
     assert LocalTrustProvider(source).load_versioned() == converted
+    assert json.loads(marker_path.read_bytes())["ref_commit"] == migrated.commit
     ordinary = prepare_v2_publication(
         snapshot=snapshot,
         authority=authority_from_verified_state(migrated, v2_trust),

@@ -337,7 +337,12 @@ def _migration_activation_transaction(
 
 
 def activate_installed_migration(
-    root: Path, legacy: LocalTrustConfig, release: VerifiedReleaseV2, *, merged_state_commit: str
+    root: Path,
+    legacy: LocalTrustConfig,
+    release: VerifiedReleaseV2,
+    *,
+    merged_state_commit: str,
+    prior_state_commit: str | None = None,
 ) -> None:
     """Atomically convert public trust only after the exact verified migration is installed."""
     try:
@@ -345,7 +350,7 @@ def activate_installed_migration(
             raise LocalTrustError()
         trust = trust_from_verified_migration(legacy, release)
         expected = {f.path: f.content for f in release.snapshot.files}
-        expected["cache/shared-state.json"] = json.dumps(
+        marker = json.dumps(
             {
                 "schema_version": 1,
                 "bundle_digest": release.manifest.bundle_digest,
@@ -355,6 +360,20 @@ def activate_installed_migration(
             sort_keys=True,
             separators=(",", ":"),
         ).encode()
+        prior_marker = (
+            None
+            if prior_state_commit is None or release.manifest.parent_bundle_digest is None
+            else json.dumps(
+                {
+                    "schema_version": 1,
+                    "bundle_digest": release.manifest.parent_bundle_digest,
+                    "graph_version": release.manifest.graph_version,
+                    "ref_commit": prior_state_commit,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+        )
         with (
             _migration_activation_transaction(root) as (coordinator, paths),
             coordinator.transaction() as transaction,
@@ -362,12 +381,20 @@ def activate_installed_migration(
             for path, content in expected.items():
                 if (transaction.read_optional(paths[path]) or b"") != content:
                     raise LocalTrustError()
+            current_marker = transaction.read_optional("shared_state")
+            if current_marker == prior_marker:
+                transaction.write("shared_state", marker)
+            elif current_marker != marker:
+                raise LocalTrustError()
             if transaction.read_optional("pending_join_trust") not in {None, b""}:
                 raise LocalTrustError()
             before = transaction.read_optional("team_trust")
             if before == trust.canonical_bytes():
                 return
-            if before != _canonical_bytes(legacy):
+            if before is None:
+                raise LocalTrustError()
+            loads_strict_object(before.decode("utf-8"))
+            if LocalTrustConfig.model_validate_json(before) != legacy:
                 raise LocalTrustError()
             transaction.write("team_trust", trust.canonical_bytes())
     except BaseException as error:  # noqa: BLE001 - fixed public activation boundary

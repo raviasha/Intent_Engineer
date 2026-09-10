@@ -1489,6 +1489,9 @@
     if (membership.action === "invite" && membership.state === "review_required") {
       section.append(actionButton("Create public invitation", () => reviewMembership("create-invite")));
     }
+    if (membership.action === "invite" && membership.state === "migration_required") {
+      section.append(actionButton("Review one-way team migration", () => reviewMembership("migration-preview")));
+    }
     if (membership.action === "join" && membership.state === "review_required") {
       section.append(actionButton("Enroll this device with WebAuthn", enrollMembership));
       section.append(actionButton("Review join", () => reviewMembership()));
@@ -1498,6 +1501,9 @@
     }
     if (membership.state === "preview_ready") {
       section.append(actionButton(membership.action === "join" ? "Authorize join with WebAuthn" : "Approve membership with WebAuthn", authorizeMembership, "danger"));
+    }
+    if (membership.state === "migration_preview") {
+      section.append(actionButton("Approve one-way migration with WebAuthn", authorizeMembership, "danger"));
     }
     if (membership.state === "member-active") {
       section.append(actionButton("Review team-state publication", () => reviewMembership("publish-preview")));
@@ -1515,7 +1521,7 @@
       section.append(actionButton("Refresh publication progress", () => reviewMembership("publish-reconcile")));
     }
     if (membership.state === "publication_closed") {
-      section.append(actionButton("Discard closed publication and review again", () => reviewMembership("publish-restart")));
+      section.append(actionButton("Discard closed publication and review again", () => reviewMembership(membership.action === "invite" ? "migration-restart" : "publish-restart")));
     }
     if (membership.state === "closed") {
       section.append(actionButton("Discard closed enrollment and start fresh", () => reviewMembership("restart")));

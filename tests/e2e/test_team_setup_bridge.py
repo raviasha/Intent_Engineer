@@ -265,6 +265,8 @@ class _GitHubTransport:
         self.tooling = None
         self.lose_bootstrap_response = False
         self.default_protected = True
+        self.merged_commit = "8" * 40
+        self.merged_parent = "c" * 40
 
     def promote_tooling(self, preview):
         self.tooling = {
@@ -552,8 +554,12 @@ class _GitHubTransport:
                     {"X-OAuth-Scopes": "repo, admin:org"},
                 )
             data = (
-                {"sha": "8" * 40, "tree": {"sha": "e" * 40}, "parents": [{"sha": "c" * 40}]}
-                if path.endswith("8" * 40)
+                {
+                    "sha": self.merged_commit,
+                    "tree": {"sha": "e" * 40},
+                    "parents": [{"sha": self.merged_parent}],
+                }
+                if path.endswith(self.merged_commit)
                 else {"sha": "c" * 40, "tree": {"sha": "b" * 40}, "parents": []}
             )
         elif path.endswith("/git/refs"):
@@ -578,8 +584,8 @@ class _GitHubTransport:
         elif path.endswith("/pulls/1"):
             data = {
                 **self.pr,
-                "merged": self.branch == "8" * 40,
-                "state": "closed" if self.branch == "8" * 40 else self.pr["state"],
+                "merged": self.branch == self.merged_commit,
+                "state": "closed" if self.branch == self.merged_commit else self.pr["state"],
                 "merge_commit_sha": self.branch,
             }
         elif path.endswith("/pulls"):
@@ -833,6 +839,7 @@ async def test_production_ui_requires_exact_enrolled_protection_decision(
     finally:
         baseline_runtime.close()
     git(harness.project, "init", "--initial-branch=main")
+    git(harness.project, "remote", "add", "origin", "https://github.com/acme/project.git")
     git(harness.project, "add", "docs/prd.md")
     git(harness.project, "commit", "-m", "Code")
     from intent_engineering.team_state.ci import CiKeyStore
@@ -1156,6 +1163,162 @@ async def test_production_ui_requires_exact_enrolled_protection_decision(
         )
         assert all(value not in public_ci_path.read_text() for value in backend.values.values())
         assert "Keep exports local" not in str(transport.writes)
+        if lost_pr_response is False:
+            from intent_engineering.control_plane import team_enrollment as journey
+            from intent_engineering.team_state.candidate import validate_candidate
+            from intent_engineering.team_state.keys import GitHubIdentity
+            from intent_engineering.team_state.publication import PreparedV1Migration
+            from intent_engineering.team_state.restore import (
+                SharedStateArtifacts,
+                StaticTrustProvider,
+                _GitRefReader,
+            )
+            from intent_engineering.team_state.setup import _draft
+            from tests.helpers.shared_state import install_state_ref
+
+            v1_artifacts = SharedStateArtifacts(
+                manifest=base64.b64decode(transport.blobs[0]["content"]),
+                bundle=base64.b64decode(transport.blobs[1]["content"]),
+                signatures=base64.b64decode(transport.blobs[2]["content"]),
+                bundle_path=(
+                    f"bundles/{typed_manifest.graph_version}-"
+                    f"{typed_manifest.bundle_digest.removeprefix('sha256:')}.intent"
+                ),
+                signature_path=(
+                    f"signatures/{typed_manifest.graph_version}-"
+                    f"{typed_manifest.bundle_digest.removeprefix('sha256:')}.json"
+                ),
+            )
+            v1_commit = install_state_ref(harness.project, v1_artifacts)
+            marker = harness.project / ".intent/cache/shared-state.json"
+            marker.parent.mkdir(exist_ok=True)
+            marker.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "bundle_digest": typed_manifest.bundle_digest,
+                        "graph_version": typed_manifest.graph_version,
+                        "ref_commit": v1_commit,
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+            )
+            marker.chmod(0o600)
+            transport.branch = v1_commit
+            transport.blobs = []
+            transport.tree = []
+            transport.commit = None
+            transport.publication_ref = None
+            transport.pr = None
+            translated_commits: dict[str, str] = {}
+
+            class RewrittenStateReader:
+                def __init__(self, root):
+                    self.reader = _GitRefReader(root)
+
+                def translated(self, commit):
+                    return translated_commits.get(commit, commit)
+
+                def commit(self):
+                    if transport.branch == transport.merged_commit:
+                        return transport.merged_commit
+                    return self.reader.commit()
+
+                def blob(self, commit, path, maximum):
+                    return self.reader.blob(self.translated(commit), path, maximum)
+
+                def parents(self, commit):
+                    return self.reader.parents(self.translated(commit))
+
+                def require_release_tree(self, commit, name):
+                    return self.reader.require_release_tree(self.translated(commit), name)
+
+                def __getattr__(self, name):
+                    return getattr(self.reader, name)
+
+                def close(self):
+                    self.reader.close()
+
+            from intent_engineering.team_state import restore
+
+            monkeypatch.setattr(
+                restore,
+                "_refresh_state_ref",
+                lambda _repository_id: RewrittenStateReader(harness.project),
+            )
+            monkeypatch.setenv("GITHUB_REPOSITORY", "acme/project")
+            invite_path = tmp_path / "alice-to-bob.intent-invite.json"
+            request = journey.save_enrollment_request(
+                harness.runtime,
+                action="invite",
+                project_id=harness.runtime.config.project_id,
+                repository_id="github.com/acme/project",
+                identity=GitHubIdentity(account_id="200", login="bob"),
+                output=str(invite_path),
+            )
+            legacy_trust = LocalTrustProvider(harness.project).load_versioned()
+            assert (
+                f"intent-engineering/{harness.runtime.config.project_id}",
+                legacy_trust.recipient_key_id,
+            ) in backend.values
+            assert journey.enrollment_status(harness.runtime)["state"] == "migration_required"
+            membership = journey.MembershipSession(service)
+            try:
+                migration_context = await membership._migration()
+                assert migration_context.commit == v1_commit
+                migration = await membership.action("migration-preview", request.session_id)
+                assert migration["state"] == "migration_preview"
+                assert migration["preview"]["legacy_parent_bundle_digest"] == (
+                    typed_manifest.bundle_digest
+                )
+                await membership.action("options", request.session_id)
+                pending = await membership.action(
+                    "verify", request.session_id, response=b"signed-assertion"
+                )
+                assert pending["state"] == "publication_pending"
+            finally:
+                membership.close()
+            migration_draft = _draft(harness.runtime)
+            assert migration_draft is not None
+            prepared_migration = migration_draft.publication()
+            assert type(prepared_migration) is PreparedV1Migration
+            migration_commit = install_state_ref(
+                harness.project,
+                SharedStateArtifacts(
+                    manifest=prepared_migration.manifest_bytes,
+                    bundle=prepared_migration.bundle,
+                    signatures=prepared_migration.signatures,
+                    bundle_path=prepared_migration.bundle_path,
+                    signature_path=prepared_migration.signature_path,
+                ),
+                parent=v1_commit,
+            )
+            git(harness.project, "update-ref", "refs/remotes/origin/intent-state", v1_commit)
+            validate_candidate(
+                harness.project,
+                StaticTrustProvider(ci_trust),
+                base=v1_commit,
+                head=migration_commit,
+                at=NOW,
+            )
+            translated_commits[transport.merged_commit] = migration_commit
+            transport.merged_parent = v1_commit
+            transport.branch = transport.merged_commit
+            membership = journey.MembershipSession(service)
+            try:
+                reconciled = await membership.action("reconcile", request.session_id)
+                assert reconciled["state"] == "review_required"
+            finally:
+                membership.close()
+            assert LocalTrustProvider(harness.project).load_versioned().schema_version == 2
+            membership = journey.MembershipSession(service)
+            try:
+                invitation = await membership.action("create-invite", request.session_id)
+                assert invitation["state"] == "invitation-ready"
+            finally:
+                membership.close()
+            assert invite_path.is_file()
     finally:
         service.close()
         harness.service.close()

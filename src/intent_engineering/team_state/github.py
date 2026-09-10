@@ -20,7 +20,7 @@ from intent_engineering.team_state.enrollment import (
     authenticate_enrollment_publication,
 )
 from intent_engineering.team_state.models import PreparedPublication
-from intent_engineering.team_state.publication import PreparedPublicationV2
+from intent_engineering.team_state.publication import PreparedPublicationV2, PreparedV1Migration
 
 _REPOSITORY = re.compile(r"(?!-)(?!.*--)[a-z0-9-]{1,39}(?<!-)/[a-z0-9][a-z0-9._-]{0,99}\Z")
 _COMMIT = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?\Z")
@@ -39,7 +39,12 @@ _MAX_RUNNER_GROUPS = _MAX_RUNNER_GROUP_PAGES * _RUNNER_GROUPS_PER_PAGE
 
 ProtectionContext = Annotated[str, Field(min_length=1, max_length=255)]
 StatusCheckAppId = Annotated[int, Field(ge=-1)]
-PublicationArtifacts = PreparedPublication | PreparedPublicationV2 | PreparedEnrollmentPublicationV2
+PublicationArtifacts = (
+    PreparedPublication
+    | PreparedV1Migration
+    | PreparedPublicationV2
+    | PreparedEnrollmentPublicationV2
+)
 
 
 def _publication_artifacts(
@@ -66,6 +71,22 @@ def _publication_artifacts(
                 bundle_path=publication_v2.bundle_path,
                 signature_path=publication_v2.signature_path,
                 authority=publication_v2.authority,
+            )
+        if type(value) is PreparedV1Migration:
+            if transition_proof is not None:
+                raise GitHubTeamStateError()
+            migration = value
+            return PreparedV1Migration(
+                repository_id=migration.repository_id,
+                branch=migration.branch,
+                manifest=migration.manifest,
+                manifest_bytes=migration.manifest_bytes,
+                bundle=migration.bundle,
+                envelope=migration.envelope,
+                signatures=migration.signatures,
+                bundle_path=migration.bundle_path,
+                signature_path=migration.signature_path,
+                authority=migration.authority,
             )
         if type(value) is PreparedEnrollmentPublicationV2:
             if transition_proof is None:

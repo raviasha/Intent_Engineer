@@ -504,6 +504,7 @@ class V1MigrationPreview:
     bundle: bytes
     authority: TeamAuthorityRegistryV2
     certificate: DeviceSignerCertificateV2
+    external_preflight_digest: str | None = None
 
     def __post_init__(self) -> None:
         if (
@@ -535,6 +536,10 @@ class V1MigrationPreview:
             or authority_digest(self.authority) != self.authority_digest
             or "sha256:" + hashlib.sha256(self.bundle).hexdigest() != self.bundle_digest
             or len(self.bundle) != self.manifest.bundle_size
+            or (
+                self.external_preflight_digest is not None
+                and re.fullmatch(r"sha256:[0-9a-f]{64}", self.external_preflight_digest) is None
+            )
         ):
             raise ValueError("migration preview binding changed")
         parsed_bundle = EncryptedBundle.model_validate_json(self.bundle)
@@ -556,6 +561,7 @@ class V1MigrationPreview:
                 "device_certificate_id": self.device_certificate_id,
                 "device_digest": self.device_digest,
                 "device_signature_id": self.device_signature_id,
+                "external_preflight_digest": self.external_preflight_digest,
                 "graph_version": self.graph_version,
                 "legacy_manifest_digest": self.legacy_manifest_digest,
                 "legacy_parent_bundle_digest": self.legacy_parent_bundle_digest,
@@ -1071,6 +1077,7 @@ def preview_v1_migration(
     sponsor_credential: CredentialRecord,
     challenge: str,
     now: datetime,
+    external_preflight_digest: str | None = None,
     authorities: MigrationKeyAuthorities | None = None,
 ) -> V1MigrationPreview:
     """Create the exact public migration draft that requires WebAuthn approval."""
@@ -1096,6 +1103,10 @@ def preview_v1_migration(
             or current.snapshot.repository_id != legacy_trust.repository_id
             or ci_recipient.project_id != legacy_trust.project_id
             or ci_recipient.repository_id != legacy_trust.repository_id
+            or (
+                external_preflight_digest is not None
+                and re.fullmatch(r"sha256:[0-9a-f]{64}", external_preflight_digest) is None
+            )
         ):
             raise ValueError("migration decision changed")
         expected_legacy = {item.signature_id: item.public_key for item in current.signing_keys}
@@ -1288,6 +1299,7 @@ def preview_v1_migration(
                 "ci_recipient_digest": ci_digest,
                 "device_certificate_id": certificate.certificate_id,
                 "device_digest": device_digest,
+                "external_preflight_digest": external_preflight_digest,
                 "graph_version": manifest.graph_version,
                 "legacy_manifest_digest": prior_manifest_digest,
                 "legacy_parent_bundle_digest": current.manifest.bundle_digest,
@@ -1347,6 +1359,7 @@ def preview_v1_migration(
             bundle=bundle,
             authority=authority,
             certificate=certificate,
+            external_preflight_digest=external_preflight_digest,
         )
     except BaseException as error:  # noqa: BLE001 - fixed migration preview boundary
         error.__traceback__ = None
@@ -1617,6 +1630,7 @@ def prepare_v1_migration(
                 "ci_recipient_digest": ci_digest,
                 "device_certificate_id": certificate.certificate_id,
                 "device_digest": device_digest,
+                "external_preflight_digest": preview.external_preflight_digest,
                 "graph_version": manifest.graph_version,
                 "legacy_manifest_digest": preview.legacy_manifest_digest,
                 "legacy_parent_bundle_digest": preview.legacy_parent_bundle_digest,

@@ -38,30 +38,26 @@ def _numbered_sections(spec_path: Path) -> Mapping[str, str]:
     return sections
 
 
-def _graph_spec_references(graph: Graph) -> tuple[str, ...]:
-    return tuple(
-        sorted(
-            {
-                reference
-                for node in graph.nodes
-                for reference in node.evidence_refs
-                if reference.startswith("spec:")
-            }
-        )
-    )
+def _graph_references(graph: Graph) -> tuple[str, ...]:
+    return tuple(sorted({reference for node in graph.nodes for reference in node.evidence_refs}))
 
 
 def _record(reference: str, section: str, spec_path: Path, observed_at: datetime) -> EvidenceRecord:
     content = section.encode("utf-8")
     content_hash = f"sha256:{sha256(content).hexdigest()}"
+    foundational_spec = reference.startswith("spec:")
     return EvidenceRecord(
         id=f"{reference}@{content_hash}",
-        connector_type="foundational-spec",
+        connector_type="foundational-spec" if foundational_spec else "foundational-markdown",
         external_object_id=reference,
         external_version=content_hash,
-        author="founding-spec",
+        author="founding-spec" if foundational_spec else "approved-design",
         observed_at=observed_at,
-        source_locator=f"{spec_path.as_posix()}#{reference.removeprefix('spec:')}",
+        source_locator=(
+            f"{spec_path.as_posix()}#{reference.removeprefix('spec:')}"
+            if foundational_spec
+            else spec_path.as_posix()
+        ),
         content_hash=content_hash,
         payload={"section_ref": reference, "section_hash": content_hash, "content": section},
         parent_ref=reference,
@@ -74,16 +70,34 @@ def import_foundational_evidence(
     store: JsonlEvidenceStore,
     *,
     observed_at: datetime,
+    referenced_markdown: Mapping[str, Path] | None = None,
 ) -> Sequence[EvidenceRecord]:
-    """Persist one immutable content-addressed row for every framework ``spec:<section>`` ref."""
+    """Persist one immutable content-addressed row for every framework evidence ref."""
     sections = _numbered_sections(spec_path)
-    references = _graph_spec_references(graph)
-    missing = tuple(reference for reference in references if reference not in sections)
+    documents = {
+        reference: (_normalized_text(path), path)
+        for reference, path in (referenced_markdown or {}).items()
+        if not reference.startswith("spec:")
+    }
+    references = tuple(
+        reference
+        for reference in _graph_references(graph)
+        if referenced_markdown is not None or reference.startswith("spec:")
+    )
+    missing = tuple(
+        reference
+        for reference in references
+        if reference not in sections and reference not in documents
+    )
     if missing:
-        raise ValueError(f"missing numbered section: {missing[0]}")
+        kind = "numbered section" if missing[0].startswith("spec:") else "foundational evidence"
+        raise ValueError(f"missing {kind}: {missing[0]}")
     imported: list[EvidenceRecord] = []
     for reference in references:
-        candidate = _record(reference, sections[reference], spec_path, observed_at)
+        content, source = (
+            (sections[reference], spec_path) if reference in sections else documents[reference]
+        )
+        candidate = _record(reference, content, source, observed_at)
         existing = {record.id: record for record in store.versions(reference)}
         record = existing.get(candidate.id, candidate)
         if record is candidate:

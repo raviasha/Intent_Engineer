@@ -145,7 +145,32 @@ def _validate_v2_candidate(
     head: str,
     at: datetime,
 ) -> None:
-    parent = _verified_v2_base(reader, base, trust, at)
+    base_manifest_bytes = reader.blob(base, "manifest.json", MAX_MANIFEST_BYTES)
+    base_manifest = parse_team_manifest(base_manifest_bytes)
+    legacy_parent: VerifiedV1Release | None = None
+    parent: VerifiedReleaseV2 | None = None
+    if type(base_manifest) is TeamStateManifest:
+        lineage = _verify_release_lineage(reader, base, trust, at, None)
+        files = _decrypt_release_payload(reader, lineage.tip, trust)
+        legacy_parent = VerifiedV1Release(
+            manifest=lineage.tip.manifest,
+            manifest_bytes=base_manifest_bytes,
+            signing_keys=tuple(
+                TrustedSigningKey(item.signature_id, item.public_key) for item in trust.signing_keys
+            ),
+            snapshot=CanonicalStateSnapshot(
+                project_id=base_manifest.project_id,
+                repository_id=base_manifest.repository_id,
+                graph_version=base_manifest.graph_version,
+                files=tuple(
+                    CanonicalStateFile(path=path, content=files[path]) for path in sorted(files)
+                ),
+            ),
+        )
+    elif type(base_manifest) is TeamStateManifestV2:
+        parent = _verified_v2_base(reader, base, trust, at)
+    else:
+        raise ValueError("state candidate changed")
     manifest_bytes = reader.blob(head, "manifest.json", MAX_MANIFEST_BYTES)
     manifest = parse_team_manifest(manifest_bytes)
     if type(manifest) is not TeamStateManifestV2:
@@ -162,17 +187,32 @@ def _validate_v2_candidate(
     if paths != expected:
         raise ValueError("state candidate inventory changed")
     _manifest, bundle, envelope = _v2_artifacts(reader, head, manifest)
-    verified = verify_v2_release(
-        manifest_bytes=manifest_bytes,
-        bundle_bytes=bundle,
-        envelope_bytes=envelope,
-        parent=parent,
-        recipient_key_id=trust.recipient_key_id,
-        recipient_private_key=trust.recipient_private_key,
-        commit=head,
-        now=at,
-    )
-    if verified.manifest.graph_version < parent.manifest.graph_version:
+    if legacy_parent is not None:
+        verified = verify_v2_migration_release(
+            manifest_bytes=manifest_bytes,
+            bundle_bytes=bundle,
+            envelope_bytes=envelope,
+            current=legacy_parent,
+            recipient_key_id=trust.recipient_key_id,
+            recipient_private_key=trust.recipient_private_key,
+            commit=head,
+            now=at,
+        )
+        parent_graph_version = legacy_parent.manifest.graph_version
+    else:
+        assert parent is not None
+        verified = verify_v2_release(
+            manifest_bytes=manifest_bytes,
+            bundle_bytes=bundle,
+            envelope_bytes=envelope,
+            parent=parent,
+            recipient_key_id=trust.recipient_key_id,
+            recipient_private_key=trust.recipient_private_key,
+            commit=head,
+            now=at,
+        )
+        parent_graph_version = parent.manifest.graph_version
+    if verified.manifest.graph_version < parent_graph_version:
         raise ValueError("state candidate graph version rollback")
 
 
