@@ -379,6 +379,21 @@ def test_closed_enrollment_restart_retires_all_local_metadata_atomically(tmp_pat
         assert _draft(runtime) is None
         assert _enrollment_receipt(runtime) is None
         assert not (project / ".intent" / "team-enrollment-approval.json").exists()
+        _stage_enrollment_approval(
+            runtime,
+            publication=publication,
+            transition_proof=proof,
+            anchor=state.state_commit,
+            receipt=GitHubSetupBridge._enrollment_receipt_for(
+                approval,
+                publication,
+                sponsor_decision=_sponsor_decision(preview, approval),
+                transition_proof=proof,
+                phase="approved",
+            ),
+        )
+        assert _draft(runtime) is not None
+        assert _enrollment_receipt(runtime) is not None
     finally:
         service.close()
         runtime.close()

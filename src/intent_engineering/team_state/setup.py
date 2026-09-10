@@ -729,6 +729,10 @@ def _stage_enrollment_approval(
                 "draft", max_bytes=MAX_BUNDLE_BYTES * 2 + 2 * 1024 * 1024
             )
             existing_receipt = transaction.read_optional_bounded("receipt", max_bytes=128 * 1024)
+            if existing_draft == _DISCARDED_ENROLLMENT_STATE:
+                existing_draft = None
+            if existing_receipt == _DISCARDED_ENROLLMENT_STATE:
+                existing_receipt = None
             if existing_draft is None and existing_receipt is None:
                 transaction.write("draft", draft_content)
                 transaction.write("receipt", receipt_content)

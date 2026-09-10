@@ -159,54 +159,71 @@ def load_enrollment_request(runtime: Runtime) -> EnrollmentRequest | None:
 
 
 def save_enrollment_request(runtime: Runtime, **fields: object) -> EnrollmentRequest:
+    from intent_engineering.storage.transaction import LocalTransactionCoordinator
+
     request = EnrollmentRequest.model_validate({"session_id": secrets.token_hex(32), **fields})
+    content = request.model_dump_json().encode()
+    if len(content) > _MAX_SESSION_BYTES:
+        raise ValueError("team enrollment unavailable")
     _recover_enrollment_session_state(runtime)
-    target = runtime.workspace_directory.file(_SESSION_FILE)
+    cancellable = _enrollment_can_cancel(runtime, request)
+    session = runtime.workspace_directory.file(_SESSION_FILE)
+    approval = runtime.workspace_directory.file(_APPROVAL_FILE)
+    draft = runtime.workspace_directory.file(_PUBLICATION_FILE)
+    receipt = runtime.workspace_directory.file(_RECEIPT_FILE)
+    journal = runtime.workspace_directory.file(_SESSION_JOURNAL_FILE)
+    coordinator: LocalTransactionCoordinator | None = None
     try:
-        with same_path_lock(target):
-            if target.exists():
-                previous = _read_enrollment_request(runtime, target)
+        coordinator = LocalTransactionCoordinator(
+            journal,
+            {
+                "session": session,
+                "approval": approval,
+                "draft": draft,
+                "receipt": receipt,
+            },
+            legacy_target_sets=(frozenset({"session", "approval"}),),
+        )
+        with coordinator.transaction(rollback_base_exceptions=True) as transaction:
+            previous_content = transaction.read_optional_bounded(
+                "session", max_bytes=_MAX_SESSION_BYTES
+            )
+            previous = _read_enrollment_request(runtime, session)
+            if (previous is None) != (previous_content is None):
+                raise ValueError("team enrollment unavailable")
+            if previous is not None:
                 if previous is not None and previous.model_dump(
                     exclude={"session_id", "created_invite"}
                 ) == (request.model_dump(exclude={"session_id", "created_invite"})):
                     return previous
                 if (
-                    previous is not None
-                    and previous.created_invite is not None
+                    previous.created_invite is not None
                     and request.action == "approve-join"
                     and request.response is not None
                     and request.response.invite_id == previous.created_invite.invite_id
-                    and _enrollment_can_cancel(runtime, previous)
+                    and cancellable
+                    and transaction.read_optional("draft") in {None, _DISCARDED_PUBLICATION_STATE}
+                    and transaction.read_optional("receipt") in {None, _DISCARDED_PUBLICATION_STATE}
+                    and transaction.read_optional("approval") is None
                 ):
-                    target.atomic_write(
-                        request.model_dump_json().encode(), reject_target_races=True
-                    )
-                    os.chmod(target.name, 0o600, dir_fd=target.parent_fd, follow_symlinks=False)
-                    return request
+                    transaction.write("session", content)
+                else:
+                    raise ValueError("team enrollment unavailable")
+            elif transaction.read_optional("approval") is not None:
                 raise ValueError("team enrollment unavailable")
-            content = request.model_dump_json().encode()
-            if len(content) > _MAX_SESSION_BYTES:
-                raise ValueError("team enrollment unavailable")
-            descriptor = os.open(
-                target.name,
-                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
-                0o600,
-                dir_fd=target.parent_fd,
-            )
-            try:
-                pending = memoryview(content)
-                while pending:
-                    count = os.write(descriptor, pending)
-                    if count <= 0:
-                        raise ValueError("team enrollment unavailable")
-                    pending = pending[count:]
-                os.fsync(descriptor)
-            finally:
-                os.close(descriptor)
-            os.fsync(target.parent_fd)
-            return request
+            else:
+                transaction.write("session", content)
+        os.chmod(session.name, 0o600, dir_fd=session.parent_fd, follow_symlinks=False)
+        os.fsync(session.parent_fd)
+        return request
     finally:
-        target.close()
+        if coordinator is not None:
+            coordinator.close()
+        journal.close()
+        receipt.close()
+        draft.close()
+        approval.close()
+        session.close()
 
 
 def _enrollment_can_cancel(runtime: Runtime, request: EnrollmentRequest) -> bool:
