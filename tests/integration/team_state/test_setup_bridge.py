@@ -621,18 +621,31 @@ async def test_restart_resumes_exact_approved_draft_without_replacing_authority(
                 phase="approved",
             ),
         )
-        result = await bridge.reconcile_member_approval(request=request, current=state)
+        decision = _sponsor_decision(preview, request)
+        result = await bridge.reconcile_member_approval(
+            request=request,
+            current=state,
+            decision_repository_id=decision.credential.repository_id,
+            decision_actor=decision.credential.actor,
+        )
         assert result.pull_request_url == "https://github.com/acme/project/pull/7"
         assert _draft(runtime).publication_commit == "3" * 40
         assert _enrollment_receipt(runtime).phase == "pr-pending"
         assert _draft(runtime).authority == publication.authority
         pr_state = "closed"
         with pytest.raises(ValueError, match="requires reconciliation"):
-            await bridge.reconcile_member_approval(request=request, current=state)
+            await bridge.reconcile_member_approval(
+                request=request,
+                current=state,
+                decision_repository_id=decision.credential.repository_id,
+                decision_actor=decision.credential.actor,
+            )
         assert _enrollment_receipt(runtime).phase == "closed"
         restarted = await bridge.reconcile_member_approval(
             request=request,
             current=state,
+            decision_repository_id=decision.credential.repository_id,
+            decision_actor=decision.credential.actor,
             restart_closed=True,
         )
         assert restarted.state == "bootstrap_required"
@@ -715,7 +728,13 @@ async def test_merge_reconciliation_persists_exact_merged_descendant_identity(
             pull_request_number=7,
             pull_request_url="https://github.com/acme/project/pull/7",
         )
-        result = await bridge.reconcile_member_approval(request=request, current=state)
+        decision = _sponsor_decision(preview, request)
+        result = await bridge.reconcile_member_approval(
+            request=request,
+            current=state,
+            decision_repository_id=decision.credential.repository_id,
+            decision_actor=decision.credential.actor,
+        )
         merged = _enrollment_receipt(runtime)
         assert result.state == "published"
         assert merged.phase == "merged"

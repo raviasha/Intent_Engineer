@@ -3511,7 +3511,11 @@ class GitSharedStateRestorer:
                 nonlocal diverged, governance_content
                 with _RestorePreimage(project, workspace, targets, paths) as preimage:
                     current = {p: preimage.content[p] for p in CANONICAL_STATE_PATHS}
-                    if (baseline_files is not None and current != baseline_files) or (
+                    if (
+                        baseline_files is not None
+                        and current != baseline_files
+                        and current != files
+                    ) or (
                         baseline_files is None
                         and any(
                             value is not None and value != files[p] for p, value in current.items()

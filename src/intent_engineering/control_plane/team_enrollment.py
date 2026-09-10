@@ -1559,7 +1559,11 @@ class MembershipSession:
                     raise ValueError("team enrollment unavailable")
                 draft = _draft(self.runtime)
                 result = await context.bridge.reconcile_member_approval(
-                    request=approval, current=context.current, restart_closed=action == "restart"
+                    request=approval,
+                    current=context.current,
+                    decision_repository_id=context.credential.repository_id,
+                    decision_actor=context.credential.actor,
+                    restart_closed=action == "restart",
                 )
                 if action == "restart" and result.state == "bootstrap_required":
                     _retire_closed_enrollment_request(
@@ -1749,6 +1753,8 @@ class MembershipSession:
                     raise ValueError("team enrollment unavailable")
             else:
                 write_public_file(output, existing_pending.response)
+            if existing_pending.phase == "response-ready":
+                LocalTrustProvider(self.runtime.root).acknowledge_join_response(existing_pending)
             return enrollment_status(self.runtime)
         invite, identity, material = self._join()
         actor = "github:" + identity.account_id
@@ -1835,9 +1841,11 @@ class MembershipSession:
                 expected_authority_before_digest=invite.authority_digest,
                 external_write_attempted=False,
             )
-            LocalTrustProvider(self.runtime.root).save_pending_join(pending)
+            trust_provider = LocalTrustProvider(self.runtime.root)
+            trust_provider.save_pending_join(pending)
             assert self.request.output is not None
             write_public_file(Path(self.request.output), joined)
+            trust_provider.acknowledge_join_response(pending)
             self.proof = b""
             self.pending_payload = None
             return enrollment_status(self.runtime)

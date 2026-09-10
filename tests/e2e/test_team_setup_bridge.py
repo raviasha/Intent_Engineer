@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 
 import anyio
@@ -10,7 +11,10 @@ import pytest
 from intent_engineering.cli.team import build_github_enable_preview, run_confirmed_github_enablement
 from intent_engineering.control_plane.models import HumanDecisionPayload
 from intent_engineering.control_plane.service import ControlPlaneService
-from intent_engineering.control_plane.webauthn_service import VerifiedAuthentication
+from intent_engineering.control_plane.webauthn_service import (
+    VerifiedAuthentication,
+    VerifiedRegistration,
+)
 from intent_engineering.team_state.github import GitHubJsonResponse
 from tests.e2e.test_team_enrollment import _TeamVerifier
 from tests.helpers.shared_state import git
@@ -250,6 +254,8 @@ async def test_setup_failure_closes_provider_and_scrubs_exception_frames(
 
 class _GitHubTransport:
     def __init__(self):
+        self.account_id = 123
+        self.login = "alice"
         self.branch = None
         self.protected = False
         self.closed = 0
@@ -301,7 +307,9 @@ class _GitHubTransport:
         else:
             self.reads.append(path)
         if path == "/user":
-            data = {"id": 123, "login": "alice"}
+            data = {"id": self.account_id, "login": self.login}
+        elif path == "/users/bob":
+            data = {"id": 200, "login": "bob"}
         elif path == "/repos/acme/project":
             data = {
                 "id": 77,
@@ -689,16 +697,473 @@ class _Keyring:
 
 
 class _SetupVerifier(_TeamVerifier):
-    next_sign_count = 0
+    def __init__(
+        self,
+        *,
+        credential_id=b"team-control-plane-credential",
+        public_key=b"team-control-plane-public-key",
+        portable_assertions=None,
+    ):
+        super().__init__()
+        self.credential_id = credential_id
+        self.public_key = public_key
+        self.next_sign_count = 0
+        self.portable_assertions = {} if portable_assertions is None else portable_assertions
 
-    def verify_authentication(self, response, request):
-        assert response == b"signed-assertion"
-        assert request == self.authentication_requests[-1]
-        return VerifiedAuthentication(
-            credential_id=b"team-control-plane-credential",
-            new_sign_count=self.next_sign_count,
+    def verify_registration(self, response, request):
+        assert response == _registration_response(request)
+        return VerifiedRegistration(
+            credential_id=self.credential_id,
+            public_key=self.public_key,
+            sign_count=0,
             user_verified=True,
         )
+
+    @staticmethod
+    def _portable_request(request, credential_id):
+        encoded_credential_id = base64.urlsafe_b64encode(credential_id).rstrip(b"=").decode()
+        credentials = tuple(
+            credential
+            for credential in request.credentials
+            if credential.credential_id == encoded_credential_id
+        )
+        assert len(credentials) == 1
+        return (
+            request.challenge,
+            request.rp_id,
+            request.expected_origin,
+            request.project_id,
+            request.repository_id,
+            request.actor,
+            request.payload_bytes,
+            tuple(
+                (
+                    credential.credential_id,
+                    credential.public_key,
+                    credential.project_id,
+                    credential.repository_id,
+                    credential.actor,
+                )
+                for credential in credentials
+            ),
+        )
+
+    def verify_authentication(self, response, request):
+        portable_credentials = {
+            b"member-signed-assertion": (b"bob-control-plane-credential", 1),
+            b"sponsor-signed-assertion": (b"team-control-plane-credential", 2),
+        }
+        if response in portable_credentials:
+            credential_id, sign_count = portable_credentials[response]
+            fingerprint = self._portable_request(request, credential_id)
+            recorded = self.portable_assertions.get(response)
+            if recorded is None:
+                assert request == self.authentication_requests[-1]
+                self.portable_assertions[response] = fingerprint
+            else:
+                assert fingerprint == recorded
+        else:
+            assert response == b"signed-assertion"
+            assert request == self.authentication_requests[-1]
+            sign_count = self.next_sign_count
+            credential_id = self.credential_id
+        return VerifiedAuthentication(
+            credential_id=credential_id,
+            new_sign_count=sign_count,
+            user_verified=True,
+        )
+
+
+async def _complete_production_two_developer_journey(
+    *,
+    tmp_path,
+    monkeypatch,
+    harness,
+    service,
+    verifier,
+    transport,
+    sponsor_backend,
+    ci_trust,
+    migration_commit,
+    invite_path,
+) -> None:
+    """Continue the real migrated invitation through B's ordinary publication."""
+    from intent_engineering.cli.runtime import load_runtime
+    from intent_engineering.cli.team_enrollment import read_invite, read_response
+    from intent_engineering.control_plane import team_enrollment as journey
+    from intent_engineering.intent_workflow.check import SharedStateRestoreStatus
+    from intent_engineering.team_state.candidate import validate_candidate
+    from intent_engineering.team_state.enrollment import PreparedEnrollmentPublicationV2
+    from intent_engineering.team_state.governance import GovernanceRegistry
+    from intent_engineering.team_state.keys import GitHubIdentity, KeyringDeviceKeyStore
+    from intent_engineering.team_state.local_trust import LocalTrustProvider
+    from intent_engineering.team_state.publication import PreparedPublicationV2
+    from intent_engineering.team_state.restore import (
+        GitSharedStateRestorer,
+        SharedStateArtifacts,
+        StaticTrustProvider,
+    )
+    from intent_engineering.team_state.setup import _draft
+    from tests.helpers.shared_state import canonical_files, git, install_state_ref, ready_project
+    from tests.unit.team_state.test_enrollment import IDENTITY_PROOF
+
+    class JourneyIdentityVerifier:
+        def verify(self, proof):
+            if proof != IDENTITY_PROOF:
+                raise ValueError("identity proof mismatch")
+            return self.lookup(200)
+
+        def lookup(self, account_id):
+            identities = (
+                GitHubIdentity(account_id="123", login="alice"),
+                GitHubIdentity(account_id="200", login="bob"),
+            )
+            return next(
+                identity for identity in identities if identity.account_id == str(account_id)
+            )
+
+    member_backend = _Keyring()
+    member_stores = []
+    portable_assertions = {}
+    verifier.portable_assertions = portable_assertions
+
+    def isolated_device_store(binding):
+        selected_backend = member_backend if binding.github_account_id == 200 else sponsor_backend
+        store = KeyringDeviceKeyStore(
+            binding,
+            backend=selected_backend,
+            lock_root=tmp_path / f"device-locks-{binding.github_account_id}",
+        )
+        if binding.github_account_id == 200:
+            member_stores.append(store)
+        return store
+
+    monkeypatch.setattr(journey, "local_identity_proof", lambda: IDENTITY_PROOF)
+    monkeypatch.setattr(journey, "identity_verifier", JourneyIdentityVerifier)
+    monkeypatch.setattr(journey, "device_store", isolated_device_store)
+
+    sponsor_baseline_files = canonical_files(harness.project)
+    sponsor_trust_bytes = (harness.project / ".intent/team-trust.json").read_bytes()
+    sponsor_marker_bytes = (harness.project / ".intent/cache/shared-state.json").read_bytes()
+    member_project = tmp_path / "developer-b"
+    member_project.mkdir()
+    ready_project(member_project)
+    for path, content in canonical_files(harness.project).items():
+        target = member_project / ".intent" / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(content)
+    (member_project / "README.md").write_text("developer B checkout\n")
+    git(member_project, "init", "--initial-branch=main")
+    git(member_project, "remote", "add", "origin", "https://github.com/acme/project.git")
+    git(member_project, "add", "README.md")
+    git(member_project, "commit", "-m", "Developer B checkout")
+
+    invite = read_invite(invite_path)
+    response_path = tmp_path / "bob-to-alice.intent-join.json"
+    member_runtime = load_runtime(member_project)
+    member_verifier = _SetupVerifier(
+        credential_id=b"bob-control-plane-credential",
+        public_key=b"bob-control-plane-public-key",
+        portable_assertions=portable_assertions,
+    )
+    member_service = ControlPlaneService(
+        member_runtime,
+        origin=ORIGIN,
+        clock=lambda: NOW,
+        webauthn_verifier=member_verifier,
+    )
+    member_request = journey.save_enrollment_request(
+        member_runtime,
+        action="join",
+        project_id=member_runtime.config.project_id,
+        repository_id="github.com/acme/project",
+        invite=invite,
+        output=str(response_path),
+    )
+    member_session = journey.MembershipSession(member_service)
+    try:
+        await member_session.action("register-options", member_request.session_id)
+        await member_session.action(
+            "register-verify",
+            member_request.session_id,
+            response=_registration_response(member_verifier.registration_requests[-1]),
+        )
+        preview = await member_session.action("preview", member_request.session_id)
+        assert preview["identity"] == {"account_id": "200", "login": "bob"}
+        await member_session.action("options", member_request.session_id)
+        member_verifier.next_sign_count = 1
+        response_ready = await member_session.action(
+            "verify",
+            member_request.session_id,
+            response=b"member-signed-assertion",
+        )
+        assert response_ready["state"] == "awaiting-merge"
+    finally:
+        member_session.close()
+        member_service.close()
+        member_runtime.close()
+    response = read_response(response_path)
+    assert response.invite_id == invite.invite_id
+    assert member_stores
+    assert member_backend is not sponsor_backend
+    assert set(member_backend.values.values()).isdisjoint(sponsor_backend.values.values())
+
+    approval_request = journey.save_enrollment_request(
+        harness.runtime,
+        action="approve-join",
+        project_id=harness.runtime.config.project_id,
+        repository_id="github.com/acme/project",
+        response=response,
+    )
+    transport.account_id = 123
+    transport.login = "alice"
+    transport.branch = migration_commit
+    transport.merged_commit = migration_commit
+    transport.merged_parent = (
+        git(harness.project, "rev-parse", migration_commit + "^").decode().strip()
+    )
+    transport.blobs = []
+    transport.tree = []
+    transport.commit = None
+    transport.publication_ref = None
+    transport.pr = None
+    transport.after_publication_tree = None
+    approval_session = journey.MembershipSession(service)
+    try:
+        approval_preview = await approval_session.action("preview", approval_request.session_id)
+        assert approval_preview["state"] == "preview_ready"
+        await approval_session.action("options", approval_request.session_id)
+        verifier.next_sign_count = 2
+        pending = await approval_session.action(
+            "verify",
+            approval_request.session_id,
+            response=b"sponsor-signed-assertion",
+        )
+        assert pending["state"] == "pr-pending"
+    finally:
+        approval_session.close()
+
+    enrollment_draft = _draft(harness.runtime)
+    assert enrollment_draft is not None
+    enrollment_publication = enrollment_draft.publication()
+    assert type(enrollment_publication) is PreparedEnrollmentPublicationV2
+    enrollment_artifacts = SharedStateArtifacts(
+        manifest=enrollment_publication.manifest_bytes,
+        bundle=enrollment_publication.bundle,
+        signatures=enrollment_publication.signatures,
+        bundle_path=enrollment_publication.bundle_path,
+        signature_path=enrollment_publication.signature_path,
+    )
+    enrollment_commit = install_state_ref(
+        harness.project, enrollment_artifacts, parent=migration_commit
+    )
+    git(
+        harness.project,
+        "update-ref",
+        "refs/remotes/origin/intent-state",
+        migration_commit,
+    )
+    validate_candidate(
+        harness.project,
+        StaticTrustProvider(ci_trust),
+        base=migration_commit,
+        head=enrollment_commit,
+        at=NOW,
+    )
+    transport.merged_parent = migration_commit
+    transport.merged_commit = enrollment_commit
+    transport.branch = enrollment_commit
+    approval_session = journey.MembershipSession(service)
+    try:
+        merged = await approval_session.action("reconcile", approval_request.session_id)
+        assert merged["state"] == "merged"
+    finally:
+        approval_session.close()
+
+    git(
+        member_project,
+        "fetch",
+        "--quiet",
+        str(harness.project),
+        enrollment_commit,
+    )
+    git(
+        member_project,
+        "update-ref",
+        "refs/remotes/origin/intent-state",
+        enrollment_commit,
+    )
+    member_governance = GovernanceRegistry(tmp_path / "member-governance")
+    member_trust_provider = LocalTrustProvider(member_project)
+    member_restorer = GitSharedStateRestorer(
+        member_trust_provider,
+        clock=lambda: NOW,
+        device_key_store=member_stores[-1],
+        governance_registry=member_governance,
+    )
+    member_restore = member_restorer.verify_and_restore_approved_baseline(member_project)
+    assert member_restore.status is SharedStateRestoreStatus.VERIFIED
+    assert LocalTrustProvider(member_project).load_pending_join() is None
+
+    service.close()
+    harness.runtime.close()
+    sponsor_project = tmp_path / "developer-a-fresh"
+    sponsor_project.mkdir()
+    ready_project(sponsor_project)
+    (sponsor_project / ".intent").chmod(0o700)
+    for path, content in sponsor_baseline_files.items():
+        target = sponsor_project / ".intent" / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(content)
+    sponsor_trust_path = sponsor_project / ".intent/team-trust.json"
+    sponsor_trust_path.write_bytes(sponsor_trust_bytes)
+    sponsor_trust_path.chmod(0o600)
+    sponsor_marker_path = sponsor_project / ".intent/cache/shared-state.json"
+    sponsor_marker_path.parent.mkdir(parents=True, exist_ok=True)
+    sponsor_marker_path.write_bytes(sponsor_marker_bytes)
+    sponsor_marker_path.chmod(0o600)
+    git(sponsor_project, "init", "--initial-branch=main")
+    git(sponsor_project, "remote", "add", "origin", "https://github.com/acme/project.git")
+    git(sponsor_project, "add", ".intent")
+    git(sponsor_project, "commit", "-m", "Developer A fresh checkout")
+    git(sponsor_project, "fetch", "--quiet", str(harness.project), enrollment_commit)
+    git(
+        sponsor_project,
+        "update-ref",
+        "refs/remotes/origin/intent-state",
+        enrollment_commit,
+    )
+    sponsor_governance = GovernanceRegistry(tmp_path / "sponsor-governance")
+    sponsor_restore = GitSharedStateRestorer(
+        LocalTrustProvider(sponsor_project),
+        clock=lambda: NOW,
+        governance_registry=sponsor_governance,
+    ).verify_and_restore_approved_baseline(sponsor_project)
+    assert sponsor_restore.status is SharedStateRestoreStatus.VERIFIED
+    assert canonical_files(sponsor_project) == canonical_files(member_project)
+
+    graph_path = member_project / ".intent/graph.yaml"
+    graph_path.write_bytes(graph_path.read_bytes() + b"\n# bob ordinary publication\n")
+    expected_member_files = canonical_files(member_project)
+    member_runtime = load_runtime(member_project)
+    member_service = ControlPlaneService(
+        member_runtime,
+        origin=ORIGIN,
+        clock=lambda: NOW,
+        webauthn_verifier=member_verifier,
+    )
+    transport.account_id = 200
+    transport.login = "bob"
+    transport.branch = enrollment_commit
+    transport.merged_commit = enrollment_commit
+    transport.merged_parent = migration_commit
+    transport.blobs = []
+    transport.tree = []
+    transport.commit = None
+    transport.publication_ref = None
+    transport.pr = None
+    transport.after_publication_tree = None
+    publication_session = journey.MembershipSession(member_service)
+    try:
+        publication_preview = await publication_session.action(
+            "publish-preview", member_request.session_id
+        )
+        assert publication_preview["state"] == "publication_preview"
+        assert publication_preview["preview"]["parent_bundle_digest"] == (
+            enrollment_publication.manifest.bundle_digest
+        )
+        await publication_session.action("publish-options", member_request.session_id)
+        member_verifier.next_sign_count = 2
+        publication_pending = await publication_session.action(
+            "publish-verify",
+            member_request.session_id,
+            response=b"signed-assertion",
+        )
+        assert publication_pending["state"] == "publication_pending"
+    finally:
+        publication_session.close()
+
+    ordinary_draft = _draft(member_runtime)
+    assert ordinary_draft is not None
+    ordinary_publication = ordinary_draft.publication()
+    assert type(ordinary_publication) is PreparedPublicationV2
+    ordinary_artifacts = SharedStateArtifacts(
+        manifest=ordinary_publication.manifest_bytes,
+        bundle=ordinary_publication.bundle,
+        signatures=ordinary_publication.signatures,
+        bundle_path=ordinary_publication.bundle_path,
+        signature_path=ordinary_publication.signature_path,
+    )
+    ordinary_commit = install_state_ref(
+        harness.project, ordinary_artifacts, parent=enrollment_commit
+    )
+    git(
+        harness.project,
+        "update-ref",
+        "refs/remotes/origin/intent-state",
+        enrollment_commit,
+    )
+    validate_candidate(
+        harness.project,
+        StaticTrustProvider(ci_trust),
+        base=enrollment_commit,
+        head=ordinary_commit,
+        at=NOW,
+    )
+    transport.merged_parent = enrollment_commit
+    transport.merged_commit = ordinary_commit
+    transport.branch = ordinary_commit
+    publication_session = journey.MembershipSession(member_service)
+    try:
+        reconciled = await publication_session.action(
+            "publish-reconcile", member_request.session_id
+        )
+        assert reconciled["state"] == "published"
+    finally:
+        publication_session.close()
+
+    git(
+        member_project,
+        "fetch",
+        "--quiet",
+        str(harness.project),
+        ordinary_commit,
+    )
+    git(
+        member_project,
+        "update-ref",
+        "refs/remotes/origin/intent-state",
+        ordinary_commit,
+    )
+    member_advance = GitSharedStateRestorer(
+        LocalTrustProvider(member_project),
+        clock=lambda: NOW,
+        device_key_store=member_stores[-1],
+        governance_registry=member_governance,
+    ).verify_and_restore_approved_baseline(member_project)
+    assert member_advance.status is SharedStateRestoreStatus.VERIFIED
+
+    git(sponsor_project, "fetch", "--quiet", str(harness.project), ordinary_commit)
+    git(
+        sponsor_project,
+        "update-ref",
+        "refs/remotes/origin/intent-state",
+        ordinary_commit,
+    )
+    sponsor_advance = GitSharedStateRestorer(
+        LocalTrustProvider(sponsor_project),
+        clock=lambda: NOW,
+        governance_registry=sponsor_governance,
+    ).verify_and_restore_approved_baseline(sponsor_project)
+    assert sponsor_advance.status is SharedStateRestoreStatus.VERIFIED
+    assert canonical_files(sponsor_project) == expected_member_files
+    assert canonical_files(member_project) == expected_member_files
+    public_exchange = invite_path.read_bytes() + response_path.read_bytes()
+    for private_value in member_backend.values.values():
+        assert private_value.encode() not in public_exchange
+
+    member_service.close()
+    member_runtime.close()
 
 
 @pytest.mark.anyio
@@ -1347,6 +1812,7 @@ async def test_production_ui_requires_exact_enrolled_protection_decision(
                 head=migration_commit,
                 at=NOW,
             )
+            transport.merged_commit = migration_commit
             translated_commits[transport.merged_commit] = migration_commit
             transport.merged_parent = v1_commit
             transport.branch = transport.merged_commit
@@ -1376,6 +1842,18 @@ async def test_production_ui_requires_exact_enrolled_protection_decision(
             finally:
                 membership.close()
             assert invite_path.is_file()
+            await _complete_production_two_developer_journey(
+                tmp_path=tmp_path,
+                monkeypatch=monkeypatch,
+                harness=harness,
+                service=service,
+                verifier=verifier,
+                transport=transport,
+                sponsor_backend=backend,
+                ci_trust=ci_trust,
+                migration_commit=migration_commit,
+                invite_path=invite_path,
+            )
     finally:
         service.close()
         harness.service.close()

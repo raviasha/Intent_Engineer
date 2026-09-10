@@ -988,12 +988,10 @@ class LocalTrustProvider:
                         if old is not None and old != receipt:
                             raise ValueError("pending join trust changed")
                         if old is None:
-                            target.atomic_write(content, reject_target_races=True)
-                            os.chmod(
-                                target.name,
-                                0o600,
-                                dir_fd=workspace.descriptor,
-                                follow_symlinks=False,
+                            target.atomic_write(
+                                content,
+                                reject_target_races=True,
+                                mode=0o600,
                             )
                             _require_owner_file(workspace, target.name)
                 finally:
@@ -1003,6 +1001,40 @@ class LocalTrustProvider:
                 project.close()
             return
         except BaseException as error:  # noqa: BLE001
+            caught = error
+        _failure(caught)
+
+    def acknowledge_join_response(self, preimage: PendingJoinTrustV2) -> PendingJoinTrustV2:
+        """CAS an exact successfully exported response into its merge-wait state."""
+        caught: BaseException
+        try:
+            preimage = PendingJoinTrustV2.model_validate_json(preimage.canonical_bytes())
+            if preimage.phase != "response-ready" or preimage.external_write_attempted:
+                raise ValueError("pending join response changed")
+            acknowledged = preimage.model_copy(
+                update={"phase": "awaiting-merge", "external_write_attempted": True}
+            )
+            project, workspace = _open_workspace(self._root, harden=True)
+            try:
+                _check_project(workspace, preimage.invite.project_id)
+                target = workspace.file(_PENDING_FILENAME)
+                try:
+                    with same_path_lock(target):
+                        if _read_pending(workspace, target) != preimage:
+                            raise ValueError("pending join response changed")
+                        target.atomic_write(
+                            acknowledged.canonical_bytes(),
+                            reject_target_races=True,
+                            mode=0o600,
+                        )
+                        _require_owner_file(workspace, target.name)
+                finally:
+                    target.close()
+            finally:
+                workspace.close()
+                project.close()
+            return acknowledged
+        except BaseException as error:  # noqa: BLE001 - fixed public trust boundary
             caught = error
         _failure(caught)
 

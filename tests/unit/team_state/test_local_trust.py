@@ -504,6 +504,86 @@ def test_versioned_reads_validate_bytes_and_metadata_on_one_locked_descriptor(
     assert opens == 1
 
 
+def test_exported_join_response_advances_only_the_exact_pending_receipt(tmp_path) -> None:
+    from intent_engineering.team_state.local_trust import (
+        LocalTrustError,
+        LocalTrustProvider,
+        PendingJoinTrustV2,
+    )
+
+    state, invite, response, before = _v2_receipts(tmp_path)
+    del state
+    root = tmp_path / "joiner"
+    (root / ".intent").mkdir(parents=True, mode=0o700)
+    provider = LocalTrustProvider(root)
+    pending = PendingJoinTrustV2(
+        phase="response-ready",
+        invite=invite,
+        response=response,
+        local_recipient_key_id=response.recipient_key_id,
+        local_signature_id=response.signature_id,
+        expected_root_key_id=invite.root.root_key_id,
+        expected_authority_before_digest=before,
+        external_write_attempted=False,
+    )
+    provider.save_pending_join(pending)
+
+    acknowledged = provider.acknowledge_join_response(pending)
+
+    assert acknowledged.phase == "awaiting-merge"
+    assert acknowledged.external_write_attempted is True
+    assert provider.load_pending_join() == acknowledged
+    assert stat.S_IMODE((root / ".intent/team-join-pending.json").stat().st_mode) == 0o600
+    with pytest.raises(LocalTrustError, match="local team trust unavailable"):
+        provider.acknowledge_join_response(pending)
+
+
+def test_export_acknowledgement_is_reloadable_after_post_replace_interruption(
+    tmp_path, monkeypatch
+) -> None:
+    from intent_engineering.storage.secure import SecureFile
+    from intent_engineering.team_state.local_trust import (
+        LocalTrustProvider,
+        PendingJoinTrustV2,
+    )
+
+    _state, invite, response, before = _v2_receipts(tmp_path)
+    root = tmp_path / "joiner"
+    (root / ".intent").mkdir(parents=True, mode=0o700)
+    provider = LocalTrustProvider(root)
+    pending = PendingJoinTrustV2(
+        phase="response-ready",
+        invite=invite,
+        response=response,
+        local_recipient_key_id=response.recipient_key_id,
+        local_signature_id=response.signature_id,
+        expected_root_key_id=invite.root.root_key_id,
+        expected_authority_before_digest=before,
+        external_write_attempted=False,
+    )
+    provider.save_pending_join(pending)
+    real_strict_fault = SecureFile._strict_fault
+    interruption = BaseException("post-replace interruption")
+
+    def interrupt_after_replace(_target, stage):
+        if stage == "existing-durable":
+            raise interruption
+
+    monkeypatch.setattr(SecureFile, "_strict_fault", interrupt_after_replace)
+    with pytest.raises(BaseException) as caught:
+        provider.acknowledge_join_response(pending)
+    assert caught.value is interruption
+    monkeypatch.setattr(SecureFile, "_strict_fault", real_strict_fault)
+
+    recovered = provider.load_pending_join()
+    assert recovered is not None
+    assert recovered == pending
+
+    acknowledged = provider.acknowledge_join_response(pending)
+    assert provider.load_pending_join() == acknowledged
+    assert stat.S_IMODE((root / ".intent/team-join-pending.json").stat().st_mode) == 0o600
+
+
 @pytest.mark.parametrize("kind", ["pending", "versioned"])
 def test_versioned_reads_reject_same_length_in_place_rewrite_with_restored_mtime(
     tmp_path: object,

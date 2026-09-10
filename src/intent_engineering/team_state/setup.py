@@ -211,31 +211,22 @@ def _require_current_enrollment_decision(
     receipt: EnrollmentReceiptV2,
     request: EnrollmentApprovalRequest,
     now: datetime,
+    *,
+    decision_repository_id: str,
+    decision_actor: str,
 ) -> None:
     payload = receipt.sponsor_decision
-    sponsor = next(
-        member
-        for member in request.preview.authority_after.members
-        if member.member_id == request.preview.invite.sponsor_member_id
-    )
     expected_subject_digest = _digest(
         {
             "approval_request_digest": request.digest(),
             "preview": request.preview.model_dump(mode="json"),
         }
     )
-    expected_repository_id = (
-        "repo:sha256:"
-        + hashlib.sha256(
-            b"intent.team-enrollment.local-repository.v2\0"
-            + request.preview.invite.repository_id.encode()
-        ).hexdigest()
-    )
     if (
         receipt.approval_request_digest != request.digest()
         or payload.project_id != request.preview.invite.project_id
-        or payload.repository_id != expected_repository_id
-        or payload.actor != sponsor.actor
+        or payload.repository_id != decision_repository_id
+        or payload.actor != decision_actor
         or payload.action is not DecisionAction.APPROVE_EXTERNAL_WRITE
         or payload.graph_version != request.preview.authority_after.sequence
         or payload.parent_bundle_digest != request.preview.base_bundle_digest
@@ -1840,7 +1831,13 @@ class GitHubSetupBridge:
                     raise ValueError("team enrollment changed")
                 await self._require_join_identity(api, request)
                 live_now = self.service._now()
-                _require_current_enrollment_decision(live_receipt, request, live_now)
+                _require_current_enrollment_decision(
+                    live_receipt,
+                    request,
+                    live_now,
+                    decision_repository_id=sponsor_decision.credential.repository_id,
+                    decision_actor=sponsor_decision.credential.actor,
+                )
                 if type(sponsor_decision) is VerifiedHumanDecision:
                     expected_decision = build_sponsor_decision_payload(
                         preview=request.preview,
@@ -1849,18 +1846,11 @@ class GitHubSetupBridge:
                         now=sponsor_decision.payload.issued_at,
                         approval_request_digest=request.digest(),
                     ).model_copy(update={"challenge": sponsor_decision.payload.challenge})
-                    live_preview = enrollment.preview_approval(
-                        invite=request.preview.invite,
-                        response=request.preview.response,
-                        current=current,
-                        now=live_now,
-                    )
                     if (
                         sponsor_decision.payload != expected_decision
                         or not sponsor_decision.payload.issued_at
                         <= live_now
                         < sponsor_decision.payload.expires_at
-                        or live_preview != request.preview
                     ):
                         raise ValueError("team enrollment changed")
                 _, _, live_protection = await self._member_preflight(
@@ -1948,12 +1938,16 @@ class GitHubSetupBridge:
         *,
         request: EnrollmentApprovalRequest,
         current: VerifiedRemoteStateV2,
+        decision_repository_id: str,
+        decision_actor: str,
         restart_closed: bool = False,
     ) -> GitHubEnableResult:
         try:
             return await self._reconcile_member_approval_unsafe(
                 request=request,
                 current=current,
+                decision_repository_id=decision_repository_id,
+                decision_actor=decision_actor,
                 restart_closed=restart_closed,
             )
         except BaseException as error:  # noqa: BLE001 - preserve cancellation identity
@@ -1963,7 +1957,8 @@ class GitHubSetupBridge:
                 else "team enrollment unavailable"
             )
             failure = _setup_failure(error, message)
-            del self, request, current, restart_closed, error, message
+            del self, request, current, decision_repository_id, decision_actor
+            del restart_closed, error, message
             raise failure.with_traceback(None) from None
 
     async def _reconcile_member_approval_unsafe(
@@ -1971,6 +1966,8 @@ class GitHubSetupBridge:
         *,
         request: EnrollmentApprovalRequest,
         current: VerifiedRemoteStateV2,
+        decision_repository_id: str,
+        decision_actor: str,
         restart_closed: bool,
     ) -> GitHubEnableResult:
         """Resume only the exact receipted enrollment publication or attest its merge."""
@@ -2105,6 +2102,8 @@ class GitHubSetupBridge:
                     live_receipt,
                     request,
                     self.service._now(),
+                    decision_repository_id=decision_repository_id,
+                    decision_actor=decision_actor,
                 )
                 _, _, protection = await self._member_preflight(
                     api,

@@ -200,7 +200,7 @@ def test_b_local_browser_ceremony_writes_only_public_response_and_restart_receip
                 result = await session.action("reconcile", request.session_id)
             else:
                 result = await session.action("verify", request.session_id, response=assertion)
-            assert result["state"] == "response-ready"
+            assert result["state"] == "awaiting-merge"
             assert IDENTITY_PROOF.decode() not in json.dumps(result)
         finally:
             session.close()
@@ -220,7 +220,7 @@ def test_b_local_browser_ceremony_writes_only_public_response_and_restart_receip
         )
         restarted = journey.MembershipSession(service)
         try:
-            assert journey.enrollment_status(runtime)["state"] == "response-ready"
+            assert journey.enrollment_status(runtime)["state"] == "awaiting-merge"
         finally:
             restarted.close()
         all_public = output.read_bytes() + b"".join(
@@ -317,10 +317,11 @@ def test_closed_enrollment_restart_retires_all_local_metadata_atomically(tmp_pat
         response=preview.response,
     )
     journey.save_approval_request(runtime, request, approval)
+    sponsor_decision = _sponsor_decision(preview, approval)
     receipt = GitHubSetupBridge._enrollment_receipt_for(
         approval,
         publication,
-        sponsor_decision=_sponsor_decision(preview, approval),
+        sponsor_decision=sponsor_decision,
         transition_proof=proof,
         phase="approved",
     )
@@ -362,7 +363,12 @@ def test_closed_enrollment_restart_retires_all_local_metadata_atomically(tmp_pat
             return SimpleNamespace(state="bootstrap_required")
 
     async def context(self, **_kwargs):
-        return SimpleNamespace(enrollment=object(), current=state, bridge=Bridge())
+        return SimpleNamespace(
+            enrollment=object(),
+            current=state,
+            bridge=Bridge(),
+            credential=sponsor_decision.credential,
+        )
 
     monkeypatch.setattr(journey.MembershipSession, "_sponsor", context)
 
