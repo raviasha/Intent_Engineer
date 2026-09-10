@@ -23,6 +23,7 @@ from intent_engineering.control_plane.models import CredentialRecord, HumanDecis
 from intent_engineering.core.models._base import StrictModel
 from intent_engineering.storage._atomic import same_path_lock
 from intent_engineering.storage.jsonl.strict import loads_strict_object
+from intent_engineering.storage.secure import SecureFile
 from intent_engineering.team_state.enrollment import (
     JoinResponseV2,
     TeamEnrollmentService,
@@ -95,6 +96,14 @@ class EnrollmentRequest(StrictModel):
         return self
 
 
+def _write_owner_session(target: SecureFile, content: bytes) -> None:
+    if len(content) > _MAX_SESSION_BYTES:
+        raise ValueError("team enrollment unavailable")
+    target.atomic_write(content, reject_target_races=True)
+    os.chmod(target.name, 0o600, dir_fd=target.parent_fd, follow_symlinks=False)
+    os.fsync(target.parent_fd)
+
+
 def _recover_enrollment_session_state(runtime: Runtime) -> None:
     from intent_engineering.storage.transaction import LocalTransactionCoordinator
 
@@ -114,6 +123,7 @@ def _recover_enrollment_session_state(runtime: Runtime) -> None:
                 "receipt": receipt,
             },
             legacy_target_sets=(frozenset({"session", "approval"}),),
+            target_writers={"session": _write_owner_session},
         )
         coordinator.recover()
     finally:
@@ -126,12 +136,9 @@ def _recover_enrollment_session_state(runtime: Runtime) -> None:
         session.close()
 
 
-def _read_enrollment_request(runtime: Runtime, target: object) -> EnrollmentRequest | None:
+def _read_enrollment_request(runtime: Runtime, target: SecureFile) -> EnrollmentRequest | None:
     from intent_engineering.cli.team import discover_github_repository
-    from intent_engineering.storage.secure import SecureFile
 
-    if type(target) is not SecureFile:
-        raise ValueError("team enrollment unavailable")
     content = target.read_optional_nonblocking(max_bytes=_MAX_SESSION_BYTES)
     if content is None:
         return None
@@ -183,6 +190,7 @@ def save_enrollment_request(runtime: Runtime, **fields: object) -> EnrollmentReq
                 "receipt": receipt,
             },
             legacy_target_sets=(frozenset({"session", "approval"}),),
+            target_writers={"session": _write_owner_session},
         )
         with coordinator.transaction(rollback_base_exceptions=True) as transaction:
             previous_content = transaction.read_optional_bounded(
@@ -213,8 +221,6 @@ def save_enrollment_request(runtime: Runtime, **fields: object) -> EnrollmentReq
                 raise ValueError("team enrollment unavailable")
             else:
                 transaction.write("session", content)
-        os.chmod(session.name, 0o600, dir_fd=session.parent_fd, follow_symlinks=False)
-        os.fsync(session.parent_fd)
         return request
     finally:
         if coordinator is not None:
@@ -358,6 +364,7 @@ def _retire_enrollment_request(runtime: Runtime, request: EnrollmentRequest) -> 
                 "receipt": receipt,
             },
             legacy_target_sets=(frozenset({"session", "approval"}),),
+            target_writers={"session": _write_owner_session},
         )
         with coordinator.transaction(rollback_base_exceptions=True) as transaction:
             session_content = transaction.read_optional_bounded(
@@ -423,6 +430,7 @@ def _retire_closed_enrollment_request(
                 "receipt": receipt,
             },
             legacy_target_sets=(frozenset({"session", "approval"}),),
+            target_writers={"session": _write_owner_session},
         )
         with coordinator.transaction(rollback_base_exceptions=True) as transaction:
             if (

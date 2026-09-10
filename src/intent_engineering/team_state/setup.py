@@ -27,6 +27,7 @@ from intent_engineering.control_plane.models import (
 from intent_engineering.control_plane.webauthn_service import VerifiedHumanDecision
 from intent_engineering.core.models._base import StrictModel
 from intent_engineering.storage._atomic import same_path_lock
+from intent_engineering.storage.secure import SecureFile
 from intent_engineering.storage.transaction import LocalTransactionCoordinator
 from intent_engineering.team_state.ci import CiTrustConfig
 from intent_engineering.team_state.enrollment import (
@@ -82,6 +83,14 @@ PreparedStatePublication = (
     PreparedPublication | PreparedPublicationV2 | PreparedEnrollmentPublicationV2
 )
 _DISCARDED_ENROLLMENT_STATE = b'{"discarded":true}'
+
+
+def _write_owner_session_file(target: SecureFile, content: bytes) -> None:
+    if len(content) > 128 * 1024:
+        raise ValueError("team enrollment unavailable")
+    target.atomic_write(content, reject_target_races=True)
+    os.chmod(target.name, 0o600, dir_fd=target.parent_fd, follow_symlinks=False)
+    os.fsync(target.parent_fd)
 
 
 class GitHubSetupRequest(StrictModel):
@@ -665,6 +674,7 @@ def _recover_enrollment_publication_state(runtime: Runtime) -> None:
                 "receipt": receipt_target,
             },
             legacy_target_sets=(frozenset({"session", "approval"}),),
+            target_writers={"session": _write_owner_session_file},
         )
         session_coordinator.recover()
         coordinator = LocalTransactionCoordinator(

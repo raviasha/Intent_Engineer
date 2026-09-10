@@ -246,3 +246,33 @@ def test_cancel_retires_exact_approval_before_a_fresh_invitation(tmp_path):
     finally:
         harness.service.close()
         harness.runtime.close()
+
+
+def test_rejected_request_preserves_owner_only_readable_session(tmp_path):
+    """Transaction rollback must not relax the mode of an existing opaque session."""
+    import stat
+
+    import pytest
+
+    from intent_engineering.control_plane import team_enrollment as journey
+    from intent_engineering.team_state.keys import GitHubIdentity
+
+    harness, request = _session(tmp_path)
+    target = harness.project / ".intent" / "team-enrollment-session.json"
+    before = target.read_bytes()
+    try:
+        with pytest.raises(ValueError, match="team enrollment unavailable"):
+            journey.save_enrollment_request(
+                harness.runtime,
+                action="invite",
+                project_id=harness.runtime.config.project_id,
+                repository_id="github.com/acme/project",
+                identity=GitHubIdentity(account_id="201", login="carol"),
+                output=str(tmp_path / "other-invite.json"),
+            )
+        assert target.read_bytes() == before
+        assert stat.S_IMODE(target.stat().st_mode) == 0o600
+        assert journey.load_enrollment_request(harness.runtime) == request
+    finally:
+        harness.service.close()
+        harness.runtime.close()
