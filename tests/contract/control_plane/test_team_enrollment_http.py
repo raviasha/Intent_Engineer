@@ -77,6 +77,8 @@ def test_enrollment_posts_reject_foreign_origin_and_missing_csrf_without_mutatio
             "verify",
             "cancel",
             "create-invite",
+            "migration-preview",
+            "migration-restart",
             "reconcile",
             "restart",
             "publish-preview",

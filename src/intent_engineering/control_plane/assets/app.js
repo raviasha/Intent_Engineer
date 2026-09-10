@@ -1448,7 +1448,7 @@
       options = requestOptions(await membershipAction("options"));
       credential = await navigator.credentials.get(options);
       response = serializeCredential(credential);
-      state.membership = await membershipAction("verify", response);
+      state.membership = { ...state.membership, ...(await membershipAction("verify", response)) };
       render();
       announce("Enrollment progress updated.");
     } catch (_error) {
@@ -1518,7 +1518,10 @@
       section.append(actionButton("Refresh enrollment progress", () => reviewMembership("reconcile")));
     }
     if (membership.state === "publication_pending") {
-      section.append(actionButton("Refresh publication progress", () => reviewMembership("publish-reconcile")));
+      section.append(actionButton("Refresh publication progress", () => reviewMembership(membership.action === "invite" ? "reconcile" : "publish-reconcile")));
+    }
+    if (membership.action === "invite" && membership.state === "publication_recovery_required") {
+      section.append(actionButton("Retry exact migration publication", () => reviewMembership("reconcile")));
     }
     if (membership.state === "publication_closed") {
       section.append(actionButton("Discard closed publication and review again", () => reviewMembership(membership.action === "invite" ? "migration-restart" : "publish-restart")));

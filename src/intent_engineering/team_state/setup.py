@@ -263,6 +263,11 @@ class EncryptedPublicationDraft(StrictModel):
     signatures: str = Field(max_length=1024 * 1024)
     anchor: str = Field(pattern=r"^[0-9a-f]{40}$")
     external_write_attempted: bool = False
+    migration_preflight_digest: str | None = Field(
+        default=None,
+        pattern=r"^sha256:[0-9a-f]{64}$",
+        exclude_if=lambda value: value is None,
+    )
     publication_commit: str | None = Field(default=None, pattern=r"^[0-9a-f]{40}$")
     pull_request_number: int | None = Field(default=None, gt=0)
     pull_request_url: str | None = Field(default=None, min_length=1, max_length=2048)
@@ -547,6 +552,7 @@ def _draft(
     pull_request_number: int | None = None,
     pull_request_url: str | None = None,
     external_write_attempted: bool | None = None,
+    migration_preflight_digest: str | None = None,
     restart_closed: bool = False,
     discard: bool = False,
 ) -> EncryptedPublicationDraft | None:
@@ -601,6 +607,11 @@ def _draft(
                         if external_write_attempted is not None
                         else (existing.external_write_attempted if existing is not None else False)
                     ),
+                    migration_preflight_digest=(
+                        migration_preflight_digest
+                        if migration_preflight_digest is not None
+                        else (existing.migration_preflight_digest if existing is not None else None)
+                    ),
                     publication_commit=publication_commit,
                     pull_request_number=pull_request_number,
                     pull_request_url=pull_request_url,
@@ -619,6 +630,7 @@ def _draft(
                     or existing.bundle != draft.bundle
                     or existing.signatures != draft.signatures
                     or existing.anchor != draft.anchor
+                    or existing.migration_preflight_digest != draft.migration_preflight_digest
                 ):
                     raise ValueError("GitHub publication draft changed")
                 if discard:

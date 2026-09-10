@@ -261,10 +261,12 @@ class _GitHubTransport:
         self.publication_ref = None
         self.pr = None
         self.after_tree = None
+        self.after_publication_tree = None
         self.lose_pr_response = False
         self.tooling = None
         self.lose_bootstrap_response = False
         self.default_protected = True
+        self.default_commit = "a" * 40
         self.merged_commit = "8" * 40
         self.merged_parent = "c" * 40
 
@@ -285,7 +287,7 @@ class _GitHubTransport:
                     else ".github/workflows/intent-check.yml",
                     "ref": "refs/heads/main",
                     "repository_id": 77,
-                    "sha": "a" * 40,
+                    "sha": self.default_commit,
                 }
             ],
         }
@@ -318,7 +320,7 @@ class _GitHubTransport:
             data = {
                 "name": "main",
                 "protected": self.default_protected,
-                "commit": {"sha": "a" * 40},
+                "commit": {"sha": self.default_commit},
             }
         elif path.endswith("/branches/main/protection"):
             data = {
@@ -455,6 +457,8 @@ class _GitHubTransport:
                         ],
                     },
                 )
+                if self.after_publication_tree:
+                    self.after_publication_tree()
             else:
                 code, data = 201, {"sha": "b" * 40}
                 if self.after_tree:
@@ -547,10 +551,10 @@ class _GitHubTransport:
             else:
                 code, data = 201, {"sha": "c" * 40, "tree": {"sha": "b" * 40}, "parents": []}
         elif "/git/commits/" in path:
-            if path.endswith("a" * 40):
+            if path.endswith(self.default_commit):
                 return GitHubJsonResponse(
                     200,
-                    {"sha": "a" * 40, "tree": {"sha": "1" * 40}, "parents": []},
+                    {"sha": self.default_commit, "tree": {"sha": "1" * 40}, "parents": []},
                     {"X-OAuth-Scopes": "repo, admin:org"},
                 )
             data = (
@@ -685,11 +689,15 @@ class _Keyring:
 
 
 class _SetupVerifier(_TeamVerifier):
+    next_sign_count = 0
+
     def verify_authentication(self, response, request):
         assert response == b"signed-assertion"
         assert request == self.authentication_requests[-1]
         return VerifiedAuthentication(
-            credential_id=b"team-control-plane-credential", new_sign_count=0, user_verified=True
+            credential_id=b"team-control-plane-credential",
+            new_sign_count=self.next_sign_count,
+            user_verified=True,
         )
 
 
@@ -1273,12 +1281,49 @@ async def test_production_ui_requires_exact_enrolled_protection_decision(
                     typed_manifest.bundle_digest
                 )
                 await membership.action("options", request.session_id)
-                pending = await membership.action(
-                    "verify", request.session_id, response=b"signed-assertion"
+                verifier.next_sign_count = 1
+                original_default_commit = transport.default_commit
+
+                def drift_default_tooling():
+                    transport.after_publication_tree = None
+                    transport.default_commit = "9" * 40
+
+                transport.after_publication_tree = drift_default_tooling
+                with pytest.raises(ValueError):
+                    await membership.action(
+                        "verify", request.session_id, response=b"signed-assertion"
+                    )
+                assert transport.tree
+                assert journey.enrollment_status(harness.runtime)["state"] == (
+                    "publication_recovery_required"
                 )
-                assert pending["state"] == "publication_pending"
             finally:
                 membership.close()
+            membership = journey.MembershipSession(service)
+            try:
+                with pytest.raises(ValueError):
+                    await membership.action("reconcile", request.session_id)
+            finally:
+                membership.close()
+            transport.default_commit = original_default_commit
+            transport.lose_pr_response = True
+            membership = journey.MembershipSession(service)
+            try:
+                with pytest.raises(ValueError):
+                    await membership.action("reconcile", request.session_id)
+            finally:
+                membership.close()
+            assert journey.enrollment_status(harness.runtime)["state"] == (
+                "publication_recovery_required"
+            )
+            membership = journey.MembershipSession(service)
+            try:
+                pending = await membership.action("reconcile", request.session_id)
+            finally:
+                membership.close()
+            assert pending["state"] == "publication_pending"
+            assert pending["action"] == "invite"
+            assert pending["session_id"] == request.session_id
             migration_draft = _draft(harness.runtime)
             assert migration_draft is not None
             prepared_migration = migration_draft.publication()
@@ -1307,11 +1352,23 @@ async def test_production_ui_requires_exact_enrolled_protection_decision(
             transport.branch = transport.merged_commit
             membership = journey.MembershipSession(service)
             try:
-                reconciled = await membership.action("reconcile", request.session_id)
-                assert reconciled["state"] == "review_required"
+                await membership._sponsor()
             finally:
                 membership.close()
             assert LocalTrustProvider(harness.project).load_versioned().schema_version == 2
+            assert _draft(harness.runtime) is not None
+            assert journey.enrollment_status(harness.runtime)["state"] == (
+                "publication_recovery_required"
+            )
+            membership = journey.MembershipSession(service)
+            try:
+                reconciled = await membership.action("reconcile", request.session_id)
+                assert reconciled["state"] == "review_required"
+                assert reconciled["action"] == "invite"
+                assert reconciled["session_id"] == request.session_id
+            finally:
+                membership.close()
+            assert _draft(harness.runtime) is None
             membership = journey.MembershipSession(service)
             try:
                 invitation = await membership.action("create-invite", request.session_id)

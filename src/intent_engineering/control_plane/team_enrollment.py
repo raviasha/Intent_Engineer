@@ -11,7 +11,7 @@ import os
 import secrets
 import stat
 from contextlib import ExitStack
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, cast
 
@@ -1115,6 +1115,15 @@ class MembershipSession:
 
         if type(decision) is not VerifiedHumanDecision:
             raise ValueError("team migration unavailable")
+        from intent_engineering.control_plane.models import credential_identity_digest
+
+        if (
+            credential_identity_digest(decision.credential)
+            != credential_identity_digest(context.credential)
+            or decision.credential.sign_count < context.credential.sign_count
+        ):
+            raise ValueError("team migration changed")
+        context = replace(context, credential=decision.credential)
         if preview.external_preflight_digest != _migration_preflight_digest(context):
             raise ValueError("team migration changed")
         prepared = prepare_v1_migration(
@@ -1133,6 +1142,7 @@ class MembershipSession:
             prepared=prepared,
             anchor=context.commit,
             external_write_attempted=True,
+            migration_preflight_digest=preview.external_preflight_digest,
             publication_commit=None if old is None else old.publication_commit,
             pull_request_number=None if old is None else old.pull_request_number,
             pull_request_url=None if old is None else old.pull_request_url,
@@ -1149,6 +1159,7 @@ class MembershipSession:
                     or fresh.ci_recipient != context.ci_recipient
                     or fresh.status != context.status
                     or fresh.protection != context.protection
+                    or fresh.tooling != context.tooling
                     or fresh.credential != context.credential
                     or load_enrollment_request(self.runtime) != self.request
                     or self.service._clock() > decision.payload.expires_at
@@ -1184,6 +1195,7 @@ class MembershipSession:
                 pull_request_url=pull_request.url,
             )
             return {
+                **enrollment_status(self.runtime),
                 "state": "publication_pending",
                 "repository_id": pull_request.repository_id,
                 "pull_request_url": pull_request.url,
@@ -1199,20 +1211,58 @@ class MembershipSession:
 
     async def _reconcile_migration(self, *, restart_closed: bool) -> dict[str, object]:
         """Recover, finish, or explicitly retire one protected migration publication."""
+        import sys
+
         from intent_engineering.team_state.github import GitHubTeamStateClient
-        from intent_engineering.team_state.local_trust import LocalTrustConfig, LocalTrustProvider
+        from intent_engineering.team_state.github_publication import GitHubApiPublisher
+        from intent_engineering.team_state.local_trust import (
+            LocalTrustConfig,
+            LocalTrustConfigV2,
+            LocalTrustProvider,
+        )
         from intent_engineering.team_state.publication import PreparedV1Migration
-        from intent_engineering.team_state.setup import GitHubSetupBridge, _draft, github_api
+        from intent_engineering.team_state.restore import verify_v1_migration
+        from intent_engineering.team_state.setup import (
+            GitHubSetupBridge,
+            _CloseOnceApi,
+            _draft,
+            _GuardedApi,
+            github_api,
+        )
 
         draft = _draft(self.runtime)
         if draft is None or type(draft.publication()) is not PreparedV1Migration:
             raise ValueError("team migration unavailable")
         publication = cast(PreparedV1Migration, draft.publication())
         trust = LocalTrustProvider(self.runtime.root).load_versioned()
+        if isinstance(trust, LocalTrustConfigV2):
+            if restart_closed:
+                raise ValueError("team migration requires reconciliation")
+            activated = await self._sponsor(preflight=False)
+            if (
+                activated.current.state_commit == draft.anchor
+                or activated.current.bundle_digest != publication.manifest.bundle_digest
+                or activated.current.authority != publication.authority
+            ):
+                raise ValueError("team migration changed")
+            _draft(
+                self.runtime,
+                prepared=publication,
+                anchor=draft.anchor,
+                publication_commit=draft.publication_commit,
+                pull_request_number=draft.pull_request_number,
+                pull_request_url=draft.pull_request_url,
+                discard=True,
+            )
+            return {
+                **enrollment_status(self.runtime),
+                "state": "review_required",
+                "repository_id": activated.current.authority.repository_id,
+            }
         if not isinstance(trust, LocalTrustConfig):
             raise TypeError("team migration changed")
         bridge = GitHubSetupBridge(self.service)
-        api = github_api()
+        api = _CloseOnceApi(github_api())
         try:
             client = GitHubTeamStateClient(
                 api,
@@ -1245,11 +1295,85 @@ class MembershipSession:
                     pull_request_url=draft.pull_request_url,
                     discard=True,
                 )
-                return {"state": "review_required", "repository_id": status.repository_id}
+                return {
+                    **enrollment_status(self.runtime),
+                    "state": "review_required",
+                    "repository_id": status.repository_id,
+                }
             if draft.publication_commit is None or draft.pull_request_number is None:
                 if restart_closed:
                     raise ValueError("team migration requires reconciliation")
-                return {"state": "publication_recovery_required"}
+                context = await self._migration()
+                if (
+                    context.status != status
+                    or context.commit != draft.anchor
+                    or draft.migration_preflight_digest is None
+                    or _migration_preflight_digest(context) != draft.migration_preflight_digest
+                ):
+                    raise ValueError("team migration changed")
+                verify_v1_migration(
+                    current=context.current,
+                    manifest=publication.manifest,
+                    envelope=publication.envelope,
+                    root=publication.authority.root,
+                    authority=publication.authority,
+                    expected_ci_recipient=context.ci_recipient,
+                    now=self.service._clock(),
+                )
+
+                async def require_live() -> None:
+                    fresh = await self._migration()
+                    if (
+                        fresh.current != context.current
+                        or fresh.commit != context.commit
+                        or fresh.trust != context.trust
+                        or fresh.ci_recipient != context.ci_recipient
+                        or fresh.status != context.status
+                        or fresh.protection != context.protection
+                        or fresh.tooling != context.tooling
+                        or fresh.credential != context.credential
+                        or load_enrollment_request(self.runtime) != self.request
+                    ):
+                        raise ValueError("team migration changed")
+
+                guarded = _GuardedApi(api, require_live)
+                guarded_client = GitHubTeamStateClient(
+                    guarded,
+                    expected_account_id=trust.recipient.github_account_id,
+                    expected_login=trust.recipient.github_login,
+                )
+                guarded_status = await guarded_client.inspect(context.bridge.repository)
+                if guarded_status != status:
+                    raise ValueError("team migration changed")
+                commit = draft.publication_commit
+                if commit is None:
+                    publisher = GitHubApiPublisher(guarded, guarded_client, status)
+                    commit = await publisher.publish(publication, base_commit=draft.anchor)
+                    _draft(
+                        self.runtime,
+                        prepared=publication,
+                        anchor=draft.anchor,
+                        external_write_attempted=True,
+                        publication_commit=commit,
+                    )
+                pull_request = await guarded_client.open_publication_pr(
+                    publication, expected_head_commit=commit
+                )
+                _draft(
+                    self.runtime,
+                    prepared=publication,
+                    anchor=draft.anchor,
+                    external_write_attempted=True,
+                    publication_commit=commit,
+                    pull_request_number=pull_request.number,
+                    pull_request_url=pull_request.url,
+                )
+                return {
+                    **enrollment_status(self.runtime),
+                    "state": "publication_pending",
+                    "repository_id": pull_request.repository_id,
+                    "pull_request_url": pull_request.url,
+                }
             context = await self._migration()
             if context.status != status:
                 raise ValueError("team migration changed")
@@ -1262,6 +1386,7 @@ class MembershipSession:
             if state == "closed":
                 if not restart_closed:
                     return {
+                        **enrollment_status(self.runtime),
                         "state": "publication_closed",
                         "repository_id": status.repository_id,
                         "pull_request_url": draft.pull_request_url,
@@ -1275,16 +1400,27 @@ class MembershipSession:
                     pull_request_url=draft.pull_request_url,
                     discard=True,
                 )
-                return {"state": "migration_required", "repository_id": status.repository_id}
+                return {
+                    **enrollment_status(self.runtime),
+                    "state": "migration_required",
+                    "repository_id": status.repository_id,
+                }
             if restart_closed:
                 raise ValueError("team migration requires reconciliation")
             return {
+                **enrollment_status(self.runtime),
                 "state": "publication_pending",
                 "repository_id": status.repository_id,
                 "pull_request_url": draft.pull_request_url,
             }
         finally:
-            await api.aclose()
+            active_error = sys.exc_info()[1]
+            with anyio.CancelScope(shield=True):
+                try:
+                    await api.aclose()
+                except BaseException:
+                    if active_error is None:
+                        raise
 
     async def _action(self, action: str, response: bytes) -> dict[str, object]:
         from intent_engineering.cli.team_enrollment import write_public_file
@@ -1298,6 +1434,19 @@ class MembershipSession:
 
         now = self.service._clock().replace(microsecond=0)
         active_trust = LocalTrustProvider(self.runtime.root).load_versioned()
+        from intent_engineering.team_state.publication import PreparedV1Migration
+        from intent_engineering.team_state.setup import _draft
+
+        durable_migration = _draft(self.runtime)
+        if (
+            self.request.action == "invite"
+            and durable_migration is not None
+            and type(durable_migration.publication()) is PreparedV1Migration
+        ):
+            if action in {"reconcile", "migration-restart"}:
+                return await self._reconcile_migration(restart_closed=action == "migration-restart")
+            if not isinstance(active_trust, LocalTrustConfig):
+                raise ValueError("team migration unavailable")
         if self.request.action == "invite" and isinstance(active_trust, LocalTrustConfig):
             if action in {"reconcile", "migration-restart"}:
                 return await self._reconcile_migration(restart_closed=action == "migration-restart")

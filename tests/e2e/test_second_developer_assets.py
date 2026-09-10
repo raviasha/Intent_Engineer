@@ -99,3 +99,26 @@ process.stdout.write(JSON.stringify({preview:JSON.parse(preview.init.body),optio
     assert result["options"] == {"session_id": "opaque-session"}
     assert result["reconcile"] == {"session_id": "opaque-session"}
     assert result["restart"] == {"session_id": "opaque-session"}
+
+
+def test_legacy_migration_ui_uses_reachable_migration_actions():
+    result = _run(r"""
+respond(take("/api/v1/status"),projection); await settle();
+nav.find((item)=>item.dataset.view==="team_state").click(); await settle();
+respond(take("/api/v1/team/membership"),{state:"migration_required",action:"invite",session_id:"opaque-session",can_cancel:true}); await settle();
+button("Review one-way team migration").click(); await settle();
+const preview=take("/api/v1/team/membership/migration-preview");
+respond(preview,{state:"migration_preview",action:"invite",session_id:"opaque-session",can_cancel:false,payload:{challenge:"challenge:"+"1".repeat(64)}}); await settle();
+button("Approve one-way migration with WebAuthn").click(); await settle();
+respond(take("/api/v1/team/membership/options"),{publicKey:{challenge:"Y2hhbGxlbmdl",allowCredentials:[],userVerification:"preferred"}}); await settle();
+respond(take("/api/v1/team/membership/verify"),{state:"publication_pending",repository_id:"github.com/acme/project",pull_request_url:"https://github.com/acme/project/pull/9"}); await settle();
+button("Refresh publication progress").click(); await settle();
+const reconcile=take("/api/v1/team/membership/reconcile");
+respond(reconcile,{state:"publication_closed",action:"invite",session_id:"opaque-session",can_cancel:false}); await settle();
+button("Discard closed publication and review again").click(); await settle();
+const restart=take("/api/v1/team/membership/migration-restart");
+process.stdout.write(JSON.stringify({preview:JSON.parse(preview.init.body),reconcile:JSON.parse(reconcile.init.body),restart:JSON.parse(restart.init.body)}));
+""")
+    assert result["preview"] == {"session_id": "opaque-session"}
+    assert result["reconcile"] == {"session_id": "opaque-session"}
+    assert result["restart"] == {"session_id": "opaque-session"}
