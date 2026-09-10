@@ -36,9 +36,10 @@ or human approval: the active agent submits a typed `BootstrapSubmission`, and t
 the exact evidence, digest, and selected nodes for explicit activation. Use `--no-open` when needed,
 and check or reuse the repository-bound process with `intent dev --project . --status`.
 
-Milestone 1 is deliberately single-user and local. Team identity enrollment and shared review
-state are Milestone 3 work; the current device credential and process metadata are not shared-team
-identity or synchronization mechanisms.
+Local onboarding starts with one sponsor device. After the protected GitHub team-state setup below
+is complete, that sponsor can enroll additional developers without sharing a private key or asking
+them to check out a second branch. Each developer keeps a separate local device credential and
+keyring; normal prompt-time restore fetches the protected state ref automatically.
 
 Existing automation may still use the granular onboarding diagnostic
 `intent onboard --project . --prd docs/PRD.md --yes`.
@@ -389,6 +390,58 @@ status; local trust is installed only after the merged artifacts and sole review
 parent have been verified. A linear-history merge may rewrite the commit SHA but
 must preserve those exact bytes.
 
+### Enroll a second developer
+
+Complete the organization-owned repository setup first. It requires a GitHub plan that supports
+the protected rules and organization runner group described above, and a short-lived classic setup
+token with `repo + admin:org` scope. The runner name must exactly match the CI descriptor, the group
+must be `intent-state`, and the group may run only the two repository/default-branch workflow paths
+listed above. A personal runner, matching labels alone, or a reusable setup token is not sufficient.
+
+Developer A creates a public invitation for Developer B, B authorizes a device locally and returns
+only the public response, and A reviews the exact authority transition:
+
+```bash
+intent team invite --github-account-id <id> --github-login <login> \
+  --output /safe/exchange/team-invite.json --project .
+intent team join --invite /safe/exchange/team-invite.json \
+  --output /safe/exchange/join-response.json --project .
+intent team approve-join --invite /safe/exchange/team-invite.json \
+  --response /safe/exchange/join-response.json --project .
+```
+
+Each command opens or resumes the repository-bound browser ceremony. Exchange files contain only
+bounded signed public material; delete or archive them according to local policy after completion.
+Never export a developer, CI, or root private key. A does not give B a second branch to manage: B
+uses an ordinary checkout, and the next prompt or restore fetches and verifies `intent-state`.
+Until the enrollment PR merges, B remains pending and cannot publish. After merge—even when a
+linear merge rewrites the commit—B automatically installs only the exact descendant containing B's
+certificate and active member record. B's later publications use the same protected PR/check path
+and unchanged CI recipient.
+
+The version 1 to version 2 migration is permanent. After a valid version 2 descendant is accepted,
+older software may read local code but cannot publish shared version 1 state, and a version 1 ref is
+rejected as rollback. State recovery publishes a new reviewed version 2 descendant; it never
+rewinds or directly updates the protected ref.
+
+Back up the stable root using the operating-system/keyring policy before migration. Ordinary
+publication never loads it. Root loss has no software bypass: existing members can continue
+ordinary work, but membership and authority changes stop until an independently designed recovery
+path exists. Root compromise requires a separately reviewed old-root-authorized rotation and
+revocation. To remove B, a sponsor performs the fresh WebAuthn/root-authorized revocation; future B
+publications are then rejected and B is removed from the active recipient set.
+
+Competing A/B children are never overwritten or auto-merged. The control plane shows a bounded,
+secret-free three-way preview; reviewed reconciliation requires explicit choices, fresh WebAuthn,
+and a new descendant of the current remote release. Authority conflicts always require the separate
+sponsor ceremony.
+
+Lost provider responses keep the exact local write receipts and are reconciled before retry. Cancel
+is unavailable after any possible external write. If the exact publication PR is closed-unmerged,
+refresh its state and use **Discard closed enrollment and start fresh** (or the equivalent local
+restart action) to retire the old draft atomically and create fresh authority. Never infer absence
+from a timeout, reuse the old approval, or update `intent-state` directly.
+
 The required PR jobs do not upload artifacts, raw test logs, or decrypted canonical state,
 use Actions caches, post comments, or write/auto-merge branches. The code check copies only its
 strict canonical result to runner-local `.intent-trusted/.intent-ci/test-results.json` for in-job
@@ -522,10 +575,10 @@ capture requires that provider's configured connection, and no offline flag crea
 
 An enrichment proposal is still only a proposal. Canonical graph changes require the unchanged
 governed review and approval flow. This release includes explainable assessment/visualization,
-resumable enrichment, CLI/browser/read-only-MCP journeys, deterministic validation, and the existing
-guarded enrollment foundation. Automatic second-developer activation/reconciliation beyond guarded
-publication, alternative/simpler-requirement generation, and broader state hardening are deferred
-follow-up work, not shipped features.
+resumable enrichment, CLI/browser/read-only-MCP journeys, deterministic validation, stable-root
+second-developer enrollment, automatic verified member restore, guarded member publication, and
+reviewed divergence reconciliation. Alternative/simpler-requirement generation and broader state
+hardening remain follow-up work.
 
 ## 6. Add compatible sources
 

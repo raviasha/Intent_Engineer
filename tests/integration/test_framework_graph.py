@@ -20,10 +20,15 @@ def test_framework_graph_is_valid_and_provenance_backed() -> None:
 
     assert graph.id == "intent-engineering-framework"
     assert graph.schema_version == "0.1.0"
-    assert graph.version == 0
+    assert graph.version == 1
     assert graph.created_at == date(2026, 8, 25)
     assert graph.source_spec == "INTENT_ENGINEERING.md"
     assert all(node.evidence_refs for node in graph.nodes if node.source_mode is not None)
+    assert {
+        "cap-stable-root-team-enrollment",
+        "cap-automatic-member-restore",
+        "cap-reviewed-team-reconciliation",
+    } <= {node.id for node in graph.nodes}
     graph.assert_invariants()
 
 
@@ -79,7 +84,8 @@ def test_framework_graph_spec_references_import_as_section_backed_versioned_evid
     assert all(record.payload["content"] for record in imported)
     assert all(record.payload["section_hash"] == record.content_hash for record in imported)
     assert all(
-        record.content_hash == f"sha256:{sha256(record.payload['content'].encode('utf-8')).hexdigest()}"
+        record.content_hash
+        == f"sha256:{sha256(record.payload['content'].encode('utf-8')).hexdigest()}"
         for record in imported
     )
     assert resolve_foundational_reference(store, "spec:1").payload["content"].startswith("## 1.")
