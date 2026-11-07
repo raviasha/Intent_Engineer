@@ -69,6 +69,7 @@ _GIT_ENVIRONMENT: Mapping[str, str] = {
     "GIT_OPTIONAL_LOCKS": "0",
 }
 _VETTED_INTERPRETERS = frozenset({"/bin/sh", "/usr/bin/python3"})
+_VETTED_INTERPRETER_DIRECTORIES = frozenset({Path("/bin"), Path("/usr/bin")})
 # The capability probe must launch through exactly the same interpreter wrapper.
 _REVIEWED_ARGV = """\
 synthetic_path = 'intent-reviewed-test:' + expected_digest
@@ -289,6 +290,45 @@ class _GitPin:
     identity: tuple[int, int]
     modified_ns: int
     digest: str
+
+
+def _trusted_interpreter_metadata(
+    *,
+    link: os.stat_result,
+    resolved: Path,
+    parent: os.stat_result,
+    target: os.stat_result,
+) -> bool:
+    link_is_safe = (
+        link.st_uid == 0
+        and (stat.S_ISREG(link.st_mode) or stat.S_ISLNK(link.st_mode))
+        and (stat.S_ISLNK(link.st_mode) or not link.st_mode & 0o022)
+    )
+    return (
+        link_is_safe
+        and resolved.parent in _VETTED_INTERPRETER_DIRECTORIES
+        and stat.S_ISDIR(parent.st_mode)
+        and parent.st_uid == 0
+        and not parent.st_mode & 0o022
+        and stat.S_ISREG(target.st_mode)
+        and target.st_uid == 0
+        and not target.st_mode & 0o022
+    )
+
+
+def _require_trusted_interpreter(interpreter: str) -> None:
+    """Allow fixed system binaries and root-owned links to fixed system binaries."""
+    link = os.lstat(interpreter)
+    resolved = Path(os.path.realpath(interpreter))
+    parent = os.stat(resolved.parent, follow_symlinks=False)
+    target = os.stat(interpreter, follow_symlinks=True)
+    if not _trusted_interpreter_metadata(
+        link=link,
+        resolved=resolved,
+        parent=parent,
+        target=target,
+    ):
+        raise ValueError("test interpreter is unavailable")
 
 
 def _pin_git_executable() -> _GitPin:
@@ -956,13 +996,7 @@ class DevObserver:
                 raise ValueError("test interpreter is unavailable") from error
             if interpreter not in _VETTED_INTERPRETERS:
                 raise ValueError("test interpreter is unavailable")
-            interpreter_metadata = os.stat(interpreter, follow_symlinks=False)
-            if (
-                not stat.S_ISREG(interpreter_metadata.st_mode)
-                or interpreter_metadata.st_uid != 0
-                or interpreter_metadata.st_mode & 0o022
-            ):
-                raise ValueError("test interpreter is unavailable")
+            _require_trusted_interpreter(interpreter)
         return _ExecutablePin(
             relative=relative,
             identities=source.identities,

@@ -5,6 +5,7 @@ import json
 import os
 import shutil
 import signal
+import stat
 import subprocess
 import tempfile
 from datetime import UTC, datetime
@@ -29,6 +30,37 @@ from tests.helpers.shared_state import ready_project
 
 NOW = datetime(2026, 8, 30, 12, 0, tzinfo=UTC)
 REPOSITORY_ID = "demo"
+
+
+def _metadata(mode: int, *, uid: int = 0) -> os.stat_result:
+    return os.stat_result((mode, 0, 0, 0, uid, 0, 0, 0, 0, 0))
+
+
+def test_trusted_interpreter_accepts_root_owned_system_symlink() -> None:
+    assert observer_module._trusted_interpreter_metadata(
+        link=_metadata(stat.S_IFLNK | 0o777),
+        resolved=Path("/usr/bin/python3.12"),
+        parent=_metadata(stat.S_IFDIR | 0o755),
+        target=_metadata(stat.S_IFREG | 0o755),
+    )
+
+
+def test_trusted_interpreter_rejects_symlink_outside_system_directories() -> None:
+    assert not observer_module._trusted_interpreter_metadata(
+        link=_metadata(stat.S_IFLNK | 0o777),
+        resolved=Path("/opt/python/bin/python3"),
+        parent=_metadata(stat.S_IFDIR | 0o755),
+        target=_metadata(stat.S_IFREG | 0o755),
+    )
+
+
+def test_trusted_interpreter_rejects_writable_target() -> None:
+    assert not observer_module._trusted_interpreter_metadata(
+        link=_metadata(stat.S_IFLNK | 0o777),
+        resolved=Path("/usr/bin/python3.12"),
+        parent=_metadata(stat.S_IFDIR | 0o755),
+        target=_metadata(stat.S_IFREG | 0o775),
+    )
 
 
 def _git(repo: Path, *args: str) -> str:
