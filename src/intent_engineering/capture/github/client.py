@@ -569,6 +569,7 @@ class GitHubClient:
         await self._close_response(response)
         del response
         payload = None
+        content = b""
         if malformed or rate_status is None:
             rate_status = None
             repository = ""
