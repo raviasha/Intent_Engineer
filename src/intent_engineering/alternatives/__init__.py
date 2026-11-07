@@ -27,6 +27,11 @@ from intent_engineering.alternatives.overlay import (
     AlternativeProjectionError,
     apply_alternative_overlay,
 )
+from intent_engineering.alternatives.proposals import (
+    AlternativeActor,
+    AlternativeProposalConflictError,
+    AlternativeProposalService,
+)
 from intent_engineering.alternatives.service import (
     AlternativeReasoner,
     RequirementAlternativeService,
@@ -37,10 +42,13 @@ from intent_engineering.alternatives.validation import (
 )
 
 __all__ = [
+    "AlternativeActor",
     "AlternativeComparison",
     "AlternativeEvidenceSummary",
     "AlternativeMode",
     "AlternativeProjectionError",
+    "AlternativeProposalConflictError",
+    "AlternativeProposalService",
     "AlternativeReasoner",
     "AlternativeRequest",
     "AlternativeRequestBuilder",

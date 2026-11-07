@@ -63,6 +63,8 @@ class RequirementAlternativeService:
         self._request_builder = request_builder or AlternativeRequestBuilder()
         self._validator = validator or AlternativeValidator()
         self._contexts: OrderedDict[str, _RequestContext] = OrderedDict()
+        self._comparisons: OrderedDict[str, AlternativeComparison] = OrderedDict()
+        self._comparison_requests: dict[str, str] = {}
         self._last_request_id: str | None = None
         self._lock = RLock()
 
@@ -78,7 +80,24 @@ class RequirementAlternativeService:
             self._contexts.move_to_end(context.request.id)
             self._last_request_id = context.request.id
             while len(self._contexts) > _MAX_CONTEXTS:
-                self._contexts.popitem(last=False)
+                expired_request_id, _expired = self._contexts.popitem(last=False)
+                expired_comparisons = tuple(
+                    comparison_id
+                    for comparison_id, request_id in self._comparison_requests.items()
+                    if request_id == expired_request_id
+                )
+                for comparison_id in expired_comparisons:
+                    self._comparisons.pop(comparison_id, None)
+                    self._comparison_requests.pop(comparison_id, None)
+
+    def _store_comparison(self, comparison: AlternativeComparison, request_id: str) -> None:
+        with self._lock:
+            self._comparisons[comparison.id] = comparison
+            self._comparisons.move_to_end(comparison.id)
+            self._comparison_requests[comparison.id] = request_id
+            while len(self._comparisons) > _MAX_CONTEXTS * 8:
+                expired_id, _expired = self._comparisons.popitem(last=False)
+                self._comparison_requests.pop(expired_id, None)
 
     def request(
         self,
@@ -131,6 +150,7 @@ class RequirementAlternativeService:
             if comparison is None:
                 invalid_output = True
                 continue
+            self._store_comparison(comparison, context.request.id)
             comparisons[comparison.alternative.candidate.digest] = comparison
         if comparisons:
             return AlternativeResult.create(
@@ -185,7 +205,44 @@ class RequirementAlternativeService:
             or current.principal_projection_digest != context.request.principal_projection_digest
         ):
             return None
-        return self._compare(context, candidate)
+        comparison = self._compare(context, candidate)
+        if comparison is not None:
+            self._store_comparison(comparison, context.request.id)
+        return comparison
+
+    def get_comparison(
+        self,
+        alternative_id: str,
+        *,
+        expected_request_digest: str,
+        expected_effect_digest: str,
+    ) -> AlternativeComparison | None:
+        """Revalidate one stored comparison against the exact current safe snapshot."""
+        if any(
+            type(value) is not str or not value
+            for value in (alternative_id, expected_request_digest, expected_effect_digest)
+        ):
+            return None
+        with self._lock:
+            comparison = self._comparisons.get(alternative_id)
+            request_id = self._comparison_requests.get(alternative_id)
+            context = self._contexts.get(request_id) if request_id is not None else None
+        if (
+            comparison is None
+            or context is None
+            or comparison.request_digest != expected_request_digest
+            or comparison.alternative.graph_effect_digest != expected_effect_digest
+        ):
+            return None
+        current = self._snapshot_loader()
+        if (
+            type(current) is not AssessmentSnapshot
+            or current.aggregate_digest != context.request.snapshot_digest
+            or current.principal_projection_digest != context.request.principal_projection_digest
+        ):
+            return None
+        revalidated = self._compare(context, comparison.alternative.candidate)
+        return comparison if revalidated == comparison else None
 
 
 __all__ = ["AlternativeReasoner", "RequirementAlternativeService"]

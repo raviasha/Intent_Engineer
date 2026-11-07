@@ -479,6 +479,9 @@ class AlternativeComparison(_AlternativeModel):
     current_state: Literal["approved"] = "approved"
     projected_state: Literal["projected"] = "projected"
     request_digest: str = Field(pattern=_DIGEST_RE)
+    snapshot_digest: str = Field(pattern=_DIGEST_RE)
+    policy_digest: str = Field(pattern=_DIGEST_RE)
+    principal_projection_digest: str = Field(pattern=_DIGEST_RE)
     alternative: RequirementAlternative
     current_scorecard: NodeScorecard
     projected_scorecard: NodeScorecard
@@ -528,6 +531,9 @@ class AlternativeComparison(_AlternativeModel):
         )
         return cls(
             request_digest=request.digest,
+            snapshot_digest=request.snapshot_digest,
+            policy_digest=request.policy_digest,
+            principal_projection_digest=request.principal_projection_digest,
             alternative=alternative,
             current_scorecard=current_scorecard,
             projected_scorecard=projected_scorecard,
