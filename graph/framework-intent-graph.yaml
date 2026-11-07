@@ -120,6 +120,26 @@ edges:
   relation: MOTIVATES
   status: active
   to: intent-preserve-fidelity
+- created_at: '2026-09-02T00:00:00Z'
+  created_by: approved-assessment-enrichment-design
+  external: false
+  from: intent-preserve-fidelity
+  id: e20
+  last_modified_at: '2026-09-02T00:00:00Z'
+  last_modified_by: approved-assessment-enrichment-design
+  relation: REALIZED_BY
+  status: active
+  to: cap-grounded-requirement-alternatives
+- created_at: '2026-09-02T00:00:00Z'
+  created_by: approved-assessment-enrichment-design
+  external: false
+  from: cap-grounded-requirement-alternatives
+  id: e21
+  last_modified_at: '2026-09-02T00:00:00Z'
+  last_modified_by: approved-assessment-enrichment-design
+  relation: DEPENDS_ON
+  status: active
+  to: cap-reconcile
 - created_at: '2026-08-25T00:00:00'
   created_by: founding-spec
   external: false
@@ -240,6 +260,22 @@ nodes:
   last_modified_by: founding-spec
   last_reassessed_at: null
   source_mode: explicit
+  status: active
+  type: CAPABILITY
+- confidence_basis: Approved grounded-alternatives design and reviewed activation boundary
+  created_at: '2026-09-02T00:00:00Z'
+  created_by: approved-assessment-enrichment-design
+  evidence_refs:
+  - design:2026-09-02-intent-graph-assessment-enrichment
+  id: cap-grounded-requirement-alternatives
+  implementation_status: implemented_baseline
+  intent_fidelity_confidence: 0.99
+  label: Compare grounded simpler or different requirements against the same intent before reviewed
+    activation
+  last_modified_at: '2026-09-02T00:00:00Z'
+  last_modified_by: approved-assessment-enrichment-design
+  last_reassessed_at: null
+  source_mode: derived
   status: active
   type: CAPABILITY
 - confidence_basis: Core capability
@@ -571,4 +607,4 @@ schema_version: 0.1.0
 source_spec: INTENT_ENGINEERING.md
 type_registry:
   extensions: []
-version: 1
+version: 2
