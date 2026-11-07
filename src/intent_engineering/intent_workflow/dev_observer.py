@@ -437,6 +437,10 @@ def _run_git_bytes_bounded(root: Path, args: tuple[str, ...], *, max_bytes: int)
         selector.close()
         if not succeeded and process.poll() is None:
             _terminate_fixed_process(process)
+        if process.stdout is not None:
+            process.stdout.close()
+        if process.stderr is not None:
+            process.stderr.close()
         stdout.clear()
 
 
