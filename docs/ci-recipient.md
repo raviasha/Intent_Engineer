@@ -2,7 +2,8 @@
 
 GitHub setup currently supports an **organization-owned repository** with a separately
 provisioned **self-hosted** runner recipient and an organization runner group restricted
-to the exact two reviewed state-validation and code-check workflows. Personal
+to the exact three reviewed state-validation, code-check, and scheduled-assurance
+workflows. Personal
 repositories and unrestricted/shared runner groups are not supported by this setup path.
 Developer private keys never leave their OS keyring. Runner private keys also stay
 in that runner service account's OS keyring: do not put them in GitHub Secrets,
@@ -25,7 +26,8 @@ Actions variables, Git, `.intent`, artifacts, command arguments, or logs.
    Configure the organization's non-default runner group named `intent-state` with
    selected-repository visibility for this repository and restricted workflow access
    to exactly `acme/project/.github/workflows/intent-state.yml@refs/heads/main` and
-   `acme/project/.github/workflows/intent-check.yml@refs/heads/main`
+   `acme/project/.github/workflows/intent-check.yml@refs/heads/main`, and
+   `acme/project/.github/workflows/intent-sync.yml@refs/heads/main`
    (substitute the real repository and default branch). Register the runner in that
    group with the exact name `release-01` used below and labels `self-hosted` and
    `intent-state`. The descriptor's `--runner` value must match the registered runner

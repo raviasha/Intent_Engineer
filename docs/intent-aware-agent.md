@@ -335,16 +335,17 @@ Configure these prerequisites before expecting the check to pass:
    runner keyring and reviewed public `INTENT_CI_TRUST_PATH` configuration; follow
    [dedicated CI recipient setup](ci-recipient.md). The older environment-JSON
    adapter remains a compatibility/test API, not a supported hosted-key deployment.
-   Both required workflows use that same runner trust lifecycle. The first reviewed
+   The two required workflows and scheduled assurance use that same runner trust lifecycle. The first reviewed
    staging action writes CODEOWNERS plus both canonical workflow files together;
    either workflow's content or preimage changing invalidates the approval. The
    checked-in workflows are tested byte-identical to the packaged setup contracts.
    Production team setup currently requires an organization-owned repository and a
    classic setup token with `repo` and `admin:org`, plus repository admin/read/write
    permission. Its organization runner group `intent-state` must have selected-repository
-   visibility and permit only the exact two
+   visibility and permit only the exact three
    `<owner>/<repository>/.github/workflows/intent-state.yml@refs/heads/<default-branch>`
-   and `<owner>/<repository>/.github/workflows/intent-check.yml@refs/heads/<default-branch>`
+   `<owner>/<repository>/.github/workflows/intent-check.yml@refs/heads/<default-branch>`,
+   and `<owner>/<repository>/.github/workflows/intent-sync.yml@refs/heads/<default-branch>`
    workflows. No other workflow may use the group. The CI descriptor's runner ID must
    match the registered runner name in that group, with labels `self-hosted` and
    `intent-state`; labels alone are not an
@@ -552,6 +553,25 @@ excluded from rollups, unsupported inputs remain `unassessed`, and a critical re
 and project robustness at 49. See [the assessment guide](assessment.md) for deductions, confidence,
 MCP reads, CI defaults, and exit codes.
 
+### Compare alternative requirements explicitly
+
+When the developer explicitly asks for a simpler, manual, narrower, or reuse-based requirement,
+the advisor uses `intent_alternative_context` and validates each host draft with
+`intent_alternative_validate`. It presents only grounded comparisons and labels every score as
+projected, not approved. A configured server reasoner may instead serve `intent_alternatives`.
+Provider unavailability does not affect assessment, visualization, or enrichment.
+
+Grounding includes bounded visible semantic labels and safe evidence summaries, never hidden branch
+content. Local validation requires exact intent preservation, complete desired-outcome accounting,
+and a one-to-one match between declared constraint changes and exact graph effects. The comparison
+shows those effects before a proposal can be created.
+
+MCP cannot submit or approve a selected alternative. For an exact host-generated candidate, select
+the requirement in `intent dev`, choose **Validate host candidate**, paste the candidate JSON, and
+choose **Validate host candidate locally**. After fresh local grounding, **Create review proposal**
+opens the existing Proposal review flow. Independent confirmation is still required before the
+requirement becomes canonical.
+
 ### Improve the graph on your schedule
 
 When there is time for stronger intent capture, start a five-, fifteen-, or thirty-minute session
@@ -579,7 +599,8 @@ An enrichment proposal is still only a proposal. Canonical graph changes require
 governed review and approval flow. This release includes explainable assessment/visualization,
 resumable enrichment, CLI/browser/read-only-MCP journeys, deterministic validation, stable-root
 second-developer enrollment, automatic verified member restore, guarded member publication, and
-reviewed divergence reconciliation. Alternative/simpler-requirement generation and broader state
+reviewed divergence reconciliation, plus explicit grounded requirement alternatives. This increment
+does not establish requirement-to-code or requirement-to-test matching; that work and broader state
 hardening remain follow-up work.
 
 ## 6. Add compatible sources

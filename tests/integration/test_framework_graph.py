@@ -6,6 +6,8 @@ from pathlib import Path
 
 import pytest
 
+from intent_engineering.core.graph import apply_changeset
+from intent_engineering.core.models import ChangeSet
 from intent_engineering.core.policy.dogfood import (
     import_foundational_evidence,
     resolve_foundational_reference,
@@ -20,7 +22,7 @@ def test_framework_graph_is_valid_and_provenance_backed() -> None:
 
     assert graph.id == "intent-engineering-framework"
     assert graph.schema_version == "0.1.0"
-    assert graph.version == 1
+    assert graph.version == 2
     assert graph.created_at == date(2026, 8, 25)
     assert graph.source_spec == "INTENT_ENGINEERING.md"
     assert all(node.evidence_refs for node in graph.nodes if node.source_mode is not None)
@@ -28,6 +30,7 @@ def test_framework_graph_is_valid_and_provenance_backed() -> None:
         "cap-stable-root-team-enrollment",
         "cap-automatic-member-restore",
         "cap-reviewed-team-reconciliation",
+        "cap-grounded-requirement-alternatives",
     } <= {node.id for node in graph.nodes}
     graph.assert_invariants()
 
@@ -55,6 +58,63 @@ def test_framework_graph_dogfoods_intent_aware_agent_workflow_vocabulary() -> No
     } <= edges
 
 
+def test_framework_graph_dogfoods_grounded_requirement_alternative_governance() -> None:
+    """The framework records alternatives as intent-preserving, reviewed proposals."""
+    graph = YamlGraphStore(Path("graph/framework-intent-graph.yaml")).load()
+    node_ids = {node.id for node in graph.nodes}
+    edges = {(edge.from_id, edge.relation.value, edge.to_id) for edge in graph.edges}
+
+    assert "cap-grounded-requirement-alternatives" in node_ids
+    assert {
+        (
+            "intent-preserve-fidelity",
+            "REALIZED_BY",
+            "cap-grounded-requirement-alternatives",
+        ),
+        (
+            "cap-grounded-requirement-alternatives",
+            "DEPENDS_ON",
+            "cap-reconcile",
+        ),
+    } <= edges
+
+
+def test_grounded_alternatives_graph_increment_is_one_public_changeset() -> None:
+    """The shipped dogfood update is exactly reproducible through the graph applier."""
+    graph = YamlGraphStore(Path("graph/framework-intent-graph.yaml")).load()
+    node_id = "cap-grounded-requirement-alternatives"
+    edge_ids = {"e20", "e21"}
+    added_node = next(node for node in graph.nodes if node.id == node_id)
+    added_edges = tuple(edge for edge in graph.edges if edge.id in edge_ids)
+    baseline = graph.model_copy(
+        update={
+            "version": graph.version - 1,
+            "nodes": tuple(node for node in graph.nodes if node.id != node_id),
+            "edges": tuple(edge for edge in graph.edges if edge.id not in edge_ids),
+        }
+    )
+    changeset = ChangeSet(
+        id="changeset:dogfood-grounded-alternatives",
+        actor="approved-assessment-enrichment-design",
+        timestamp=datetime(2026, 9, 2, tzinfo=UTC),
+        baseline_graph_version=baseline.version,
+        evidence_refs=("design:2026-09-02-intent-graph-assessment-enrichment",),
+        nodes_added=(added_node,),
+        nodes_updated=(),
+        nodes_superseded=(),
+        edges_added=added_edges,
+        edges_updated=(),
+        edges_superseded=(),
+        confidence_changes=(),
+        implementation_status_changes=(),
+        reconciliation_cases_created=(),
+        reconciliation_cases_resolved=(),
+        validation_status="validated",
+    )
+
+    assert apply_changeset(baseline, changeset) == graph
+
+
 def test_framework_graph_spec_references_import_as_section_backed_versioned_evidence(
     tmp_path: Path,
 ) -> None:
@@ -64,13 +124,20 @@ def test_framework_graph_spec_references_import_as_section_backed_versioned_evid
     store = JsonlEvidenceStore(tmp_path / "framework-evidence.jsonl")
     design_reference = "design:2026-09-09-second-developer-enrollment"
     design_path = Path("docs/superpowers/specs/2026-09-09-second-developer-enrollment-design.md")
+    alternatives_reference = "design:2026-09-02-intent-graph-assessment-enrichment"
+    alternatives_path = Path(
+        "docs/superpowers/specs/2026-09-02-intent-graph-assessment-enrichment-design.md"
+    )
 
     imported = import_foundational_evidence(
         graph,
         Path("INTENT_ENGINEERING.md"),
         store,
         observed_at=datetime(2026, 8, 25, tzinfo=UTC),
-        referenced_markdown={design_reference: design_path},
+        referenced_markdown={
+            design_reference: design_path,
+            alternatives_reference: alternatives_path,
+        },
     )
 
     references = {reference for node in graph.nodes for reference in node.evidence_refs}
@@ -90,6 +157,10 @@ def test_framework_graph_spec_references_import_as_section_backed_versioned_evid
     assert (
         resolve_foundational_reference(store, design_reference).payload["content"]
         == design_path.read_text()
+    )
+    assert (
+        resolve_foundational_reference(store, alternatives_reference).payload["content"]
+        == alternatives_path.read_text()
     )
 
 

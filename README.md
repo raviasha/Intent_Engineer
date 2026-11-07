@@ -256,15 +256,16 @@ case actions and do not mutate the graph.
 ## Current release boundary
 
 Included now are explainable assessment and visualization, resumable progressive enrichment,
-CLI/browser/read-only-MCP journeys, deterministic validation, and the existing reviewed guarded
+grounded simpler/manual/narrowed/reuse requirement alternatives, CLI/browser/read-only-MCP
+journeys, deterministic validation, and the existing reviewed guarded
 enrollment foundation. The local assessment and enrichment path works offline; configured remote
 evidence sources still require their provider connection. The `intent-advisor` plugin can suggest
 when to inspect or clarify intent, but it cannot provide human approval or bypass repository ACL,
 proposal, reconciliation, or release controls.
 
-Deferred follow-up work is explicitly not shipped or reachable: automatic second-developer
-activation/reconciliation beyond the guarded publication foundation, generation of alternative or
-simpler requirements, and the broader state-hardening backlog.
+Deferred follow-up work is explicitly not shipped or reachable: requirement-to-code/test matching,
+automatic activation beyond the existing reviewed governance boundaries, and the broader
+state-hardening backlog.
 
 ## What classifications mean
 

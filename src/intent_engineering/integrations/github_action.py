@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
@@ -22,6 +23,7 @@ from intent_engineering.intent_workflow.check import (
 from intent_engineering.intent_workflow.dev_observer import DevObserver, TestRunStatus
 from intent_engineering.storage.jsonl.strict import loads_strict_object
 from intent_engineering.storage.secure import SecureDirectory
+from intent_engineering.team_state.ci import CI_TRUST_PATH_ENV, ci_trust_from_environment
 from intent_engineering.team_state.restore import EnvironmentTrustProvider, GitSharedStateRestorer
 
 _STAGED_RESULT = Path(".intent-ci/reviewed-tests.json")
@@ -75,11 +77,14 @@ def _require_snapshot(observer: DevObserver, expected: str) -> None:
         raise ValueError("clean commit snapshot changed")
 
 
-def restore(root: Path) -> None:
+def restore(root: Path, *, require_ci: bool = False) -> None:
     """Verify the fetched protected ref before restoring any approved local baseline."""
-    result = GitSharedStateRestorer(
-        EnvironmentTrustProvider()
-    ).verify_and_restore_approved_baseline(root)
+    trust_provider = (
+        ci_trust_from_environment(root)
+        if require_ci or CI_TRUST_PATH_ENV in os.environ
+        else EnvironmentTrustProvider()
+    )
+    result = GitSharedStateRestorer(trust_provider).verify_and_restore_approved_baseline(root)
     if result.status is not SharedStateRestoreStatus.VERIFIED:
         raise ValueError("shared state unavailable")
 
@@ -191,13 +196,15 @@ def write_results(root: Path, at: datetime, *, assurance_workspace: Path | None 
             _clear_results(root)
 
 
-def main() -> int:
+def main(*, require_ci: bool = False) -> int:
     """Keep all subprocess and trust failures fixed and secret-free on workflow stdout."""
     try:
         root = Path.cwd()
         now = datetime.now(UTC)
         if sys.argv[1:] == ["restore"]:
-            restore(root)
+            restore(root, require_ci=require_ci)
+        elif len(sys.argv) == 4 and sys.argv[1:3] == ["restore", "--project"]:
+            restore(Path(sys.argv[3]), require_ci=require_ci)
         elif sys.argv[1:] == ["test"]:
             anyio.run(run_tests, root, now)
         elif sys.argv[1:] == ["results"]:

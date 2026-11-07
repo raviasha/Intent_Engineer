@@ -220,7 +220,7 @@ class ProposalConfirmationPreview(StrictModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
     schema_version: Literal[1] = 1
-    proposal: ClarificationIntentProposal
+    proposal: IntentProposal
     selected_node_ids: tuple[str, ...]
     activation_changeset: ChangeSet
     high_risk: bool
@@ -1526,7 +1526,7 @@ class ProposalConfirmationService:
     @classmethod
     def _validate_source_roles(
         cls,
-        proposal: ClarificationIntentProposal,
+        proposal: IntentProposal,
         config: ProjectConfig,
         evidence: tuple[EvidenceRecord, ...],
         snapshot: LocalTransactionSnapshot,
@@ -1534,7 +1534,7 @@ class ProposalConfirmationService:
         configured = set(config.source_roles)
         submitted = set(proposal.source_roles)
         if not submitted.issubset(configured):
-            raise ValueError("clarification source role changed")
+            raise ValueError("proposal source role changed")
         _, ingestions, _ = parse_evidence_lines(snapshot.content.get("evidence"))
         connector_ids: dict[str, set[str]] = {}
         for ingestion in ingestions:
@@ -1548,7 +1548,7 @@ class ProposalConfirmationService:
                 if role is not None and role in submitted:
                     used.add(role)
         if used != submitted:
-            raise ValueError("clarification source association changed")
+            raise ValueError("proposal source association changed")
 
     @staticmethod
     def _risk(proposal: IntentProposal, graph: Graph) -> tuple[bool, tuple[str, ...]]:
@@ -1734,6 +1734,23 @@ class ProposalConfirmationService:
                 raise ValueError("confirmation snapshot changed")
             transaction.append("cases", append)
         return candidate
+
+    @staticmethod
+    def _selectable_node_ids(proposal: IntentProposal) -> tuple[str, ...]:
+        changeset = proposal.changeset
+        return tuple(
+            sorted(
+                {
+                    *(node.id for node in changeset.nodes_added),
+                    *(item.node_id for item in changeset.nodes_updated),
+                    *changeset.nodes_superseded,
+                    *(edge.from_id for edge in changeset.edges_added),
+                    *(edge.to_id for edge in changeset.edges_added),
+                    *(item.subject_ref for item in changeset.confidence_changes),
+                    *(item.claim_id for item in changeset.implementation_status_changes),
+                }
+            )
+        )
 
     @staticmethod
     def _activation(
@@ -1923,7 +1940,7 @@ class ProposalConfirmationService:
         self,
         snapshot: LocalTransactionSnapshot,
         *,
-        proposal: ClarificationIntentProposal,
+        proposal: IntentProposal,
         actor: str,
         high_risk: bool,
         reasons: tuple[str, ...],
@@ -1996,7 +2013,7 @@ class ProposalConfirmationService:
     def _authenticate_applied(
         self,
         *,
-        proposal: ClarificationIntentProposal,
+        proposal: IntentProposal,
         decision: ProposalDecisionRecord,
         actor: str,
         at: datetime,
@@ -2020,14 +2037,18 @@ class ProposalConfirmationService:
                 }
             )
         )
-        added = tuple(sorted(node.id for node in proposal.changeset.nodes_added))
+        allowed = (
+            tuple(sorted(node.id for node in proposal.changeset.nodes_added))
+            if isinstance(proposal, ClarificationIntentProposal)
+            else self._selectable_node_ids(proposal)
+        )
         if (
             ledger is None
             or self._store.bytes() != ledger
             or self._store.get(proposal.id) != proposal
             or config.project_id not in {graph.id.removeprefix("graph:"), graph.name}
-            or not set(selected).issubset(added)
-            or (added and not selected)
+            or not set(selected).issubset(allowed)
+            or (not isinstance(proposal, ClarificationIntentProposal) and selected != allowed)
             or not refs_allowed(proposal.evidence_refs, evidence, frozenset(actor_aliases))
             or at < proposal.proposed_at
         ):
@@ -2072,19 +2093,20 @@ class ProposalConfirmationService:
         if decision != expected_decision:
             raise ValueError("conflicting applied clarification decision")
 
-        events = self._store.clarification_events(proposal.clarification_session_id)
-        closed = tuple(event for event in events if event.event_type == "closed")
-        if (
-            len(closed) != 1
-            or events[-1] != closed[0]
-            or closed[0].proposal_id != proposal.id
-            or closed[0].decision_id != decision.id
-            or closed[0].activation_changeset_id != activation.id
-            or closed[0].actor != actor
-            or closed[0].at != at
-            or closed[0].session.status != "closed"
-        ):
-            raise ValueError("clarification closure replay mismatch")
+        if isinstance(proposal, ClarificationIntentProposal):
+            events = self._store.clarification_events(proposal.clarification_session_id)
+            closed = tuple(event for event in events if event.event_type == "closed")
+            if (
+                len(closed) != 1
+                or events[-1] != closed[0]
+                or closed[0].proposal_id != proposal.id
+                or closed[0].decision_id != decision.id
+                or closed[0].activation_changeset_id != activation.id
+                or closed[0].actor != actor
+                or closed[0].at != at
+                or closed[0].session.status != "closed"
+            ):
+                raise ValueError("clarification closure replay mismatch")
 
         history = self._history_changesets(snapshot.content.get("history"))
         matching = tuple(item for item in history if item.id == activation.id)
@@ -2158,18 +2180,25 @@ class ProposalConfirmationService:
         if ledger is None or self._store.bytes() != ledger:
             raise ValueError("proposal ledger changed")
         proposal = self._store.get(proposal_id)
-        if not isinstance(proposal, ClarificationIntentProposal):
-            raise TypeError("proposal is not clarification-bound")
+        if proposal.kind is not ProposalKind.REQUIREMENT:
+            raise TypeError("proposal is not requirement-bound")
         if proposal_digest is not None and proposal.digest != proposal_digest:
             raise ValueError("proposal digest changed")
         if self._store.decision_for(proposal.id) is not None:
             raise ValueError("proposal already decided")
-        added = tuple(sorted(node.id for node in proposal.changeset.nodes_added))
-        selected = tuple(sorted(selected_node_ids or added))
+        allowed = (
+            tuple(sorted(node.id for node in proposal.changeset.nodes_added))
+            if isinstance(proposal, ClarificationIntentProposal)
+            else self._selectable_node_ids(proposal)
+        )
+        selected = tuple(sorted(selected_node_ids or allowed))
         if (
             tuple(sorted(set(selected))) != selected
-            or not set(selected).issubset(added)
-            or (added and not selected)
+            or not set(selected).issubset(allowed)
+            or (
+                not isinstance(proposal, ClarificationIntentProposal)
+                and (not selected or selected != allowed)
+            )
             or at < proposal.proposed_at
             or graph.version != proposal.baseline_graph_version
         ):
@@ -2271,8 +2300,8 @@ class ProposalConfirmationService:
         if ledger is None or self._store.bytes() != ledger:
             raise ValueError("proposal ledger changed")
         proposal = self._store.get(proposal_id)
-        if not isinstance(proposal, ClarificationIntentProposal):
-            raise TypeError("proposal is not clarification-bound")
+        if proposal.kind is not ProposalKind.REQUIREMENT:
+            raise TypeError("proposal is not requirement-bound")
         if proposal_digest is not None and proposal.digest != proposal_digest:
             raise ValueError("proposal digest changed")
         actor_aliases = self._aliases(actor, policy, provider_principals)
@@ -2287,13 +2316,20 @@ class ProposalConfirmationService:
             )
         )
         existing_decision = self._store.decision_for(proposal.id)
-        added = tuple(sorted(node.id for node in proposal.changeset.nodes_added))
-        selected = tuple(sorted(selected_node_ids or added))
+        allowed = (
+            tuple(sorted(node.id for node in proposal.changeset.nodes_added))
+            if isinstance(proposal, ClarificationIntentProposal)
+            else self._selectable_node_ids(proposal)
+        )
+        selected = tuple(sorted(selected_node_ids or allowed))
         if config.project_id != graph.id.removeprefix("graph:") and config.project_id != graph.name:
             raise ValueError("project binding changed")
         if (
-            not set(selected).issubset(added)
-            or (added and not selected)
+            not set(selected).issubset(allowed)
+            or (
+                not isinstance(proposal, ClarificationIntentProposal)
+                and (not selected or selected != allowed)
+            )
             or not refs_allowed(proposal.evidence_refs, evidence, actor_aliases)
             or at < proposal.proposed_at
         ):
@@ -2388,43 +2424,45 @@ class ProposalConfirmationService:
         decision_frame = serialize_intent_ledger_record(
             IntentLedgerRecord(sequence=len(ledger.splitlines()), decision=decision)
         )
-        proposed_session = self._store.session(proposal.clarification_session_id)
-        if proposed_session.status == "closed":
-            durable = self._store.decision_for(proposal.id)
-            if durable != decision:
-                raise ValueError("conflicting concurrent clarification closure")
-            return self._authenticate_applied(
-                proposal=proposal,
-                decision=durable,
-                actor=actor,
-                at=at,
-                selected=selected,
+        append = decision_frame
+        if isinstance(proposal, ClarificationIntentProposal):
+            proposed_session = self._store.session(proposal.clarification_session_id)
+            if proposed_session.status == "closed":
+                durable = self._store.decision_for(proposal.id)
+                if durable != decision:
+                    raise ValueError("conflicting concurrent clarification closure")
+                return self._authenticate_applied(
+                    proposal=proposal,
+                    decision=durable,
+                    actor=actor,
+                    at=at,
+                    selected=selected,
+                )
+            if proposed_session.status != "proposed":
+                raise ValueError("clarification session is not proposed")
+            closed_event = _event(
+                proposed_session.model_copy(update={"status": "closed"}),
+                "closed",
+                actor,
+                at,
+                proposed_session.latest_event_id,
+                proposal.id,
+                decision.id,
+                changeset.id,
             )
-        if proposed_session.status != "proposed":
-            raise ValueError("clarification session is not proposed")
-        closed_event = _event(
-            proposed_session.model_copy(update={"status": "closed"}),
-            "closed",
-            actor,
-            at,
-            proposed_session.latest_event_id,
-            proposal.id,
-            decision.id,
-            changeset.id,
-        )
-        closed_frame = serialize_intent_ledger_record(
-            IntentLedgerRecord(
-                sequence=len(ledger.splitlines()) + 1,
-                clarification=closed_event,
+            append += serialize_intent_ledger_record(
+                IntentLedgerRecord(
+                    sequence=len(ledger.splitlines()) + 1,
+                    clarification=closed_event,
+                )
             )
-        )
         extras_preimages = {name: snapshot.content.get(name) for name in self._extras}
         try:
             self._executor.apply(
                 changeset,
                 resolved_cases=resolved_cases,
                 intent_proposal_preimage=ledger,
-                intent_proposal_append=decision_frame + closed_frame,
+                intent_proposal_append=append,
                 evidence_preimage=snapshot.content.get("evidence"),
                 rollback_base_exceptions=True,
                 read_only_extras=self._extras,

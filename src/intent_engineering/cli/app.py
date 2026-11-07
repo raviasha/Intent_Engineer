@@ -18,6 +18,7 @@ import typer
 
 from intent_engineering.assessment.service import GraphAssessmentService
 from intent_engineering.capture.base import Connector
+from intent_engineering.cli.alternatives import alternatives_command
 from intent_engineering.cli.assessment import assess_command, assessment_gate_command
 from intent_engineering.cli.connectors import (
     configured_actor_principals,
@@ -107,6 +108,11 @@ from intent_engineering.render import GraphRenderer, render_drift_report
 from intent_engineering.storage.interfaces import GraphStore
 from intent_engineering.storage.secure import SecureDirectory
 from intent_engineering.sync.models import SyncRunResult, SyncRunStatus
+from intent_engineering.team_state.ci import (
+    CI_TRUST_PATH_ENV,
+    CI_TRUST_REQUIRED_ENV,
+    ci_trust_from_environment,
+)
 from intent_engineering.team_state.restore import EnvironmentTrustProvider, GitSharedStateRestorer
 from intent_engineering.validation import validate_project
 
@@ -132,16 +138,22 @@ app.command("dev")(dev_command)
 app.command("ensure")(ensure_command)
 app.command("assess")(assess_command)
 app.command("refine")(refine_command)
+app.command("alternatives")(alternatives_command)
 app.command("assessment-gate", hidden=True)(assessment_gate_command)
 
 _MAX_PROMPT_HOOK_BYTES = 64 * 1024
+
+
+def _stderr_logger_factory(*_args: object) -> structlog.WriteLogger:
+    """Bind each logger to the current process stderr instead of a stale capture stream."""
+    return structlog.WriteLogger(sys.stderr)
 
 
 def _configure_logging() -> None:
     """Keep library operational logs off the structured stdout protocol."""
     structlog.configure(
         processors=[structlog.processors.JSONRenderer()],
-        logger_factory=structlog.WriteLoggerFactory(__import__("sys").stderr),
+        logger_factory=_stderr_logger_factory,
     )
 
 
@@ -503,11 +515,16 @@ def check_command(
     output_format: OutputFormat = typer.Option(OutputFormat.JSON, "--format"),
 ) -> None:
     """Run readiness, capture, validation, assurance, and bounded drift reporting."""
+    trust_provider = (
+        ci_trust_from_environment(project)
+        if CI_TRUST_PATH_ENV in os.environ or CI_TRUST_REQUIRED_ENV in os.environ
+        else EnvironmentTrustProvider()
+    )
     adapter = _CliCheckRuntimeAdapter(
         project,
         principal_resolver=_authorized_principals,
         mcp_connector_resolver=lambda runtime: connector_catalog(runtime).read_connectors(),
-        shared_state_restorer=GitSharedStateRestorer(EnvironmentTrustProvider()),
+        shared_state_restorer=GitSharedStateRestorer(trust_provider),
     )
 
     async def run() -> CheckResult:

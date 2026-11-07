@@ -371,6 +371,48 @@ def test_service_preserves_exact_shared_state_health_in_its_visible_projection(
         harness.runtime.close()
 
 
+def test_invalid_shared_state_blocks_non_recovery_mutation_surfaces(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catches a readable local baseline remaining writable after shared verification fails."""
+    harness = _harness(tmp_path)
+    try:
+        proposal_id, _evidence_ref = _bootstrap_proposal(harness)
+        payload = harness.sign(harness.service.proposal_preview(proposal_id))
+        monkeypatch.setattr(
+            harness.service,
+            "_shared_state_status",
+            SharedStateRestoreStatus.INVALID,
+        )
+        reached: list[str] = []
+
+        def submit(*_args: object, **_kwargs: object) -> object:
+            reached.append("alternative")
+            raise AssertionError("invalid shared state reached alternative persistence")
+
+        def apply(*_args: object, **_kwargs: object) -> object:
+            reached.append("decision")
+            raise AssertionError("invalid shared state reached decision persistence")
+
+        monkeypatch.setattr(harness.service._alternative_proposals, "submit", submit)
+        monkeypatch.setattr(harness.service, "_apply_decision", apply)
+        before = harness.state()
+
+        with pytest.raises(ControlPlaneError):
+            harness.service.alternative_propose("alternative:test", "sha256:test", "sha256:test")
+        with pytest.raises(ControlPlaneError):
+            harness.service.apply_decision(b"signed-assertion", payload)
+        with pytest.raises(ControlPlaneError):
+            harness.service.registration_options()
+
+        assert reached == []
+        assert harness.state() == before
+    finally:
+        harness.service.close()
+        harness.runtime.close()
+
+
 def test_service_projects_a_verified_shared_baseline_as_ready(tmp_path: Path) -> None:
     """Catches verified shared health being downgraded to local-only after local validation."""
     harness = _harness(tmp_path, shared_state_status=SharedStateRestoreStatus.VERIFIED)

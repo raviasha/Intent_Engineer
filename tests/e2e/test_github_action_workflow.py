@@ -242,21 +242,30 @@ def test_intent_sync_workflow_is_nightly_manual_read_only_and_ordered() -> None:
     assert all(value != "write" for value in job["permissions"].values())
     steps = job["steps"]
     assert steps[0]["uses"].startswith("actions/checkout@")
-    assert steps[0]["with"] == {"fetch-depth": "0", "persist-credentials": "false"}
+    assert steps[0]["with"] == {
+        "ref": "${{ github.workflow_sha }}",
+        "fetch-depth": "0",
+        "persist-credentials": "false",
+    }
     assert steps[1] == {
         "uses": "actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065",
         "with": {"python-version": "3.12"},
     }
-    assert steps[2]["run"] == "python -m pip install ."
-    assert steps[3]["run"] == "python -m intent_engineering.integrations.github_action restore"
-    assert steps[4]["run"] == "intent sync --project . --sources markdown,git,github"
+    assert steps[2]["run"] == (
+        "python -I -m pip install --require-hashes --only-binary=:all: "
+        "-r src/intent_engineering/integrations/ci-runtime.lock"
+    )
+    assert steps[3]["run"] == "python -I ci/assurance.py restore --project ."
+    assert steps[4]["run"] == (
+        "python -I ci/intent.py sync --project . --sources markdown,git,github"
+    )
     assert steps[4]["env"] == {
         "GH_TOKEN": "${{ secrets.GITHUB_TOKEN }}",
         "GITHUB_REPOSITORY": "${{ github.repository }}",
     }
-    assert steps[5]["run"] == "intent validate --project ."
+    assert steps[5]["run"] == "python -I ci/intent.py validate --project ."
     assert steps[6]["run"] == (
-        "intent drift --project . --format markdown --output intent-drift.md"
+        "python -I ci/intent.py drift --project . --format markdown --output intent-drift.md"
     )
     assert steps[7] == {
         "uses": "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02",
@@ -274,24 +283,29 @@ def test_intent_sync_workflow_is_nightly_manual_read_only_and_ordered() -> None:
         "name": "Restore verified intent state at comparison base",
         "if": "steps.assessment-base.outputs.available == 'true'",
         "working-directory": "${{ runner.temp }}/intent-assessment-base",
-        "run": "python -m intent_engineering.integrations.github_action restore",
-        "env": {"INTENT_CI_SHARED_STATE_TRUST": "${{ secrets.INTENT_CI_SHARED_STATE_TRUST }}"},
+        "run": 'python -I "$GITHUB_WORKSPACE/ci/assurance.py" restore --project .',
     }
     assert steps[10]["name"] == "Capture comparison-base source versions"
     assert steps[10]["if"] == "steps.assessment-base.outputs.available == 'true'"
     assert steps[10]["working-directory"] == "${{ runner.temp }}/intent-assessment-base"
-    assert steps[10]["run"] == "intent sync --project . --sources markdown,git,github"
+    assert steps[10]["run"] == (
+        'python -I "$GITHUB_WORKSPACE/ci/intent.py" sync '
+        "--project . --sources markdown,git,github"
+    )
     assert steps[11] == {
         "name": "Assess exact comparison base",
         "if": "steps.assessment-base.outputs.available == 'true'",
         "working-directory": "${{ runner.temp }}/intent-assessment-base",
-        "run": "intent assess --project . --format json > $GITHUB_WORKSPACE/intent-assessment-base.json",
+        "run": (
+            'python -I "$GITHUB_WORKSPACE/ci/intent.py" assess --project . '
+            "--format json > $GITHUB_WORKSPACE/intent-assessment-base.json"
+        ),
     }
     assert steps[12]["name"] == "Remove comparison-base worktree"
     assert steps[12]["if"] == "always() && steps.assessment-base.outputs.available == 'true'"
     assert steps[13] == {
         "name": "Assess graph robustness",
-        "run": "intent assess --project . --format json > intent-assessment.json",
+        "run": "python -I ci/intent.py assess --project . --format json > intent-assessment.json",
     }
     assert steps[14] == {
         "uses": "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02",
@@ -306,14 +320,14 @@ def test_intent_sync_workflow_is_nightly_manual_read_only_and_ordered() -> None:
         "name": "Gate assessment against exact comparison base",
         "if": "steps.assessment-base.outputs.available == 'true'",
         "run": (
-            "intent assessment-gate --project . "
+            "python -I ci/intent.py assessment-gate --project . "
             "--base-report intent-assessment-base.json "
             "--head-report intent-assessment.json --format json"
         ),
     }
     assert steps[16] == {
         "name": "Require resolution of pending review",
-        "run": "intent check --require-review",
+        "run": "python -I ci/intent.py check --require-review",
     }
     assert steps.index(steps[14]) < steps.index(steps[15]) < steps.index(steps[16])
     assert "continue-on-error" not in text
@@ -323,6 +337,31 @@ def test_intent_sync_workflow_is_nightly_manual_read_only_and_ordered() -> None:
     assert "intent init" not in text
     assert "intent-advisor" not in text
     assert "plugins/" not in text
+
+
+def test_scheduled_assurance_uses_protected_keyring_runtime_without_floating_install() -> None:
+    """Nightly assurance must use the reviewed runner trust and dependency boundary."""
+    path = ROOT / ".github/workflows/intent-sync.yml"
+    text = path.read_text(encoding="utf-8")
+    workflow = yaml.safe_load(text)
+    job = workflow["jobs"]["drift"]
+    steps = job["steps"]
+
+    assert job["runs-on"] == {
+        "group": "intent-state",
+        "labels": ["self-hosted", "intent-state"],
+    }
+    assert steps[0]["with"]["ref"] == "${{ github.workflow_sha }}"
+    assert steps[2]["run"] == (
+        "python -I -m pip install --require-hashes --only-binary=:all: "
+        "-r src/intent_engineering/integrations/ci-runtime.lock"
+    )
+    assert "INTENT_CI_SHARED_STATE_TRUST" not in text
+    assert "pip install ." not in text
+    assert all(
+        "python -m intent_engineering" not in step.get("run", "")
+        for step in steps
+    )
 
 
 def test_required_check_is_independent_ordered_and_fail_closed() -> None:

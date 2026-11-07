@@ -6,6 +6,7 @@ import json
 import mmap
 import os
 import re
+import shutil
 import signal
 import stat
 import subprocess
@@ -105,7 +106,10 @@ def _run_hook(
 
 
 def _installed_hook_schema(kind: str) -> dict[str, object]:
-    binary = Path("/Applications/ChatGPT.app/Contents/Resources/codex")
+    executable = shutil.which("codex")
+    if executable is None:
+        pytest.skip("installed Codex host binary unavailable")
+    binary = Path(executable)
     marker = f'"title": "user-prompt-submit.command.{kind}"'.encode()
     prefix = b'{\n  "$schema": "http://json-schema.org/draft-07/schema#"'
     with (
@@ -164,7 +168,11 @@ def _durable_bytes(project: Path) -> dict[str, bytes]:
     return {
         str(path.relative_to(workspace)): path.read_bytes()
         for path in sorted(workspace.rglob("*"))
-        if path.is_file() and not path.is_symlink()
+        if path.is_file()
+        and not path.is_symlink()
+        and not path.name.endswith(".lock")
+        and str(path.relative_to(workspace))
+        != "cache/control-plane.json"
     }
 
 
@@ -313,7 +321,7 @@ def test_real_hook_routes_ready_prompt_to_preflight_without_secret_or_echo(
     assert "capability" not in lowered
     assert "token" not in lowered
     after = _durable_bytes(project)
-    assert after.keys() - before.keys() == {".config.yaml.lock"}
+    assert after.keys() == before.keys()
     assert after["evidence/evidence.jsonl"].startswith(before["evidence/evidence.jsonl"])
     for path in before:
         if path != "evidence/evidence.jsonl":
@@ -752,6 +760,23 @@ def test_skill_routes_clarifications_and_states_advisory_mcp_failure_boundary() 
     assert "capability token" in skill
     assert "advisory" in skill.casefold()
     assert "independently authenticated non-MCP local human" in skill
+
+
+def test_skill_routes_only_explicit_alternative_requests_through_validated_projection() -> None:
+    skill = (PLUGIN_ROOT / "skills" / "intent-advisor" / "SKILL.md").read_text(encoding="utf-8")
+
+    assert "Only enter this workflow when the user explicitly asks for alternatives" in skill
+    assert "intent_alternative_context" in skill
+    assert "intent_alternative_validate" in skill
+    assert "intent_alternatives" in skill
+    assert "`simpler` to `simplify`" in skill
+    assert "`manual` or `different approach` to `change_approach`" in skill
+    assert "`smaller scope` to `narrow_scope`" in skill
+    assert "`reuse existing` to `reuse_capability`" in skill
+    assert "projected, not approved" in skill.casefold()
+    assert "Never submit or approve an alternative over MCP" in skill
+    assert "Validate host candidate locally" in skill
+    assert "local Proposal review view" in skill
 
 
 def test_skill_human_attention_guidance_defers_to_the_route_selected_view() -> None:

@@ -1,8 +1,8 @@
 # Task 7 Second-Developer Enrollment and Publication Design Addendum
 
-**Date:** 2026-09-09  
-**Status:** Approved implementation design addendum  
-**Depends on:** Task 6 GitHub state preflight, protected `intent-state` publication, CI recipient provisioning, and automatic restore  
+**Date:** 2026-09-09
+**Status:** Approved implementation design addendum
+**Depends on:** Task 6 GitHub state preflight, protected `intent-state` publication, CI recipient provisioning, and automatic restore
 **Scope:** enroll a second human developer, let that developer restore and publish, and reconcile concurrent publication without transporting private keys
 
 ## Decision summary

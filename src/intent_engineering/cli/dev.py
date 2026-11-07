@@ -1422,6 +1422,14 @@ def _shared_restore(
     marker_status = _untrusted_shared_marker_status(root)
     if marker_status is SharedStateRestoreStatus.INVALID:
         return SharedStateRestoreResult(status=SharedStateRestoreStatus.INVALID)
+    selected_environment = os.environ if environment is None else environment
+    if (
+        marker_status is SharedStateRestoreStatus.NOT_REQUIRED
+        and TRUST_ENVIRONMENT_VARIABLE not in selected_environment
+        and not os.path.lexists(root / ".intent" / "team-trust.json")
+        and not os.path.lexists(root / ".intent" / "join-activation.json")
+    ):
+        return SharedStateRestoreResult(status=SharedStateRestoreStatus.NOT_REQUIRED)
     trust = None
     try:
         try:
@@ -1732,6 +1740,11 @@ def _start_or_reuse_background_service(
             current = _running_service(root)
             if current is not None and current.shared_state_status is shared_state_status:
                 ready = True
+                threading.Thread(
+                    target=process.wait,
+                    name="intent-dev-background-reaper",
+                    daemon=True,
+                ).start()
                 return True
             if process.poll() is not None:
                 current = _running_service(root)

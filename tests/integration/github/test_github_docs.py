@@ -76,6 +76,9 @@ def test_github_guide_keeps_release_boundaries_and_action_contract_visible() -> 
         "GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}",
         "GITHUB_REPOSITORY: ${{ github.repository }}",
         "`intent-drift` artifact",
+        "`intent-assurance` artifact",
+        "exact comparison base",
+        "python -I ci/intent.py assessment-gate --project . --base-report intent-assessment-base.json --head-report intent-assessment.json --format json",
         "GitHub-only failed sync exits with",
         "partial result and exit with code 3",
     ):
@@ -90,21 +93,52 @@ def test_github_guide_keeps_release_boundaries_and_action_contract_visible() -> 
         "pull-requests": "read",
     }
     steps = job["steps"]
-    assert [step["run"] for step in steps if "run" in step] == [
-        "python -m pip install .",
-        "python -m intent_engineering.integrations.github_action restore",
-        "intent sync --project . --sources markdown,git,github",
-        "intent validate --project .",
-        "intent drift --project . --format markdown --output intent-drift.md",
-        "intent check --require-review",
-    ]
-    assert steps[4]["env"] == {
+    named_steps = {step["name"]: step for step in steps if "name" in step}
+    assert named_steps["Install protected hash-locked tooling dependencies"]["run"] == (
+        "python -I -m pip install --require-hashes --only-binary=:all: "
+        "-r src/intent_engineering/integrations/ci-runtime.lock"
+    )
+    assert named_steps["Restore verified approved intent state"]["run"] == (
+        "python -I ci/assurance.py restore --project ."
+    )
+    capture = named_steps["Capture configured source versions"]
+    assert capture["run"] == (
+        "python -I ci/intent.py sync --project . --sources markdown,git,github"
+    )
+    assert capture["env"] == {
         "GH_TOKEN": "${{ secrets.GITHUB_TOKEN }}",
         "GITHUB_REPOSITORY": "${{ github.repository }}",
     }
+    assert named_steps["Validate captured canonical state"]["run"] == (
+        "python -I ci/intent.py validate --project ."
+    )
+    assert named_steps["Render drift and assurance report"]["run"] == (
+        "python -I ci/intent.py drift --project . --format markdown --output intent-drift.md"
+    )
+    assert named_steps["Assess exact comparison base"]["run"] == (
+        'python -I "$GITHUB_WORKSPACE/ci/intent.py" assess --project . '
+        "--format json > $GITHUB_WORKSPACE/intent-assessment-base.json"
+    )
+    assert named_steps["Assess graph robustness"]["run"] == (
+        "python -I ci/intent.py assess --project . --format json > intent-assessment.json"
+    )
+    assert named_steps["Gate assessment against exact comparison base"]["run"] == (
+        "python -I ci/intent.py assessment-gate --project . "
+        "--base-report intent-assessment-base.json "
+        "--head-report intent-assessment.json --format json"
+    )
+    assert named_steps["Require resolution of pending review"]["run"] == (
+        "python -I ci/intent.py check --require-review"
+    )
     assert steps[7]["with"] == {
         "name": "intent-drift",
         "path": "intent-drift.md",
+        "retention-days": "7",
+        "if-no-files-found": "error",
+    }
+    assert steps[14]["with"] == {
+        "name": "intent-assurance",
+        "path": "intent-drift.md\nintent-assessment.json\nintent-assessment-base.json\n",
         "retention-days": "7",
         "if-no-files-found": "error",
     }

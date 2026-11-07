@@ -13,6 +13,12 @@ from mcp.server.mcpserver import MCPServer
 from mcp.types import INTERNAL_ERROR, INVALID_PARAMS, ToolAnnotations
 from pydantic import BaseModel, WithJsonSchema
 
+from intent_engineering.alternatives import (
+    AlternativeMode,
+    AlternativeReasoner,
+    RequirementAlternativeCandidate,
+    RequirementAlternativeService,
+)
 from intent_engineering.assessment.models import AssessmentHealth, AssessmentReport
 from intent_engineering.assessment.service import GraphAssessmentService
 from intent_engineering.capture.mcp.profile_loader import load_strict_yaml_mapping_bytes
@@ -48,6 +54,7 @@ _SCHEMA_VERSION = "1"
 _MAX_ASSESSMENT_GAPS = 100
 _MAX_ASSESSMENT_RESPONSE_BYTES = 32 * 1024 * 1024
 _MAX_ENRICHMENT_RESPONSE_BYTES = 4 * 1024 * 1024
+_MAX_ALTERNATIVE_RESPONSE_BYTES = 1024 * 1024
 _ENRICHMENT_SESSION_PATTERN = re.compile(r"^refine:[^\x00-\x20\x7f]{1,249}$")
 _ASSESSMENT_TOOL_NAMES = frozenset(
     {
@@ -60,6 +67,13 @@ _ENRICHMENT_TOOL_NAMES = frozenset(
     {
         "intent_enrichment_status",
         "intent_enrichment_next_question",
+    }
+)
+_ALTERNATIVE_TOOL_NAMES = frozenset(
+    {
+        "intent_alternative_context",
+        "intent_alternative_validate",
+        "intent_alternatives",
     }
 )
 type _IdentifierInput = Annotated[
@@ -103,6 +117,22 @@ type _EnrichmentSessionInput = Annotated[
         }
     ),
 ]
+type _AlternativeModesInput = Annotated[
+    object,
+    WithJsonSchema(
+        {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 4,
+            "uniqueItems": True,
+            "items": {"type": "string", "enum": [mode.value for mode in AlternativeMode]},
+        }
+    ),
+]
+type _AlternativeCandidateInput = Annotated[
+    object,
+    WithJsonSchema({"type": "object", "minProperties": 1, "maxProperties": 20}),
+]
 
 
 def _valid_identifier(value: str) -> bool:
@@ -142,6 +172,20 @@ def _enrichment_session_id(value: object) -> str | None:
     if selected is None or _ENRICHMENT_SESSION_PATTERN.fullmatch(selected) is None:
         return None
     return selected
+
+
+def _alternative_modes(value: object | None) -> tuple[AlternativeMode, ...] | None:
+    if value is None:
+        return (AlternativeMode.SIMPLIFY,)
+    if type(value) is not list or not 1 <= len(value) <= len(AlternativeMode):
+        return None
+    raw = cast(list[object], value)
+    if any(type(item) is not str or item not in AlternativeMode._value2member_map_ for item in raw):
+        return None
+    modes = tuple(AlternativeMode(cast(str, item)) for item in raw)
+    if len(set(modes)) != len(modes):
+        return None
+    return tuple(sorted(modes, key=lambda item: item.value))
 
 
 def _invalid_input() -> Never:
@@ -222,6 +266,36 @@ def _bounded_enrichment_response(payload: dict[str, object]) -> dict[str, object
     return bounded
 
 
+def _bounded_alternative_response(payload: dict[str, object]) -> dict[str, object] | None:
+    """Return canonical alternative output within one strict public byte bound."""
+    encoded = b""
+    bounded: dict[str, object] | None = None
+    signal: BaseException | None = None
+    try:
+        encoded = json.dumps(
+            payload,
+            allow_nan=False,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        if len(encoded) <= _MAX_ALTERNATIVE_RESPONSE_BYTES:
+            bounded = payload
+    except Exception:  # noqa: BLE001 - one fixed response-encoding failure boundary
+        bounded = None
+    except BaseException as caught:  # noqa: BLE001 - preserve cancellation identity
+        signal = _scrub_signal(caught)
+    finally:
+        payload = {}
+        encoded = b""
+    if signal is not None:
+        caught_signal = signal
+        signal = None
+        bounded = None
+        raise caught_signal.with_traceback(None)
+    return bounded
+
+
 @dataclass(frozen=True)
 class _ReadSnapshot:
     config: ProjectConfig
@@ -254,10 +328,142 @@ def _context_markdown(payload: dict[str, object]) -> str:
 class McpReadServices:
     """Build fresh, immutable authorized projections from one held local runtime."""
 
-    def __init__(self, runtime: Runtime) -> None:
+    def __init__(
+        self,
+        runtime: Runtime,
+        *,
+        alternative_reasoner: AlternativeReasoner | None = None,
+    ) -> None:
         self.runtime = runtime
         self._assessment_service = GraphAssessmentService()
         self._enrichment_service: GraphEnrichmentService | None = None
+        self._alternative_service = RequirementAlternativeService(
+            snapshot_loader=lambda: self.runtime.assessment_snapshot(
+                self.runtime.config.local_actor
+            ),
+            reasoner=alternative_reasoner,
+            assessment=self._assessment_service,
+        )
+
+    def alternative_context(
+        self,
+        subject_ref: str,
+        modes: tuple[AlternativeMode, ...],
+    ) -> dict[str, object] | None:
+        """Return one bounded request suitable for host-side reasoning."""
+        request = None
+        bounded: dict[str, object] | None = None
+        signal: BaseException | None = None
+        failed = False
+        try:
+            request = self._alternative_service.context(
+                subject_ref=subject_ref,
+                modes=modes,
+            )
+            bounded = _bounded_alternative_response(
+                {"schema_version": _SCHEMA_VERSION, "request": request.model_dump(mode="json")}
+            )
+        except Exception as caught:  # noqa: BLE001 - one fixed read failure
+            _scrub_signal(caught)
+            failed = True
+        except BaseException as caught:  # noqa: BLE001 - preserve cancellation identity
+            signal = _scrub_signal(caught)
+        finally:
+            subject_ref = ""
+            modes = ()
+            request = None
+        if signal is not None:
+            caught_signal = signal
+            signal = None
+            bounded = None
+            raise caught_signal.with_traceback(None)
+        return None if failed else bounded
+
+    def alternative_validate(
+        self,
+        request_id: str,
+        candidate: object,
+    ) -> dict[str, object] | None:
+        """Validate one host-generated candidate without creating a proposal."""
+        parsed: RequirementAlternativeCandidate | None = None
+        comparison = None
+        bounded: dict[str, object] | None = None
+        encoded = b""
+        signal: BaseException | None = None
+        failed = False
+        try:
+            if type(candidate) is not dict:
+                raise ValueError("invalid alternative candidate")
+            encoded = json.dumps(
+                candidate,
+                allow_nan=False,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+            if len(encoded) > 16 * 1024:
+                raise ValueError("invalid alternative candidate")
+            parsed = RequirementAlternativeCandidate.model_validate_json(encoded, strict=True)
+            comparison = self._alternative_service.validate_candidate(
+                request_id=request_id,
+                candidate=parsed,
+            )
+            if comparison is None:
+                raise ValueError("invalid alternative candidate")
+            bounded = _bounded_alternative_response(
+                {
+                    "schema_version": _SCHEMA_VERSION,
+                    "comparison": comparison.model_dump(mode="json"),
+                }
+            )
+        except Exception as caught:  # noqa: BLE001 - one fixed read failure
+            _scrub_signal(caught)
+            failed = True
+        except BaseException as caught:  # noqa: BLE001 - preserve cancellation identity
+            signal = _scrub_signal(caught)
+        finally:
+            request_id = ""
+            candidate = None
+            parsed = None
+            comparison = None
+            encoded = b""
+        if signal is not None:
+            caught_signal = signal
+            signal = None
+            bounded = None
+            raise caught_signal.with_traceback(None)
+        return None if failed else bounded
+
+    def alternatives(
+        self,
+        subject_ref: str,
+        modes: tuple[AlternativeMode, ...],
+    ) -> dict[str, object] | None:
+        """Invoke the optional reasoner and return detached validated comparisons."""
+        result = None
+        bounded: dict[str, object] | None = None
+        signal: BaseException | None = None
+        failed = False
+        try:
+            result = self._alternative_service.request(subject_ref=subject_ref, modes=modes)
+            bounded = _bounded_alternative_response(
+                {"schema_version": _SCHEMA_VERSION, "result": result.model_dump(mode="json")}
+            )
+        except Exception as caught:  # noqa: BLE001 - one fixed read failure
+            _scrub_signal(caught)
+            failed = True
+        except BaseException as caught:  # noqa: BLE001 - preserve cancellation identity
+            signal = _scrub_signal(caught)
+        finally:
+            subject_ref = ""
+            modes = ()
+            result = None
+        if signal is not None:
+            caught_signal = signal
+            signal = None
+            bounded = None
+            raise caught_signal.with_traceback(None)
+        return None if failed else bounded
 
     def _enrichment(self) -> GraphEnrichmentService:
         """Load enrichment only when requested so narrow read runtimes stay compatible."""
@@ -850,6 +1056,72 @@ def validate_enrichment_tool_call(name: str, arguments: dict[str, object]) -> No
         raise caught_signal.with_traceback(None)
 
 
+def validate_alternative_tool_call(name: str, arguments: dict[str, object]) -> None:
+    """Validate raw alternative arguments before SDK coercion or handler lookup."""
+    from intent_engineering.integrations.mcp_server.intent_workflow import (
+        _require_exact_json,
+    )
+
+    signal: BaseException | None = None
+    try:
+        if type(name) is not str or name not in _ALTERNATIVE_TOOL_NAMES:
+            raise ValueError("invalid alternative request")
+        if type(arguments) is not dict:
+            raise ValueError("invalid alternative request")
+        _require_exact_json(arguments)
+        keys = set(dict.keys(arguments))
+        if name in {"intent_alternative_context", "intent_alternatives"}:
+            if not {"subject_ref"} <= keys <= {"subject_ref", "modes"}:
+                raise ValueError("invalid alternative request")
+            if (
+                _input_string(
+                    dict.__getitem__(arguments, "subject_ref"),
+                    maximum=512,
+                    maximum_bytes=512,
+                    identifier=True,
+                )
+                is None
+            ):
+                raise ValueError("invalid alternative request")
+            if "modes" in keys and _alternative_modes(dict.__getitem__(arguments, "modes")) is None:
+                raise ValueError("invalid alternative request")
+        else:
+            if keys != {"request_id", "candidate"}:
+                raise ValueError("invalid alternative request")
+            if (
+                _input_string(
+                    dict.__getitem__(arguments, "request_id"),
+                    maximum=512,
+                    maximum_bytes=512,
+                    identifier=True,
+                )
+                is None
+                or type(dict.__getitem__(arguments, "candidate")) is not dict
+            ):
+                raise ValueError("invalid alternative request")
+            encoded = json.dumps(
+                dict.__getitem__(arguments, "candidate"),
+                allow_nan=False,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+            if not encoded or len(encoded) > 16 * 1024:
+                raise ValueError("invalid alternative request")
+            RequirementAlternativeCandidate.model_validate_json(encoded, strict=True)
+    except Exception:  # noqa: BLE001 - one fixed raw alternative boundary
+        raise ValueError("invalid intent tool arguments") from None
+    except BaseException as caught:  # noqa: BLE001 - preserve cancellation identity
+        signal = _scrub_signal(caught)
+    finally:
+        name = ""
+        arguments = {}
+    if signal is not None:
+        caught_signal = signal
+        signal = None
+        raise caught_signal.with_traceback(None)
+
+
 def register_read_tools(server: MCPServer, services: McpReadServices) -> None:
     """Register the exact version-1 read-only tool surface."""
 
@@ -929,6 +1201,74 @@ def register_read_tools(server: MCPServer, services: McpReadServices) -> None:
     def intent_status() -> dict[str, object]:
         """Summarize the authorized durable graph, evidence, and case state."""
         return _available(services.status())
+
+    @server.tool(
+        name="intent_alternative_context",
+        annotations=_READ_ONLY,
+        structured_output=True,
+    )
+    def intent_alternative_context(
+        subject_ref: _IdentifierInput,
+        modes: _AlternativeModesInput | None = None,
+    ) -> dict[str, object]:
+        """Return bounded intent, outcome, constraint, and evidence grounding."""
+        selected_subject = _input_string(
+            subject_ref,
+            maximum=512,
+            maximum_bytes=512,
+            identifier=True,
+        )
+        selected_modes = _alternative_modes(modes)
+        del subject_ref, modes
+        if selected_subject is None or selected_modes is None:
+            _invalid_input()
+        payload = services.alternative_context(selected_subject, selected_modes)
+        del selected_subject, selected_modes
+        return _available(payload)
+
+    @server.tool(
+        name="intent_alternative_validate",
+        annotations=_READ_ONLY,
+        structured_output=True,
+    )
+    def intent_alternative_validate(
+        request_id: _IdentifierInput,
+        candidate: _AlternativeCandidateInput,
+    ) -> dict[str, object]:
+        """Validate one host-generated candidate and compute a detached projection."""
+        selected_request = _input_string(
+            request_id,
+            maximum=512,
+            maximum_bytes=512,
+            identifier=True,
+        )
+        selected_candidate = candidate if type(candidate) is dict else None
+        del request_id, candidate
+        if selected_request is None or selected_candidate is None:
+            _invalid_input()
+        payload = services.alternative_validate(selected_request, selected_candidate)
+        del selected_request, selected_candidate
+        return _found(payload)
+
+    @server.tool(name="intent_alternatives", annotations=_READ_ONLY, structured_output=True)
+    def intent_alternatives(
+        subject_ref: _IdentifierInput,
+        modes: _AlternativeModesInput | None = None,
+    ) -> dict[str, object]:
+        """Generate optional alternatives through the configured detached reasoner."""
+        selected_subject = _input_string(
+            subject_ref,
+            maximum=512,
+            maximum_bytes=512,
+            identifier=True,
+        )
+        selected_modes = _alternative_modes(modes)
+        del subject_ref, modes
+        if selected_subject is None or selected_modes is None:
+            _invalid_input()
+        payload = services.alternatives(selected_subject, selected_modes)
+        del selected_subject, selected_modes
+        return _available(payload)
 
     @server.tool(
         name="intent_enrichment_status",

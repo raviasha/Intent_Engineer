@@ -883,3 +883,26 @@ def test_hidden_cli_leaves_structlog_usable_for_later_library_calls(capsys) -> N
     )
 
     assert "advisory_prompt_contract_logging_probe" in capsys.readouterr().out
+
+
+def test_cli_logging_uses_restored_stderr_after_in_process_invocation(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    request: pytest.FixtureRequest,
+) -> None:
+    """Catches an in-process CLI invocation retaining its already-closed capture stream."""
+    structlog.reset_defaults()
+    request.addfinalizer(structlog.reset_defaults)
+    project = tmp_path / "project"
+    project.mkdir()
+
+    result = CliRunner().invoke(
+        app,
+        ["ensure", "--project", str(project), "--preset", "developer", "--format", "json"],
+    )
+    assert result.exit_code == 0
+
+    structlog.get_logger("intent_engineering.logging_contract").info(
+        "post_cli_logging_probe"
+    )
+    assert "post_cli_logging_probe" in capsys.readouterr().err

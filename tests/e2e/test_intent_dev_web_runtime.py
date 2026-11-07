@@ -17,7 +17,7 @@ from typing import Any, cast
 import pytest
 import uvicorn
 
-from intent_engineering.cli.dev import _ControlPlaneSite
+from intent_engineering.cli.dev import SharedStateRestoreStatus, _ControlPlaneSite
 from intent_engineering.control_plane import build_control_plane_app
 
 NODE = shutil.which("node")
@@ -552,6 +552,9 @@ def _launched_site(service: _LaunchedJourneyService) -> Iterator[str]:
         instance_id="instance:" + "8" * 64,
         project_id="project",
         repository_id="repo:sha256:" + "4" * 64,
+        launch_mode="manual_headless",
+        shared_state_status=SharedStateRestoreStatus.NOT_REQUIRED,
+        shutdown_requested=threading.Event(),
     )
     server = uvicorn.Server(
         uvicorn.Config(
@@ -604,14 +607,14 @@ const nav = ["home", "onboarding", "inbox", "proposal", "team_state"].map((view)
 globalThis.document = { getElementById(id) { return id === "app" ? app : status; }, querySelectorAll() { return nav; }, createElement(tag) { return new Element(tag); }, createTextNode(value) { return new TextNode(value); } };
 globalThis.window = { location: { hash: "#csrf=launched-browser-csrf", pathname: "/" } }; globalThis.location = window.location;
 globalThis.history = { replaceState() {} };
-globalThis.Headers = class { constructor() { this.values = new Map(); } set(key, value) { this.values.set(key.toLowerCase(), String(value)); } };
+globalThis.Headers = class { constructor(initial = {}) { this.values = new Map(Object.entries(initial).map(([key, value]) => [key.toLowerCase(), String(value)])); } set(key, value) { this.values.set(key.toLowerCase(), String(value)); } };
 globalThis.atob = (value) => Buffer.from(value, "base64").toString("binary"); globalThis.btoa = (value) => Buffer.from(value, "binary").toString("base64");
 const bytes = (value) => Uint8Array.from(Buffer.from(value)).buffer;
 Object.defineProperty(globalThis, "navigator", { configurable: true, value: { credentials: { get() { return Promise.resolve({ id: "assertion", rawId: bytes("assertion"), type: "public-key", response: { authenticatorData: bytes("auth"), clientDataJSON: bytes("client"), signature: bytes("sig"), userHandle: null } }); } } } });
 const origin = __ORIGIN__; const parsedOrigin = new URL(origin); let cookie = ""; const network = [];
-function raw(path, init = {}) { return new Promise((resolve, reject) => { const method = init.method || "GET"; const headers = { Host: parsedOrigin.host }; for (const [key, value] of (init.headers?.values || new Map())) headers[key] = value; if (cookie) headers.Cookie = cookie; if (method !== "GET") headers.Origin = origin; const body = init.body || ""; if (body) headers["Content-Length"] = String(Buffer.byteLength(body)); network.push({ path, method, headers: { ...headers } }); const request = http.request({ host: "127.0.0.1", port: parsedOrigin.port, path, method, headers }, (response) => { let content = ""; response.setEncoding("utf8"); response.on("data", (chunk) => { content += chunk; }); response.on("end", () => resolve({ status: response.statusCode, headers: response.headers, text: content })); }); request.on("error", reject); if (body) request.write(body); request.end(); }); }
-const root = await raw("/"); cookie = root.headers["set-cookie"][0].split(";", 1)[0]; const asset = await raw("/app.js");
-globalThis.fetch = async (path, init = {}) => { const response = await raw(path, init); return { ok: response.status >= 200 && response.status < 300, status: response.status, text: async () => response.text }; };
+function raw(path, init = {}) { return new Promise((resolve, reject) => { const method = init.method || "GET"; const headers = { Host: parsedOrigin.host }; const headerValues = init.headers?.values || new Map(Object.entries(init.headers || {})); for (const [key, value] of headerValues) headers[key] = value; if (cookie) headers.Cookie = cookie; if (method !== "GET") headers.Origin = origin; const body = init.body || ""; if (body) headers["Content-Length"] = String(Buffer.byteLength(body)); network.push({ path, method, headers: { ...headers } }); const request = http.request({ host: "127.0.0.1", port: parsedOrigin.port, path, method, headers }, (response) => { let content = ""; response.setEncoding("utf8"); response.on("data", (chunk) => { content += chunk; }); response.on("end", () => resolve({ status: response.statusCode, headers: response.headers, text: content })); }); request.on("error", reject); if (body) request.write(body); request.end(); }); }
+const root = await raw("/"); if (root.headers["set-cookie"]) throw new Error("root issued a cookie before bootstrap"); const asset = await raw("/app.js");
+globalThis.fetch = async (path, init = {}) => { const response = await raw(path, init); if (response.headers["set-cookie"]) cookie = response.headers["set-cookie"][0].split(";", 1)[0]; return { ok: response.status >= 200 && response.status < 300, status: response.status, text: async () => response.text }; };
 function walk(node, items = []) { items.push(node); for (const child of node.children || []) walk(child, items); return items; }
 function findButton(label) { return walk(app).find((node) => node.tagName === "button" && node.textContent === label); }
 async function waitFor(predicate) { for (let index = 0; index < 300; index += 1) { const value = predicate(); if (value) return value; await new Promise((resolve) => setTimeout(resolve, 10)); } throw new Error(`timed out: ${app.textContent} / ${status.textContent}`); }
@@ -647,6 +650,7 @@ def test_launched_http_and_shipped_asset_complete_encoded_case_and_answer_journe
     result = json.loads(completed.stdout)
     paths = [item["path"] for item in result["network"]]
     assert "/app.js" in paths
+    assert "/_intent/browser/bootstrap" in paths
     assert "/api/v1/proposals/case%3Aencoded" in paths
     assert "/api/v1/clarifications/answers/preview" in paths
     assert paths.count("/api/v1/decisions/options") == 2

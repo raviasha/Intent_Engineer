@@ -28,6 +28,9 @@
     developmentObservation: "/api/v1/development/observation",
     reviewedTests: "/api/v1/development/tests/run",
     assessment: "/api/v1/assessment",
+    alternatives: "/api/v1/alternatives",
+    alternativeValidate: "/api/v1/alternatives/validate",
+    alternativePropose: "/api/v1/alternatives/propose",
     enrichmentStart: "/api/v1/enrichment/start",
     enrichmentCurrent: "/api/v1/enrichment/current",
     enrichmentAnswer: "/api/v1/enrichment/answer",
@@ -83,6 +86,13 @@
     session: null,
     question: null,
     unavailable: false,
+    generation: 0,
+  });
+  const alternativeState = Object.seal({
+    subjectRef: null,
+    result: null,
+    unavailable: false,
+    importOnly: false,
     generation: 0,
   });
   let csrfToken = readCsrfBootstrap();
@@ -452,6 +462,13 @@
       return;
     }
     assessmentState.selectedNodeId = nodeId;
+    if (alternativeState.subjectRef !== nodeId) {
+      alternativeState.subjectRef = null;
+      alternativeState.result = null;
+      alternativeState.unavailable = false;
+      alternativeState.importOnly = false;
+      alternativeState.generation += 1;
+    }
     render();
     focusAssessmentRepresentation(source === "table" ? "graph" : "table", nodeId);
   }
@@ -703,6 +720,19 @@
     if (node.recommended_next_action) {
       addText(detail, "p", `Recommended next action: ${node.recommended_next_action}`);
     }
+    if (
+      node.node_type === "requirement" &&
+      (node.health === "orange" || node.health === "red")
+    ) {
+      detail.append(
+        actionButton("Suggest alternatives", () => requestAlternatives(node.node_id))
+      );
+    }
+    if (node.node_type === "requirement") {
+      detail.append(
+        actionButton("Validate host candidate", () => openHostAlternativeImport(node.node_id))
+      );
+    }
     for (const dimension of node.dimensions) {
       const card = document.createElement("article");
       card.className = assessmentClass(
@@ -731,6 +761,364 @@
       detail.append(card);
     }
     section.append(detail);
+  }
+
+  function acceptAlternativesResponse(payload, subjectRef) {
+    const statuses = new Set([
+      "available", "provider_unavailable", "invalid_provider_output",
+      "subject_unavailable", "stale_request", "no_valid_alternatives",
+    ]);
+    if (
+      !exactObjectKeys(payload, ["schema_version", "request_digest", "status", "alternatives"]) ||
+      payload.schema_version !== 1 ||
+      typeof payload.request_digest !== "string" ||
+      !/^sha256:[0-9a-f]{64}$/.test(payload.request_digest) ||
+      !statuses.has(payload.status) ||
+      !Array.isArray(payload.alternatives) ||
+      payload.alternatives.length > 8 ||
+      (payload.status === "available") !== (payload.alternatives.length > 0)
+    ) {
+      throw new Error("Invalid alternatives response.");
+    }
+    for (const item of payload.alternatives) {
+      if (
+        !exactObjectKeys(item, ["comparison_id", "comparison"]) ||
+        typeof item.comparison_id !== "string" ||
+        !/^alternative-comparison:sha256:[0-9a-f]{64}$/.test(item.comparison_id) ||
+        !item.comparison ||
+        typeof item.comparison !== "object" ||
+        Array.isArray(item.comparison)
+      ) {
+        throw new Error("Invalid alternative comparison.");
+      }
+      const comparison = item.comparison;
+      const alternative = comparison.alternative;
+      const candidate = alternative && alternative.candidate;
+      if (
+        comparison.current_state !== "approved" ||
+        comparison.projected_state !== "projected" ||
+        comparison.request_digest !== payload.request_digest ||
+        typeof comparison.snapshot_digest !== "string" ||
+        !/^sha256:[0-9a-f]{64}$/.test(comparison.snapshot_digest) ||
+        !alternative ||
+        typeof alternative !== "object" ||
+        typeof alternative.graph_effect_digest !== "string" ||
+        !/^sha256:[0-9a-f]{64}$/.test(alternative.graph_effect_digest) ||
+        !candidate ||
+        typeof candidate !== "object" ||
+        candidate.subject_ref !== subjectRef ||
+        typeof candidate.proposed_text !== "string" ||
+        !candidate.proposed_text ||
+        candidate.proposed_text.length > 8192 ||
+        !comparison.current_scorecard ||
+        comparison.current_scorecard.node_id !== subjectRef ||
+        !comparison.projected_scorecard ||
+        comparison.projected_scorecard.node_id !== subjectRef ||
+        !Array.isArray(comparison.dimension_deltas) ||
+        comparison.dimension_deltas.length > 7
+      ) {
+        throw new Error("Invalid alternative comparison.");
+      }
+    }
+    return payload;
+  }
+
+  async function requestAlternatives(subjectRef) {
+    const node = assessmentNode(subjectRef);
+    if (
+      !node ||
+      node.node_type !== "requirement" ||
+      !["orange", "red"].includes(node.health)
+    ) {
+      return;
+    }
+    const generation = alternativeState.generation + 1;
+    alternativeState.generation = generation;
+    alternativeState.subjectRef = subjectRef;
+    alternativeState.result = null;
+    alternativeState.unavailable = false;
+    alternativeState.importOnly = false;
+    render();
+    try {
+      const result = acceptAlternativesResponse(
+        await fetchJson(api.alternatives, {
+          method: "POST",
+          body: JSON.stringify({ subject_ref: subjectRef, modes: ["simplify", "change_approach"] }),
+        }),
+        subjectRef
+      );
+      if (generation !== alternativeState.generation || subjectRef !== alternativeState.subjectRef) {
+        return;
+      }
+      alternativeState.result = result;
+      alternativeState.unavailable = result.status !== "available";
+      render();
+      announce(
+        result.status === "available"
+          ? "Projected requirement alternatives are ready for comparison. Nothing is approved."
+          : "Alternative suggestions are unavailable. The approved assessment remains available."
+      );
+    } catch (_error) {
+      if (generation !== alternativeState.generation) {
+        return;
+      }
+      alternativeState.result = null;
+      alternativeState.unavailable = true;
+      render();
+      announce("Alternative suggestions are unavailable. The approved assessment remains available.");
+    }
+  }
+
+  async function proposeAlternative(item) {
+    const subjectRef = alternativeState.subjectRef;
+    const result = alternativeState.result;
+    const generation = alternativeState.generation;
+    try {
+      if (!subjectRef || !result || !result.alternatives.includes(item)) {
+        throw new Error("Alternative selection is stale.");
+      }
+      const comparison = item.comparison;
+      const response = await fetchJson(api.alternativePropose, {
+        method: "POST",
+        body: JSON.stringify({
+          alternative_id: item.comparison_id,
+          expected_request_digest: comparison.request_digest,
+          expected_effect_digest: comparison.alternative.graph_effect_digest,
+        }),
+      });
+      if (
+        generation !== alternativeState.generation ||
+        !exactObjectKeys(response, ["schema_version", "proposal_id", "status"]) ||
+        response.schema_version !== 1 ||
+        response.status !== "pending_review" ||
+        typeof response.proposal_id !== "string" ||
+        !/^proposal:sha256:[0-9a-f]{64}$/.test(response.proposal_id)
+      ) {
+        throw new Error("Invalid alternative proposal response.");
+      }
+      selectProposal(response.proposal_id);
+      await showView("proposal");
+    } catch (_error) {
+      announce("The alternative could not be staged for review. No approved requirement changed.");
+    }
+  }
+
+  async function validateHostAlternative(field) {
+    const subjectRef = alternativeState.subjectRef;
+    const node = assessmentNode(subjectRef);
+    const generation = alternativeState.generation + 1;
+    let raw = typeof field.value === "string" ? field.value : "";
+    let candidate = null;
+    let body = "";
+    field.value = "";
+    try {
+      if (!node || node.node_type !== "requirement" || !raw) {
+        throw new Error("Host candidate is unavailable.");
+      }
+      candidate = JSON.parse(raw);
+      raw = "";
+      if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) {
+        throw new Error("Invalid host candidate.");
+      }
+      body = JSON.stringify({
+        subject_ref: subjectRef,
+        modes: ["simplify", "change_approach", "narrow_scope", "reuse_capability"],
+        candidate,
+      });
+      candidate = null;
+      alternativeState.generation = generation;
+      const result = acceptAlternativesResponse(
+        await fetchJson(api.alternativeValidate, { method: "POST", body }),
+        subjectRef
+      );
+      body = "";
+      if (generation !== alternativeState.generation || subjectRef !== alternativeState.subjectRef) {
+        return;
+      }
+      alternativeState.result = result;
+      alternativeState.unavailable = result.status !== "available";
+      alternativeState.importOnly = false;
+      render();
+      announce(
+        result.status === "available"
+          ? "The host candidate was revalidated locally. It remains projected, not approved."
+          : "The host candidate did not pass local validation. No approved requirement changed."
+      );
+    } catch (_error) {
+      if (generation === alternativeState.generation) {
+        alternativeState.result = null;
+        alternativeState.unavailable = true;
+        render();
+        announce("The host candidate could not be validated. No approved requirement changed.");
+      }
+    } finally {
+      field.value = "";
+      raw = "";
+      candidate = null;
+      body = "";
+    }
+  }
+
+  function renderHostAlternativeImport(region) {
+    const form = document.createElement("aside");
+    form.className = "alternative-host-import";
+    addText(form, "h4", "Host-generated candidate");
+    addText(
+      form,
+      "p",
+      "Paste the exact candidate returned by your coding host. Intent Dev will re-ground and revalidate it before comparison."
+    );
+    const label = document.createElement("label");
+    label.textContent = "Candidate JSON";
+    const field = document.createElement("textarea");
+    field.id = "alternative-host-candidate";
+    field.maxLength = 16384;
+    field.autocomplete = "off";
+    label.append(field);
+    form.append(
+      label,
+      actionButton("Validate host candidate locally", () => void validateHostAlternative(field))
+    );
+    region.append(form);
+  }
+
+  function openHostAlternativeImport(subjectRef) {
+    const node = assessmentNode(subjectRef);
+    if (!node || node.node_type !== "requirement") {
+      return;
+    }
+    alternativeState.generation += 1;
+    alternativeState.subjectRef = subjectRef;
+    alternativeState.result = null;
+    alternativeState.unavailable = false;
+    alternativeState.importOnly = true;
+    render();
+  }
+
+  function renderAlternatives(section) {
+    if (alternativeState.subjectRef !== assessmentState.selectedNodeId) {
+      return;
+    }
+    const region = document.createElement("section");
+    region.className = "alternative-comparisons";
+    region.setAttribute("aria-labelledby", "alternative-comparisons-title");
+    addText(region, "h3", "Requirement alternatives").id = "alternative-comparisons-title";
+    if (alternativeState.importOnly) {
+      addText(region, "p", "Revalidate an exact host-generated candidate against current local intent evidence.");
+      renderHostAlternativeImport(region);
+      section.append(region);
+      return;
+    }
+    if (!alternativeState.result && !alternativeState.unavailable) {
+      addText(region, "p", "Preparing grounded alternatives from visible intent evidence.");
+      renderHostAlternativeImport(region);
+      section.append(region);
+      return;
+    }
+    if (alternativeState.unavailable || !alternativeState.result) {
+      addText(region, "p", "Alternative suggestions are unavailable. Approved assessment remains available.");
+      renderHostAlternativeImport(region);
+      section.append(region);
+      return;
+    }
+    for (const item of alternativeState.result.alternatives) {
+      const comparison = item.comparison;
+      const candidate = comparison.alternative.candidate;
+      const card = document.createElement("article");
+      card.className = "alternative-comparison";
+      addText(card, "h4", candidate.mode.replaceAll("_", " "));
+      const columns = document.createElement("div");
+      columns.className = "alternative-comparison-columns";
+      const current = document.createElement("section");
+      addText(current, "h5", "Current approved requirement");
+      const changedStatement = Array.isArray(candidate.graph_effects)
+        ? candidate.graph_effects.find((effect) =>
+          effect && effect.effect === "update_node" && effect.target_ref === candidate.subject_ref
+        )
+        : null;
+      addText(current, "p", changedStatement && changedStatement.before
+        ? changedStatement.before
+        : assessmentNode(candidate.subject_ref).node_id);
+      addText(current, "p", `Approved score: ${scoreText(comparison.current_scorecard.robustness)}`);
+      const projected = document.createElement("section");
+      addText(projected, "h5", "Projected alternative — not approved");
+      addText(projected, "p", candidate.proposed_text);
+      addText(projected, "p", `Projected score: ${scoreText(comparison.projected_scorecard.robustness)}`);
+      columns.append(current, projected);
+      card.append(columns);
+      if (Array.isArray(candidate.preserved_intent_refs)) {
+        for (const intent of candidate.preserved_intent_refs) {
+          addText(card, "p", `Preserved intent: ${intent}`);
+        }
+      }
+      if (Array.isArray(candidate.preserved_outcome_refs)) {
+        for (const outcome of candidate.preserved_outcome_refs) {
+          addText(card, "p", `Preserved outcome: ${outcome}`);
+        }
+      }
+      if (Array.isArray(candidate.weakened_outcomes)) {
+        for (const outcome of candidate.weakened_outcomes) {
+          addText(card, "p", `Weakened outcome: ${outcome.outcome_ref} — ${outcome.rationale}`);
+        }
+      }
+      if (Array.isArray(candidate.constraint_effects)) {
+        for (const constraint of candidate.constraint_effects) {
+          const label = constraint.effect === "remove" ? "Removed constraint" : "Changed constraint";
+          const proposed = constraint.proposed_text || "superseded";
+          addText(card, "p", `${label}: ${constraint.constraint_ref} → ${proposed} — ${constraint.rationale}`);
+        }
+      }
+      if (Array.isArray(candidate.graph_effects)) {
+        for (const effect of candidate.graph_effects) {
+          const field = effect.field ? ` ${effect.field}` : "";
+          const before = effect.before === null ? "∅" : effect.before;
+          const after = effect.after === null ? "∅" : effect.after;
+          addText(card, "p", `Exact graph effect: ${effect.effect} ${effect.target_ref}${field}: ${before} → ${after}`);
+        }
+      }
+      if (candidate.complexity && typeof candidate.complexity === "object") {
+        addText(
+          card,
+          "p",
+          `Complexity: implementation ${candidate.complexity.implementation}; operations ${candidate.complexity.operations}. ${candidate.complexity_rationale}`
+        );
+      }
+      if (Array.isArray(candidate.risks)) {
+        for (const risk of candidate.risks) {
+          addText(card, "p", `Risk: ${risk}`);
+        }
+      }
+      if (Array.isArray(candidate.tradeoffs)) {
+        for (const tradeoff of candidate.tradeoffs) {
+          addText(card, "p", `Tradeoff: ${tradeoff}`);
+        }
+      }
+      if (Array.isArray(candidate.assumptions)) {
+        for (const assumption of candidate.assumptions) {
+          addText(card, "p", `Assumption: ${assumption}`);
+        }
+      }
+      if (Array.isArray(candidate.supporting_evidence_refs)) {
+        for (const evidence of candidate.supporting_evidence_refs) {
+          addText(card, "p", `Supporting evidence: ${evidence}`);
+        }
+      }
+      if (Array.isArray(comparison.dimension_deltas)) {
+        for (const delta of comparison.dimension_deltas) {
+          addText(
+            card,
+            "p",
+            `Projected ${delta.dimension}: ${scoreText(delta.current)} → ${scoreText(delta.projected)} (${delta.delta === null ? "N/A" : delta.delta >= 0 ? `+${delta.delta}` : delta.delta})`
+          );
+        }
+      }
+      card.append(
+        actionButton("Create review proposal", () => void proposeAlternative(item))
+      );
+      region.append(card);
+    }
+    renderHostAlternativeImport(region);
+    section.append(region);
   }
 
   function renderAssessment() {
@@ -836,6 +1224,7 @@
     renderAssessmentGraph(section);
     renderAssessmentTable(section);
     renderAssessmentDetail(section);
+    renderAlternatives(section);
     return section;
   }
 

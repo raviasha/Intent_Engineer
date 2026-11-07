@@ -166,6 +166,20 @@ may receive a short-lived process-local capability, while new/ambiguous and conf
 token-free. The diagnostic CLI `intent preflight --task "..."` only renders context and does not mint
 authorization.
 
+Requirement alternatives remain read-only over MCP. After an explicit developer request:
+
+- `intent_alternative_context` returns bounded ACL-safe intent, outcome, constraint, evidence
+  metadata, and current score context;
+- `intent_alternative_validate` revalidates one complete untrusted host candidate and computes its
+  projected comparison; and
+- `intent_alternatives` uses an injected server reasoner when configured, otherwise returning the
+  fixed provider-unavailable state.
+
+Exact modes are `simplify`, `change_approach`, `narrow_scope`, and `reuse_capability`. Scores are
+projected, not approved. No MCP alternative tool submits, approves, or applies a proposal. A selected
+host candidate must be revalidated in the local Intent Dev view before **Create review proposal**
+can enter the independently authenticated Proposal review flow.
+
 Active-agent reasoning may submit proposals. Scheduled semantic reasoning is optional; the default
 CLI uses no model and deterministic assurance only. Regardless of origin, confidence is not a claim
 of truth and never grants authority to confirm a proposal, resolve a conflict, or mutate a provider.

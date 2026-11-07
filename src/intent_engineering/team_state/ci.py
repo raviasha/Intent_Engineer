@@ -28,6 +28,7 @@ from intent_engineering.team_state.restore import SharedStateTrust, TrustedSigni
 from intent_engineering.team_state.signing import _KeyringBackend, _lock_target
 
 CI_TRUST_PATH_ENV = "INTENT_CI_TRUST_PATH"
+CI_TRUST_REQUIRED_ENV = "INTENT_CI_TRUST_REQUIRED"
 MAX_CI_PUBLIC_BYTES = 32 * 1024
 
 
