@@ -19,6 +19,9 @@ it becomes a reviewable reconciliation case with its supporting evidence.
 The supplied [framework graph](graph/framework-intent-graph.yaml) dogfoods the
 same graph model used for a project.
 
+New to the project? Start with the [five-minute user guide](docs/quick-start.md) for installation,
+onboarding, everyday development, graph assessment, team enrollment, and CI assurance.
+
 ## Guided developer journey
 
 Requires Python 3.12 or newer.
