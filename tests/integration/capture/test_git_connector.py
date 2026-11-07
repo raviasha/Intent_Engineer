@@ -124,7 +124,18 @@ async def test_git_connector_deduplicates_merge_paths_with_unusual_names(tmp_pat
     git(repo, "checkout", default_branch)
     main_path = "main\tname.md"
     commit(repo, main_path, "main\n", "Main", "Main body")
-    git(repo, "merge", "--no-ff", "feature", "-m", "Merge feature")
+    git(
+        repo,
+        "-c",
+        "user.name=Intent Tester",
+        "-c",
+        "user.email=intent@example.test",
+        "merge",
+        "--no-ff",
+        "feature",
+        "-m",
+        "Merge feature",
+    )
     merge_sha = git(repo, "rev-parse", "HEAD")
     connector = GitConnector(repo)
 

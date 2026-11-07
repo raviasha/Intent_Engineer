@@ -27,10 +27,17 @@ def test_hosted_ci_uses_the_release_import_boundary() -> None:
     workflow = _workflow("ci.yml")
     commands = [step.get("run") for step in workflow["jobs"]["test"]["steps"]]
 
+    assert commands[2] == (
+        "python -m venv .venv\n"
+        ".venv/bin/python -m pip install -e '.[dev]'\n"
+    )
+    assert commands[3:5] == [
+        ".venv/bin/ruff check .",
+        ".venv/bin/mypy --strict src",
+    ]
     assert commands[-1] == (
-        "PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest "
-        "-p anyio.pytest_plugin -p pytest_cov.plugin --import-mode=importlib "
-        "--cov=intent_engineering --cov-report=term-missing"
+        "PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 .venv/bin/python -m pytest "
+        "-p anyio.pytest_plugin --import-mode=importlib -q -W error"
     )
 
 
