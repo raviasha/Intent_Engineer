@@ -689,6 +689,7 @@ def test_constructor_preserves_primary_cancellation_and_scrubs_close_cancellatio
     close_signal.secret = close_marker  # type: ignore[attr-defined]
     retained: list[object] = []
     original_close = enrichment_store_module.SecureFile.close
+    target_path = tmp_path / "enrichment-sessions.jsonl"
 
     def cancel(_store: EnrichmentSessionStore) -> object:
         try:
@@ -699,6 +700,9 @@ def test_constructor_preserves_primary_cancellation_and_scrubs_close_cancellatio
 
     def close(file: object) -> None:
         if getattr(file, "_parent_fd", -1) < 0:
+            return
+        if getattr(file, "path", None) != target_path:
+            original_close(file)  # type: ignore[arg-type]
             return
         original_close(file)  # type: ignore[arg-type]
         try:
@@ -712,7 +716,7 @@ def test_constructor_preserves_primary_cancellation_and_scrubs_close_cancellatio
     monkeypatch.setattr(enrichment_store_module.SecureFile, "close", close)
 
     with pytest.raises(BaseException) as raised:
-        EnrichmentSessionStore(tmp_path / "enrichment-sessions.jsonl")
+        EnrichmentSessionStore(target_path)
 
     assert raised.value is primary
     for signal in (primary, close_signal):

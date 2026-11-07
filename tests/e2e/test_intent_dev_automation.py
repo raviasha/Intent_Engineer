@@ -746,21 +746,33 @@ def test_scheduled_capture_uploads_a_report_before_failing_for_pending_review(
     workflow = yaml.safe_load(
         (Path(__file__).parents[2] / ".github/workflows/intent-sync.yml").read_text()
     )
-    uploaded = False
-    for step in workflow["jobs"]["drift"]["steps"][4:]:
-        if "uses" in step:
-            assert "upload-artifact" in step["uses"]
-            report = (repo / step["with"]["path"]).read_text()
-            assert "CONFLICTING" in report
-            uploaded = True
-            continue
+    steps = workflow["jobs"]["drift"]["steps"]
+    named_steps = {step["name"]: step for step in steps if "name" in step}
+    for name in (
+        "Capture configured source versions",
+        "Validate captured canonical state",
+        "Render drift and assurance report",
+    ):
+        step = named_steps[name]
         arguments = shlex.split(step["run"])[1:]
         if "--sources" in arguments:
             # GitHub connector behavior is separately covered by its offline API fixtures.
             arguments[arguments.index("--sources") + 1] = "markdown,git"
         result = CliRunner().invoke(app, arguments)
-        assert result.exit_code == (4 if uploaded else 0), result.stdout
-    assert uploaded
+        assert result.exit_code == 0, result.stdout
+    drift_upload = next(
+        step
+        for step in steps
+        if step.get("with", {}).get("name") == "intent-drift"
+    )
+    assert "upload-artifact" in drift_upload["uses"]
+    report = (repo / drift_upload["with"]["path"]).read_text()
+    assert "CONFLICTING" in report
+    check = CliRunner().invoke(
+        app,
+        shlex.split(named_steps["Require resolution of pending review"]["run"])[1:],
+    )
+    assert check.exit_code == 4, check.stdout
     runtime = load_runtime(repo)
     try:
         assert any(record.source_locator == "new-source.md" for record in runtime.evidence())
