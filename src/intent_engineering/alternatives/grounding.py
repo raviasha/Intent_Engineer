@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from collections import deque
-from collections.abc import Mapping
 
 from intent_engineering.alternatives.models import (
     AlternativeContextNode,
@@ -98,13 +97,7 @@ def _evidence_summaries(
 
 
 def _visible_evidence_summary(record: EvidenceRecord) -> str:
-    payload = record.payload
-    if isinstance(payload, Mapping):
-        text = payload.get("text")
-        if type(text) is str and text.strip():
-            encoded = text.strip().encode("utf-8")
-            if len(encoded) <= 2 * 1024:
-                return text.strip()
+    """Return fixed provider-safe metadata; arbitrary evidence text never crosses this boundary."""
     return (
         f"Visible {record.connector_type} evidence observed "
         f"{record.observed_at.date().isoformat()}."

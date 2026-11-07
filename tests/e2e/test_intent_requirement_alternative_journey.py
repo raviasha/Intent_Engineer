@@ -110,6 +110,7 @@ def test_manual_alternative_is_canonical_only_after_independent_review(tmp_path)
 
     assert approved_graph.version == snapshot.graph.version + 1
     assert approved_after.snapshot_digest != approved_before.snapshot_digest
+    assert approved_after.node("req:export") == comparison.projected_scorecard
     approved_requirement = next(node for node in approved_graph.nodes if node.id == "req:export")
     assert approved_requirement.label == "An owner exports the report on request."
     assert harness.paths["graph"].read_bytes() != graph_before
