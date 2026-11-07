@@ -18,6 +18,7 @@ import typer
 
 from intent_engineering.assessment.service import GraphAssessmentService
 from intent_engineering.capture.base import Connector
+from intent_engineering.cli.alternatives import alternatives_command
 from intent_engineering.cli.assessment import assess_command, assessment_gate_command
 from intent_engineering.cli.connectors import (
     configured_actor_principals,
@@ -132,6 +133,7 @@ app.command("dev")(dev_command)
 app.command("ensure")(ensure_command)
 app.command("assess")(assess_command)
 app.command("refine")(refine_command)
+app.command("alternatives")(alternatives_command)
 app.command("assessment-gate", hidden=True)(assessment_gate_command)
 
 _MAX_PROMPT_HOOK_BYTES = 64 * 1024

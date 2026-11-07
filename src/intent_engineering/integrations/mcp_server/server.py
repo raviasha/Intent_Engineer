@@ -43,6 +43,7 @@ from intent_engineering.integrations.mcp_server.resources import register_read_r
 from intent_engineering.integrations.mcp_server.tools import (
     McpReadServices,
     register_read_tools,
+    validate_alternative_tool_call,
     validate_assessment_tool_call,
     validate_enrichment_tool_call,
 )
@@ -82,6 +83,11 @@ class _IntentMCPServer(MCPServer[Any]):
             "intent_enrichment_status",
             "intent_enrichment_next_question",
         }
+        alternative_tool = name in {
+            "intent_alternative_context",
+            "intent_alternative_validate",
+            "intent_alternatives",
+        }
         failed = False
         response: CallToolResult | InputRequiredResult | None = None
         try:
@@ -91,6 +97,8 @@ class _IntentMCPServer(MCPServer[Any]):
                 validate_assessment_tool_call(name, arguments)
             elif enrichment_tool:
                 validate_enrichment_tool_call(name, arguments)
+            elif alternative_tool:
+                validate_alternative_tool_call(name, arguments)
             response = await super().call_tool(name, arguments, context)
         except (ToolError, ValueError):
             failed = True
@@ -99,7 +107,7 @@ class _IntentMCPServer(MCPServer[Any]):
                 raise
             failed = True
         finally:
-            del name, arguments, context, assessment_tool, enrichment_tool
+            del name, arguments, context, assessment_tool, enrichment_tool, alternative_tool
         if failed:
             message = (
                 "invalid intent workflow arguments"

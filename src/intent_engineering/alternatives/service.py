@@ -99,12 +99,12 @@ class RequirementAlternativeService:
                 expired_id, _expired = self._comparisons.popitem(last=False)
                 self._comparison_requests.pop(expired_id, None)
 
-    def request(
+    def _new_context(
         self,
         *,
         subject_ref: str,
-        modes: tuple[AlternativeMode, ...] = (AlternativeMode.SIMPLIFY,),
-    ) -> AlternativeResult:
+        modes: tuple[AlternativeMode, ...],
+    ) -> _RequestContext:
         snapshot = self._snapshot_loader()
         report = self._assessment.assess(snapshot, self._policy)
         request = self._request_builder.build(
@@ -115,6 +115,25 @@ class RequirementAlternativeService:
         )
         context = _RequestContext(request=request, snapshot=snapshot)
         self._store_context(context)
+        return context
+
+    def context(
+        self,
+        *,
+        subject_ref: str,
+        modes: tuple[AlternativeMode, ...] = (AlternativeMode.SIMPLIFY,),
+    ) -> AlternativeRequest:
+        """Build and retain one bounded host-reasoning request without generation."""
+        return self._new_context(subject_ref=subject_ref, modes=modes).request
+
+    def request(
+        self,
+        *,
+        subject_ref: str,
+        modes: tuple[AlternativeMode, ...] = (AlternativeMode.SIMPLIFY,),
+    ) -> AlternativeResult:
+        context = self._new_context(subject_ref=subject_ref, modes=modes)
+        request = context.request
         if self._reasoner is None:
             return AlternativeResult.create(
                 request=request,
