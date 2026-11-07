@@ -135,7 +135,15 @@ python -m intent_engineering.integrations.github_action restore
 intent sync --project . --sources markdown,git,github
 intent validate --project .
 intent drift --project . --format markdown --output intent-drift.md
+intent assess --project . --format json > intent-assessment.json
+intent assessment-gate --project . --base-report intent-assessment-base.json --head-report intent-assessment.json --format json
+intent check --require-review
 ```
+
+Before assessing the current graph, the workflow resolves the exact comparison base, restores
+and syncs that detached checkout, and writes `intent-assessment-base.json`. An initial commit has
+no comparison base, so it publishes the head assessment without running the comparison gate. The
+detached worktree is removed even when an earlier comparison step fails.
 
 Because `.intent` is ignored, a clean checkout restores its approved baseline from the fetched
 protected `intent-state` ref. The older sync workflow uses a legacy environment-trust
@@ -145,9 +153,12 @@ whose key remains in its self-hosted runner OS keyring. Missing keys, invalid si
 or incompatible state fail closed. The workflow
 never runs `intent init` and cannot report an empty graph version 0 as clean. See
 [CI setup and trust prerequisites](intent-aware-agent.md#required-github-check-setup).
-After uploading the report, the final step runs `intent check --require-review`. Pending review
-therefore fails the workflow with exit 4 only after the artifact is available. Restore, capture,
-validation and rendering failures still stop the workflow; no failing command is masked.
+The workflow uploads the drift report as the `intent-drift` artifact, then uploads the head and
+available base assessment reports as the `intent-assurance` artifact. It gates the head assessment
+against the exact comparison base before the final `intent check --require-review` step. Pending
+review therefore fails the workflow with exit 4 only after the artifacts are available. Restore,
+capture, validation, rendering, assessment, and comparison failures still stop the workflow; no
+failing command is masked.
 
 The sync step supplies `GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}` and
 `GITHUB_REPOSITORY: ${{ github.repository }}`. The workflow uploads the exact
