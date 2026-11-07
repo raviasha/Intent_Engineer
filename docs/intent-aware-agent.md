@@ -335,16 +335,17 @@ Configure these prerequisites before expecting the check to pass:
    runner keyring and reviewed public `INTENT_CI_TRUST_PATH` configuration; follow
    [dedicated CI recipient setup](ci-recipient.md). The older environment-JSON
    adapter remains a compatibility/test API, not a supported hosted-key deployment.
-   Both required workflows use that same runner trust lifecycle. The first reviewed
+   The two required workflows and scheduled assurance use that same runner trust lifecycle. The first reviewed
    staging action writes CODEOWNERS plus both canonical workflow files together;
    either workflow's content or preimage changing invalidates the approval. The
    checked-in workflows are tested byte-identical to the packaged setup contracts.
    Production team setup currently requires an organization-owned repository and a
    classic setup token with `repo` and `admin:org`, plus repository admin/read/write
    permission. Its organization runner group `intent-state` must have selected-repository
-   visibility and permit only the exact two
+   visibility and permit only the exact three
    `<owner>/<repository>/.github/workflows/intent-state.yml@refs/heads/<default-branch>`
-   and `<owner>/<repository>/.github/workflows/intent-check.yml@refs/heads/<default-branch>`
+   `<owner>/<repository>/.github/workflows/intent-check.yml@refs/heads/<default-branch>`,
+   and `<owner>/<repository>/.github/workflows/intent-sync.yml@refs/heads/<default-branch>`
    workflows. No other workflow may use the group. The CI descriptor's runner ID must
    match the registered runner name in that group, with labels `self-hosted` and
    `intent-state`; labels alone are not an

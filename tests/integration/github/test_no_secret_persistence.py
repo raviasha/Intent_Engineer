@@ -94,6 +94,46 @@ def _repository_traceback(error: BaseException) -> bytes:
     return "".join(frames).encode("utf-8", errors="backslashreplace")
 
 
+@pytest.mark.anyio
+async def test_rejected_object_payload_is_cleared_from_traceback_locals() -> None:
+    token = "gh" + "p_object-traceback-secret"
+
+    def handler(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"provider_secret": token})
+
+    credentials = GitHubCredentials.resolve({"GH_TOKEN": token}, lambda _: "unused")
+    client = GitHubClient(
+        credentials,
+        transport=httpx.MockTransport(handler),
+        retry_policy=RetryPolicy(max_attempts=1),
+    )
+    with pytest.raises(GitHubProtocolError) as caught:
+        await client.request_json_object("GET", "/items")
+    await client.aclose()
+
+    assert all(needle not in _repository_traceback(caught.value) for needle in _audit_needles(token))
+
+
+@pytest.mark.anyio
+async def test_rejected_page_payload_is_cleared_from_traceback_locals() -> None:
+    token = "gh" + "p_page-traceback-secret"
+
+    def handler(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=[{"provider_secret": token}])
+
+    credentials = GitHubCredentials.resolve({"GH_TOKEN": token}, lambda _: "unused")
+    client = GitHubClient(
+        credentials,
+        transport=httpx.MockTransport(handler),
+        retry_policy=RetryPolicy(max_attempts=1),
+    )
+    with pytest.raises(GitHubProtocolError) as caught:
+        await client.get_pages("/items", {})
+    await client.aclose()
+
+    assert all(needle not in _repository_traceback(caught.value) for needle in _audit_needles(token))
+
+
 def _scan_project(
     project: Path,
     token: str,

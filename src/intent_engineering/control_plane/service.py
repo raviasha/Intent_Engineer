@@ -1054,6 +1054,14 @@ class ControlPlaneService:
             raise ValueError("invalid control plane clock")
         return value.astimezone(UTC)
 
+    def _require_mutation_ready(self) -> None:
+        """Permit canonical intent writes only on local-only or verified shared state."""
+        if self._shared_state_status not in {
+            SharedStateRestoreStatus.NOT_REQUIRED,
+            SharedStateRestoreStatus.VERIFIED,
+        }:
+            raise ControlPlaneError() from None
+
     def _nonce(self) -> str:
         value = self._challenge_source()
         if type(value) is not bytes or len(value) != 32:
@@ -1846,6 +1854,7 @@ class ControlPlaneService:
         signal: BaseException | None = None
         failed = False
         try:
+            self._require_mutation_ready()
             result = self._enrichment_projection(operation())
         except Exception as caught:  # noqa: BLE001 - fixed browser boundary
             self._scrub_enrichment_signal(caught)
@@ -1984,6 +1993,7 @@ class ControlPlaneService:
         proposal = None
         signal: BaseException | None = None
         try:
+            self._require_mutation_ready()
             proposal = self._alternative_proposals.submit(
                 alternative_id,
                 expected_request_digest=expected_request_digest,
@@ -2049,6 +2059,7 @@ class ControlPlaneService:
         signal: BaseException | None = None
         failed = False
         try:
+            self._require_mutation_ready()
             proposal = self._enrichment_service.propose(session_id, submission)
             return EnrichmentProposalResponse.model_validate(
                 {
@@ -2344,6 +2355,7 @@ class ControlPlaneService:
         result: dict[str, object] | None = None
         signal: BaseException | None = None
         try:
+            self._require_mutation_ready()
             from intent_engineering.cli.intent_workflow import _capture_prd, _snapshot_config
 
             with self._runtime.transactions.transaction(rollback_base_exceptions=True):
@@ -2769,6 +2781,7 @@ class ControlPlaneService:
         material: _DecisionMaterial | None = None
         inserted = False
         try:
+            self._require_mutation_ready()
             authority = self._authority()
             at = self._now()
             self._purge_pending_answers(at)
@@ -2868,6 +2881,7 @@ class ControlPlaneService:
         result: bytes | None = None
         signal: BaseException | None = None
         try:
+            self._require_mutation_ready()
             authority = self._authority()
             with self._runtime.transactions.transaction(
                 rollback_base_exceptions=True,
@@ -2919,6 +2933,7 @@ class ControlPlaneService:
         result: CredentialRecord | None = None
         signal: BaseException | None = None
         try:
+            self._require_mutation_ready()
             if type(response) is not bytes:
                 raise TypeError("invalid registration response")
             authority = self._authority()
@@ -3013,6 +3028,7 @@ class ControlPlaneService:
         result: bytes | None = None
         signal: BaseException | None = None
         try:
+            self._require_mutation_ready()
             self._purge_pending_answers(self._now())
             if not isinstance(payload, HumanDecisionPayload):
                 raise TypeError("invalid decision payload")
@@ -3336,6 +3352,7 @@ class ControlPlaneService:
         signal: BaseException | None = None
         failed = False
         try:
+            self._require_mutation_ready()
             self._purge_pending_answers(self._now())
             if type(assertion) is not bytes or not isinstance(payload, HumanDecisionPayload):
                 raise TypeError("invalid decision assertion")

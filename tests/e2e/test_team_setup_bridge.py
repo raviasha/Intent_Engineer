@@ -365,6 +365,7 @@ class _GitHubTransport:
                         "selected_workflows": [
                             "acme/project/.github/workflows/intent-check.yml@refs/heads/main",
                             "acme/project/.github/workflows/intent-state.yml@refs/heads/main",
+                            "acme/project/.github/workflows/intent-sync.yml@refs/heads/main",
                         ],
                     }
                 ],

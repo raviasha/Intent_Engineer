@@ -667,6 +667,11 @@ class GitHubClient:
                 or (oauth_scopes is not None and len(oauth_scopes.encode("utf-8")) > 4096)
                 or self._provider_material_overlaps_credential((parsed, oauth_scopes))
             ):
+                await self._close_response(response)
+                response = None
+                content = b""
+                parsed = None
+                oauth_scopes = None
                 raise GitHubProtocolError(endpoint)
             from intent_engineering.team_state.github import GitHubJsonResponse
 
@@ -776,6 +781,7 @@ class GitHubClient:
             ):
                 await self._close_response(response)
                 del response
+                content = b""
                 payload = None
                 raise GitHubProtocolError(endpoint) from None
 
@@ -789,6 +795,7 @@ class GitHubClient:
             if reflected_provider_material:
                 await self._close_response(response)
                 del response
+                content = b""
                 payload = None
                 first_etag = None
                 items.clear()

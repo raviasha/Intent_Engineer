@@ -378,14 +378,18 @@ def test_scheduled_workflow_is_read_only_and_orders_capture_before_assurance() -
     steps = job["steps"]
     assert steps[0] == {
         "uses": "actions/checkout@11d5960a326750d5838078e36cf38b85af677262",
-        "with": {"fetch-depth": 0, "persist-credentials": False},
+        "with": {
+            "ref": "${{ github.workflow_sha }}",
+            "fetch-depth": 0,
+            "persist-credentials": False,
+        },
     }
     assert steps[1] == {
         "uses": "actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065",
         "with": {"python-version": "3.12"},
     }
     assert [step["name"] for step in steps[2:7]] == [
-        "Install Intent Engineering",
+        "Install protected hash-locked tooling dependencies",
         "Restore verified approved intent state",
         "Capture configured source versions",
         "Validate captured canonical state",
@@ -401,15 +405,22 @@ def test_scheduled_workflow_is_read_only_and_orders_capture_before_assurance() -
         },
     }
     commands = [step.get("run", "") for step in steps]
-    assert commands[2] == "python -m pip install ."
-    assert commands[3] == "python -m intent_engineering.integrations.github_action restore"
-    assert commands[4] == "intent sync --project . --sources markdown,git,github"
-    assert commands[5] == "intent validate --project ."
-    assert commands[6] == ("intent drift --project . --format markdown --output intent-drift.md")
-    assessment_index = commands.index(
-        "intent assess --project . --format json > intent-assessment.json"
+    assert commands[2] == (
+        "python -I -m pip install --require-hashes --only-binary=:all: "
+        "-r src/intent_engineering/integrations/ci-runtime.lock"
     )
-    review_index = commands.index("intent check --require-review")
+    assert commands[3] == "python -I ci/assurance.py restore --project ."
+    assert commands[4] == (
+        "python -I ci/intent.py sync --project . --sources markdown,git,github"
+    )
+    assert commands[5] == "python -I ci/intent.py validate --project ."
+    assert commands[6] == (
+        "python -I ci/intent.py drift --project . --format markdown --output intent-drift.md"
+    )
+    assessment_index = commands.index(
+        "python -I ci/intent.py assess --project . --format json > intent-assessment.json"
+    )
+    review_index = commands.index("python -I ci/intent.py check --require-review")
     assert assessment_index < review_index
     assert steps[review_index - 1]["name"] == "Gate assessment against exact comparison base"
     assert steps[4]["env"] == {
@@ -473,18 +484,25 @@ def test_guided_adoption_docs_and_plugin_independent_assurance_are_ordered() -> 
     steps = workflow["jobs"]["drift"]["steps"]
     assert steps[0] == {
         "uses": "actions/checkout@11d5960a326750d5838078e36cf38b85af677262",
-        "with": {"fetch-depth": 0, "persist-credentials": False},
+        "with": {
+            "ref": "${{ github.workflow_sha }}",
+            "fetch-depth": 0,
+            "persist-credentials": False,
+        },
     }
     assert steps[1] == {
         "uses": "actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065",
         "with": {"python-version": "3.12"},
     }
     assert [step.get("run") for step in steps[2:7]] == [
-        "python -m pip install .",
-        "python -m intent_engineering.integrations.github_action restore",
-        "intent sync --project . --sources markdown,git,github",
-        "intent validate --project .",
-        "intent drift --project . --format markdown --output intent-drift.md",
+        (
+            "python -I -m pip install --require-hashes --only-binary=:all: "
+            "-r src/intent_engineering/integrations/ci-runtime.lock"
+        ),
+        "python -I ci/assurance.py restore --project .",
+        "python -I ci/intent.py sync --project . --sources markdown,git,github",
+        "python -I ci/intent.py validate --project .",
+        "python -I ci/intent.py drift --project . --format markdown --output intent-drift.md",
     ]
     assert "intent-advisor" not in raw
     assert "plugins/" not in raw

@@ -53,7 +53,8 @@ and code-owner enforcement before a second protection authorization.
 The organization runner group must be named `intent-state`, non-default, visible
 only to selected repositories, and restricted to this repository's exact
 `.github/workflows/intent-state.yml@refs/heads/<default-branch>` and
-`.github/workflows/intent-check.yml@refs/heads/<default-branch>` workflows, with no
+`.github/workflows/intent-check.yml@refs/heads/<default-branch>`, and
+`.github/workflows/intent-sync.yml@refs/heads/<default-branch>` workflows, with no
 additional workflow entries. The
 registered runner name must equal the CI descriptor's runner ID and have both
 `self-hosted` and `intent-state` labels; the workflow selects the group explicitly.
@@ -130,14 +131,14 @@ cron `17 2 * * *`. Its exact read-only permissions are `contents: read`,
 `issues: read`, and `pull-requests: read`. The ordered command sequence is:
 
 ```bash
-python -m pip install .
-python -m intent_engineering.integrations.github_action restore
-intent sync --project . --sources markdown,git,github
-intent validate --project .
-intent drift --project . --format markdown --output intent-drift.md
-intent assess --project . --format json > intent-assessment.json
-intent assessment-gate --project . --base-report intent-assessment-base.json --head-report intent-assessment.json --format json
-intent check --require-review
+python -I -m pip install --require-hashes --only-binary=:all: -r src/intent_engineering/integrations/ci-runtime.lock
+python -I ci/assurance.py restore --project .
+python -I ci/intent.py sync --project . --sources markdown,git,github
+python -I ci/intent.py validate --project .
+python -I ci/intent.py drift --project . --format markdown --output intent-drift.md
+python -I ci/intent.py assess --project . --format json > intent-assessment.json
+python -I ci/intent.py assessment-gate --project . --base-report intent-assessment-base.json --head-report intent-assessment.json --format json
+python -I ci/intent.py check --require-review
 ```
 
 Before assessing the current graph, the workflow resolves the exact comparison base, restores
@@ -146,11 +147,13 @@ no comparison base, so it publishes the head assessment without running the comp
 detached worktree is removed even when an earlier comparison step fails.
 
 Because `.intent` is ignored, a clean checkout restores its approved baseline from the fetched
-protected `intent-state` ref. The older sync workflow uses a legacy environment-trust
-adapter and is not the production key-provisioning path. Do not place recipient private
-keys in GitHub Secrets. New team setup requires a [dedicated CI recipient](ci-recipient.md)
-whose key remains in its self-hosted runner OS keyring. Missing keys, invalid signatures
-or incompatible state fail closed. The workflow
+protected `intent-state` ref. The sync workflow runs only the protected
+`github.workflow_sha` on the restricted self-hosted runner and uses its dedicated CI
+recipient. Do not place recipient private keys in GitHub Secrets; the key remains in the
+runner service account's OS keyring and only the reviewed public trust path is configured
+outside the checkout. Dependencies are hash-locked, and repository code is invoked from
+the protected checkout without a package install. Missing keys, invalid signatures or
+incompatible state fail closed. The workflow
 never runs `intent init` and cannot report an empty graph version 0 as clean. See
 [CI setup and trust prerequisites](intent-aware-agent.md#required-github-check-setup).
 The workflow uploads the drift report as the `intent-drift` artifact, then uploads the head and

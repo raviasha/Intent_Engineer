@@ -30,7 +30,11 @@ from intent_engineering.core.models import (
     ReconciliationCase,
     ReconciliationCaseType,
 )
-from intent_engineering.intent_workflow.check import CheckService
+from intent_engineering.intent_workflow.check import (
+    CheckService,
+    SharedStateRestoreResult,
+    SharedStateRestoreStatus,
+)
 from intent_engineering.storage.executor import LocalChangeSetExecutor
 from intent_engineering.team_state import restore as restore_module
 from intent_engineering.team_state.restore import (
@@ -77,6 +81,14 @@ def _action():
     path = Path(__file__).parents[2] / "src/intent_engineering/integrations/github_action.py"
     assert path.is_file(), "reviewed GitHub check runner is missing"
     return importlib.import_module("intent_engineering.integrations.github_action")
+
+
+def _scheduled_cli_arguments(command: str) -> list[str]:
+    parts = shlex.split(command)
+    launcher = next(
+        index for index, value in enumerate(parts) if value.endswith("ci/intent.py")
+    )
+    return parts[launcher + 1 :]
 
 
 def _require_local_listener() -> None:
@@ -577,6 +589,62 @@ def test_ci_restore_requires_real_trust_even_for_locally_onboarded_state(tmp_pat
         action.restore(repo)
 
 
+def test_scheduled_restore_selects_runner_keyring_trust(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    action = _action()
+    repo = tmp_path / "project"
+    repo.mkdir()
+    provider = object()
+    observed: list[tuple[Path, object]] = []
+
+    monkeypatch.setenv("INTENT_CI_TRUST_PATH", str(tmp_path / "protected" / "trust.json"))
+    monkeypatch.delenv("INTENT_CI_SHARED_STATE_TRUST", raising=False)
+    monkeypatch.setattr(action, "ci_trust_from_environment", lambda root: provider)
+
+    class _Restorer:
+        def __init__(self, selected: object) -> None:
+            self._selected = selected
+
+        def verify_and_restore_approved_baseline(self, root: Path) -> SharedStateRestoreResult:
+            observed.append((root, self._selected))
+            return SharedStateRestoreResult(status=SharedStateRestoreStatus.VERIFIED)
+
+    monkeypatch.setattr(action, "GitSharedStateRestorer", _Restorer)
+
+    action.restore(repo)
+
+    assert observed == [(repo, provider)]
+
+
+def test_protected_scheduled_restore_never_falls_back_to_environment_trust(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    action = _action()
+    repo = tmp_path / "project"
+    repo.mkdir()
+    selected: list[Path] = []
+
+    monkeypatch.delenv("INTENT_CI_TRUST_PATH", raising=False)
+    monkeypatch.setenv("INTENT_CI_SHARED_STATE_TRUST", "legacy-secret")
+
+    def require_keyring(root: Path) -> object:
+        selected.append(root)
+        raise ValueError("keyring required")
+
+    monkeypatch.setattr(action, "ci_trust_from_environment", require_keyring)
+    monkeypatch.setattr(
+        action,
+        "EnvironmentTrustProvider",
+        lambda: pytest.fail("protected scheduled restore used legacy trust"),
+    )
+
+    with pytest.raises(ValueError, match="keyring required"):
+        action.restore(repo, require_ci=True)
+
+    assert selected == [repo]
+
+
 @pytest.mark.parametrize("commands", [[], [["tools/test-runner"], ["tools/test-runner", "fail"]]])
 def test_all_reviewed_commands_must_pass_before_staging_ci_evidence(
     tmp_path: Path,
@@ -754,7 +822,7 @@ def test_scheduled_capture_uploads_a_report_before_failing_for_pending_review(
         "Render drift and assurance report",
     ):
         step = named_steps[name]
-        arguments = shlex.split(step["run"])[1:]
+        arguments = _scheduled_cli_arguments(step["run"])
         if "--sources" in arguments:
             # GitHub connector behavior is separately covered by its offline API fixtures.
             arguments[arguments.index("--sources") + 1] = "markdown,git"
@@ -770,7 +838,7 @@ def test_scheduled_capture_uploads_a_report_before_failing_for_pending_review(
     assert "CONFLICTING" in report
     check = CliRunner().invoke(
         app,
-        shlex.split(named_steps["Require resolution of pending review"]["run"])[1:],
+        _scheduled_cli_arguments(named_steps["Require resolution of pending review"]["run"]),
     )
     assert check.exit_code == 4, check.stdout
     runtime = load_runtime(repo)
@@ -852,7 +920,7 @@ def test_scheduled_pipeline_does_not_mask_operational_failures(
     )
     for step in workflow["jobs"]["drift"]["steps"][4:]:
         assert "uses" not in step, "an operational failure must stop before upload"
-        arguments = shlex.split(step["run"])[1:]
+        arguments = _scheduled_cli_arguments(step["run"])
         if "--sources" in arguments:
             arguments[arguments.index("--sources") + 1] = "markdown,git"
         result = CliRunner().invoke(app, arguments)

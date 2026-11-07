@@ -906,6 +906,10 @@ class GitHubTeamStateClient:
                     f"{repository}/.github/workflows/intent-state.yml@refs/heads/"
                     f"{reviewed.default_branch}"
                 ),
+                (
+                    f"{repository}/.github/workflows/intent-sync.yml@refs/heads/"
+                    f"{reviewed.default_branch}"
+                ),
             )
         )
         matching_groups = [

@@ -384,6 +384,7 @@ def _default_tooling(
                         "selected_workflows": [
                             "acme/project/.github/workflows/intent-check.yml@refs/heads/main",
                             "acme/project/.github/workflows/intent-state.yml@refs/heads/main",
+                            "acme/project/.github/workflows/intent-sync.yml@refs/heads/main",
                         ],
                     }
                 ],
@@ -560,6 +561,7 @@ def _runner_group(group_id: int, *, exact: bool = False) -> dict[str, object]:
             [
                 "acme/project/.github/workflows/intent-check.yml@refs/heads/main",
                 "acme/project/.github/workflows/intent-state.yml@refs/heads/main",
+                "acme/project/.github/workflows/intent-sync.yml@refs/heads/main",
             ]
             if exact
             else ["acme/project/.github/workflows/other.yml@refs/heads/main"]
@@ -674,8 +676,8 @@ async def test_default_branch_tooling_rejects_missing_or_wrong_check_workflow(
 
 
 @pytest.mark.anyio
-async def test_runner_group_requires_exact_sorted_state_and_check_workflows() -> None:
-    """Catches a runner group omitting either protected workflow from its exact ACL."""
+async def test_runner_group_requires_exact_sorted_protected_workflows() -> None:
+    """Catches a runner group omitting any protected workflow from its exact ACL."""
     api = QueueApi(
         _inspection() + _default_tooling(),
         pages=[_runner_page(), _required_workflow_page(), _required_check_workflow_page()],
@@ -695,7 +697,9 @@ async def test_runner_group_requires_exact_sorted_state_and_check_workflows() ->
 
 
 @pytest.mark.anyio
-@pytest.mark.parametrize("change", ["missing_check", "missing_state", "extra", "unsorted"])
+@pytest.mark.parametrize(
+    "change", ["missing_check", "missing_state", "missing_sync", "extra", "unsorted"]
+)
 async def test_runner_group_rejects_any_other_selected_workflow_set(change: str) -> None:
     tooling = _default_tooling()
     group_payload = dict(tooling[2].payload)
@@ -704,7 +708,9 @@ async def test_runner_group_rejects_any_other_selected_workflow_set(change: str)
     if change == "missing_check":
         selected = selected[1:]
     elif change == "missing_state":
-        selected = selected[:1]
+        selected.pop(1)
+    elif change == "missing_sync":
+        selected = selected[:-1]
     elif change == "extra":
         selected.append("acme/project/.github/workflows/other.yml@refs/heads/main")
     else:
