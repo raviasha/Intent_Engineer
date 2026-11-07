@@ -139,11 +139,16 @@ app.command("assessment-gate", hidden=True)(assessment_gate_command)
 _MAX_PROMPT_HOOK_BYTES = 64 * 1024
 
 
+def _stderr_logger_factory(*_args: object) -> structlog.WriteLogger:
+    """Bind each logger to the current process stderr instead of a stale capture stream."""
+    return structlog.WriteLogger(sys.stderr)
+
+
 def _configure_logging() -> None:
     """Keep library operational logs off the structured stdout protocol."""
     structlog.configure(
         processors=[structlog.processors.JSONRenderer()],
-        logger_factory=structlog.WriteLoggerFactory(__import__("sys").stderr),
+        logger_factory=_stderr_logger_factory,
     )
 
 
