@@ -6,12 +6,15 @@ from pathlib import Path
 import pytest
 
 from intent_engineering.alternatives.models import AlternativeMode
+from intent_engineering.alternatives.overlay import apply_alternative_overlay
 from intent_engineering.alternatives.proposals import (
     AlternativeActor,
     AlternativeProposalConflictError,
     AlternativeProposalService,
 )
 from intent_engineering.alternatives.service import RequirementAlternativeService
+from intent_engineering.assessment import GraphAssessmentService
+from intent_engineering.core.graph import apply_changeset
 from intent_engineering.intent_workflow import ProposalKind
 from intent_engineering.intent_workflow.clarification import ProposalConfirmationService
 from intent_engineering.intent_workflow.proposal_store import IntentProposalStore
@@ -60,10 +63,10 @@ def test_submit_creates_pending_proposal_without_mutating_graph(tmp_path: Path) 
     assert proposal.kind is ProposalKind.REQUIREMENT
     assert proposal.proposed_by == "actor:owner"
     assert proposal.evidence_refs == ("evidence:visible",)
-    assert proposal.changeset.nodes_updated[0].node_id == "req:export"
-    assert proposal.changeset.nodes_updated[0].replacement.label == (
-        "An owner exports the report on request."
+    requirement_update = next(
+        item for item in proposal.changeset.nodes_updated if item.node_id == "req:export"
     )
+    assert requirement_update.replacement.label == ("An owner exports the report on request.")
     assert loader.snapshot.graph.model_dump_json() == before
     assert store.get(proposal.id) == proposal
     store.close()
@@ -84,6 +87,35 @@ def test_selected_alternative_uses_existing_independent_high_risk_review(
     assert high_risk is True
     assert "node_update" in reasons
     assert proposal.proposed_by == proposal.changeset.actor
+    store.close()
+
+
+def test_projected_assessment_matches_the_exact_activated_semantics(tmp_path: Path) -> None:
+    loader, _alternatives, comparison, store, proposals = _services(tmp_path)
+    proposal = proposals.submit(
+        comparison.id,
+        expected_request_digest=comparison.request_digest,
+        expected_effect_digest=comparison.alternative.graph_effect_digest,
+    )
+
+    activated_graph = apply_changeset(loader.snapshot.graph, proposal.changeset)
+    projected_graph = apply_alternative_overlay(loader.snapshot.graph, comparison.alternative)
+    activated_snapshot = loader.snapshot.model_copy(
+        update={
+            "graph": activated_graph,
+            "graph_digest": "sha256:" + "d" * 64,
+            "aggregate_digest": "sha256:" + "e" * 64,
+        }
+    )
+    approved = GraphAssessmentService().assess(activated_snapshot)
+
+    assert tuple(
+        (node.id, node.label, node.status, node.evidence_refs) for node in activated_graph.nodes
+    ) == tuple(
+        (node.id, node.label, node.status, node.evidence_refs) for node in projected_graph.nodes
+    )
+    assert activated_graph.edges == projected_graph.edges
+    assert approved.node("req:export") == comparison.projected_scorecard
     store.close()
 
 

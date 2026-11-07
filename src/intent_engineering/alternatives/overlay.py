@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
-from intent_engineering.alternatives.models import (
-    GraphEffectKind,
-    RequirementAlternative,
-)
-from intent_engineering.core.models import Graph, Node
+from datetime import UTC, datetime
+
+from intent_engineering.alternatives.activation import build_alternative_changeset
+from intent_engineering.alternatives.models import RequirementAlternative
+from intent_engineering.core.graph import apply_changeset
+from intent_engineering.core.models import Graph
 
 
 class AlternativeProjectionError(ValueError):
@@ -19,39 +20,17 @@ class AlternativeProjectionError(ValueError):
 def _apply(graph: Graph, alternative: RequirementAlternative) -> Graph:
     if type(graph) is not Graph or type(alternative) is not RequirementAlternative:
         raise TypeError("invalid projection input")
-    if alternative.graph_effect_digest != alternative.candidate.graph_effect_digest:
-        raise ValueError("effect digest mismatch")
-
-    nodes: dict[str, Node] = {node.id: node for node in graph.nodes}
-    removed: set[str] = set()
-    for effect in alternative.candidate.graph_effects:
-        if effect.effect is GraphEffectKind.UPDATE_NODE:
-            node = nodes.get(effect.target_ref)
-            if (
-                node is None
-                or effect.field not in {"label", "statement"}
-                or effect.before != node.label
-                or effect.after is None
-            ):
-                raise ValueError("invalid node update")
-            nodes[node.id] = node.model_copy(update={"label": effect.after})
-        elif effect.effect is GraphEffectKind.REMOVE_NODE:
-            if effect.target_ref not in nodes:
-                raise ValueError("invalid node removal")
-            removed.add(effect.target_ref)
-        else:
-            raise ValueError("unsupported graph effect")
-
-    projected = graph.model_copy(
-        update={
-            "nodes": tuple(nodes[node_id] for node_id in sorted(nodes) if node_id not in removed),
-            "edges": tuple(
-                edge
-                for edge in graph.edges
-                if edge.from_id not in removed and edge.to_id not in removed
-            ),
-        }
+    timestamp = max(
+        (node.last_modified_at for node in graph.nodes),
+        default=datetime(1970, 1, 1, tzinfo=UTC),
     )
+    changeset = build_alternative_changeset(
+        graph,
+        alternative,
+        actor="alternative-projection",
+        timestamp=timestamp,
+    )
+    projected = apply_changeset(graph, changeset).model_copy(update={"version": graph.version})
     projected.assert_invariants()
     return projected
 

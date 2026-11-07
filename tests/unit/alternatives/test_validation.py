@@ -26,6 +26,7 @@ def _candidate() -> RequirementAlternativeCandidate:
         subject_ref="req:export",
         proposed_text="An owner exports the report on request.",
         mode=AlternativeMode.CHANGE_APPROACH,
+        preserved_intent_refs=("intent:portable-report",),
         preserved_outcome_refs=("outcome:portable-report",),
         weakened_outcomes=(),
         constraint_effects=(
@@ -53,6 +54,13 @@ def _candidate() -> RequirementAlternativeCandidate:
                 before="Automate scheduled CSV export.",
                 after="An owner exports the report on request.",
             ),
+            GraphEffect(
+                effect=GraphEffectKind.UPDATE_NODE,
+                target_ref="constraint:weekly",
+                field="statement",
+                before="The report is available weekly.",
+                after="Make the report available on request.",
+            ),
         ),
     )
 
@@ -75,7 +83,7 @@ def test_validator_accepts_grounded_intent_preserving_candidate() -> None:
 
     assert alternative.request_digest == request.digest
     assert alternative.candidate.preserved_outcome_refs == ("outcome:portable-report",)
-    assert alternative.graph_effect_digest == candidate.graph_effect_digest
+    assert alternative.graph_effect_digest == candidate.activation_effect_digest
 
 
 @pytest.mark.parametrize(
@@ -100,13 +108,79 @@ def test_validator_rejects_ungrounded_references(field: str, value: object) -> N
 
 def test_validator_rejects_graph_effects_that_do_not_match_the_proposed_requirement() -> None:
     candidate = _candidate()
-    effect = candidate.graph_effects[0].model_copy(update={"after": "A different requirement."})
+    effect = next(
+        item for item in candidate.graph_effects if item.target_ref == candidate.subject_ref
+    ).model_copy(update={"after": "A different requirement."})
     mismatched = RequirementAlternativeCandidate.model_validate(
-        {**candidate.model_dump(), "graph_effects": (effect,)}
+        {
+            **candidate.model_dump(),
+            "graph_effects": tuple(
+                effect if item.target_ref == candidate.subject_ref else item
+                for item in candidate.graph_effects
+            ),
+        }
     )
 
     with pytest.raises(AlternativeValidationError, match="alternative candidate invalid"):
         AlternativeValidator().validate(_request(), mismatched)
+
+
+def test_validator_rejects_undeclared_intent_or_constraint_mutation() -> None:
+    candidate = _candidate()
+    intent_removal = GraphEffect(
+        effect=GraphEffectKind.REMOVE_NODE,
+        target_ref="intent:portable-report",
+        before="Customers can take their reports with them.",
+    )
+    undeclared_constraint = next(
+        item for item in candidate.graph_effects if item.target_ref == "constraint:weekly"
+    )
+    subject_removal = GraphEffect(
+        effect=GraphEffectKind.REMOVE_NODE,
+        target_ref="req:export",
+        before="Automate scheduled CSV export.",
+    )
+
+    for effects, constraint_effects in (
+        ((*candidate.graph_effects, intent_removal), candidate.constraint_effects),
+        ((*candidate.graph_effects, subject_removal), candidate.constraint_effects),
+        (
+            tuple(
+                item
+                for item in candidate.graph_effects
+                if item.target_ref != undeclared_constraint.target_ref
+            ),
+            candidate.constraint_effects,
+        ),
+    ):
+        unaccounted = RequirementAlternativeCandidate.model_validate(
+            {
+                **candidate.model_dump(),
+                "graph_effects": effects,
+                "constraint_effects": constraint_effects,
+            }
+        )
+        with pytest.raises(AlternativeValidationError):
+            AlternativeValidator().validate(_request(), unaccounted)
+
+
+def test_validator_rejects_overlapping_or_uncovered_outcomes() -> None:
+    candidate = _candidate()
+    overlapping = RequirementAlternativeCandidate.model_validate(
+        {
+            **candidate.model_dump(),
+            "weakened_outcomes": (
+                {
+                    "schema_version": 1,
+                    "outcome_ref": "outcome:portable-report",
+                    "rationale": "Delivery is no longer automatic.",
+                },
+            ),
+        }
+    )
+
+    with pytest.raises(AlternativeValidationError):
+        AlternativeValidator().validate(_request(), overlapping)
 
 
 def test_candidate_model_rejects_unknown_effect_shape_before_validation() -> None:

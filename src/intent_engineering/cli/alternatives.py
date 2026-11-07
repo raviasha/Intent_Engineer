@@ -45,15 +45,25 @@ def _text_result(result: AlternativeResult) -> str:
     lines = ["Requirement alternatives"]
     for index, comparison in enumerate(result.alternatives, start=1):
         candidate = comparison.alternative.candidate
+        subject_update = next(
+            (
+                effect
+                for effect in candidate.graph_effects
+                if effect.effect.value == "update_node"
+                and effect.target_ref == candidate.subject_ref
+            ),
+            None,
+        )
         lines.extend(
             [
                 "",
                 f"Alternative {index} — Projected — not approved",
                 (
                     f"Current requirement: {comparison.current_scorecard.node_id} — "
-                    f"{candidate.graph_effects[0].before}"
+                    f"{subject_update.before if subject_update is not None else 'unavailable'}"
                 ),
                 f"Proposed requirement: {candidate.proposed_text}",
+                "Preserved intent: " + ", ".join(candidate.preserved_intent_refs),
                 "Preserved outcomes: " + ", ".join(candidate.preserved_outcome_refs),
                 "Weakened outcomes: "
                 + (
@@ -66,7 +76,8 @@ def _text_result(result: AlternativeResult) -> str:
                 "Constraint changes: "
                 + (
                     "; ".join(
-                        f"{item.constraint_ref} ({item.effect.value}) — {item.rationale}"
+                        f"{item.constraint_ref} ({item.effect.value})"
+                        f" → {item.proposed_text or 'superseded'} — {item.rationale}"
                         for item in candidate.constraint_effects
                     )
                     or "none declared"
@@ -80,6 +91,12 @@ def _text_result(result: AlternativeResult) -> str:
                 "Risks: " + "; ".join(candidate.risks),
                 "Trade-offs: " + "; ".join(candidate.tradeoffs),
                 "Assumptions: " + "; ".join(candidate.assumptions),
+                "Exact graph effects: "
+                + "; ".join(
+                    f"{item.effect.value} {item.target_ref}"
+                    f" {item.field or ''}: {item.before or '∅'} → {item.after or '∅'}"
+                    for item in candidate.graph_effects
+                ),
                 "Projected dimension deltas: "
                 + ", ".join(
                     f"{item.dimension.value}={item.delta:+d}"

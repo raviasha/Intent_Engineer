@@ -7,6 +7,7 @@ from pydantic import ValidationError
 
 from intent_engineering.alternatives.models import (
     AlternativeComparison,
+    AlternativeContextNode,
     AlternativeEvidenceSummary,
     AlternativeMode,
     AlternativeRequest,
@@ -62,6 +63,23 @@ def _request() -> AlternativeRequest:
         intent_refs=("intent:portable-report",),
         desired_outcome_refs=("outcome:portable-report",),
         constraint_refs=("constraint:weekly",),
+        context_nodes=(
+            AlternativeContextNode(
+                node_ref="constraint:weekly",
+                node_type="constraint",
+                label="Export weekly.",
+            ),
+            AlternativeContextNode(
+                node_ref="intent:portable-report",
+                node_type="product_intent",
+                label="Customers can take reports with them.",
+            ),
+            AlternativeContextNode(
+                node_ref="outcome:portable-report",
+                node_type="desired_outcome",
+                label="Customers obtain a portable report.",
+            ),
+        ),
         evidence_summaries=(
             AlternativeEvidenceSummary(
                 evidence_ref="evidence:customer-interview",
@@ -80,6 +98,7 @@ def _candidate() -> RequirementAlternativeCandidate:
         subject_ref="req:export",
         proposed_text="An owner exports the report on request.",
         mode=AlternativeMode.CHANGE_APPROACH,
+        preserved_intent_refs=("intent:portable-report",),
         preserved_outcome_refs=("outcome:portable-report",),
         weakened_outcomes=(
             OutcomeEffect(
@@ -111,6 +130,13 @@ def _candidate() -> RequirementAlternativeCandidate:
                 field="statement",
                 before="Automate scheduled CSV export.",
                 after="An owner exports the report on request.",
+            ),
+            GraphEffect(
+                effect=GraphEffectKind.UPDATE_NODE,
+                target_ref="constraint:weekly",
+                field="statement",
+                before="Export weekly.",
+                after="Export on request rather than weekly.",
             ),
         ),
     )
@@ -144,7 +170,7 @@ def test_request_candidate_and_result_have_content_addressed_identities() -> Non
     alternative = RequirementAlternative.from_candidate(
         candidate,
         request_digest=request.digest,
-        graph_effect_digest=candidate.graph_effect_digest,
+        graph_effect_digest=candidate.activation_effect_digest,
     )
     comparison = AlternativeComparison.create(
         request=request,
@@ -219,7 +245,7 @@ def test_result_status_is_consistent_with_alternatives() -> None:
                     alternative=RequirementAlternative.from_candidate(
                         _candidate(),
                         request_digest=request.digest,
-                        graph_effect_digest=_candidate().graph_effect_digest,
+                        graph_effect_digest=_candidate().activation_effect_digest,
                     ),
                     current_scorecard=request.current_scorecard,
                     projected_scorecard=_scorecard(robustness=78),

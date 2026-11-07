@@ -9,11 +9,12 @@ from datetime import UTC, datetime
 
 from pydantic import ConfigDict, field_validator
 
-from intent_engineering.alternatives.models import AlternativeComparison, GraphEffectKind
+from intent_engineering.alternatives.activation import build_alternative_changeset
+from intent_engineering.alternatives.models import AlternativeComparison
 from intent_engineering.alternatives.service import RequirementAlternativeService
 from intent_engineering.assessment import AssessmentSnapshot
 from intent_engineering.core.graph import apply_changeset
-from intent_engineering.core.models import ChangeSet, NodeUpdate
+from intent_engineering.core.models import ChangeSet
 from intent_engineering.core.models._base import StrictModel
 from intent_engineering.intent_workflow import IntentProposal, ProposalKind
 from intent_engineering.intent_workflow.proposal_store import IntentProposalStore
@@ -153,54 +154,12 @@ class AlternativeProposalService:
         actor: str,
         timestamp: datetime,
     ) -> ChangeSet:
-        nodes = {node.id: node for node in snapshot.graph.nodes}
-        updates: list[NodeUpdate] = []
-        superseded: list[str] = []
-        for effect in comparison.alternative.candidate.graph_effects:
-            node = nodes.get(effect.target_ref)
-            if node is None:
-                raise ValueError("proposal target unavailable")
-            if effect.effect is GraphEffectKind.UPDATE_NODE:
-                if effect.after is None or effect.before != node.label:
-                    raise ValueError("proposal target changed")
-                replacement = node.model_copy(
-                    update={
-                        "label": effect.after,
-                        "last_modified_by": actor,
-                        "last_modified_at": timestamp,
-                        "evidence_refs": tuple(
-                            sorted(
-                                set(node.evidence_refs)
-                                | set(comparison.alternative.candidate.supporting_evidence_refs)
-                            )
-                        ),
-                    }
-                )
-                updates.append(NodeUpdate(node_id=node.id, replacement=replacement))
-            elif effect.effect is GraphEffectKind.REMOVE_NODE:
-                superseded.append(node.id)
-            else:
-                raise ValueError("unsupported proposal effect")
-        changeset = ChangeSet(
-            id="",
+        return build_alternative_changeset(
+            snapshot.graph,
+            comparison.alternative,
             actor=actor,
             timestamp=timestamp,
-            baseline_graph_version=snapshot.graph.version,
-            evidence_refs=comparison.alternative.candidate.supporting_evidence_refs,
-            nodes_added=(),
-            nodes_updated=tuple(sorted(updates, key=lambda item: item.node_id)),
-            nodes_superseded=tuple(sorted(superseded)),
-            edges_added=(),
-            edges_updated=(),
-            edges_superseded=(),
-            confidence_changes=(),
-            implementation_status_changes=(),
-            reconciliation_cases_created=(),
-            reconciliation_cases_resolved=(),
-            validation_status="validated",
         )
-        identity = _digest(changeset.model_dump(mode="json", exclude={"id"}))
-        return changeset.model_copy(update={"id": f"changeset:alternative:{identity}"})
 
     @staticmethod
     def _proposal(

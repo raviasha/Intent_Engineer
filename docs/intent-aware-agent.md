@@ -560,6 +560,11 @@ the advisor uses `intent_alternative_context` and validates each host draft with
 projected, not approved. A configured server reasoner may instead serve `intent_alternatives`.
 Provider unavailability does not affect assessment, visualization, or enrichment.
 
+Grounding includes bounded visible semantic labels and safe evidence summaries, never hidden branch
+content. Local validation requires exact intent preservation, complete desired-outcome accounting,
+and a one-to-one match between declared constraint changes and exact graph effects. The comparison
+shows those effects before a proposal can be created.
+
 MCP cannot submit or approve a selected alternative. For an exact host-generated candidate, select
 the requirement in `intent dev`, choose **Validate host candidate**, paste the candidate JSON, and
 choose **Validate host candidate locally**. After fresh local grounding, **Create review proposal**

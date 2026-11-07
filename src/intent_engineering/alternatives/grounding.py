@@ -3,15 +3,17 @@
 from __future__ import annotations
 
 from collections import deque
+from collections.abc import Mapping
 
 from intent_engineering.alternatives.models import (
+    AlternativeContextNode,
     AlternativeEvidenceSummary,
     AlternativeMode,
     AlternativeRequest,
     AlternativeUnavailable,
 )
 from intent_engineering.assessment import AssessmentReport, AssessmentSnapshot
-from intent_engineering.core.models import Node, NodeType
+from intent_engineering.core.models import EvidenceRecord, Node, NodeType
 
 _MAX_TRAVERSAL_DEPTH = 3
 _MAX_VISITED_NODES = 128
@@ -89,13 +91,24 @@ def _evidence_summaries(
         summaries.append(
             AlternativeEvidenceSummary(
                 evidence_ref=record.id,
-                summary=(
-                    f"Visible {record.connector_type} evidence observed "
-                    f"{record.observed_at.date().isoformat()}."
-                ),
+                summary=_visible_evidence_summary(record),
             )
         )
     return tuple(summaries)
+
+
+def _visible_evidence_summary(record: EvidenceRecord) -> str:
+    payload = record.payload
+    if isinstance(payload, Mapping):
+        text = payload.get("text")
+        if type(text) is str and text.strip():
+            encoded = text.strip().encode("utf-8")
+            if len(encoded) <= 2 * 1024:
+                return text.strip()
+    return (
+        f"Visible {record.connector_type} evidence observed "
+        f"{record.observed_at.date().isoformat()}."
+    )
 
 
 class AlternativeRequestBuilder:
@@ -156,6 +169,14 @@ class AlternativeRequestBuilder:
             intent_refs=intent_refs,
             desired_outcome_refs=outcome_refs,
             constraint_refs=constraint_refs,
+            context_nodes=tuple(
+                AlternativeContextNode(
+                    node_ref=node.id,
+                    node_type=(node.type.value if isinstance(node.type, NodeType) else node.type),
+                    label=node.label,
+                )
+                for node in context
+            ),
             evidence_summaries=evidence,
             current_scorecard=scorecard,
             snapshot_digest=snapshot.aggregate_digest,

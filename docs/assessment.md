@@ -104,7 +104,8 @@ requirement and choose **Suggest alternatives**. Each result shows:
 - changed or removed constraints;
 - implementation and operational complexity;
 - supporting evidence, risks, trade-offs, and assumptions; and
-- server-computed score changes by assessment dimension.
+- server-computed score changes by assessment dimension; and
+- the exact requirement and constraint graph effects that independent review would activate.
 
 Every alternative is labeled **Projected — not approved**. Generation and comparison do not edit
 the graph. Choosing **Create review proposal** creates an ordinary pending requirement proposal;
@@ -116,6 +117,11 @@ The optional CLI uses the same bounded service:
 intent alternatives req:csv-export --mode simplify --format json
 intent alternatives req:csv-export --mode change_approach --format markdown
 ```
+
+The reasoner sees only bounded ACL-visible intent, outcome, constraint labels, and safe evidence
+summaries. Local validation requires the candidate to preserve the visible intent, account for every
+visible desired outcome, and match every declared constraint change to an exact graph effect. The
+same locally materialized activation shape drives both projected assessment and the pending proposal.
 
 No AI provider is required for assessment or enrichment. Without a configured alternative
 reasoner, this command returns the fixed provider-unavailable state and assessment remains

@@ -190,6 +190,8 @@ def test_packaged_browser_labels_alternatives_as_projected_not_approved() -> Non
     assert 'actionButton("Validate host candidate"' in script
     assert "Weakened outcome" in script
     assert "Removed constraint" in script
+    assert "Preserved intent" in script
+    assert "Exact graph effect" in script
     assert 'node.node_type === "requirement"' in script
     assert "localStorage" not in script
     assert "innerHTML" not in script

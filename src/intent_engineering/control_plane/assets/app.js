@@ -1046,6 +1046,11 @@
       addText(projected, "p", `Projected score: ${scoreText(comparison.projected_scorecard.robustness)}`);
       columns.append(current, projected);
       card.append(columns);
+      if (Array.isArray(candidate.preserved_intent_refs)) {
+        for (const intent of candidate.preserved_intent_refs) {
+          addText(card, "p", `Preserved intent: ${intent}`);
+        }
+      }
       if (Array.isArray(candidate.preserved_outcome_refs)) {
         for (const outcome of candidate.preserved_outcome_refs) {
           addText(card, "p", `Preserved outcome: ${outcome}`);
@@ -1059,7 +1064,16 @@
       if (Array.isArray(candidate.constraint_effects)) {
         for (const constraint of candidate.constraint_effects) {
           const label = constraint.effect === "remove" ? "Removed constraint" : "Changed constraint";
-          addText(card, "p", `${label}: ${constraint.constraint_ref} — ${constraint.rationale}`);
+          const proposed = constraint.proposed_text || "superseded";
+          addText(card, "p", `${label}: ${constraint.constraint_ref} → ${proposed} — ${constraint.rationale}`);
+        }
+      }
+      if (Array.isArray(candidate.graph_effects)) {
+        for (const effect of candidate.graph_effects) {
+          const field = effect.field ? ` ${effect.field}` : "";
+          const before = effect.before === null ? "∅" : effect.before;
+          const after = effect.after === null ? "∅" : effect.after;
+          addText(card, "p", `Exact graph effect: ${effect.effect} ${effect.target_ref}${field}: ${before} → ${after}`);
         }
       }
       if (candidate.complexity && typeof candidate.complexity === "object") {

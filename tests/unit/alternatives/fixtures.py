@@ -6,6 +6,7 @@ from datetime import UTC, datetime
 
 from intent_engineering.alternatives.models import (
     AlternativeComparison,
+    AlternativeContextNode,
     AlternativeEvidenceSummary,
     AlternativeMode,
     AlternativeRequest,
@@ -234,6 +235,23 @@ def available_alternative_result() -> AlternativeResult:
         intent_refs=("intent:portable-report",),
         desired_outcome_refs=("outcome:portable-report",),
         constraint_refs=("constraint:weekly",),
+        context_nodes=(
+            AlternativeContextNode(
+                node_ref="constraint:weekly",
+                node_type="constraint",
+                label="The report is available weekly.",
+            ),
+            AlternativeContextNode(
+                node_ref="intent:portable-report",
+                node_type="product_intent",
+                label="Customers can take their reports with them.",
+            ),
+            AlternativeContextNode(
+                node_ref="outcome:portable-report",
+                node_type="desired_outcome",
+                label="A customer can obtain a portable report.",
+            ),
+        ),
         evidence_summaries=(
             AlternativeEvidenceSummary(
                 evidence_ref="evidence:visible",
@@ -249,6 +267,7 @@ def available_alternative_result() -> AlternativeResult:
         subject_ref="req:export",
         proposed_text="Provide a downloadable CSV on request.",
         mode=AlternativeMode.SIMPLIFY,
+        preserved_intent_refs=("intent:portable-report",),
         preserved_outcome_refs=("outcome:portable-report",),
         weakened_outcomes=(),
         constraint_effects=(),
@@ -274,7 +293,7 @@ def available_alternative_result() -> AlternativeResult:
     alternative = RequirementAlternative.from_candidate(
         candidate,
         request_digest=request.digest,
-        graph_effect_digest=candidate.graph_effect_digest,
+        graph_effect_digest=candidate.activation_effect_digest,
     )
     comparison = AlternativeComparison.create(
         request=request,

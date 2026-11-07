@@ -27,7 +27,10 @@ def test_overlay_updates_only_the_detached_requirement() -> None:
     projected = apply_alternative_overlay(snapshot.graph, alternative)
 
     projected_requirement = next(node for node in projected.nodes if node.id == "req:export")
+    projected_constraint = next(node for node in projected.nodes if node.id == "constraint:weekly")
     assert projected_requirement.label == "An owner exports the report on request."
+    assert projected_constraint.label == "Make the report available on request."
+    assert projected_requirement.evidence_refs == ("evidence:visible",)
     assert snapshot.graph.model_dump_json() == approved_bytes
     assert projected.id == snapshot.graph.id
     assert projected.version == snapshot.graph.version

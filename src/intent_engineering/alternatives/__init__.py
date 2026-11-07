@@ -6,6 +6,7 @@ from intent_engineering.alternatives.grounding import (
 )
 from intent_engineering.alternatives.models import (
     AlternativeComparison,
+    AlternativeContextNode,
     AlternativeEvidenceSummary,
     AlternativeMode,
     AlternativeRequest,
@@ -44,6 +45,7 @@ from intent_engineering.alternatives.validation import (
 __all__ = [
     "AlternativeActor",
     "AlternativeComparison",
+    "AlternativeContextNode",
     "AlternativeEvidenceSummary",
     "AlternativeMode",
     "AlternativeProjectionError",

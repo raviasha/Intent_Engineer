@@ -45,7 +45,10 @@ def test_cli_compares_current_and_manual_alternative(monkeypatch) -> None:
     assert "Proposed requirement" in result.stdout
     assert "An owner exports the report on request" in result.stdout
     assert "Projected — not approved" in result.stdout
+    assert "Preserved intent" in result.stdout
     assert "Preserved outcomes" in result.stdout
+    assert "Make the report available on request" in result.stdout
+    assert "Exact graph effects" in result.stdout
     assert runtime.closed is True
 
 

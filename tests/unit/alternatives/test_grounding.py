@@ -23,7 +23,13 @@ def test_request_contains_only_visible_bounded_intent_and_requirement_grounding(
     assert request.intent_refs == ("intent:portable-report",)
     assert request.desired_outcome_refs == ("outcome:portable-report",)
     assert request.constraint_refs == ("constraint:weekly",)
+    assert tuple((item.node_ref, item.label) for item in request.context_nodes) == (
+        ("constraint:weekly", "The report is available weekly."),
+        ("intent:portable-report", "Customers can take their reports with them."),
+        ("outcome:portable-report", "A customer can obtain a portable report."),
+    )
     assert request.evidence_summaries[0].evidence_ref == "evidence:visible"
+    assert request.evidence_summaries[0].summary == "A weekly report is sufficient."
     assert "PRIVATE-SENTINEL" not in encoded
     assert "/private/workspace" not in encoded
     assert len(encoded.encode("utf-8")) <= 64 * 1024

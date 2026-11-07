@@ -19,6 +19,7 @@ _CANDIDATE_BYTE_LIMIT = 16 * 1024
 _REQUEST_BYTE_LIMIT = 64 * 1024
 _MAX_EFFECTS = 32
 _MAX_ALTERNATIVES = 8
+_MAX_VISITED_CONTEXT_NODES = 128
 
 
 def _canonical_json(value: object) -> bytes:
@@ -138,6 +139,21 @@ class AlternativeEvidenceSummary(_AlternativeModel):
         return _exact_text(value, label="summary", maximum=2 * 1024)
 
 
+class AlternativeContextNode(_AlternativeModel):
+    """Bounded visible semantic context supplied to an optional reasoner."""
+
+    schema_version: Literal[1] = 1
+    node_ref: str
+    node_type: str
+    label: str
+
+    @field_validator("node_ref", "node_type", "label", mode="before")
+    @classmethod
+    def validate_text(cls, value: object, info: ValidationInfo) -> str:
+        maximum = 4 * 1024 if info.field_name == "label" else 512
+        return _exact_text(value, label=str(info.field_name), maximum=maximum)
+
+
 class ComplexityEstimate(_AlternativeModel):
     schema_version: Literal[1] = 1
     implementation: ComplexityLevel
@@ -246,6 +262,7 @@ class AlternativeRequest(_AlternativeModel):
     intent_refs: tuple[str, ...]
     desired_outcome_refs: tuple[str, ...]
     constraint_refs: tuple[str, ...]
+    context_nodes: tuple[AlternativeContextNode, ...]
     evidence_summaries: tuple[AlternativeEvidenceSummary, ...]
     current_scorecard: NodeScorecard
     snapshot_digest: str = Field(pattern=_DIGEST_RE)
@@ -283,6 +300,17 @@ class AlternativeRequest(_AlternativeModel):
             raise ValueError("evidence summaries must have unique references")
         return tuple(sorted(value, key=lambda item: item.evidence_ref))
 
+    @field_validator("context_nodes")
+    @classmethod
+    def canonicalize_context(
+        cls, value: tuple[AlternativeContextNode, ...]
+    ) -> tuple[AlternativeContextNode, ...]:
+        if len(value) > _MAX_VISITED_CONTEXT_NODES:
+            raise ValueError("context_nodes exceeds item limit")
+        if len({item.node_ref for item in value}) != len(value):
+            raise ValueError("context nodes must have unique references")
+        return tuple(sorted(value, key=lambda item: item.node_ref))
+
     @model_validator(mode="after")
     def validate_identity_and_bounds(self) -> Self:
         material = self._identity_material()
@@ -291,6 +319,11 @@ class AlternativeRequest(_AlternativeModel):
             raise ValueError("alternative request identity does not match canonical content")
         if self.current_scorecard.node_id != self.subject_ref:
             raise ValueError("current scorecard must describe the request subject")
+        expected_context = (
+            set(self.intent_refs) | set(self.desired_outcome_refs) | set(self.constraint_refs)
+        )
+        if {item.node_ref for item in self.context_nodes} != expected_context:
+            raise ValueError("context nodes must exactly describe semantic references")
         if len(_canonical_json(material)) > _REQUEST_BYTE_LIMIT:
             raise ValueError("alternative request exceeds its UTF-8 byte limit")
         return self
@@ -318,6 +351,7 @@ class RequirementAlternativeCandidate(_AlternativeModel):
     subject_ref: str
     proposed_text: str
     mode: AlternativeMode
+    preserved_intent_refs: tuple[str, ...]
     preserved_outcome_refs: tuple[str, ...]
     weakened_outcomes: tuple[OutcomeEffect, ...]
     constraint_effects: tuple[ConstraintEffect, ...]
@@ -335,7 +369,7 @@ class RequirementAlternativeCandidate(_AlternativeModel):
         limit = 8 * 1024 if info.field_name == "proposed_text" else 2 * 1024
         return _exact_text(value, label=str(info.field_name), maximum=limit)
 
-    @field_validator("preserved_outcome_refs", "supporting_evidence_refs")
+    @field_validator("preserved_intent_refs", "preserved_outcome_refs", "supporting_evidence_refs")
     @classmethod
     def canonicalize_references(
         cls, value: tuple[str, ...], info: ValidationInfo
@@ -406,6 +440,16 @@ class RequirementAlternativeCandidate(_AlternativeModel):
     def graph_effect_digest(self) -> str:
         return _digest([item.model_dump(mode="json") for item in self.graph_effects])
 
+    @property
+    def activation_effect_digest(self) -> str:
+        """Digest the complete locally reviewable semantic activation material."""
+        return _digest(
+            {
+                "graph_effects": [item.model_dump(mode="json") for item in self.graph_effects],
+                "supporting_evidence_refs": self.supporting_evidence_refs,
+            }
+        )
+
 
 class RequirementAlternative(_AlternativeModel):
     """A locally validated candidate bound to one request and detached effect."""
@@ -417,7 +461,7 @@ class RequirementAlternative(_AlternativeModel):
 
     @model_validator(mode="after")
     def validate_effect_digest(self) -> Self:
-        if self.graph_effect_digest != self.candidate.graph_effect_digest:
+        if self.graph_effect_digest != self.candidate.activation_effect_digest:
             raise ValueError("graph effect digest does not match candidate")
         return self
 
@@ -599,6 +643,7 @@ class AlternativeResult(_AlternativeModel):
 
 __all__ = [
     "AlternativeComparison",
+    "AlternativeContextNode",
     "AlternativeEvidenceSummary",
     "AlternativeMode",
     "AlternativeRequest",
