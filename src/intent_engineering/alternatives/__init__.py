@@ -23,6 +23,14 @@ from intent_engineering.alternatives.models import (
     RequirementAlternative,
     RequirementAlternativeCandidate,
 )
+from intent_engineering.alternatives.overlay import (
+    AlternativeProjectionError,
+    apply_alternative_overlay,
+)
+from intent_engineering.alternatives.service import (
+    AlternativeReasoner,
+    RequirementAlternativeService,
+)
 from intent_engineering.alternatives.validation import (
     AlternativeValidationError,
     AlternativeValidator,
@@ -32,6 +40,8 @@ __all__ = [
     "AlternativeComparison",
     "AlternativeEvidenceSummary",
     "AlternativeMode",
+    "AlternativeProjectionError",
+    "AlternativeReasoner",
     "AlternativeRequest",
     "AlternativeRequestBuilder",
     "AlternativeResult",
@@ -50,4 +60,6 @@ __all__ = [
     "OutcomeEffect",
     "RequirementAlternative",
     "RequirementAlternativeCandidate",
+    "RequirementAlternativeService",
+    "apply_alternative_overlay",
 ]

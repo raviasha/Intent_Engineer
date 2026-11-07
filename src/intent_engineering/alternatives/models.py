@@ -476,6 +476,8 @@ class AlternativeComparison(_AlternativeModel):
     """Approved-versus-projected comparison for one validated alternative."""
 
     schema_version: Literal[1] = 1
+    current_state: Literal["approved"] = "approved"
+    projected_state: Literal["projected"] = "projected"
     request_digest: str = Field(pattern=_DIGEST_RE)
     alternative: RequirementAlternative
     current_scorecard: NodeScorecard
