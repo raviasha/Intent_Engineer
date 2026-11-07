@@ -1,0 +1,41 @@
+"""Grounded, proposal-only alternatives for intent-aligned requirements."""
+
+from intent_engineering.alternatives.models import (
+    AlternativeComparison,
+    AlternativeEvidenceSummary,
+    AlternativeMode,
+    AlternativeRequest,
+    AlternativeResult,
+    AlternativeStatus,
+    AlternativeUnavailable,
+    ComplexityEstimate,
+    ComplexityLevel,
+    ConstraintEffect,
+    ConstraintEffectKind,
+    DimensionScoreDelta,
+    GraphEffect,
+    GraphEffectKind,
+    OutcomeEffect,
+    RequirementAlternative,
+    RequirementAlternativeCandidate,
+)
+
+__all__ = [
+    "AlternativeComparison",
+    "AlternativeEvidenceSummary",
+    "AlternativeMode",
+    "AlternativeRequest",
+    "AlternativeResult",
+    "AlternativeStatus",
+    "AlternativeUnavailable",
+    "ComplexityEstimate",
+    "ComplexityLevel",
+    "ConstraintEffect",
+    "ConstraintEffectKind",
+    "DimensionScoreDelta",
+    "GraphEffect",
+    "GraphEffectKind",
+    "OutcomeEffect",
+    "RequirementAlternative",
+    "RequirementAlternativeCandidate",
+]
