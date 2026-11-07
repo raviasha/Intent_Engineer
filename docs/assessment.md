@@ -92,6 +92,39 @@ proposal does not edit the canonical graph. The proposed ChangeSet must pass the
 and approval boundary before it can become canonical. Scores remain derived projections and are
 recomputed from the accepted graph and currently visible evidence.
 
+## Compare simpler or different requirements
+
+Alternatives are suggestions for satisfying the same intent with a simpler implementation, a
+different or manual approach, a narrower scope, or reuse of an existing capability. They are
+generated only after an explicit request. In `intent dev`, select a visible orange or red
+requirement and choose **Suggest alternatives**. Each result shows:
+
+- the current approved requirement beside the projected alternative;
+- preserved and weakened desired outcomes;
+- changed or removed constraints;
+- implementation and operational complexity;
+- supporting evidence, risks, trade-offs, and assumptions; and
+- server-computed score changes by assessment dimension.
+
+Every alternative is labeled **Projected — not approved**. Generation and comparison do not edit
+the graph. Choosing **Create review proposal** creates an ordinary pending requirement proposal;
+the existing independent local review remains the only activation path.
+
+The optional CLI uses the same bounded service:
+
+```bash
+intent alternatives req:csv-export --mode simplify --format json
+intent alternatives req:csv-export --mode change_approach --format markdown
+```
+
+No AI provider is required for assessment or enrichment. Without a configured alternative
+reasoner, this command returns the fixed provider-unavailable state and assessment remains
+available. A coding host can instead call `intent_alternative_context`, draft up to four candidates,
+and pass each one to `intent_alternative_validate`. Only locally validated candidates should be
+shown. To select an exact host-generated candidate, choose **Validate host candidate** for the
+requirement in Intent Dev, paste the candidate JSON, and choose **Validate host candidate locally**.
+Intent Dev re-grounds it against the current ACL-filtered snapshot before enabling proposal review.
+
 ## MCP reads
 
 Start a standalone stdio server when the client manages the process:
@@ -120,6 +153,17 @@ They do not recover, advance, pause, resume, answer, skip, propose, or mutate a 
 Expired, stale, corrupt, hidden, and absent sessions fail closed. Responses are bounded and contain
 neither plaintext answers nor hidden evidence. No enrichment mutation tool is registered over MCP.
 
+Three additional read-only alternative tools are explicit-request only:
+
+- `intent_alternative_context` returns the bounded visible grounding packet;
+- `intent_alternative_validate` validates one untrusted host candidate and returns its projected
+  comparison; and
+- `intent_alternatives` invokes a configured server reasoner, or returns a fixed provider-unavailable
+  result.
+
+They cannot submit, approve, or apply a proposal. The local control plane revalidates a selected
+host candidate before it can create a pending proposal.
+
 ## CI comparison defaults
 
 When an exact comparison base exists, the scheduled/manual `.github/workflows/intent-sync.yml`
@@ -141,7 +185,8 @@ initial commit has no comparison base, so the workflow publishes its head report
 comparison gate. The later `intent check --require-review` remains a separate assurance decision.
 
 Assessment reports do not approve requirements, resolve conflicts, or authorize changes. Graph
-visualization with health styling and voluntary enrichment sessions are available projections over
-this foundation. Automatic activation/reconciliation beyond guarded publication, generation of
-alternative or simpler requirements, and the broader state-hardening backlog remain deferred and
-must not be treated as shipped behavior.
+visualization, voluntary enrichment, and grounded requirement alternatives are available projections
+over this foundation. This alternatives increment focuses on intent-to-requirement alignment; it
+does not establish requirement-to-code or requirement-to-test matching. That traceability work,
+automatic activation beyond existing reviewed governance, and the broader state-hardening backlog
+remain deferred.

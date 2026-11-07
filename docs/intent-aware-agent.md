@@ -552,6 +552,20 @@ excluded from rollups, unsupported inputs remain `unassessed`, and a critical re
 and project robustness at 49. See [the assessment guide](assessment.md) for deductions, confidence,
 MCP reads, CI defaults, and exit codes.
 
+### Compare alternative requirements explicitly
+
+When the developer explicitly asks for a simpler, manual, narrower, or reuse-based requirement,
+the advisor uses `intent_alternative_context` and validates each host draft with
+`intent_alternative_validate`. It presents only grounded comparisons and labels every score as
+projected, not approved. A configured server reasoner may instead serve `intent_alternatives`.
+Provider unavailability does not affect assessment, visualization, or enrichment.
+
+MCP cannot submit or approve a selected alternative. For an exact host-generated candidate, select
+the requirement in `intent dev`, choose **Validate host candidate**, paste the candidate JSON, and
+choose **Validate host candidate locally**. After fresh local grounding, **Create review proposal**
+opens the existing Proposal review flow. Independent confirmation is still required before the
+requirement becomes canonical.
+
 ### Improve the graph on your schedule
 
 When there is time for stronger intent capture, start a five-, fifteen-, or thirty-minute session
@@ -579,7 +593,8 @@ An enrichment proposal is still only a proposal. Canonical graph changes require
 governed review and approval flow. This release includes explainable assessment/visualization,
 resumable enrichment, CLI/browser/read-only-MCP journeys, deterministic validation, stable-root
 second-developer enrollment, automatic verified member restore, guarded member publication, and
-reviewed divergence reconciliation. Alternative/simpler-requirement generation and broader state
+reviewed divergence reconciliation, plus explicit grounded requirement alternatives. This increment
+does not establish requirement-to-code or requirement-to-test matching; that work and broader state
 hardening remain follow-up work.
 
 ## 6. Add compatible sources

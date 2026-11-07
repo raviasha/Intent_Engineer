@@ -200,7 +200,17 @@ def test_public_alpha_docs_and_bindings_match_the_shipped_operating_model(
         "intent_enrichment_next_question",
     ):
         assert shipped in assessment
-    assert "alternative or simpler requirements" in assessment
+    for shipped in (
+        "intent alternatives req:csv-export",
+        "intent_alternative_context",
+        "intent_alternative_validate",
+        "intent_alternatives",
+        "Projected — not approved",
+        "Validate host candidate locally",
+        "requirement-to-code or requirement-to-test matching",
+    ):
+        assert shipped in assessment
+    assert "does not establish" in assessment
     assert "remain deferred" in assessment
 
     clean_project = init_git_repo(tmp_path)
