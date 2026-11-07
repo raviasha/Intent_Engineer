@@ -754,6 +754,23 @@ def test_skill_routes_clarifications_and_states_advisory_mcp_failure_boundary() 
     assert "independently authenticated non-MCP local human" in skill
 
 
+def test_skill_routes_only_explicit_alternative_requests_through_validated_projection() -> None:
+    skill = (PLUGIN_ROOT / "skills" / "intent-advisor" / "SKILL.md").read_text(encoding="utf-8")
+
+    assert "Only enter this workflow when the user explicitly asks for alternatives" in skill
+    assert "intent_alternative_context" in skill
+    assert "intent_alternative_validate" in skill
+    assert "intent_alternatives" in skill
+    assert "`simpler` to `simplify`" in skill
+    assert "`manual` or `different approach` to `change_approach`" in skill
+    assert "`smaller scope` to `narrow_scope`" in skill
+    assert "`reuse existing` to `reuse_capability`" in skill
+    assert "projected, not approved" in skill.casefold()
+    assert "Never submit or approve an alternative over MCP" in skill
+    assert "Validate host candidate locally" in skill
+    assert "local Proposal review view" in skill
+
+
 def test_skill_human_attention_guidance_defers_to_the_route_selected_view() -> None:
     """The skill must not replace a bounded readiness route with a fixed destination."""
     skill = (PLUGIN_ROOT / "skills" / "intent-advisor" / "SKILL.md").read_text(encoding="utf-8")

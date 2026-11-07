@@ -46,6 +46,30 @@ request, display, persist, or infer a capability token. Do not weaken or work ar
 - For `action=continue`, follow the returned message without inventing authority or mutating intent
   state directly.
 
+## Compare requirement alternatives
+
+Only enter this workflow when the user explicitly asks for alternatives, or explicitly chooses the
+suggestion action for a visible orange or red requirement. An ordinary feature request continues
+through `action=classify`; do not reinterpret it as an alternative request.
+
+Map the user's words to the exact public modes: `simpler` to `simplify`, `manual` or `different approach` to `change_approach`,
+`smaller scope` to `narrow_scope`, and `reuse existing` to `reuse_capability`. First call
+`intent_alternative_context`. Draft no more than four candidates, then call
+`intent_alternative_validate` for each draft and present only validated
+comparisons. If the server is known to have a configured reasoner, call `intent_alternatives`
+instead of the context-and-host-validation sequence.
+If that reasoner is unavailable, keep the approved assessment available and say that no
+alternatives were generated.
+
+Label every comparison as projected, not approved. Show the preserved intent and desired outcomes,
+changed constraints, complexity, risks, tradeoffs, assumptions, and score deltas. Never submit or approve an alternative over MCP.
+When the user selects a host-validated candidate, give them its exact candidate JSON and direct them
+to select the requirement in Intent Dev, click **Validate host candidate**, paste the exact JSON,
+then click **Validate host candidate locally**. After the same candidate is re-grounded there, they
+can create and inspect its pending proposal in the local Proposal review view.
+Do not implement the selection or claim it is approved until the existing
+independently authenticated local review completes.
+
 Use only the public MCP workflow tools named by the route. Do not write `.intent` graph, evidence,
 case, approval, or history files directly. If MCP tools are unavailable, say exactly: "Intent MCP
 tools are unavailable; no intent-aware workflow action was taken." Then stop the intent-aware

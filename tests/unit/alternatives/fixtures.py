@@ -4,6 +4,20 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
+from intent_engineering.alternatives.models import (
+    AlternativeComparison,
+    AlternativeEvidenceSummary,
+    AlternativeMode,
+    AlternativeRequest,
+    AlternativeResult,
+    AlternativeStatus,
+    ComplexityEstimate,
+    ComplexityLevel,
+    GraphEffect,
+    GraphEffectKind,
+    RequirementAlternative,
+    RequirementAlternativeCandidate,
+)
 from intent_engineering.assessment import (
     AssessmentDimension,
     AssessmentHealth,
@@ -207,3 +221,69 @@ def assessment_pair(*, include_hidden: bool = False) -> tuple[AssessmentSnapshot
         assessment_complete=True,
     )
     return snapshot, report
+
+
+def available_alternative_result() -> AlternativeResult:
+    """Return one complete detached comparison for adapter contract tests."""
+    snapshot, report = assessment_pair()
+    current = report.node("req:export")
+    request = AlternativeRequest.create(
+        subject_ref="req:export",
+        subject_text="Automate scheduled CSV export.",
+        requested_modes=(AlternativeMode.SIMPLIFY,),
+        intent_refs=("intent:portable-report",),
+        desired_outcome_refs=("outcome:portable-report",),
+        constraint_refs=("constraint:weekly",),
+        evidence_summaries=(
+            AlternativeEvidenceSummary(
+                evidence_ref="evidence:visible",
+                summary="A weekly report is sufficient.",
+            ),
+        ),
+        current_scorecard=current,
+        snapshot_digest=snapshot.aggregate_digest,
+        policy_digest=report.policy_digest,
+        principal_projection_digest=snapshot.principal_projection_digest,
+    )
+    candidate = RequirementAlternativeCandidate(
+        subject_ref="req:export",
+        proposed_text="Provide a downloadable CSV on request.",
+        mode=AlternativeMode.SIMPLIFY,
+        preserved_outcome_refs=("outcome:portable-report",),
+        weakened_outcomes=(),
+        constraint_effects=(),
+        supporting_evidence_refs=("evidence:visible",),
+        complexity=ComplexityEstimate(
+            implementation=ComplexityLevel.LOW,
+            operations=ComplexityLevel.LOW,
+        ),
+        complexity_rationale="Avoids scheduler operations.",
+        risks=("A customer must initiate the download.",),
+        tradeoffs=("Less automation for lower operational complexity.",),
+        assumptions=("On-demand access meets the portability intent.",),
+        graph_effects=(
+            GraphEffect(
+                effect=GraphEffectKind.UPDATE_NODE,
+                target_ref="req:export",
+                field="statement",
+                before="Automate scheduled CSV export.",
+                after="Provide a downloadable CSV on request.",
+            ),
+        ),
+    )
+    alternative = RequirementAlternative.from_candidate(
+        candidate,
+        request_digest=request.digest,
+        graph_effect_digest=candidate.graph_effect_digest,
+    )
+    comparison = AlternativeComparison.create(
+        request=request,
+        alternative=alternative,
+        current_scorecard=current,
+        projected_scorecard=current,
+    )
+    return AlternativeResult.create(
+        request=request,
+        status=AlternativeStatus.AVAILABLE,
+        alternatives=(comparison,),
+    )

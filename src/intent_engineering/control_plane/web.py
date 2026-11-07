@@ -20,6 +20,11 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from intent_engineering.control_plane.http_models import (
     MAX_HTTP_BODY_BYTES,
+    AlternativeProposalRequest,
+    AlternativeProposalResponse,
+    AlternativesRequest,
+    AlternativesResponse,
+    AlternativeValidationRequest,
     AssessmentNodeResponse,
     AssessmentResponse,
     ClarificationAnswerDiscardRequest,
@@ -97,6 +102,9 @@ _STATIC_METHODS = {
         )
     },
     "/api/v1/assessment": "GET",
+    "/api/v1/alternatives": "POST",
+    "/api/v1/alternatives/validate": "POST",
+    "/api/v1/alternatives/propose": "POST",
     "/api/v1/status": "GET",
     "/api/v1/inbox": "GET",
     "/api/v1/development/observation": "GET",
@@ -860,6 +868,63 @@ def _make_handlers(
             detached = None
         return _end_handler(request, signal, response)
 
+    async def alternatives_endpoint(request: Request) -> Response:
+        response: Response | None = None
+        signal: BaseException | None = None
+        model: object = None
+        result: dict[str, object] | None = None
+        detached: object = None
+        try:
+            if request.url.path == "/api/v1/alternatives":
+                model = _parse_body(request, AlternativesRequest)
+                alternative_request = cast(AlternativesRequest, model)
+                result = service.alternatives(
+                    alternative_request.subject_ref,
+                    tuple(alternative_request.modes),
+                )
+                detached = AlternativesResponse.model_validate(result)
+            elif request.url.path == "/api/v1/alternatives/validate":
+                model = _parse_body(request, AlternativeValidationRequest)
+                validation_request = cast(AlternativeValidationRequest, model)
+                result = service.alternative_validate(
+                    validation_request.subject_ref,
+                    tuple(validation_request.modes),
+                    validation_request.candidate,
+                )
+                detached = AlternativesResponse.model_validate(result)
+            elif request.url.path == "/api/v1/alternatives/propose":
+                model = _parse_body(request, AlternativeProposalRequest)
+                proposal_request = cast(AlternativeProposalRequest, model)
+                result = service.alternative_propose(
+                    proposal_request.alternative_id,
+                    proposal_request.expected_request_digest,
+                    proposal_request.expected_effect_digest,
+                )
+                detached = AlternativeProposalResponse.model_validate(result)
+            else:  # pragma: no cover - exact static routes only
+                raise _HandlerRequestError()
+            response = _json_response(cast(Any, detached).model_dump(mode="json"))
+        except _HandlerRequestError:
+            response = _fixed_response(400)
+        except Exception:  # noqa: BLE001 - fixed browser boundary
+            response = _fixed_response(503)
+        except BaseException as caught:  # noqa: BLE001 - preserve cancellation identity
+            caught.__traceback__ = None
+            caught.__cause__ = None
+            caught.__context__ = None
+            signal = caught
+        finally:
+            if "alternative_request" in locals():
+                alternative_request = cast(AlternativesRequest, None)
+            if "proposal_request" in locals():
+                proposal_request = cast(AlternativeProposalRequest, None)
+            if "validation_request" in locals():
+                validation_request = cast(AlternativeValidationRequest, None)
+            model = None
+            result = None
+            detached = None
+        return _end_handler(request, signal, response)
+
     async def enrichment_endpoint(request: Request) -> Response:
         response: Response | None = None
         signal: BaseException | None = None
@@ -1408,6 +1473,7 @@ def _make_handlers(
     return {
         "assessment": assessment_endpoint,
         "assessment_node": assessment_node_endpoint,
+        "alternatives": alternatives_endpoint,
         "enrichment": enrichment_endpoint,
         "status": status_endpoint,
         "inbox": inbox_endpoint,
@@ -1479,6 +1545,17 @@ def build_control_plane_app(
                 "/api/v1/assessment/nodes/{node_id}",
                 handlers["assessment_node"],
                 methods=["GET"],
+            ),
+            Route("/api/v1/alternatives", handlers["alternatives"], methods=["POST"]),
+            Route(
+                "/api/v1/alternatives/validate",
+                handlers["alternatives"],
+                methods=["POST"],
+            ),
+            Route(
+                "/api/v1/alternatives/propose",
+                handlers["alternatives"],
+                methods=["POST"],
             ),
             *[
                 Route(

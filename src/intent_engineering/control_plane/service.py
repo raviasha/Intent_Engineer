@@ -18,6 +18,16 @@ from pathlib import PurePosixPath
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Literal, cast
 
+from intent_engineering.alternatives import (
+    AlternativeActor,
+    AlternativeMode,
+    AlternativeProposalService,
+    AlternativeReasoner,
+    AlternativeResult,
+    AlternativeStatus,
+    RequirementAlternativeCandidate,
+    RequirementAlternativeService,
+)
 from intent_engineering.assessment.models import AssessmentReport, AssessmentSnapshot, NodeScorecard
 from intent_engineering.assessment.service import GraphAssessmentService
 from intent_engineering.assessment.snapshot import (
@@ -41,6 +51,8 @@ from intent_engineering.cli.runtime import Runtime
 from intent_engineering.cli.writes import MutationPolicy, write_workflow
 from intent_engineering.control_plane.http_models import (
     MAX_HTTP_RESPONSE_BYTES,
+    AlternativeProposalResponse,
+    AlternativesResponse,
     AssessmentNodeResponse,
     AssessmentResponse,
     EnrichmentProposalResponse,
@@ -371,6 +383,7 @@ class ControlPlaneService:
         publication_service: PublicationService | None = None,
         reconciliation_service: ReconciliationService | None = None,
         reconciliation_remote: Callable[[], VerifiedReleaseV2] | None = None,
+        alternative_reasoner: AlternativeReasoner | None = None,
     ) -> None:
         if type(runtime) is not Runtime:
             raise ValueError("invalid control plane runtime")
@@ -412,6 +425,18 @@ class ControlPlaneService:
             str, tuple[ReconciliationPreview, HumanDecisionPayload]
         ] = {}
         self._assessment_service = GraphAssessmentService(clock=self._clock)
+        self._alternative_service = RequirementAlternativeService(
+            snapshot_loader=self._alternative_snapshot,
+            reasoner=alternative_reasoner,
+            assessment=self._assessment_service,
+        )
+        self._alternative_proposals = AlternativeProposalService(
+            alternatives=self._alternative_service,
+            snapshot_loader=self._alternative_snapshot,
+            proposal_store=runtime.intent_proposals,
+            actor_resolver=self._alternative_actor,
+            clock=self._clock,
+        )
         enrichment_proposals = ClarificationCoordinator(
             graph_store=runtime.graph_store,
             evidence_store=runtime.evidence_store,
@@ -1422,6 +1447,41 @@ class ControlPlaneService:
             actor = ""
             principals = frozenset()
 
+    def _alternative_snapshot(self) -> AssessmentSnapshot:
+        """Return one detached ACL-safe snapshot after exact read-authority revalidation."""
+        authority: _Authority | None = None
+        try:
+            authority = self._read_only_authority()
+            actor = authority.config.local_actor
+            principals = self._principals(authority, actor)
+            snapshot = self._assessment_snapshot_from_authority(authority, actor, principals)
+            if not self._read_only_authority_matches(authority):
+                raise ValueError("alternative authority changed")
+            return snapshot
+        finally:
+            if authority is not None:
+                authority.scrub_private()
+                authority.close()
+
+    def _alternative_actor(self) -> AlternativeActor:
+        """Resolve the local proposal author from freshly held authority."""
+        authority: _Authority | None = None
+        try:
+            authority = self._read_only_authority()
+            actor = authority.config.local_actor
+            aliases = ProposalConfirmationService._aliases(
+                actor,
+                authority.policy,
+                authority.provider_principals,
+            )
+            if actor not in aliases or not self._read_only_authority_matches(authority):
+                raise ValueError("alternative actor unavailable")
+            return AlternativeActor(actor=actor, aliases=tuple(sorted(aliases)))
+        finally:
+            if authority is not None:
+                authority.scrub_private()
+                authority.close()
+
     def _assessment_cursor_extent_mask(self, snapshot_digest: str, focus: str | None) -> int:
         material = _canonical_bytes(
             {
@@ -1809,6 +1869,145 @@ class ControlPlaneService:
     ) -> dict[str, object]:
         """Start one voluntary session and return its single current question."""
         return self._enrichment_boundary(lambda: self._enrichment_service.start(minutes, focus))
+
+    def alternatives(self, subject_ref: str, modes: tuple[str, ...]) -> dict[str, object]:
+        """Generate only explicit, detached requirement alternatives."""
+        result = None
+        signal: BaseException | None = None
+        try:
+            if type(subject_ref) is not str or type(modes) is not tuple:
+                raise ValueError("invalid alternatives request")
+            parsed_modes = tuple(AlternativeMode(mode) for mode in modes)
+            if not parsed_modes or len(set(parsed_modes)) != len(parsed_modes):
+                raise ValueError("invalid alternatives request")
+            result = self._alternative_service.request(
+                subject_ref=subject_ref,
+                modes=parsed_modes,
+            )
+            return self._alternatives_projection(result)
+        except Exception as caught:  # noqa: BLE001 - fixed browser boundary
+            self._scrub_enrichment_signal(caught)
+            raise ControlPlaneError() from None
+        except BaseException as caught:  # noqa: BLE001 - preserve cancellation identity
+            signal = self._scrub_enrichment_signal(caught)
+        finally:
+            subject_ref = ""
+            modes = ()
+            if "parsed_modes" in locals():
+                parsed_modes = ()
+            result = None
+        if signal is not None:
+            detached = signal
+            signal = None
+            raise detached.with_traceback(None)
+        raise ControlPlaneError() from None
+
+    @staticmethod
+    def _alternatives_projection(result: AlternativeResult) -> dict[str, object]:
+        return AlternativesResponse.model_validate(
+            {
+                "schema_version": 1,
+                "request_digest": result.request_digest,
+                "status": result.status.value,
+                "alternatives": [
+                    {
+                        "comparison_id": item.id,
+                        "comparison": item.model_dump(mode="json"),
+                    }
+                    for item in result.alternatives
+                ],
+            }
+        ).model_dump(mode="json")
+
+    def alternative_validate(
+        self,
+        subject_ref: str,
+        modes: tuple[str, ...],
+        candidate: RequirementAlternativeCandidate,
+    ) -> dict[str, object]:
+        """Re-ground one host candidate and retain only its local validated comparison."""
+        request = None
+        comparison = None
+        result = None
+        signal: BaseException | None = None
+        try:
+            if type(candidate) is not RequirementAlternativeCandidate:
+                raise ValueError("invalid alternative candidate")
+            parsed_modes = tuple(AlternativeMode(mode) for mode in modes)
+            if not parsed_modes or len(set(parsed_modes)) != len(parsed_modes):
+                raise ValueError("invalid alternatives request")
+            request = self._alternative_service.context(
+                subject_ref=subject_ref,
+                modes=parsed_modes,
+            )
+            comparison = self._alternative_service.validate_candidate(
+                request_id=request.id,
+                candidate=candidate,
+            )
+            result = AlternativeResult.create(
+                request=request,
+                status=(
+                    AlternativeStatus.AVAILABLE
+                    if comparison is not None
+                    else AlternativeStatus.NO_VALID_ALTERNATIVES
+                ),
+                alternatives=() if comparison is None else (comparison,),
+            )
+            return self._alternatives_projection(result)
+        except Exception as caught:  # noqa: BLE001 - fixed browser boundary
+            self._scrub_enrichment_signal(caught)
+            raise ControlPlaneError() from None
+        except BaseException as caught:  # noqa: BLE001 - preserve cancellation identity
+            signal = self._scrub_enrichment_signal(caught)
+        finally:
+            subject_ref = ""
+            modes = ()
+            candidate = cast(RequirementAlternativeCandidate, None)
+            if "parsed_modes" in locals():
+                parsed_modes = ()
+            request = None
+            comparison = None
+            result = None
+        if signal is not None:
+            detached = signal
+            signal = None
+            raise detached.with_traceback(None)
+        raise ControlPlaneError() from None
+
+    def alternative_propose(
+        self,
+        alternative_id: str,
+        expected_request_digest: str,
+        expected_effect_digest: str,
+    ) -> dict[str, object]:
+        """Create a pending proposal; never approve or apply the selected alternative."""
+        proposal = None
+        signal: BaseException | None = None
+        try:
+            proposal = self._alternative_proposals.submit(
+                alternative_id,
+                expected_request_digest=expected_request_digest,
+                expected_effect_digest=expected_effect_digest,
+            )
+            return AlternativeProposalResponse(
+                proposal_id=proposal.id,
+                status="pending_review",
+            ).model_dump(mode="json")
+        except Exception as caught:  # noqa: BLE001 - fixed browser boundary
+            self._scrub_enrichment_signal(caught)
+            raise ControlPlaneError() from None
+        except BaseException as caught:  # noqa: BLE001 - preserve cancellation identity
+            signal = self._scrub_enrichment_signal(caught)
+        finally:
+            alternative_id = ""
+            expected_request_digest = ""
+            expected_effect_digest = ""
+            proposal = None
+        if signal is not None:
+            detached = signal
+            signal = None
+            raise detached.with_traceback(None)
+        raise ControlPlaneError() from None
 
     def enrichment_current(self, session_id: str) -> dict[str, object]:
         """Refresh one durable session without exposing answers."""

@@ -169,6 +169,23 @@ dd {
   padding: 1rem;
 }
 
+.alternative-comparisons {
+  margin-top: 1.5rem;
+}
+
+.alternative-comparison {
+  border: 1px solid CanvasText;
+  border-radius: 0.75rem;
+  margin-top: 1rem;
+  padding: 1rem;
+}
+
+.alternative-comparison-columns {
+  display: grid;
+  gap: 1rem;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
 .assessment-dimension {
   border-left: 0.45rem solid currentColor;
   margin: 0.75rem 0;

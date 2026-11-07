@@ -9,6 +9,13 @@ from typing import Literal, cast
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, field_validator, model_validator
 
+from intent_engineering.alternatives.models import (
+    AlternativeComparison,
+    AlternativeMode,
+    AlternativeResult,
+    AlternativeStatus,
+    RequirementAlternativeCandidate,
+)
 from intent_engineering.assessment.models import AssessmentReport, NodeScorecard
 from intent_engineering.control_plane.models import HumanDecisionPayload
 from intent_engineering.intent_workflow.enrichment import EnrichmentQuestion
@@ -369,6 +376,77 @@ class EnrichmentProposalRequest(EnrichmentSessionRequest):
             encoded = None
 
 
+class AlternativesRequest(HttpRequestModel):
+    """Request alternatives for one visible requirement after an explicit human action."""
+
+    subject_ref: str = Field(min_length=1, max_length=_MAX_IDENTIFIER_BYTES)
+    modes: list[str] = Field(min_length=1, max_length=4)
+
+    @field_validator("subject_ref", mode="before")
+    @classmethod
+    def require_exact_subject(cls, value: object) -> str:
+        if (
+            type(value) is not str
+            or not value
+            or len(value.encode("utf-8")) > _MAX_IDENTIFIER_BYTES
+            or _CONTROL.search(value) is not None
+        ):
+            raise ValueError("invalid alternatives request")
+        return value
+
+    @field_validator("modes")
+    @classmethod
+    def require_unique_modes(cls, value: list[str]) -> list[str]:
+        allowed = {mode.value for mode in AlternativeMode}
+        if any(type(item) is not str or item not in allowed for item in value):
+            raise ValueError("invalid alternatives request")
+        if len(set(value)) != len(value):
+            raise ValueError("invalid alternatives request")
+        return sorted(value)
+
+
+class AlternativeProposalRequest(HttpRequestModel):
+    """Bind one projected alternative to its exact request and graph effect."""
+
+    alternative_id: str = Field(min_length=1, max_length=_MAX_IDENTIFIER_BYTES)
+    expected_request_digest: str = Field(pattern=_DIGEST_PATTERN.pattern)
+    expected_effect_digest: str = Field(pattern=_DIGEST_PATTERN.pattern)
+
+    @field_validator("alternative_id", mode="before")
+    @classmethod
+    def require_exact_alternative_id(cls, value: object) -> str:
+        if (
+            type(value) is not str
+            or not value.startswith("alternative-comparison:sha256:")
+            or len(value.encode("utf-8")) > _MAX_IDENTIFIER_BYTES
+            or _CONTROL.search(value) is not None
+        ):
+            raise ValueError("invalid alternative proposal request")
+        return value
+
+    @field_validator("expected_request_digest", "expected_effect_digest", mode="before")
+    @classmethod
+    def require_exact_digest(cls, value: object) -> str:
+        if type(value) is not str:
+            raise ValueError("invalid alternative proposal request")
+        return value
+
+
+class AlternativeValidationRequest(AlternativesRequest):
+    """Revalidate one host-drafted candidate inside local control-plane authority."""
+
+    candidate: RequirementAlternativeCandidate
+
+    @field_validator("candidate", mode="before")
+    @classmethod
+    def require_exact_candidate(cls, value: object) -> RequirementAlternativeCandidate:
+        if type(value) is not dict:
+            raise ValueError("invalid alternative validation request")
+        return RequirementAlternativeCandidate.model_validate_json(
+            _canonical_json_bytes(value), strict=True
+        )
+
+
 class _HttpResponseModel(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True, validate_default=True)
 
@@ -549,6 +627,83 @@ class EnrichmentProposalResponse(_HttpResponseModel):
         return ClarificationIntentProposal.model_validate_json(
             _canonical_json_bytes(value), strict=True
         )
+
+
+class AlternativeComparisonResponse(_HttpResponseModel):
+    """One comparison with its content-addressed selection identity."""
+
+    comparison_id: str = Field(min_length=1, max_length=_MAX_IDENTIFIER_BYTES)
+    comparison: dict[str, object]
+
+    @field_validator("comparison", mode="before")
+    @classmethod
+    def require_exact_comparison(cls, value: object) -> dict[str, object]:
+        if type(value) is not dict:
+            raise ValueError("invalid alternatives response")
+        comparison = AlternativeComparison.model_validate_json(
+            _canonical_json_bytes(value), strict=True
+        )
+        return cast(dict[str, object], comparison.model_dump(mode="json"))
+
+    @model_validator(mode="after")
+    def require_comparison_identity(self) -> AlternativeComparisonResponse:
+        comparison = AlternativeComparison.model_validate_json(
+            _canonical_json_bytes(self.comparison), strict=True
+        )
+        if self.comparison_id != comparison.id:
+            raise ValueError("invalid alternatives response")
+        return self
+
+
+class AlternativesResponse(_HttpResponseModel):
+    """One bounded approved-versus-projected alternative result."""
+
+    schema_version: Literal[1] = 1
+    request_digest: str = Field(pattern=_DIGEST_PATTERN.pattern)
+    status: Literal[
+        "available",
+        "provider_unavailable",
+        "invalid_provider_output",
+        "subject_unavailable",
+        "stale_request",
+        "no_valid_alternatives",
+    ]
+    alternatives: list[AlternativeComparisonResponse] = Field(max_length=8)
+
+    @model_validator(mode="after")
+    def require_exact_result(self) -> AlternativesResponse:
+        result = AlternativeResult(
+            request_digest=self.request_digest,
+            status=AlternativeStatus(self.status),
+            alternatives=tuple(
+                AlternativeComparison.model_validate_json(
+                    _canonical_json_bytes(item.comparison), strict=True
+                )
+                for item in self.alternatives
+            ),
+        )
+        if len(result.alternatives) != len(self.alternatives):
+            raise ValueError("invalid alternatives response")
+        return self
+
+
+class AlternativeProposalResponse(_HttpResponseModel):
+    """A selected alternative stored only as a pending governed proposal."""
+
+    schema_version: Literal[1] = 1
+    proposal_id: str = Field(min_length=1, max_length=_MAX_IDENTIFIER_BYTES)
+    status: Literal["pending_review"]
+
+    @field_validator("proposal_id", mode="before")
+    @classmethod
+    def require_exact_proposal_id(cls, value: object) -> str:
+        if (
+            type(value) is not str
+            or not value.startswith("proposal:sha256:")
+            or len(value.encode("utf-8")) > _MAX_IDENTIFIER_BYTES
+        ):
+            raise ValueError("invalid alternative proposal response")
+        return value
 
 
 def _canonical_json_bytes(value: object) -> bytes:
