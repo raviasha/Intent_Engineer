@@ -465,6 +465,7 @@ def test_ordinary_dev_replaces_automatic_owner_and_opens_with_ephemeral_bootstra
             urlopen(untrusted_exchange, timeout=3)
         assert untrusted.value.code == 403
         assert untrusted.value.headers.get("Set-Cookie") is None
+        untrusted.value.close()
         exchange = Request(
             origin + dev_cli._BROWSER_BOOTSTRAP_PATH,
             data=exchange_body,
@@ -482,6 +483,7 @@ def test_ordinary_dev_replaces_automatic_owner_and_opens_with_ephemeral_bootstra
         with pytest.raises(HTTPError) as replay:
             urlopen(exchange, timeout=3)
         assert replay.value.code == 403
+        replay.value.close()
         request = Request(
             origin + "/api/v1/development/tests/run",
             data=json.dumps({"command_id": "test:sha256:" + "f" * 64}).encode(),
@@ -501,6 +503,7 @@ def test_ordinary_dev_replaces_automatic_owner_and_opens_with_ephemeral_bootstra
                 )
         except HTTPError as error:
             authenticated_results.append((error.code, "http_error"))
+            error.close()
 
     monkeypatch.setattr(dev_cli, "_wait_for_exit", exercise_authenticated_browser)
     try:
