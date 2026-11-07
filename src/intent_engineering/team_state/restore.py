@@ -1922,6 +1922,55 @@ class _TreeFence:
             self.parent.close()
 
 
+class _FileIdentityPins:
+    """Keep authenticated file inodes alive so unlink/recreate cannot reuse them."""
+
+    def __init__(self, workspace: SecureDirectory) -> None:
+        self.workspace = workspace
+        self.descriptors: dict[int, tuple[int, ...]] = {}
+
+    def pin(self, path: str, expected_identity: tuple[int, int]) -> None:
+        target = self.workspace.file(path)
+        descriptor = -1
+        try:
+            descriptor = os.open(
+                target.name,
+                os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
+                dir_fd=target.parent_fd,
+            )
+            metadata = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_nlink != 1
+                or (metadata.st_dev, metadata.st_ino) != expected_identity
+            ):
+                raise UnsafePathError()
+            self.descriptors[descriptor] = _change_token(metadata)
+            descriptor = -1
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+            target.close()
+
+    def verify(self) -> None:
+        if any(
+            _change_token(os.fstat(descriptor)) != token
+            for descriptor, token in self.descriptors.items()
+        ):
+            raise UnsafePathError()
+
+    def close(self) -> None:
+        for descriptor in self.descriptors:
+            os.close(descriptor)
+        self.descriptors.clear()
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self.close()
+
+
 class _PinnedState:
     """Bind immutable authenticated bytes to the directory and file identities used."""
 
@@ -1935,16 +1984,26 @@ class _PinnedState:
         self.files = dict(files)
         self.identities: dict[str, tuple[tuple[int, int], ...]] = {}
         self.inventory_sealed = False
-        if identities is not None:
-            if set(identities) != set(files):
-                raise UnsafePathError()
-            self.identities = dict(identities)
-            return
-        for path, content in self.files.items():
-            observed = workspace.read_relative(path, nonblocking=True, max_bytes=MAX_FILE_BYTES)
-            if observed.content != content:
-                raise UnsafePathError()
-            self.identities[path] = observed.identities
+        self._pins = _FileIdentityPins(workspace)
+        try:
+            if identities is not None:
+                if set(identities) != set(files):
+                    raise UnsafePathError()
+                self.identities = dict(identities)
+            else:
+                for path, content in self.files.items():
+                    observed = workspace.read_relative(
+                        path, nonblocking=True, max_bytes=MAX_FILE_BYTES
+                    )
+                    if observed.content != content:
+                        raise UnsafePathError()
+                    self.identities[path] = observed.identities
+            for path in self.files:
+                if not path.endswith("/"):
+                    self._pins.pin(path, self.identities[path][-1])
+        except BaseException:
+            self.close()
+            raise
 
     def _inventory(self) -> tuple[tuple[str, bytes, tuple[tuple[int, int], ...]], ...]:
         entries: list[tuple[str, bytes, tuple[tuple[int, int], ...]]] = []
@@ -2008,16 +2067,29 @@ class _PinnedState:
                     raise UnsafePathError()
                 self.files[path] = b""
                 self.identities[path] = identities
+                if not path.endswith("/"):
+                    self._pins.pin(path, identities[-1])
         self.inventory_sealed = True
         self.verify()
 
     def verify(self, parent: SecureDirectory | None = None) -> None:
         fence = _TreeFence(self.workspace, self.files, parent)
         try:
+            self._pins.verify()
             self._verify_content()
             fence.verify()
+            self._pins.verify()
         finally:
             fence.close()
+
+    def close(self) -> None:
+        self._pins.close()
+
+    def __del__(self) -> None:  # pragma: no cover - deterministic owners close promptly
+        try:
+            self.close()
+        except OSError:
+            pass
 
     def _verify_content(self) -> None:
         if self.inventory_sealed:
@@ -2594,7 +2666,10 @@ def _replace_existing_state(
                 _assert_named_directory(project, ".intent", workspace)
                 _assert_project_binding(project)
                 return
-            with coordinator.transaction(rollback_base_exceptions=True) as transaction:
+            with (
+                coordinator.transaction(rollback_base_exceptions=True) as transaction,
+                _FileIdentityPins(workspace) as identity_pins,
+            ):
                 installed: dict[str, bytes] = {}
                 identities: dict[str, tuple[tuple[int, int], ...]] = {}
                 for path in CANONICAL_STATE_PATHS:
@@ -2603,6 +2678,7 @@ def _replace_existing_state(
                     identities[path] = workspace.read_relative(
                         path, nonblocking=True, max_bytes=MAX_FILE_BYTES
                     ).identities
+                    identity_pins.pin(path, identities[path][-1])
                     fault_hook(f"target:{path}")
                 for path, content in (
                     ("cache/checkpoints.yaml", b""),
@@ -2613,7 +2689,9 @@ def _replace_existing_state(
                     identities[path] = workspace.read_relative(
                         path, nonblocking=True, max_bytes=MAX_FILE_BYTES
                     ).identities
+                    identity_pins.pin(path, identities[path][-1])
                 fault_hook("existing_precommit")
+                identity_pins.verify()
                 _assert_project_binding(project)
                 _assert_named_directory(project, ".intent", workspace)
                 terminal_state = _PinnedState(workspace, installed, identities)
@@ -2640,20 +2718,18 @@ def _install_fresh_state(
         state.verify(stage_directory)
         # Previously writable staged inodes never become the installed authority.
         # Materialize the authenticated immutable bytes into new regular files.
+        state.close()
         _write_staged_state(
             stage_directory,
             {path: state.files[path] for path in CANONICAL_STATE_PATHS},
             state.files["cache/shared-state.json"],
             fresh=False,
         )
-        refreshed = _PinnedState(
+        state = _PinnedState(
             state.workspace,
             {path: content for path, content in state.files.items() if not path.endswith("/")},
         )
-        refreshed.seal_inventory()
-        state.files = refreshed.files
-        state.identities = refreshed.identities
-        state.inventory_sealed = True
+        state.seal_inventory()
         state.verify(stage_directory)
         _rename_directory_exclusive(stage_directory, root_directory)
         installed = True
@@ -2679,6 +2755,7 @@ def _install_fresh_state(
             _discard_stage(root_directory, recovery, state)
         raise
     finally:
+        state.close()
         _remove_empty_directory(root_directory, recovery)
         recovery.close()
 

@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 from typing import Any, cast
 
+import httpx
 import pytest
 import yaml  # type: ignore[import-untyped]
 from starlette.testclient import TestClient
@@ -191,7 +192,8 @@ def test_enrichment_http_routes_preserve_the_exact_session_lifecycle() -> None:
     ]
 
 
-def test_enrichment_http_cancellation_preserves_identity_and_scrubs_answer() -> None:
+@pytest.mark.anyio
+async def test_enrichment_http_cancellation_preserves_identity_and_scrubs_answer() -> None:
     class _Cancel(BaseException):
         pass
 
@@ -204,17 +206,17 @@ def test_enrichment_http_cancellation_preserves_identity_and_scrubs_answer() -> 
                 raise signal
             raise AssertionError("test requires an answer")
 
-    client = TestClient(
-        build_control_plane_app(cast(Any, _CancelledService()), origin=ORIGIN, csrf_secret=CSRF),
-        base_url=ORIGIN,
+    app = build_control_plane_app(
+        cast(Any, _CancelledService()), origin=ORIGIN, csrf_secret=CSRF
     )
-
-    with pytest.raises(_Cancel) as captured:
-        client.post(
-            "/api/v1/enrichment/answer",
-            content=b'{"session_id":"refine:session","gap_id":"gap:one","answer":"PRIVATE-HTTP-ANSWER"}',
-            headers=_headers(),
-        )
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url=ORIGIN) as client:
+        with pytest.raises(_Cancel) as captured:
+            await client.post(
+                "/api/v1/enrichment/answer",
+                content=b'{"session_id":"refine:session","gap_id":"gap:one","answer":"PRIVATE-HTTP-ANSWER"}',
+                headers=_headers(),
+            )
 
     assert captured.value is signal
     assert signal.args == ()

@@ -342,6 +342,37 @@ def test_instance_rebound_shutdown_refuses_takeover_without_pid_signaling(
     }
 
 
+def test_startup_probe_retries_while_the_server_thread_is_alive(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    metadata = ControlPlaneProcessMetadata(
+        pid=123,
+        process_start_id="sha256:" + "a" * 64,
+        instance_id="instance:" + "b" * 64,
+        project_id="project",
+        repository_id="repo:sha256:" + "c" * 64,
+        origin="http://localhost:43127",
+        launch_mode="manual_headless",
+    )
+    attempts: list[bool] = []
+
+    def delayed_probe(*_args: object) -> bool:
+        attempts.append(True)
+        return len(attempts) == 2
+
+    class LiveThread:
+        @staticmethod
+        def is_alive() -> bool:
+            return True
+
+    monkeypatch.setattr(dev_cli, "_probe", delayed_probe)
+    monkeypatch.setattr(dev_cli.time, "sleep", lambda _seconds: None)
+
+    dev_cli._wait_until_probed(metadata, metadata.repository_id, LiveThread())  # type: ignore[arg-type]
+
+    assert len(attempts) == 2
+
+
 def test_uninitialized_repository_requires_an_explicit_prd_without_mutation(tmp_path: Path) -> None:
     project = _project(tmp_path)
 

@@ -950,6 +950,22 @@ def _wait_until_started(server: uvicorn.Server, thread: threading.Thread) -> Non
     raise _DevUnavailable()
 
 
+def _wait_until_probed(
+    metadata: ControlPlaneProcessMetadata,
+    repository_id: str,
+    thread: threading.Thread,
+) -> None:
+    """Allow the kernel's listener tables to catch up with the started server."""
+    deadline = time.monotonic() + _STARTUP_TIMEOUT_SECONDS
+    while time.monotonic() < deadline:
+        if _probe(metadata, repository_id):
+            return
+        if not thread.is_alive():
+            break
+        time.sleep(0.01)
+    raise _DevUnavailable()
+
+
 def _start(
     started: _Started,
     target: SecureFile,
@@ -1023,8 +1039,7 @@ def _start(
         launch_mode=launch_mode,
         shared_state_status=shared_state_status,
     )
-    if not _probe(started.metadata, repository_id):
-        raise _DevUnavailable()
+    _wait_until_probed(started.metadata, repository_id, started.thread)
     started.metadata_bytes = started.metadata.canonical_bytes()
     target.atomic_write(started.metadata_bytes, reject_target_races=True)
     runtime = None
