@@ -3,6 +3,7 @@
 from collections.abc import Sequence
 from unicodedata import category
 
+from intent_engineering.assessment.models import AssessmentHealth, AssessmentReport, NodeScorecard
 from intent_engineering.core.models import (
     Graph,
     Node,
@@ -10,6 +11,7 @@ from intent_engineering.core.models import (
     ReconciliationCase,
     is_nonterminal_case_status,
 )
+from intent_engineering.render.mermaid import _assessment_scorecards
 
 SEMANTIC_GROUPS: tuple[tuple[str, frozenset[NodeType]], ...] = (
     (
@@ -42,6 +44,12 @@ SEMANTIC_GROUPS: tuple[tuple[str, frozenset[NodeType]], ...] = (
     ),
     ("Test references", frozenset({NodeType.TEST})),
 )
+_HEALTH_TEXT: dict[AssessmentHealth, str] = {
+    AssessmentHealth.GREEN: "✓ Green",
+    AssessmentHealth.ORANGE: "! Orange",
+    AssessmentHealth.RED: "× Red",
+    AssessmentHealth.UNASSESSED: "? Unassessed",
+}
 
 
 def _escape_markdown(value: str) -> str:
@@ -89,12 +97,88 @@ def _render_cases(cases: Sequence[ReconciliationCase]) -> str:
     return "\n".join(lines)
 
 
-def render_markdown(graph: Graph, cases: Sequence[ReconciliationCase]) -> str:
+def _score(value: int | None) -> str:
+    return "N/A" if value is None else str(value)
+
+
+def _dimension_label(scorecard: NodeScorecard) -> str:
+    return (
+        "N/A"
+        if scorecard.worst_dimension is None
+        else scorecard.worst_dimension.value.replace("_", " ").capitalize()
+    )
+
+
+def _render_assessment(graph: Graph, assessment: AssessmentReport) -> str:
+    scorecards = _assessment_scorecards(graph, assessment)
+    lines = [
+        "## Assessment (non-canonical)",
+        "",
+        "This detached, explainable overlay does not change canonical graph state.",
+        "",
+        f"- graph: {_escape_markdown(assessment.graph_id)}",
+        f"- version: {assessment.graph_version}",
+        f"- snapshot: {assessment.snapshot_digest}",
+        f"- principal projection: {assessment.principal_projection_digest}",
+        "",
+        (
+            f"Project: {_HEALTH_TEXT[assessment.project.health]} · "
+            f"Robustness {_score(assessment.project.robustness)} · "
+            f"Confidence {_score(assessment.project.confidence)}"
+        ),
+        "",
+        "| Node | Health | Robustness | Confidence | Worst dimension |",
+        "| --- | --- | ---: | ---: | --- |",
+    ]
+    for node in sorted(graph.nodes, key=lambda item: item.id):
+        scorecard = scorecards[node.id]
+        lines.append(
+            f"| `{_escape_markdown(node.id)}` | {_HEALTH_TEXT[scorecard.health]} | "
+            f"{_score(scorecard.robustness)} | {_score(scorecard.confidence)} | "
+            f"{_dimension_label(scorecard)} |"
+        )
+
+    deductions: list[str] = []
+    for node in sorted(graph.nodes, key=lambda item: item.id):
+        scorecard = scorecards[node.id]
+        for dimension in scorecard.dimensions:
+            label = dimension.dimension.value.replace("_", " ").capitalize()
+            for check in dimension.failed:
+                deductions.append(
+                    f"- `{_escape_markdown(node.id)}` — {_HEALTH_TEXT[check.severity]} — "
+                    f"{label} — {check.points} points: {_escape_markdown(check.explanation)}"
+                )
+                references = tuple(sorted({*check.references, *dimension.evidence_refs}))
+                deductions.append(
+                    "  - Evidence: "
+                    + (
+                        ", ".join(f"`{_escape_markdown(reference)}`" for reference in references)
+                        if references
+                        else "none"
+                    )
+                )
+            if dimension.recommended_next_action:
+                deductions.append(
+                    "  - Recommended next action: "
+                    + _escape_markdown(dimension.recommended_next_action)
+                )
+    lines.extend(("", "### Evidence-linked deductions", ""))
+    lines.extend(deductions or ("_No score deductions._",))
+    return "\n".join(lines)
+
+
+def render_markdown(
+    graph: Graph,
+    cases: Sequence[ReconciliationCase],
+    assessment: AssessmentReport | None = None,
+) -> str:
     """Render a deterministic Markdown view without mutating graph state."""
     sections = [
         f"# {_escape_markdown(graph.name or graph.id)}",
         _escape_markdown(graph.purpose or ""),
     ]
+    if assessment is not None:
+        sections.append(_render_assessment(graph, assessment))
     sections.extend(_render_node_group(group, graph.nodes) for group in SEMANTIC_GROUPS)
     sections.append(_render_cases(cases))
     return "\n\n".join(section for section in sections if section) + "\n"

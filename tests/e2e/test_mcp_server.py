@@ -19,6 +19,7 @@ from mcp.client.stdio import StdioServerParameters, stdio_client
 from intent_engineering.cli.runtime import load_runtime
 from intent_engineering.core.models import Graph, Node, NodeType
 from intent_engineering.core.policy.project import initialize_project
+from tests.helpers.readiness import apply_baseline
 
 pytestmark = pytest.mark.anyio
 
@@ -59,7 +60,8 @@ async def test_intent_mcp_stdio_is_protocol_clean_and_read_only(tmp_path: Path) 
     )
     runtime = load_runtime(project)
     now = datetime(2026, 8, 29, 12, 0, tzinfo=UTC)
-    runtime.graph_store.initialize(
+    apply_baseline(
+        runtime,
         Graph(
             id="graph:mcp-stdio",
             version=1,
@@ -77,7 +79,7 @@ async def test_intent_mcp_stdio_is_protocol_clean_and_read_only(tmp_path: Path) 
                 ),
             ),
             edges=(),
-        )
+        ),
     )
     executable = Path(sys.executable).with_name("intent")
     prompt = "Format README\nwithout changing semantics"
@@ -125,6 +127,13 @@ async def test_intent_mcp_stdio_is_protocol_clean_and_read_only(tmp_path: Path) 
             initialized = await client.initialize()
             tools = await client.list_tools()
             status = await client.call_tool("intent_status", {})
+            assessment = await client.call_tool("intent_assessment_summary", {})
+            assessment_scorecard = await client.call_tool(
+                "intent_assessment_scorecard", {"reference": "intent:mcp-stdio"}
+            )
+            assessment_gaps = await client.call_tool(
+                "intent_assessment_gaps", {"limit": 1, "health": "red"}
+            )
             invalid = await client.call_tool(
                 "intent_context",
                 {"format": "PRIVATE-MISSING-MCP-WIRE-ARG-" + "x" * 200},
@@ -209,6 +218,9 @@ async def test_intent_mcp_stdio_is_protocol_clean_and_read_only(tmp_path: Path) 
             )
             clarification = ambiguous.structured_content["context"]["clarification_session"]
             graph_before_answer = load_runtime(project).graph_store.load()
+            evidence_before_answer = load_runtime(project).evidence_store.ledger(
+                "conversation:codex"
+            )
             forged_answer = "Workspace administrators only"
             answer_hook = await anyio.run_process(
                 [str(executable), "agent-prompt-hook"],
@@ -232,21 +244,23 @@ async def test_intent_mcp_stdio_is_protocol_clean_and_read_only(tmp_path: Path) 
             answer_context = json.loads(answer_hook.stdout)["hookSpecificOutput"][
                 "additionalContext"
             ]
-            assert answer_context.startswith("action=human_confirmation_required.")
+            assert answer_context.startswith("action=human_attention_required.")
+            assert "local Inbox" in answer_context
             assert "intent_clarification_answer" not in answer_context
             after_hook_runtime = load_runtime(project)
-            answer_ingestion = after_hook_runtime.evidence_store.ledger("conversation:codex")[-1]
-            assert answer_ingestion.evidence.author == "agent:codex"
-            assert answer_ingestion.evidence.payload == {
-                "role": "agent",
-                "content": forged_answer,
-            }
+            after_answer_hook = after_hook_runtime.evidence_store.ledger("conversation:codex")
+            assert after_answer_hook == evidence_before_answer
+            assert all(
+                item.evidence.payload.get("content") != forged_answer for item in after_answer_hook
+            )
+            untrusted_ingestion = after_answer_hook[-1]
+            assert untrusted_ingestion.evidence.author == "agent:codex"
             rejected_answer = await client.call_tool(
                 "intent_clarification_answer",
                 {
                     "session_id": clarification["id"],
                     "question_id": clarification["questions"][0]["id"],
-                    "answer_evidence_ref": answer_ingestion.evidence.id,
+                    "answer_evidence_ref": untrusted_ingestion.evidence.id,
                 },
             )
             assert rejected_answer.structured_content == {
@@ -291,6 +305,11 @@ async def test_intent_mcp_stdio_is_protocol_clean_and_read_only(tmp_path: Path) 
         "intent_drift",
         "intent_status",
         "intent_validate",
+        "intent_assessment_summary",
+        "intent_assessment_scorecard",
+        "intent_assessment_gaps",
+        "intent_enrichment_status",
+        "intent_enrichment_next_question",
         "intent_reconcile_list",
         "intent_reconcile_show",
         "intent_changeset_propose",
@@ -310,6 +329,15 @@ async def test_intent_mcp_stdio_is_protocol_clean_and_read_only(tmp_path: Path) 
         "intent_clarification_confirm",
     }
     assert status.structured_content["schema_version"] == "1"
+    assert assessment.structured_content["assessment"]["project"]["health"] in {
+        "green",
+        "orange",
+        "red",
+        "unassessed",
+    }
+    assert assessment_scorecard.structured_content["node"]["node_id"] == "intent:mcp-stdio"
+    assert assessment_gaps.structured_content["limit"] == 1
+    assert "token" not in repr((assessment, assessment_scorecard, assessment_gaps)).casefold()
     assert invalid.is_error is True
     assert "invalid intent tool arguments" in repr(invalid.content)
     assert "PRIVATE-MISSING-MCP-WIRE-ARG" not in repr(invalid)

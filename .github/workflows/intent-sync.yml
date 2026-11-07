@@ -5,34 +5,94 @@ name: Intent sync
   schedule:
     - cron: "17 2 * * *"
 
+permissions: {}
+
+concurrency:
+  group: intent-sync-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   drift:
     runs-on: ubuntu-latest
+    environment: intent-ci
+    timeout-minutes: 20
     permissions:
       contents: read
       issues: read
       pull-requests: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
-      - uses: actions/setup-python@v5
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: "3.12"
       - name: Install Intent Engineering
         run: python -m pip install .
-      - name: Require restored approved intent baseline
-        run: intent status --project . --format json --require-baseline
-      - name: Validate local intent state
-        run: intent validate --project .
+      - name: Restore verified approved intent state
+        run: python -m intent_engineering.integrations.github_action restore
+        env:
+          INTENT_CI_SHARED_STATE_TRUST: ${{ secrets.INTENT_CI_SHARED_STATE_TRUST }}
       - name: Capture configured source versions
         run: intent sync --project . --sources markdown,git,github
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_REPOSITORY: ${{ github.repository }}
+      - name: Validate captured canonical state
+        run: intent validate --project .
       - name: Render drift and assurance report
         run: intent drift --project . --format markdown --output intent-drift.md
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: intent-drift
           path: intent-drift.md
+          retention-days: 7
+          if-no-files-found: error
+      - name: Resolve exact comparison base
+        id: assessment-base
+        run: |
+          if git rev-parse --verify --quiet HEAD^ >/dev/null; then
+            base_sha="$(git merge-base HEAD HEAD^)"
+            git worktree add --detach "$RUNNER_TEMP/intent-assessment-base" "$base_sha"
+            printf 'available=true\nsha=%s\n' "$base_sha" >> "$GITHUB_OUTPUT"
+          else
+            # An initial commit has no exact base; publish its head report without comparison.
+            printf 'available=false\n' >> "$GITHUB_OUTPUT"
+          fi
+      - name: Restore verified intent state at comparison base
+        if: steps.assessment-base.outputs.available == 'true'
+        working-directory: ${{ runner.temp }}/intent-assessment-base
+        run: python -m intent_engineering.integrations.github_action restore
+        env:
+          INTENT_CI_SHARED_STATE_TRUST: ${{ secrets.INTENT_CI_SHARED_STATE_TRUST }}
+      - name: Capture comparison-base source versions
+        if: steps.assessment-base.outputs.available == 'true'
+        working-directory: ${{ runner.temp }}/intent-assessment-base
+        run: intent sync --project . --sources markdown,git,github
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+      - name: Assess exact comparison base
+        if: steps.assessment-base.outputs.available == 'true'
+        working-directory: ${{ runner.temp }}/intent-assessment-base
+        run: intent assess --project . --format json > $GITHUB_WORKSPACE/intent-assessment-base.json
+      - name: Remove comparison-base worktree
+        if: always() && steps.assessment-base.outputs.available == 'true'
+        run: git worktree remove --force "$RUNNER_TEMP/intent-assessment-base"
+      - name: Assess graph robustness
+        run: intent assess --project . --format json > intent-assessment.json
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: intent-assurance
+          path: |
+            intent-drift.md
+            intent-assessment.json
+            intent-assessment-base.json
+          retention-days: 7
+          if-no-files-found: error
+      - name: Gate assessment against exact comparison base
+        if: steps.assessment-base.outputs.available == 'true'
+        run: intent assessment-gate --project . --base-report intent-assessment-base.json --head-report intent-assessment.json --format json
+      - name: Require resolution of pending review
+        run: intent check --require-review

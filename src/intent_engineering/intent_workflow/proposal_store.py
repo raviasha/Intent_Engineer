@@ -48,9 +48,10 @@ class IntentLedgerRecord(StrictModel):
 
     @model_validator(mode="after")
     def require_exactly_one_payload(self) -> Self:
-        if sum(
-            item is not None for item in (self.proposal, self.decision, self.clarification)
-        ) != 1:
+        if (
+            sum(item is not None for item in (self.proposal, self.decision, self.clarification))
+            != 1
+        ):
             raise ValueError("invalid intent proposal ledger")
         return self
 
@@ -117,6 +118,152 @@ def _validated_decision(value: ProposalDecisionRecord) -> ProposalDecisionRecord
         validated = None
 
 
+def parse_intent_ledger(content: bytes) -> _LedgerState | None:
+    """Validate held canonical bytes and reconstruct their complete ledger state."""
+    encoded_line: bytes | None = None
+    line: bytes | None = None
+    payload: dict[str, object] | None = None
+    canonical: bytes | None = None
+    record: IntentLedgerRecord | None = None
+    proposal: IntentProposal | None = None
+    decision: ProposalDecisionRecord | None = None
+    clarification: ClarificationEvent | None = None
+    proposals: dict[str, IntentProposal] = {}
+    decisions: dict[str, ProposalDecisionRecord] = {}
+    clarification_events: list[ClarificationEvent] = []
+    sessions: dict[str, ClarificationSession] = {}
+    latest_events: dict[str, ClarificationEvent] = {}
+    pending_proposal_id: str | None = None
+    pending_session_id: str | None = None
+    result: _LedgerState | None = None
+    try:
+        if type(content) is not bytes or (content and not content.endswith(b"\n")):
+            return None
+        for expected_sequence, encoded_line in enumerate(content.splitlines(keepends=True)):
+            if not encoded_line.endswith(b"\n") or not encoded_line.strip():
+                return None
+            line = encoded_line[:-1]
+            payload = loads_strict_object(line.decode("utf-8"))
+            canonical = _canonical_json(payload) + b"\n"
+            if canonical != encoded_line:
+                return None
+            record = IntentLedgerRecord.model_validate_json(line)
+            if _serialize(record) != encoded_line or record.sequence != expected_sequence:
+                return None
+            proposal = record.proposal
+            decision = record.decision
+            clarification = record.clarification
+            if pending_proposal_id is not None and (
+                not isinstance(proposal, ClarificationIntentProposal)
+                or proposal.id != pending_proposal_id
+                or proposal.clarification_session_id != pending_session_id
+            ):
+                return None
+            if clarification is not None:
+                previous = sessions.get(clarification.session.id)
+                previous_event = latest_events.get(clarification.session.id)
+                if not IntentProposalStore._valid_clarification_transition(
+                    previous, clarification, previous_event
+                ):
+                    return None
+                if clarification.event_type == "closed":
+                    bound_proposal = proposals.get(clarification.proposal_id or "")
+                    bound_decision = decisions.get(clarification.proposal_id or "")
+                    if (
+                        not isinstance(bound_proposal, ClarificationIntentProposal)
+                        or not isinstance(bound_decision, ProposalDecisionV3)
+                        or bound_proposal.clarification_session_id != clarification.session.id
+                        or bound_decision.id != clarification.decision_id
+                        or bound_decision.actor != clarification.actor
+                        or bound_decision.decided_at != clarification.at
+                        or bound_decision.activation_changeset_id
+                        != clarification.activation_changeset_id
+                    ):
+                        return None
+                clarification_events.append(clarification)
+                sessions[clarification.session.id] = clarification.session
+                latest_events[clarification.session.id] = clarification
+                if clarification.event_type == "proposed":
+                    pending_proposal_id = clarification.proposal_id
+                    pending_session_id = clarification.session.id
+                continue
+            if proposal is not None:
+                if proposal.id in proposals:
+                    return None
+                if isinstance(proposal, ClarificationIntentProposal):
+                    session = sessions.get(proposal.clarification_session_id)
+                    if (
+                        session is None
+                        or session.status != "proposed"
+                        or session.task_id != proposal.task_id
+                        or session.baseline_graph_version != proposal.baseline_graph_version
+                        or latest_events[session.id].proposal_id != proposal.id
+                    ):
+                        return None
+                proposals[proposal.id] = proposal
+                if isinstance(proposal, ClarificationIntentProposal):
+                    pending_proposal_id = None
+                    pending_session_id = None
+                continue
+            if decision is None:
+                return None
+            proposal = proposals.get(decision.proposal_id)
+            if (
+                proposal is None
+                or decision.proposal_digest != proposal.digest
+                or decision.baseline_graph_version != proposal.baseline_graph_version
+                or decision.proposal_id in decisions
+            ):
+                return None
+            if isinstance(proposal, ClarificationIntentProposal) and (
+                not isinstance(decision, ProposalDecisionV3)
+                or sessions[proposal.clarification_session_id].status != "proposed"
+            ):
+                return None
+            decisions[decision.proposal_id] = decision
+        if pending_proposal_id is not None:
+            return None
+        if any(
+            isinstance(item, ClarificationIntentProposal)
+            and item.id in decisions
+            and (
+                sessions[item.clarification_session_id].status != "closed"
+                or latest_events[item.clarification_session_id].proposal_id != item.id
+                or latest_events[item.clarification_session_id].decision_id != decisions[item.id].id
+            )
+            for item in proposals.values()
+        ):
+            return None
+        result = _LedgerState(
+            content,
+            dict(proposals),
+            dict(decisions),
+            tuple(clarification_events),
+            dict(sessions),
+        )
+        return result
+    except (TypeError, UnicodeError, ValidationError, ValueError):
+        return None
+    finally:
+        content = b""
+        encoded_line = None
+        line = None
+        payload = None
+        canonical = None
+        record = None
+        proposal = None
+        decision = None
+        clarification = None
+        proposals.clear()
+        decisions.clear()
+        clarification_events.clear()
+        sessions.clear()
+        latest_events.clear()
+        pending_proposal_id = None
+        pending_session_id = None
+        result = None
+
+
 class IntentProposalStore:
     """Store immutable proposals and their terminal decisions in one framed ledger."""
 
@@ -157,152 +304,15 @@ class IntentProposalStore:
 
     def _decode_unlocked(self) -> _LedgerState | None:
         content: bytes | None = None
-        encoded_line: bytes | None = None
-        line: bytes | None = None
-        payload: dict[str, object] | None = None
-        canonical: bytes | None = None
-        record: IntentLedgerRecord | None = None
-        proposal: IntentProposal | None = None
-        decision: ProposalDecisionRecord | None = None
-        clarification: ClarificationEvent | None = None
-        proposals: dict[str, IntentProposal] = {}
-        decisions: dict[str, ProposalDecisionRecord] = {}
-        clarification_events: list[ClarificationEvent] = []
-        sessions: dict[str, ClarificationSession] = {}
-        latest_events: dict[str, ClarificationEvent] = {}
-        pending_proposal_id: str | None = None
-        pending_session_id: str | None = None
         result: _LedgerState | None = None
         try:
             content = self._read_content_unlocked()
-            if content is None or (content and not content.endswith(b"\n")):
+            if content is None:
                 return None
-            for expected_sequence, encoded_line in enumerate(content.splitlines(keepends=True)):
-                if not encoded_line.endswith(b"\n") or not encoded_line.strip():
-                    return None
-                line = encoded_line[:-1]
-                payload = loads_strict_object(line.decode("utf-8"))
-                canonical = _canonical_json(payload) + b"\n"
-                if canonical != encoded_line:
-                    return None
-                record = IntentLedgerRecord.model_validate_json(line)
-                if _serialize(record) != encoded_line:
-                    return None
-                if record.sequence != expected_sequence:
-                    return None
-                proposal = record.proposal
-                decision = record.decision
-                clarification = record.clarification
-                if pending_proposal_id is not None and (
-                    not isinstance(proposal, ClarificationIntentProposal)
-                    or proposal.id != pending_proposal_id
-                    or proposal.clarification_session_id != pending_session_id
-                ):
-                    return None
-                if clarification is not None:
-                    previous = sessions.get(clarification.session.id)
-                    previous_event = latest_events.get(clarification.session.id)
-                    if not self._valid_clarification_transition(
-                        previous, clarification, previous_event
-                    ):
-                        return None
-                    if clarification.event_type == "closed":
-                        bound_proposal = proposals.get(clarification.proposal_id or "")
-                        bound_decision = decisions.get(clarification.proposal_id or "")
-                        if (
-                            not isinstance(bound_proposal, ClarificationIntentProposal)
-                            or not isinstance(bound_decision, ProposalDecisionV3)
-                            or bound_proposal.clarification_session_id
-                            != clarification.session.id
-                            or bound_decision.id != clarification.decision_id
-                            or bound_decision.actor != clarification.actor
-                            or bound_decision.decided_at != clarification.at
-                            or bound_decision.activation_changeset_id
-                            != clarification.activation_changeset_id
-                        ):
-                            return None
-                    clarification_events.append(clarification)
-                    sessions[clarification.session.id] = clarification.session
-                    latest_events[clarification.session.id] = clarification
-                    if clarification.event_type == "proposed":
-                        pending_proposal_id = clarification.proposal_id
-                        pending_session_id = clarification.session.id
-                    continue
-                if proposal is not None:
-                    if proposal.id in proposals:
-                        return None
-                    if isinstance(proposal, ClarificationIntentProposal):
-                        session = sessions.get(proposal.clarification_session_id)
-                        if (
-                            session is None
-                            or session.status != "proposed"
-                            or session.task_id != proposal.task_id
-                            or session.baseline_graph_version != proposal.baseline_graph_version
-                            or latest_events[session.id].proposal_id != proposal.id
-                        ):
-                            return None
-                    proposals[proposal.id] = proposal
-                    if isinstance(proposal, ClarificationIntentProposal):
-                        pending_proposal_id = None
-                        pending_session_id = None
-                    continue
-                if decision is None:
-                    return None
-                proposal = proposals.get(decision.proposal_id)
-                if (
-                    proposal is None
-                    or decision.proposal_digest != proposal.digest
-                    or decision.baseline_graph_version != proposal.baseline_graph_version
-                    or decision.proposal_id in decisions
-                ):
-                    return None
-                if isinstance(proposal, ClarificationIntentProposal) and (
-                    not isinstance(decision, ProposalDecisionV3)
-                    or sessions[proposal.clarification_session_id].status != "proposed"
-                ):
-                    return None
-                decisions[decision.proposal_id] = decision
-            if pending_proposal_id is not None:
-                return None
-            if any(
-                isinstance(item, ClarificationIntentProposal)
-                and item.id in decisions
-                and (
-                    sessions[item.clarification_session_id].status != "closed"
-                    or latest_events[item.clarification_session_id].proposal_id != item.id
-                    or latest_events[item.clarification_session_id].decision_id
-                    != decisions[item.id].id
-                )
-                for item in proposals.values()
-            ):
-                return None
-            result = _LedgerState(
-                content,
-                dict(proposals),
-                dict(decisions),
-                tuple(clarification_events),
-                dict(sessions),
-            )
+            result = parse_intent_ledger(content)
             return result
-        except (TypeError, UnicodeError, ValidationError, ValueError):
-            return None
         finally:
             content = None
-            encoded_line = None
-            line = None
-            payload = None
-            canonical = None
-            record = None
-            proposal = None
-            decision = None
-            clarification = None
-            proposals.clear()
-            decisions.clear()
-            clarification_events.clear()
-            sessions.clear()
-            latest_events.clear()
-            pending_proposal_id = None
-            pending_session_id = None
             result = None
 
     @staticmethod
@@ -372,15 +382,13 @@ class IntentProposalStore:
             )
         if event.event_type == "conflicted":
             conflict = session.conflicts[-1] if session.conflicts else None
-            accepted = (
-                next(
-                    (
-                        item
-                        for item in previous.answers
-                        if conflict is not None and item.question_id == conflict.question_id
-                    ),
-                    None,
-                )
+            accepted = next(
+                (
+                    item
+                    for item in previous.answers
+                    if conflict is not None and item.question_id == conflict.question_id
+                ),
+                None,
             )
             expected_predecessor = (
                 previous.conflicts[-1].conflicting_evidence_ref
@@ -540,7 +548,9 @@ class IntentProposalStore:
                 state = self._decode_unlocked()
                 if state is None:
                     raise IntentProposalStoreError()
-                existing = tuple(item for item in state.clarification_events if item.id == validated.id)
+                existing = tuple(
+                    item for item in state.clarification_events if item.id == validated.id
+                )
                 if existing:
                     if len(existing) == 1 and existing[0] == validated:
                         return False
@@ -554,9 +564,7 @@ class IntentProposalStore:
                     ),
                     None,
                 )
-                if not self._valid_clarification_transition(
-                    previous, validated, previous_event
-                ):
+                if not self._valid_clarification_transition(previous, validated, previous_event):
                     raise IntentProposalStoreError()
                 encoded = _serialize(
                     IntentLedgerRecord(
@@ -692,5 +700,6 @@ __all__ = [
     "IntentLedgerRecord",
     "IntentProposalStore",
     "IntentProposalStoreError",
+    "parse_intent_ledger",
     "serialize_intent_ledger_record",
 ]

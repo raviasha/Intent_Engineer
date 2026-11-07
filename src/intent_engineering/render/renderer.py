@@ -8,6 +8,7 @@ import stat
 from collections.abc import Sequence
 from pathlib import Path
 
+from intent_engineering.assessment.models import AssessmentReport
 from intent_engineering.core.models import ReconciliationCase
 from intent_engineering.render.markdown import render_markdown
 from intent_engineering.render.mermaid import render_mermaid
@@ -17,13 +18,21 @@ from intent_engineering.storage.interfaces import GraphStore
 class GraphRenderer:
     """Render a graph-store snapshot into explicitly supplied generated files."""
 
-    def __init__(self, graph_store: GraphStore, cases: Sequence[ReconciliationCase] = ()) -> None:
+    def __init__(
+        self,
+        graph_store: GraphStore,
+        cases: Sequence[ReconciliationCase] = (),
+        assessment: AssessmentReport | None = None,
+    ) -> None:
         self._graph_store = graph_store
         self._cases = tuple(cases)
+        self._assessment = assessment
 
     def render_all(self, output_dir: Path) -> tuple[Path, Path]:
         """Write Markdown and Mermaid files below ``output_dir`` only."""
         graph = self._graph_store.load()
+        markdown = render_markdown(graph, self._cases, self._assessment)
+        mermaid = render_mermaid(graph, self._assessment)
         output_dir = output_dir.absolute()
         markdown_path = output_dir / "graph.md"
         mermaid_path = output_dir / "graph.mmd"
@@ -33,10 +42,8 @@ class GraphRenderer:
                 raise ValueError("generated view output directory must not be a symlink")
             self._assert_safe_target(directory_fd, markdown_path.name)
             self._assert_safe_target(directory_fd, mermaid_path.name)
-            self._atomic_write(
-                directory_fd, markdown_path.name, render_markdown(graph, self._cases)
-            )
-            self._atomic_write(directory_fd, mermaid_path.name, render_mermaid(graph))
+            self._atomic_write(directory_fd, markdown_path.name, markdown)
+            self._atomic_write(directory_fd, mermaid_path.name, mermaid)
         finally:
             os.close(directory_fd)
         return markdown_path, mermaid_path

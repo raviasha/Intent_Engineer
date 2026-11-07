@@ -19,6 +19,9 @@ it becomes a reviewable reconciliation case with its supporting evidence.
 The supplied [framework graph](graph/framework-intent-graph.yaml) dogfoods the
 same graph model used for a project.
 
+New to the project? Start with the [five-minute user guide](docs/quick-start.md) for installation,
+onboarding, everyday development, graph assessment, team enrollment, and CI assurance.
+
 ## Guided developer journey
 
 Requires Python 3.12 or newer.
@@ -87,12 +90,25 @@ intentionally omits `cwd`: on a local Codex host, `--project .` binds to the act
 working directory. A remote executor must explicitly reproduce or configure that repository
 working directory; it must not assume `.` refers to the user's checkout.
 
-The bundle automatically offers onboarding when no approved baseline exists. After approval the
-hook persists its exact stdin prompt as untrusted `agent:codex` context, supplies only opaque
-conversation and evidence references, and routes the agent's bounded classification draft through
-token-free `intent_advisory_preflight`. The hook boundary is callable by the coding agent, so it
-never claims local-human attribution or approval. Raw prompt text never crosses that MCP wire
-boundary.
+The bundle first runs the same non-authoritative readiness check as
+`intent ensure --project . --preset developer --format json`. When approved shared-state trust is
+configured, that operation performs a bounded fetch of only `origin/intent-state`, verifies and
+restores the signed baseline, then starts or reuses the repository-bound local service before
+returning. A missing or offline protected ref reports fixed unavailable/stale guidance rather than
+silently using an older tracking ref. A successful online restore also records bounded, non-secret
+repository/project and release-digest metadata in the current OS account's owner-only
+`.intent-engineering` governance registry. Deleting the ignored repository cache cannot opt that
+checkout out of team governance; missing trust remains unavailable/offline-stale. Explicit offline
+verification of a cached tracking ref is likewise stale, never fresh verified state. A fresh
+repository with no approved shared baseline still
+receives the unchanged onboarding offer and no state is created. If an approved graph has pending
+proposal review, an open reconciliation case, or unanswered clarification, it stops before
+capturing or classifying the prompt and directs the developer to the already-running local review
+view. Otherwise, it persists the exact stdin prompt as untrusted `agent:codex` context, supplies
+only opaque conversation and evidence references, and routes the agent's bounded classification
+draft through token-free `intent_advisory_preflight`. The hook boundary is callable by the coding
+agent, so it never claims local-human attribution or approval. Raw prompt text never crosses that
+MCP wire boundary.
 
 The advisory classifications are `no_semantic_impact`, `aligned`, `new_or_ambiguous`, and
 `conflicting`. Continue normal work for the first two. The plugin never receives a mutation
@@ -100,9 +116,45 @@ capability and does not provide mandatory mutation enforcement. Mandatory Codex 
 truthfully unavailable through `MandatoryHookUnavailable` with the message
 `Codex mandatory mutation hook is unavailable`.
 
-To opt out, decline the onboarding offer or disable/uninstall `intent-advisor`. A decline leaves
-the repository unchanged for that task; disabling the plugin leaves ordinary coding behavior
-unchanged. The CLI and MCP services remain usable independently.
+To inspect the machine-facing gate directly, run
+`intent ensure --project . --preset developer --format json`. To opt out, decline the onboarding
+offer or disable/uninstall `intent-advisor`. A decline leaves the repository unchanged for that
+task; disabling the plugin leaves ordinary coding behavior unchanged. The CLI and MCP services
+remain usable independently.
+
+While `intent dev` is running, it polls bounded Git and test-result evidence at a fixed cadence
+without waiting for a browser request. The Home view shows the latest detached observation and
+offers an explicit **Run reviewed tests** action for command IDs from reviewed project
+configuration. The write uses the same-origin/CSRF boundary; it supplies an identifier, never a
+shell command, and neither polling nor test execution asserts implementation completion.
+The automatic prompt-time service intentionally opens no browser and never persists its CSRF
+bootstrap. Running ordinary `intent dev` later securely replaces that attested headless owner,
+opens a browser with a new in-memory bootstrap, and keeps the protected write actions usable;
+`intent dev --status` and `intent dev --no-open` continue to reuse the existing process.
+
+### Required GitHub check
+
+The separate PR workflow, [intent-check.yml](.github/workflows/intent-check.yml), exposes the
+required status **`Intent Engineering / check`**. It installs the package, restores the signed and
+encrypted approved baseline, runs every reviewed `test_commands` argv from that baseline, writes
+canonical evidence for the checkout's exact Git commit, and runs:
+
+```bash
+intent check --ci --require-review --test-results .intent-ci/test-results.json
+```
+
+Passing tests are evidence, not human approval. Missing trust or baseline, failing tests, invalid
+evidence, and unresolved review work fail the job. Disabling the local plugin does not disable
+this GitHub backstop. The nightly/manual `intent-sync.yml` remains separate: it captures configured
+Markdown, Git, and GitHub sources, validates state, renders and uploads the drift report, then
+runs the review-required check. Pending review fails the run after producing its report.
+
+This workflow requires operator setup; committing it does not enable branch protection. Configure
+the protected `intent-ci` environment, supply the CI recipient key and pinned signing-key trust,
+publish compatible approved encrypted state to protected `intent-state`, and require the exact
+status above on your code branches. A bare checkout or a locally manufactured `.intent` directory
+cannot satisfy CI. See [CI setup and trust prerequisites](docs/intent-aware-agent.md#required-github-check-setup)
+before enabling it. Automated key enrollment and publication setup remain future work.
 
 Clients other than Codex that launch and connect stdio themselves may run
 `intent mcp --project .`; that is a client-managed process, not an extra Codex setup step.
@@ -139,6 +191,36 @@ The workflow deliberately fails with `onboarding_required` on a clean checkout u
 `.intent` baseline is restored first or the job runs in a persistent/self-hosted workspace. It
 never initializes and reports a clean graph version 0.
 
+Inspect the current visible graph's deterministic robustness without changing it:
+
+```bash
+intent assess --project . --format json
+intent assess --project . --focus <node-or-branch-id> --format json
+```
+
+The scorecard is derived, explainable, ACL-filtered, non-canonical, and model-independent. Green
+requires a score and confidence of at least 75 with no blocking conflict; orange covers scores
+50–74 or insufficient confidence; red is below 50 or blocked. Non-applicable dimensions are `N/A`,
+unsupported inputs remain `unassessed`, and a critical red path caps branch and project robustness
+at 49. The CLI, read-only MCP tools, and CI comparison share the same semantic report digest. See
+[the assessment guide](docs/assessment.md) for dimensions, exact exit codes, and CI defaults.
+
+Improve the graph when you have time; this does not require a new development prompt:
+
+```bash
+intent refine --project . --minutes 5
+intent refine --project . --session <session-id> --action pause --format json
+intent refine --project . --session <session-id> --action resume --format json
+```
+
+The same workflow is available as **Improve graph** in `intent dev`. It asks one deterministic,
+gap-linked question at a time. An explicit answer is captured immediately as ACL-scoped evidence;
+the session ledger keeps only its evidence reference. Pause/restart/resume is durable. Neither an
+answer nor an enrichment session changes the canonical graph. A proposed change still enters the
+existing human-governed proposal and approval workflow. MCP exposes only bounded status and
+next-question reads—never answer, skip, pause, resume, propose, approve, or mutation authority.
+See [the assessment guide](docs/assessment.md) for the CLI and MCP response contract.
+
 For team conversations and external requirements, configure GitHub and/or a compatible MCP source,
 then schedule capture independently from reconciliation:
 
@@ -170,6 +252,19 @@ records a deterministic preview and returns an approval hash with review-require
 exit status. Re-run it with the exact `--approve <hash>` to apply the approved
 ChangeSet and resolve the case. `defer` and `mark-false-positive` are terminal
 case actions and do not mutate the graph.
+
+## Current release boundary
+
+Included now are explainable assessment and visualization, resumable progressive enrichment,
+CLI/browser/read-only-MCP journeys, deterministic validation, and the existing reviewed guarded
+enrollment foundation. The local assessment and enrichment path works offline; configured remote
+evidence sources still require their provider connection. The `intent-advisor` plugin can suggest
+when to inspect or clarify intent, but it cannot provide human approval or bypass repository ACL,
+proposal, reconciliation, or release controls.
+
+Deferred follow-up work is explicitly not shipped or reachable: automatic second-developer
+activation/reconciliation beyond the guarded publication foundation, generation of alternative or
+simpler requirements, and the broader state-hardening backlog.
 
 ## What classifications mean
 

@@ -24,6 +24,7 @@ from intent_engineering.intent_workflow.models import (
 from intent_engineering.intent_workflow.proposal_store import (
     IntentProposalStore,
     IntentProposalStoreError,
+    parse_intent_ledger,
 )
 from intent_engineering.storage import secure as secure_storage
 from intent_engineering.storage.secure import SecureDirectory
@@ -162,6 +163,20 @@ def test_proposal_store_is_canonical_idempotent_and_append_only(
     assert proposal_store.bytes() == before
     assert proposal_store.get(proposal.id) == proposal
     assert proposal_store.list() == (proposal,)
+
+
+def test_pure_held_bytes_parser_reconstructs_only_valid_canonical_state(
+    proposal: IntentProposal,
+) -> None:
+    """Catches snapshot consumers needing file I/O or bypassing ledger state validation."""
+    canonical = _canonical_record(0, proposal=proposal)
+
+    state = parse_intent_ledger(canonical)
+
+    assert state is not None
+    assert state.content == canonical
+    assert state.proposals == {proposal.id: proposal}
+    assert parse_intent_ledger(canonical + _canonical_record(1, proposal=proposal)) is None
 
 
 def test_decision_binds_exact_proposal_actor_and_graph_version(
@@ -488,8 +503,7 @@ def _fifo_swap_before_append_probe(path: str, proposal_json: str, connection: An
     except IntentProposalStoreError as error:
         result = (
             "fixed-unavailable"
-            if error.args == ("intent proposal ledger unavailable",)
-            and error.__context__ is None
+            if error.args == ("intent proposal ledger unavailable",) and error.__context__ is None
             else "unsafe-error"
         )
     except Exception:  # noqa: BLE001 - child reports any unexpected public failure

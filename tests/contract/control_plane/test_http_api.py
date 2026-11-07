@@ -16,6 +16,13 @@ from starlette.types import Message, Receive, Scope, Send
 from intent_engineering.control_plane import build_control_plane_app, http_models
 from intent_engineering.control_plane.http_models import RegistrationVerifyRequest
 from intent_engineering.control_plane.models import CredentialRecord, HumanDecisionPayload
+from intent_engineering.intent_workflow.dev_observer import (
+    ObservationResult,
+    TestRunStatus,
+)
+from intent_engineering.intent_workflow.dev_observer import (
+    TestRunResult as ObserverTestRunResult,
+)
 
 ORIGIN = "http://localhost:43127"
 CSRF = "csrf-process-secret-43127"
@@ -150,6 +157,23 @@ class _Service:
         self._fail()
         return b'{"publicKey":{"userVerification":"required"}}'
 
+    def team_publication_preview(self) -> dict[str, object]:
+        self.calls.append(("team_publication_preview", None))
+        self._fail()
+        return {
+            "schema_version": 1,
+            "preview": {
+                "snapshot_digest": "sha256:" + "1" * 64,
+                "bundle_digest": "sha256:" + "2" * 64,
+                "bundle_size": 123,
+                "branch": "intent-publication/" + "2" * 64,
+                "parent_bundle_digest": None,
+                "recipient_key_ids": ["recipient:alice"],
+                "created_at": "2026-08-30T12:00:00Z",
+            },
+            "payload": {**_payload(), "action": "publish_state"},
+        }
+
     def apply_decision(self, response: bytes, payload: HumanDecisionPayload) -> dict[str, object]:
         self.calls.append(("apply_decision", (response, payload)))
         self._fail()
@@ -161,6 +185,25 @@ class _Service:
             "graph_version": 4,
             "changeset_id": "changeset:result",
         }
+
+    def development_observation(self) -> ObservationResult:
+        self.calls.append(("development_observation", None))
+        self._fail()
+        return ObservationResult(
+            current_revision="1" * 40,
+            command_ids=("test:sha256:" + "2" * 64,),
+            changed_paths=("feature.py",),
+            evidence_candidates=(),
+        )
+
+    async def run_reviewed_tests(self, command_id: str) -> ObserverTestRunResult:
+        self.calls.append(("run_reviewed_tests", command_id))
+        self._fail()
+        return ObserverTestRunResult(
+            command_id=command_id,
+            status=TestRunStatus.PASSED,
+            exit_code=0,
+        )
 
 
 def _app(service: _Service):
@@ -195,8 +238,7 @@ def _assert_security_headers(response: Any) -> None:
         "style-src 'self'; connect-src 'self'"
     )
     assert response.headers["referrer-policy"] == "no-referrer"
-    cookie = response.headers["set-cookie"]
-    assert cookie == f"intent_csrf={CSRF}; Path=/; HttpOnly; SameSite=Strict"
+    assert "set-cookie" not in response.headers
 
 
 def test_exact_routes_delegate_to_the_service_and_return_detached_json() -> None:
@@ -246,6 +288,12 @@ def test_exact_routes_delegate_to_the_service_and_return_detached_json() -> None
         ),
         headers=_trusted_headers(),
     )
+    observation = client.get("/api/v1/development/observation", headers={"Origin": ORIGIN})
+    reviewed_tests = client.post(
+        "/api/v1/development/tests/run",
+        content=_json_bytes({"command_id": "test:sha256:" + "2" * 64}),
+        headers=_trusted_headers(),
+    )
 
     assert status.json() == service.status_result
     assert inbox.json() == {
@@ -266,6 +314,22 @@ def test_exact_routes_delegate_to_the_service_and_return_detached_json() -> None
     assert registration.json() == _credential().model_dump(mode="json")
     assert decision_options.json() == {"publicKey": {"userVerification": "required"}}
     assert decision.json()["status"] == "resolved"
+    assert observation.json() == {
+        "schema_version": 1,
+        "current_revision": "1" * 40,
+        "command_ids": ["test:sha256:" + "2" * 64],
+        "changed_paths": ["feature.py"],
+        "evidence_candidates": [],
+    }
+    assert reviewed_tests.json() == {
+        "schema_version": 1,
+        "command_id": "test:sha256:" + "2" * 64,
+        "status": "passed",
+        "exit_code": 0,
+        "stdout": "",
+        "stderr": "",
+        "artifact": None,
+    }
     assert service.calls == [
         ("status", None),
         ("inbox", None),
@@ -289,6 +353,8 @@ def test_exact_routes_delegate_to_the_service_and_return_detached_json() -> None
                 _decision_payload(),
             ),
         ),
+        ("development_observation", None),
+        ("run_reviewed_tests", "test:sha256:" + "2" * 64),
     ]
     for response in (
         status,
@@ -300,9 +366,41 @@ def test_exact_routes_delegate_to_the_service_and_return_detached_json() -> None
         registration,
         decision_options,
         decision,
+        observation,
+        reviewed_tests,
     ):
         assert response.headers["content-type"] == "application/json"
         _assert_security_headers(response)
+
+
+def test_reviewed_test_route_requires_same_origin_csrf_and_exact_json() -> None:
+    """Catches browser-triggered test execution bypassing the protected write boundary."""
+    service = _Service()
+    client = TestClient(_app(service), base_url=ORIGIN)
+    path = "/api/v1/development/tests/run"
+    body = _json_bytes({"command_id": "test:sha256:" + "2" * 64})
+
+    assert (
+        client.post(path, content=body, headers={"Content-Type": "application/json"}).status_code
+        == 403
+    )
+    assert (
+        client.post(
+            path,
+            content=body,
+            headers={**_trusted_headers(), "Origin": "http://localhost:43128"},
+        ).status_code
+        == 403
+    )
+    assert (
+        client.post(
+            path,
+            content=_json_bytes({"command_id": "test:sha256:" + "2" * 64, "extra": True}),
+            headers=_trusted_headers(),
+        ).status_code
+        == 400
+    )
+    assert service.calls == []
 
 
 def test_starlette_lifespan_starts_without_bypassing_the_http_boundary() -> None:
@@ -313,6 +411,21 @@ def test_starlette_lifespan_starts_without_bypassing_the_http_boundary() -> None
 
     assert response.status_code == 200
     assert response.json() == service.status_result
+
+
+def test_team_publication_preview_route_returns_only_the_service_projection() -> None:
+    """Catches the Team state browser view constructing or exposing publication artifacts."""
+    service = _Service()
+
+    response = TestClient(_app(service), base_url=ORIGIN).get("/api/v1/team/publication/preview")
+
+    assert response.status_code == 200
+    assert response.json() == service.team_publication_preview()
+    assert "bundle" not in response.json()["preview"]
+    assert service.calls == [
+        ("team_publication_preview", None),
+        ("team_publication_preview", None),
+    ]
 
 
 @pytest.mark.parametrize(
@@ -656,6 +769,28 @@ def test_invalid_service_output_and_service_errors_have_one_fixed_secret_free_re
     assert service_error.status_code == 503
     assert invalid_output.json() == service_error.json() == FIXED_ERROR
     assert "PRIVATE" not in invalid_output.text + service_error.text
+
+
+def test_status_fails_closed_when_acl_filtered_inbox_projection_is_unavailable() -> None:
+    """Catches authority or storage failure being rewritten as an empty ready Home view."""
+
+    class InboxUnavailable(_Service):
+        def inbox(self) -> dict[str, object]:
+            self.calls.append(("inbox", None))
+            raise ValueError("PRIVATE-INBOX-STORAGE-FAILURE")
+
+    service = InboxUnavailable()
+    service.status_result["status"] = "human_attention_required"
+    service.status_result["attention_route"] = "inbox"
+    service.status_result["pending_proposal_ids"] = ["proposal:hidden"]
+    client = TestClient(_app(service), base_url=ORIGIN)
+
+    response = client.get("/api/v1/status", headers={"Origin": ORIGIN})
+
+    assert response.status_code == 503
+    assert response.json() == FIXED_ERROR
+    assert "PRIVATE" not in response.text
+    assert service.calls == [("status", None), ("inbox", None)]
 
 
 def _repository_traceback_locals(error: BaseException) -> str:

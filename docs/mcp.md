@@ -96,6 +96,16 @@ hook dependency. It fails with `onboarding_required` on a clean checkout unless 
 `.intent` baseline is restored first or a persistent/self-hosted workspace supplies it; it never
 creates a clean graph version 0.
 
+Assessment is another read-only surface over the same approved state:
+
+```bash
+intent assess --project . --format json
+```
+
+The result is derived, explainable, ACL-filtered, non-canonical, and model-independent. Its green,
+orange, red, `N/A`, and `unassessed` meanings, confidence threshold, critical red-path cap, CI
+defaults, and exact exit codes are documented in [the assessment guide](assessment.md).
+
 ## Compatible MCP sources
 
 Copy both the reviewed provider profile and its example binding into the project, set
@@ -146,7 +156,10 @@ intent mcp --project .
 ```
 
 It exposes authorized context, explain, impact, drift, status, validation, reconciliation views,
-and proposal/preview/execution tools. `intent_context` is read-only. An active agent may submit its
+and proposal/preview/execution tools. `intent_context` is read-only. Assessment uses the same
+semantic report through the read-only `intent_assessment_summary`,
+`intent_assessment_scorecard`, and `intent_assessment_gaps` tools; no tool recomputes scores or
+returns an authority token. An active agent may submit its
 typed PRD proposal with `intent_bootstrap_propose` and its attributed task classification with
 `intent_preflight`; those submissions are revalidated against current durable state. Aligned tasks
 may receive a short-lived process-local capability, while new/ambiguous and conflicting tasks remain

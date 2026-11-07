@@ -314,6 +314,27 @@ def test_challenge_store_allows_exactly_one_concurrent_consumer(tmp_path: Path) 
     assert outcomes == ["consumed", "unavailable"]
 
 
+def test_revoke_checks_complete_binding_before_writing_terminal_transition(
+    tmp_path: Path,
+) -> None:
+    """Catches a mismatched cancel request consuming another enrollment's challenge."""
+    store = challenge_store(tmp_path)
+    record = challenge_record().model_copy(update={"ceremony": "registration"})
+    assert store.issue(record)
+
+    with pytest.raises(ValueError, match="challenge unavailable"):
+        store.revoke(
+            record.id,
+            record.issued_at,
+            project_id=record.project_id,
+            repository_id=record.repository_id,
+            actor="local:other",
+            payload_digest=record.payload_digest,
+        )
+
+    assert store.consume(record.id, record.issued_at) == record
+
+
 def test_store_preserves_cancellation_identity(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -23,6 +23,36 @@ class ConflictingMutationId(MutationStoreError):
     """Raised when one immutable mutation identity is reused for different bytes."""
 
 
+def parse_immutable_records[RecordT: (WritePlan, ApprovalRecord)](
+    content: bytes | None, model: type[RecordT]
+) -> dict[str, RecordT]:
+    """Validate exact ledger bytes with the same immutable-ID rules used by the stores."""
+    records: dict[str, RecordT] = {}
+    encodings: dict[str, bytes] = {}
+    if content is None:
+        return records
+    for line in content.decode("utf-8").splitlines():
+        if not line.strip():
+            raise MutationStoreError("invalid mutation store")
+        payload = loads_strict_object(line)
+        record = model.model_validate_json(
+            json.dumps(
+                payload,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+        )
+        existing = records.get(record.id)
+        if existing is not None:
+            if existing != record or encodings[record.id] != line.encode("utf-8"):
+                raise MutationStoreError("invalid mutation store")
+            continue
+        records[record.id] = record
+        encodings[record.id] = line.encode("utf-8")
+    return records
+
+
 class _ImmutableJsonlStore[RecordT: (WritePlan, ApprovalRecord)]:
     _model: type[RecordT]
 
@@ -41,33 +71,10 @@ class _ImmutableJsonlStore[RecordT: (WritePlan, ApprovalRecord)]:
                 content = None
             else:  # pragma: no cover - a safe existing file was replaced during inspection
                 raise
-        records: dict[str, RecordT] = {}
-        encodings: dict[str, bytes] = {}
         try:
-            if content is not None:
-                lines = content.decode("utf-8").splitlines()
-                for line in lines:
-                    if not line.strip():
-                        return None
-                    payload = loads_strict_object(line)
-                    record = self._model.model_validate_json(
-                        json.dumps(
-                            payload,
-                            ensure_ascii=False,
-                            separators=(",", ":"),
-                            sort_keys=True,
-                        )
-                    )
-                    existing = records.get(record.id)
-                    if existing is not None:
-                        if existing != record or encodings[record.id] != line.encode("utf-8"):
-                            return None
-                        continue
-                    records.setdefault(record.id, record)
-                    encodings[record.id] = line.encode("utf-8")
+            return parse_immutable_records(content, self._model)
         except (TypeError, UnicodeError, ValidationError, ValueError):
             return None
-        return records
 
     def _rebuild_unlocked(self) -> None:
         records = self._decode_unlocked()

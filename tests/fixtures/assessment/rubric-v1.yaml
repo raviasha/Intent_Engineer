@@ -1,0 +1,88 @@
+project_id: project:rubric
+graph:
+  id: graph:rubric
+  version: 1
+  nodes:
+    - id: intent:export
+      type: PRODUCT_INTENT
+      label: Export data
+      status: active
+      created_by: local:asha
+      created_at: '2026-09-01T00:00:00+00:00'
+      last_modified_by: local:asha
+      last_modified_at: '2026-09-01T00:00:00+00:00'
+      source_mode: explicit
+      intent_fidelity_confidence: 0.9
+      confidence_basis: stakeholder-approved
+      evidence_refs: [evidence:intent]
+    - id: req:csv
+      type: REQUIREMENT
+      label: Export CSV data
+      status: active
+      created_by: local:asha
+      created_at: '2026-09-01T00:00:00+00:00'
+      last_modified_by: local:asha
+      last_modified_at: '2026-09-01T00:00:00+00:00'
+      source_mode: explicit
+      intent_fidelity_confidence: 0.9
+      confidence_basis: stakeholder-approved
+      evidence_refs: [evidence:req]
+    - id: file:export
+      type: FILE
+      label: export.py
+      status: active
+      created_by: local:asha
+      created_at: '2026-09-01T00:00:00+00:00'
+      last_modified_by: local:asha
+      last_modified_at: '2026-09-01T00:00:00+00:00'
+      source_mode: explicit
+      intent_fidelity_confidence: 0.9
+      confidence_basis: repository-observation
+      evidence_refs: [evidence:file]
+  edges:
+    - id: edge:refines
+      from: intent:export
+      relation: REFINES
+      to: req:csv
+      status: active
+      created_by: local:asha
+      created_at: '2026-09-01T00:00:00+00:00'
+      last_modified_by: local:asha
+      last_modified_at: '2026-09-01T00:00:00+00:00'
+    - id: edge:implemented-by
+      from: req:csv
+      relation: IMPLEMENTED_BY
+      to: file:export
+      status: active
+      created_by: local:asha
+      created_at: '2026-09-01T00:00:00+00:00'
+      last_modified_by: local:asha
+      last_modified_at: '2026-09-01T00:00:00+00:00'
+evidence:
+  - id: evidence:intent
+    connector_type: fixture
+    external_object_id: intent-export
+    external_version: '1'
+    author: Asha
+    observed_at: '2026-09-01T00:00:00+00:00'
+    source_locator: fixture://intent-export
+    content_hash: sha256:intent
+    payload: {kind: intent}
+  - id: evidence:req
+    connector_type: fixture
+    external_object_id: req-csv
+    external_version: '1'
+    author: Asha
+    observed_at: '2026-09-01T00:00:00+00:00'
+    source_locator: fixture://req-csv
+    content_hash: sha256:req
+    payload: {kind: requirement}
+  - id: evidence:file
+    connector_type: fixture
+    external_object_id: file-export
+    external_version: '1'
+    author: Asha
+    observed_at: '2026-09-01T00:00:00+00:00'
+    source_locator: fixture://file-export
+    content_hash: sha256:file
+    payload: {kind: implementation}

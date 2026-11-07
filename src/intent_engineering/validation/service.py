@@ -11,6 +11,7 @@ from datetime import UTC
 from enum import StrEnum
 from hashlib import sha256
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any, Literal, cast
 
 import yaml  # type: ignore[import-untyped]
@@ -38,6 +39,10 @@ from intent_engineering.storage.jsonl.case_store import (
     parse_case_versions,
 )
 from intent_engineering.storage.jsonl.evidence_store import parse_evidence_lines
+from intent_engineering.storage.jsonl.receipt_store import (
+    ReceiptStoreError,
+    validate_receipt_ledger,
+)
 from intent_engineering.storage.jsonl.strict import loads_strict_json
 from intent_engineering.storage.secure import (
     SecureDirectory,
@@ -59,6 +64,8 @@ _GITHUB_CONNECTOR_PREFIX = "github:"
 _GITHUB_SHA = re.compile(r"^[0-9a-f]{40}$")
 _MCP_CONNECTOR_IDENTITY = re.compile(r"^[0-9a-f]{64}$")
 _MCP_WRITE_EVIDENCE = re.compile(r"^evidence:mcp-write:[0-9a-f]{64}$")
+MAX_CANONICAL_FILE_BYTES = 8 * 1024 * 1024
+MAX_CANONICAL_SNAPSHOT_BYTES = 16 * 1024 * 1024
 
 
 class DiagnosticSeverity(StrEnum):
@@ -1028,6 +1035,10 @@ class WorkspaceValidationService:
             captured = self._capture()
         except _CaptureFailure as error:
             return _report((_diagnostic(error.code, error.scope),))
+        return self._validate_snapshot(captured)
+
+    @staticmethod
+    def _validate_snapshot(captured: _CapturedWorkspace) -> ValidationReport:
         diagnostics: list[ValidationDiagnostic] = []
         if captured.recovered:
             diagnostics.append(
@@ -1069,6 +1080,10 @@ class WorkspaceValidationService:
         except (UnicodeError, json.JSONDecodeError, ValidationError, TypeError, ValueError):
             diagnostics.append(_diagnostic("history.invalid", "history"))
         try:
+            validate_receipt_ledger(captured.content["receipts"])
+        except ReceiptStoreError:
+            diagnostics.append(_diagnostic("receipts.invalid", "receipts"))
+        try:
             checkpoints = _parse_checkpoints(captured.content["checkpoints"])
         except (UnicodeError, ValidationError, TypeError, ValueError, yaml.YAMLError):
             diagnostics.append(_diagnostic("checkpoints.invalid", "checkpoints"))
@@ -1092,6 +1107,41 @@ class WorkspaceValidationService:
                 _checkpoint_diagnostics(checkpoints, evidence, ingestions, legacy_ids)
             )
         return _report(diagnostics, graph)
+
+
+def validate_canonical_snapshot(content: Mapping[str, bytes | None]) -> ValidationReport:
+    """Validate one bounded immutable canonical snapshot without any filesystem reads."""
+    try:
+        snapshot = dict(content)
+        if set(snapshot) != {
+            "config",
+            "graph",
+            "history",
+            "cases",
+            "evidence",
+            "receipts",
+            "checkpoints",
+        }:
+            raise ValueError("invalid canonical snapshot")
+        if any(value is not None and type(value) is not bytes for value in snapshot.values()):
+            raise ValueError("invalid canonical snapshot")
+        sizes = [len(value) for value in snapshot.values() if value is not None]
+        if (
+            any(size > MAX_CANONICAL_FILE_BYTES for size in sizes)
+            or sum(sizes) > MAX_CANONICAL_SNAPSHOT_BYTES
+        ):
+            raise ValueError("oversized canonical snapshot")
+    except (TypeError, ValueError):
+        return _report((_diagnostic("workspace.snapshot_invalid", "workspace"),))
+    try:
+        if snapshot["config"] is None:
+            raise ValueError("missing config")
+        config = _parse_config(snapshot["config"])
+    except (UnicodeError, TypeError, ValueError, yaml.YAMLError):
+        return _report((_diagnostic("config.invalid", "config"),))
+    return WorkspaceValidationService._validate_snapshot(
+        _CapturedWorkspace(config, MappingProxyType(snapshot), False)
+    )
 
 
 def validate_project(root: Path) -> ValidationReport:

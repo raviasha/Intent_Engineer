@@ -6,14 +6,15 @@ import base64
 import json
 import re
 import secrets
-from collections.abc import Callable, Iterator, Mapping, Sequence
+import traceback
+from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from hashlib import sha256
 from pathlib import Path
 from threading import local
 from types import MappingProxyType
-from typing import Literal
+from typing import Literal, NoReturn
 
 from pydantic import ConfigDict, Field, ValidationError, model_validator
 
@@ -129,6 +130,8 @@ class _Journal(StrictModel):
     state: Literal["prepared", "committed"]
     transaction_id: str = Field(pattern=r"^[0-9a-f]{64}$")
     preimages: tuple[_Preimage, ...]
+    scope: str | None = None
+    postimages: tuple[_Preimage, ...] = ()
 
 
 def _digest(content: bytes) -> str:
@@ -144,6 +147,59 @@ def _reject_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]
     return result
 
 
+def _scrub_signal(error: BaseException) -> BaseException:
+    old_traceback = error.__traceback__
+    error.args = ()
+    error.__dict__.clear()
+    error.__traceback__ = None
+    error.__cause__ = None
+    error.__context__ = None
+    if old_traceback is not None:
+        traceback.clear_frames(old_traceback)
+    old_traceback = None
+    return error
+
+
+def _signal_chain(error: BaseException) -> tuple[BaseException, ...]:
+    pending = [error]
+    seen: set[int] = set()
+    result: list[BaseException] = []
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        result.append(current)
+        cause = current.__cause__
+        context = current.__context__
+        if cause is not None:
+            pending.append(cause)
+        if context is not None:
+            pending.append(context)
+    pending.clear()
+    seen.clear()
+    return tuple(result)
+
+
+def _scrub_signal_chain(error: BaseException) -> None:
+    for current in _signal_chain(error):
+        _scrub_signal(current)
+
+
+def _raise_signal(error: BaseException) -> NoReturn:
+    try:
+        raise error.with_traceback(None) from None
+    except BaseException as caught:  # noqa: BLE001 - detach the suspended primary context
+        caught.__traceback__ = None
+        caught.__cause__ = None
+        caught.__context__ = None
+        error = BaseException()
+        try:
+            raise caught.with_traceback(None) from None
+        finally:
+            caught = BaseException()
+
+
 class LocalTransaction:
     """The mutation handle yielded while a coordinator owns every target lock."""
 
@@ -155,6 +211,7 @@ class LocalTransaction:
         read_only: bool = False,
         extra_read_policies: Mapping[str, LocalTransactionExtraReadPolicy] | None = None,
         extra_read_budget: _ExtraReadBudget | None = None,
+        _issued_by: object | None = None,
     ) -> None:
         self._owner = owner
         self._extras = dict(extras or {})
@@ -162,6 +219,7 @@ class LocalTransaction:
         self._extra_read_policies = dict(extra_read_policies or {})
         self._extra_read_budget = extra_read_budget or _ExtraReadBudget(self._extra_read_policies)
         self._active = True
+        self._issued_by = _issued_by
 
     def _target(self, name: str) -> SecureFile:
         if not self._active:
@@ -189,6 +247,8 @@ class LocalTransaction:
         target = self._read_target(name)
         if name in self._extras:
             return self._extra_read_budget.read_optional(name, target)
+        if self._read_only:
+            return target.read_optional_nonblocking()
         return target.read_optional()
 
     def read(self, name: str) -> bytes:
@@ -200,10 +260,25 @@ class LocalTransaction:
             return content
         return self._read_target(name).read_bytes()
 
+    def read_optional_bounded(self, name: str, *, max_bytes: int) -> bytes | None:
+        """Read one held regular target only up to an exact caller-supplied bound."""
+        if type(max_bytes) is not int or max_bytes < 0:
+            raise ValueError("invalid local transaction read bound")
+        if name in self._extras:
+            raise ValueError("bounded canonical read cannot target an extra")
+        return self._read_target(name).read_optional_nonblocking(max_bytes=max_bytes)
+
     def write(self, name: str, content: bytes) -> None:
         """Durably replace one target and expose its deterministic crash stage."""
+        self._target(name)
+        self._owner._record_recovery_write(name, content)
+        self._owner._write_target(name, content)
+        self._owner._fault(f"target:{name}")
+
+    def delete(self, name: str) -> None:
+        """Durably remove one target while retaining its journaled preimage."""
         target = self._target(name)
-        target.atomic_write(content)
+        target.unlink(missing_ok=True)
         self._owner._fault(f"target:{name}")
 
     def append(self, name: str, content: bytes) -> None:
@@ -228,6 +303,9 @@ class _TransactionThreadState(local):
         self.extra_read_policies: dict[str, LocalTransactionExtraReadPolicy] = {}
         self.extra_read_budget: _ExtraReadBudget | None = None
         self.poisoned = False
+        self.issued_write_transactions: list[LocalTransaction] = []
+        self.issued_no_recovery_read_transactions: list[LocalTransaction] = []
+        self.no_recovery_read_active = False
 
 
 class LocalTransactionCoordinator:
@@ -240,6 +318,13 @@ class LocalTransactionCoordinator:
         *,
         fault_hook: Callable[[str], None] | None = None,
         legacy_target_sets: Sequence[frozenset[str]] = (),
+        recovery_scope: str | None = None,
+        max_recovery_bytes: int | None = None,
+        recovery_merges: Mapping[
+            str, Callable[[bytes | None, bytes | None, bytes | None], bytes | None]
+        ]
+        | None = None,
+        target_writers: Mapping[str, Callable[[SecureFile, bytes], None]] | None = None,
     ) -> None:
         if not targets or any(not _TARGET_PATTERN.fullmatch(name) for name in targets):
             raise ValueError("invalid local transaction targets")
@@ -261,6 +346,15 @@ class LocalTransactionCoordinator:
         self._fault_hook = fault_hook
         self._legacy_target_sets = frozenset(legacy_sets)
         self._thread_state = _TransactionThreadState()
+        self.__transaction_authority = object()
+        self.__no_recovery_read_authority = object()
+        self._recovery_scope = recovery_scope
+        self._max_recovery_bytes = max_recovery_bytes
+        self._recovery_merges = dict(recovery_merges or {})
+        self._target_writers = dict(target_writers or {})
+        if set(self._recovery_merges) - set(targets):
+            raise ValueError("invalid recovery merge target")
+        self._prepared_journal: _Journal | None = None
 
     def close(self) -> None:
         """Release journal and target descriptors after all transactions quiesce."""
@@ -328,7 +422,7 @@ class LocalTransactionCoordinator:
                 if name in policies:
                     value = reads.read_optional(name, files[name])
                 else:
-                    value = files[name].read_optional()
+                    value = files[name].read_optional_nonblocking()
                 content[name] = value
                 value = None
             succeeded = True
@@ -359,6 +453,35 @@ class LocalTransactionCoordinator:
         except KeyError as error:
             raise ValueError("unknown local transaction target") from error
 
+    def owns_active_write_transaction(self, transaction: object) -> bool:
+        """Authenticate one exact mutation handle issued for the current held lock scope."""
+        return bool(
+            type(transaction) is LocalTransaction
+            and transaction._owner is self
+            and transaction._issued_by is self.__transaction_authority
+            and transaction._active
+            and not transaction._read_only
+            and self._thread_state.active
+            and any(
+                transaction is issued for issued in self._thread_state.issued_write_transactions
+            )
+        )
+
+    def owns_active_no_recovery_read_transaction(self, transaction: object) -> bool:
+        """Authenticate one exact read handle issued without recovery on this thread."""
+        return bool(
+            type(transaction) is LocalTransaction
+            and transaction._owner is self
+            and transaction._issued_by is self.__no_recovery_read_authority
+            and transaction._active
+            and transaction._read_only
+            and self._thread_state.no_recovery_read_active
+            and any(
+                transaction is issued
+                for issued in self._thread_state.issued_no_recovery_read_transactions
+            )
+        )
+
     def _fault(self, stage: str) -> None:
         if self._fault_hook is not None:
             self._fault_hook(stage)
@@ -375,7 +498,24 @@ class LocalTransactionCoordinator:
             yield
 
     def _snapshot(self) -> dict[str, bytes | None]:
-        return {name: self._targets[name].read_optional() for name in sorted(self._targets)}
+        if self._max_recovery_bytes is None:
+            return {name: self._targets[name].read_optional() for name in sorted(self._targets)}
+        result: dict[str, bytes | None] = {}
+        remaining = self._max_recovery_bytes
+        for name in sorted(self._targets):
+            result[name] = self._targets[name].read_optional_nonblocking(max_bytes=remaining)
+            if remaining is not None:
+                remaining -= len(result[name] or b"")
+        return result
+
+    def _require_no_recovery_journal(self) -> None:
+        """Reject any journal entry by held-directory metadata without reading its payload."""
+        try:
+            present = self._journal.exists()
+        except UnsafePathError:
+            raise TransactionRecoveryError() from None
+        if present:
+            raise TransactionRecoveryError() from None
 
     def _journal_for(
         self,
@@ -402,19 +542,61 @@ class LocalTransactionCoordinator:
             state=state,
             transaction_id=transaction_id,
             preimages=tuple(records),
+            scope=self._recovery_scope,
         )
 
-    def _write_journal(self, journal: _Journal) -> None:
-        payload = json.dumps(
-            journal.model_dump(mode="json", by_alias=True),
+    @staticmethod
+    def _journal_bytes(journal: _Journal) -> bytes:
+        document = journal.model_dump(mode="json", by_alias=True)
+        if journal.scope is None:
+            document.pop("scope")
+        if not journal.postimages:
+            document.pop("postimages")
+        return json.dumps(
+            document,
             ensure_ascii=True,
             separators=(",", ":"),
             sort_keys=True,
         ).encode("utf-8")
+
+    def _write_journal(self, journal: _Journal) -> None:
+        if self._max_recovery_bytes is not None:
+            retained = sum(
+                len(record.content or "") * 3 // 4 - (record.content or "").count("=")
+                for record in (*journal.preimages, *journal.postimages)
+            )
+            if retained > self._max_recovery_bytes:
+                raise TransactionRecoveryError()
+        payload = self._journal_bytes(journal)
         self._journal.atomic_write(payload)
 
+    def _record_recovery_write(self, name: str, content: bytes) -> None:
+        if name not in self._recovery_merges:
+            return
+        journal = self._prepared_journal
+        if journal is None:
+            raise TransactionRecoveryError()
+        post = self._journal_for({name: content}, "prepared", journal.transaction_id).preimages[0]
+        records = {p.target: p for p in journal.postimages}
+        records[name] = post
+        updated = journal.model_copy(
+            update={"postimages": tuple(records[n] for n in sorted(records))}
+        )
+        self._write_journal(updated)
+        self._prepared_journal = updated
+
+    def _write_target(self, name: str, content: bytes) -> None:
+        writer = self._target_writers.get(name)
+        if writer is None:
+            self._targets[name].atomic_write(content)
+        else:
+            writer(self._targets[name], content)
+
     def _read_journal(self) -> tuple[_Journal, dict[str, bytes | None]] | None:
-        content = self._journal.read_optional()
+        limit = self._max_recovery_bytes
+        content = self._journal.read_optional_nonblocking(
+            max_bytes=None if limit is None else (limit * 4 // 3) + 65536
+        )
         if content is None:
             return None
         try:
@@ -426,6 +608,10 @@ class LocalTransactionCoordinator:
                 ),
             )
             journal = _Journal.model_validate(loaded)
+            if journal.scope != self._recovery_scope or (
+                self._recovery_scope is not None and content != self._journal_bytes(journal)
+            ):
+                raise ValueError("journal recovery scope changed")
             names = tuple(record.target for record in journal.preimages)
             name_set = frozenset(names)
             if len(names) != len(name_set) or (
@@ -433,6 +619,7 @@ class LocalTransactionCoordinator:
             ):
                 raise ValueError("journal target set mismatch")
             preimages: dict[str, bytes | None] = {}
+            total = 0
             for record in journal.preimages:
                 if record.content is None:
                     decoded = None
@@ -445,17 +632,54 @@ class LocalTransactionCoordinator:
                 if _digest(digest_content) != record.digest:
                     raise ValueError("preimage digest mismatch")
                 preimages[record.target] = decoded
+                total += len(decoded or b"")
+                if limit is not None and total > limit:
+                    raise ValueError("journal recovery size exceeded")
+            post_names = tuple(record.target for record in journal.postimages)
+            if len(set(post_names)) != len(post_names) or set(post_names) - set(
+                self._recovery_merges
+            ):
+                raise ValueError("journal recovery target changed")
+            for record in journal.postimages:
+                decoded = base64.b64decode(record.content or "", validate=True)
+                if (
+                    _digest(decoded) != record.digest
+                    or base64.b64encode(decoded).decode() != record.content
+                ):
+                    raise ValueError("journal recovery postimage changed")
+                total += len(decoded)
+                if limit is not None and total > limit:
+                    raise ValueError("journal recovery size exceeded")
             return journal, preimages
         except (UnicodeError, json.JSONDecodeError, ValidationError, ValueError) as error:
             raise TransactionRecoveryError() from error
 
-    def _restore(self, preimages: Mapping[str, bytes | None]) -> None:
-        for name in sorted(preimages):
-            content = preimages[name]
+    def _restore(
+        self, preimages: Mapping[str, bytes | None], journal: _Journal | None = None
+    ) -> None:
+        restored = dict(preimages)
+        current = (
+            self._snapshot()
+            if self._max_recovery_bytes is not None or self._recovery_merges
+            else {}
+        )
+        if journal is not None:
+            touched = {record.target for record in journal.postimages}
+            for name in self._recovery_merges.keys() - touched:
+                # No write-ahead postimage means this transaction never touched
+                # the shared target; an intervening writer owns its current bytes.
+                restored.pop(name, None)
+            for record in journal.postimages:
+                post = base64.b64decode(record.content or "", validate=True)
+                restored[record.target] = self._recovery_merges[record.target](
+                    preimages[record.target], post, current[record.target]
+                )
+        for name in sorted(restored):
+            content = restored[name]
             if content is None:
                 self._targets[name].unlink(missing_ok=True)
             else:
-                self._targets[name].atomic_write(content)
+                self._write_target(name, content)
 
     def _recover_unlocked(self) -> bool:
         loaded = self._read_journal()
@@ -464,7 +688,7 @@ class LocalTransactionCoordinator:
         journal, preimages = loaded
         try:
             if journal.state == "prepared":
-                self._restore(preimages)
+                self._restore(preimages, journal)
             self._journal.unlink()
         except Exception as error:
             raise TransactionRecoveryError() from error
@@ -472,12 +696,16 @@ class LocalTransactionCoordinator:
 
     def recover(self) -> None:
         """Recover a prepared transaction or finish a committed stale journal."""
+        if self._thread_state.no_recovery_read_active:
+            raise ValueError("recovery unavailable during no-recovery read")
         with self._locks():
             self._recover_unlocked()
 
     @contextmanager
     def coordinated(self) -> Iterator[None]:
         """Recover and serialize one non-transactional target operation."""
+        if self._thread_state.no_recovery_read_active:
+            raise ValueError("coordinated operation unavailable during no-recovery read")
         if self._thread_state.active:
             yield
             return
@@ -490,27 +718,79 @@ class LocalTransactionCoordinator:
         extras: Mapping[str, SecureFile] | None = None,
         *,
         extra_read_policies: Mapping[str, LocalTransactionExtraReadPolicy] | None = None,
+        target_names: Collection[str] | None = None,
     ) -> LocalTransactionSnapshot:
-        """Recover, then read every canonical target under one deterministic lock set."""
+        """Recover, then read selected canonical targets under one deterministic lock set."""
         extra_files = dict(extras or {})
         policies = self._extra_read_policies(extra_files, extra_read_policies)
+        selected_names = (
+            frozenset(self._targets) if target_names is None else frozenset(target_names)
+        )
+        if any(type(name) is not str for name in selected_names) or not selected_names.issubset(
+            self._targets
+        ):
+            raise ValueError("invalid local snapshot target selection")
         if any(not _TARGET_PATTERN.fullmatch(name) for name in extra_files):
             raise ValueError("invalid local snapshot targets")
         if set(extra_files) & set(self._targets):
             raise ValueError("duplicate local snapshot target")
         all_files = {**self._targets, **extra_files}
+        selected_files = {
+            **{name: self._targets[name] for name in selected_names},
+            **extra_files,
+        }
         lock_keys = [self._journal.lock_key, *(item.lock_key for item in all_files.values())]
         if len(lock_keys) != len(set(lock_keys)):
             raise ValueError("duplicate local snapshot target")
+        if self._thread_state.no_recovery_read_active:
+            raise ValueError("recovering snapshot unavailable during no-recovery read")
         if self._thread_state.active:
             self._require_nested_extras(extra_files)
             policies, budget = self._nested_extra_read_state(extra_files, policies)
-            content = self._read_files(all_files, policies, budget=budget)
+            content = self._read_files(selected_files, policies, budget=budget)
             return LocalTransactionSnapshot(MappingProxyType(content), False)
         with self._locks(extra_files):
             recovered = self._recover_unlocked()
-            content = self._read_files(all_files, policies)
+            content = self._read_files(selected_files, policies)
         return LocalTransactionSnapshot(MappingProxyType(content), recovered)
+
+    def snapshot_without_recovery(
+        self,
+        extras: Mapping[str, SecureFile] | None = None,
+        *,
+        extra_read_policies: Mapping[str, LocalTransactionExtraReadPolicy] | None = None,
+        target_names: Collection[str] | None = None,
+    ) -> LocalTransactionSnapshot:
+        """Read an exact snapshot only when no transaction requires recovery."""
+        extra_files = dict(extras or {})
+        policies = self._extra_read_policies(extra_files, extra_read_policies)
+        selected_names = (
+            frozenset(self._targets) if target_names is None else frozenset(target_names)
+        )
+        if any(type(name) is not str for name in selected_names) or not selected_names.issubset(
+            self._targets
+        ):
+            raise ValueError("invalid local snapshot target selection")
+        if any(not _TARGET_PATTERN.fullmatch(name) for name in extra_files):
+            raise ValueError("invalid local snapshot targets")
+        if (
+            set(extra_files) & set(self._targets)
+            or self._thread_state.active
+            or self._thread_state.no_recovery_read_active
+        ):
+            raise ValueError("read-only snapshot unavailable")
+        all_files = {**self._targets, **extra_files}
+        selected_files = {
+            **{name: self._targets[name] for name in selected_names},
+            **extra_files,
+        }
+        lock_keys = [self._journal.lock_key, *(item.lock_key for item in all_files.values())]
+        if len(lock_keys) != len(set(lock_keys)):
+            raise ValueError("duplicate local snapshot target")
+        with self._locks(extra_files):
+            self._require_no_recovery_journal()
+            content = self._read_files(selected_files, policies)
+        return LocalTransactionSnapshot(MappingProxyType(content), False)
 
     @contextmanager
     def read_transaction(
@@ -530,6 +810,8 @@ class LocalTransactionCoordinator:
         lock_keys = [self._journal.lock_key, *(item.lock_key for item in all_files.values())]
         if len(lock_keys) != len(set(lock_keys)):
             raise ValueError("duplicate local transaction target")
+        if self._thread_state.no_recovery_read_active:
+            raise ValueError("recovering read unavailable during no-recovery read")
         if self._thread_state.active:
             self._require_nested_extras(extra_files)
             policies, budget = self._nested_extra_read_state(extra_files, policies)
@@ -557,6 +839,106 @@ class LocalTransactionCoordinator:
                 yield transaction
             finally:
                 transaction._finish()
+
+    @contextmanager
+    def read_transaction_without_recovery(
+        self,
+        extras: Mapping[str, SecureFile] | None = None,
+        *,
+        extra_read_policies: Mapping[str, LocalTransactionExtraReadPolicy] | None = None,
+    ) -> Iterator[LocalTransaction]:
+        """Hold a read-only view only when no transaction journal exists."""
+        extra_files = dict(extras or {})
+        policies = self._extra_read_policies(extra_files, extra_read_policies)
+        if any(not _TARGET_PATTERN.fullmatch(name) for name in extra_files):
+            raise ValueError("invalid local transaction extras")
+        if (
+            set(extra_files) & set(self._targets)
+            or self._thread_state.active
+            or self._thread_state.no_recovery_read_active
+        ):
+            raise ValueError("read-only transaction unavailable")
+        all_files = {**self._targets, **extra_files}
+        lock_keys = [self._journal.lock_key, *(item.lock_key for item in all_files.values())]
+        if len(lock_keys) != len(set(lock_keys)):
+            raise ValueError("duplicate local transaction target")
+        transaction: LocalTransaction | None = None
+        primary_signal: BaseException | None = None
+        cleanup_signal: BaseException | None = None
+        try:
+            try:
+                with self._locks(extra_files):
+                    self._require_no_recovery_journal()
+                    transaction = LocalTransaction(
+                        self,
+                        extra_files,
+                        read_only=True,
+                        extra_read_policies=policies,
+                        _issued_by=self.__no_recovery_read_authority,
+                    )
+                    self._thread_state.issued_no_recovery_read_transactions.append(transaction)
+                    self._thread_state.no_recovery_read_active = True
+                    try:
+                        yield transaction
+                    except BaseException as caught:  # noqa: BLE001 - defer signal selection
+                        primary_signal = caught
+                    finally:
+                        self._thread_state.no_recovery_read_active = False
+                        try:
+                            self._thread_state.issued_no_recovery_read_transactions.remove(
+                                transaction
+                            )
+                        finally:
+                            transaction._finish()
+            except BaseException as caught:  # noqa: BLE001 - select after every lock cleanup
+                cleanup_signal = caught
+        finally:
+            transaction = None
+            extra_files.clear()
+            policies.clear()
+            all_files.clear()
+        cleanup_cancellation = (
+            next(
+                (
+                    signal
+                    for signal in _signal_chain(cleanup_signal)
+                    if not isinstance(signal, Exception)
+                ),
+                None,
+            )
+            if cleanup_signal is not None
+            else None
+        )
+        selected: BaseException | None
+        scrub = False
+        if primary_signal is not None and not isinstance(primary_signal, Exception):
+            selected = primary_signal
+            scrub = True
+        elif cleanup_cancellation is not None:
+            selected = cleanup_cancellation
+            scrub = True
+        elif primary_signal is not None:
+            selected = primary_signal
+            scrub = cleanup_signal is not None
+        else:
+            selected = cleanup_signal
+            scrub = cleanup_signal is not None and not isinstance(cleanup_signal, Exception)
+        if scrub:
+            if cleanup_signal is not None:
+                _scrub_signal_chain(cleanup_signal)
+            if primary_signal is not None:
+                _scrub_signal_chain(primary_signal)
+        primary_signal = None
+        cleanup_signal = None
+        cleanup_cancellation = None
+        scrubbed = scrub
+        scrub = False
+        if selected is not None:
+            detached = selected
+            selected = None
+            if scrubbed:
+                _raise_signal(detached)
+            raise detached
 
     @contextmanager
     def transaction(
@@ -577,6 +959,8 @@ class LocalTransactionCoordinator:
         lock_keys = [self._journal.lock_key, *(item.lock_key for item in all_files.values())]
         if len(lock_keys) != len(set(lock_keys)):
             raise ValueError("duplicate local transaction target")
+        if self._thread_state.no_recovery_read_active:
+            raise ValueError("write transaction unavailable during no-recovery read")
         if self._thread_state.active:
             self._require_nested_extras(extra_files)
             policies, budget = self._nested_extra_read_state(extra_files, policies)
@@ -585,13 +969,16 @@ class LocalTransactionCoordinator:
                 extra_files,
                 extra_read_policies=policies,
                 extra_read_budget=budget,
+                _issued_by=self.__transaction_authority,
             )
+            self._thread_state.issued_write_transactions.append(transaction)
             try:
                 yield transaction
             except BaseException:
                 self._thread_state.poisoned = True
                 raise
             finally:
+                self._thread_state.issued_write_transactions.remove(transaction)
                 transaction._finish()
             return
         with self._locks(extra_files):
@@ -600,30 +987,36 @@ class LocalTransactionCoordinator:
             transaction_id = secrets.token_hex(32)
             prepared = self._journal_for(preimages, "prepared", transaction_id)
             self._write_journal(prepared)
+            self._prepared_journal = prepared
             budget = _ExtraReadBudget(policies)
             transaction = LocalTransaction(
                 self,
                 extra_files,
                 extra_read_policies=policies,
                 extra_read_budget=budget,
+                _issued_by=self.__transaction_authority,
             )
             self._thread_state.active = True
             self._thread_state.extras = extra_files
             self._thread_state.extra_read_policies = policies
             self._thread_state.extra_read_budget = budget
             self._thread_state.poisoned = False
+            self._thread_state.issued_write_transactions.append(transaction)
             try:
                 self._fault("journal_prepared")
                 yield transaction
                 if self._thread_state.poisoned:
                     raise ValueError("nested local transaction failed")
-                committed = prepared.model_copy(update={"state": "committed"})
+                committed = (self._prepared_journal or prepared).model_copy(
+                    update={"state": "committed"}
+                )
                 self._write_journal(committed)
                 self._fault("journal_committed")
                 self._journal.unlink()
+                self._fault("journal_cleaned")
             except Exception:
                 try:
-                    self._restore(preimages)
+                    self._restore(preimages, self._prepared_journal)
                     self._journal.unlink(missing_ok=True)
                 except Exception as recovery_error:
                     raise TransactionRecoveryError() from recovery_error
@@ -631,15 +1024,17 @@ class LocalTransactionCoordinator:
             except BaseException:
                 if rollback_base_exceptions:
                     try:
-                        self._restore(preimages)
+                        self._restore(preimages, self._prepared_journal)
                         self._journal.unlink(missing_ok=True)
                     except Exception as recovery_error:
                         raise TransactionRecoveryError() from recovery_error
                 raise
             finally:
+                self._thread_state.issued_write_transactions.remove(transaction)
                 transaction._finish()
                 self._thread_state.active = False
                 self._thread_state.extras = {}
                 self._thread_state.extra_read_policies = {}
                 self._thread_state.extra_read_budget = None
                 self._thread_state.poisoned = False
+                self._prepared_journal = None

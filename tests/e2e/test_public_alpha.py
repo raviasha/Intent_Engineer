@@ -80,6 +80,7 @@ def test_public_alpha_docs_and_bindings_match_the_shipped_operating_model(
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     guide = (ROOT / "docs/mcp.md").read_text(encoding="utf-8")
     adoption = (ROOT / "docs/intent-aware-agent.md").read_text(encoding="utf-8")
+    assessment = (ROOT / "docs/assessment.md").read_text(encoding="utf-8")
     github = (ROOT / "docs/github.md").read_text(encoding="utf-8")
     guided_spec = (
         ROOT / "docs/superpowers/specs/2026-08-28-guided-onboarding-plugin-design.md"
@@ -171,6 +172,36 @@ def test_public_alpha_docs_and_bindings_match_the_shipped_operating_model(
     assert "not a claim" in profiles
     assert "copy both" in examples
     assert "profiles/mcp/slack.yaml" in examples
+    for truth in (
+        "derived",
+        "explainable",
+        "ACL-filtered",
+        "non-canonical",
+        "model-independent",
+        "intent assess --project . --format json",
+        "intent_assessment_summary",
+        "intent_assessment_scorecard",
+        "intent_assessment_gaps",
+        "N/A",
+        "unassessed",
+        "capped at 49",
+        "exit code `0`",
+        "exit code `1`",
+        "exit code `5`",
+    ):
+        assert truth in assessment
+    for text in (readme, guide, adoption):
+        assert "assessment guide" in text
+        assert "intent assess --project ." in text
+    for shipped in (
+        "Improve the graph",
+        "intent refine --project . --minutes 5",
+        "intent_enrichment_status",
+        "intent_enrichment_next_question",
+    ):
+        assert shipped in assessment
+    assert "alternative or simpler requirements" in assessment
+    assert "remain deferred" in assessment
 
     clean_project = init_git_repo(tmp_path)
     (clean_project / "docs").mkdir()
@@ -335,29 +366,43 @@ def test_scheduled_workflow_is_read_only_and_orders_capture_before_assurance() -
         "pull-requests": "read",
     }
     steps = job["steps"]
-    assert steps[0] == {"uses": "actions/checkout@v4", "with": {"fetch-depth": 0}}
+    assert steps[0] == {
+        "uses": "actions/checkout@11d5960a326750d5838078e36cf38b85af677262",
+        "with": {"fetch-depth": 0, "persist-credentials": False},
+    }
     assert steps[1] == {
-        "uses": "actions/setup-python@v5",
+        "uses": "actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065",
         "with": {"python-version": "3.12"},
     }
     assert [step["name"] for step in steps[2:7]] == [
         "Install Intent Engineering",
-        "Require restored approved intent baseline",
-        "Validate local intent state",
+        "Restore verified approved intent state",
         "Capture configured source versions",
+        "Validate captured canonical state",
         "Render drift and assurance report",
     ]
     assert steps[7] == {
-        "uses": "actions/upload-artifact@v4",
-        "with": {"name": "intent-drift", "path": "intent-drift.md"},
+        "uses": "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02",
+        "with": {
+            "name": "intent-drift",
+            "path": "intent-drift.md",
+            "retention-days": 7,
+            "if-no-files-found": "error",
+        },
     }
     commands = [step.get("run", "") for step in steps]
     assert commands[2] == "python -m pip install ."
-    assert commands[3] == "intent status --project . --format json --require-baseline"
-    assert commands[4] == "intent validate --project ."
-    assert commands[5] == "intent sync --project . --sources markdown,git,github"
+    assert commands[3] == "python -m intent_engineering.integrations.github_action restore"
+    assert commands[4] == "intent sync --project . --sources markdown,git,github"
+    assert commands[5] == "intent validate --project ."
     assert commands[6] == ("intent drift --project . --format markdown --output intent-drift.md")
-    assert steps[5]["env"] == {
+    assessment_index = commands.index(
+        "intent assess --project . --format json > intent-assessment.json"
+    )
+    review_index = commands.index("intent check --require-review")
+    assert assessment_index < review_index
+    assert steps[review_index - 1]["name"] == "Gate assessment against exact comparison base"
+    assert steps[4]["env"] == {
         "GH_TOKEN": "${{ secrets.GITHUB_TOKEN }}",
         "GITHUB_REPOSITORY": "${{ github.repository }}",
     }
@@ -416,16 +461,19 @@ def test_guided_adoption_docs_and_plugin_independent_assurance_are_ordered() -> 
     workflow = yaml.safe_load(raw)
     assert set(workflow["on"]) == {"schedule", "workflow_dispatch"}
     steps = workflow["jobs"]["drift"]["steps"]
-    assert steps[0] == {"uses": "actions/checkout@v4", "with": {"fetch-depth": 0}}
+    assert steps[0] == {
+        "uses": "actions/checkout@11d5960a326750d5838078e36cf38b85af677262",
+        "with": {"fetch-depth": 0, "persist-credentials": False},
+    }
     assert steps[1] == {
-        "uses": "actions/setup-python@v5",
+        "uses": "actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065",
         "with": {"python-version": "3.12"},
     }
     assert [step.get("run") for step in steps[2:7]] == [
         "python -m pip install .",
-        "intent status --project . --format json --require-baseline",
-        "intent validate --project .",
+        "python -m intent_engineering.integrations.github_action restore",
         "intent sync --project . --sources markdown,git,github",
+        "intent validate --project .",
         "intent drift --project . --format markdown --output intent-drift.md",
     ]
     assert "intent-advisor" not in raw

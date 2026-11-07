@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 import pytest
@@ -186,7 +187,12 @@ def _fake_process_server(
                 }
                 status = 200
             elif self.path == "/_intent/dev/instance" and instance_id is not None:
-                payload = {"schema_version": 1, "instance_id": instance_id}
+                payload = {
+                    "schema_version": 1,
+                    "instance_id": instance_id,
+                    "project_id": project_id,
+                    "repository_id": repository_id,
+                }
                 status = 200
             else:
                 payload = {"schema_version": 1, "status": "unavailable"}
@@ -240,14 +246,100 @@ def test_process_metadata_is_strict_and_secret_free() -> None:
             "project_id": "project",
             "repository_id": "repo:sha256:" + "c" * 64,
             "origin": "http://localhost:43127",
+            "launch_mode": "automatic",
+            "shared_state_status": "verified",
         }
     )
 
     assert metadata.origin == "http://localhost:43127"
+    assert metadata.launch_mode == "automatic"
+    assert metadata.shared_state_status.value == "verified"
     with pytest.raises(ValueError):
         ControlPlaneProcessMetadata.model_validate(
             {**metadata.model_dump(), "csrf_secret": "must-not-be-persisted"}
         )
+
+
+def test_legacy_process_metadata_is_reusable_but_not_replaceable() -> None:
+    """Catches an old locator being silently promoted to replaceable authority."""
+    metadata = ControlPlaneProcessMetadata.model_validate(
+        {
+            "schema_version": 1,
+            "pid": 123,
+            "process_start_id": "sha256:" + "a" * 64,
+            "instance_id": "instance:" + "b" * 64,
+            "project_id": "project",
+            "repository_id": "repo:sha256:" + "c" * 64,
+            "origin": "http://localhost:43127",
+        }
+    )
+
+    assert metadata.launch_mode == "legacy"
+    assert dev_cli._request_interactive_takeover(metadata, metadata.repository_id) is False
+
+
+def test_instance_rebound_shutdown_refuses_takeover_without_pid_signaling(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catches a stale probe stopping a rebound endpoint or an unrelated reused PID."""
+    requests: list[tuple[str, str, bytes, dict[str, str]]] = []
+
+    class Response:
+        status = 409
+
+        @staticmethod
+        def read(_maximum: int) -> bytes:
+            return b'{"schema_version":1,"status":"rejected"}'
+
+    class Connection:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+        def request(self, method: str, path: str, body: bytes, headers: dict[str, str]) -> None:
+            requests.append((method, path, body, headers))
+
+        @staticmethod
+        def getresponse() -> Response:
+            return Response()
+
+        @staticmethod
+        def close() -> None:
+            pass
+
+    metadata = ControlPlaneProcessMetadata(
+        pid=123,
+        process_start_id="sha256:" + "a" * 64,
+        instance_id="instance:" + "b" * 64,
+        project_id="project",
+        repository_id="repo:sha256:" + "c" * 64,
+        origin="http://localhost:43127",
+        launch_mode="automatic",
+    )
+    monkeypatch.setattr(dev_cli, "_probe", lambda *_args: True)
+    monkeypatch.setattr(dev_cli.http.client, "HTTPConnection", Connection)
+    monkeypatch.setattr(
+        dev_cli.os,
+        "kill",
+        lambda *_args: (_ for _ in ()).throw(AssertionError("PID signaling is forbidden")),
+    )
+    assert dev_cli._request_interactive_takeover(metadata, metadata.repository_id) is False
+    assert len(requests) == 1
+    method, path, body, headers = requests[0]
+    assert (method, path) == ("POST", dev_cli._SHUTDOWN_PATH)
+    assert json.loads(body) == {
+        "schema_version": 1,
+        "instance_id": metadata.instance_id,
+        "project_id": metadata.project_id,
+        "repository_id": metadata.repository_id,
+        "launch_mode": "automatic",
+    }
+    assert headers == {
+        "Host": "localhost:43127",
+        "Origin": metadata.origin,
+        "Content-Type": "application/json",
+        "Content-Length": str(len(body)),
+        "Accept": "application/json",
+    }
 
 
 def test_uninitialized_repository_requires_an_explicit_prd_without_mutation(tmp_path: Path) -> None:
@@ -311,7 +403,7 @@ def test_fresh_repository_starts_reuses_serves_assets_and_cleans_up(tmp_path: Pa
         assert reuse.stdout == f"intent dev: already running at {metadata.origin}\n"
         assert reuse.stderr == ""
         assert "<title>Intent Engineering review</title>" in page
-        assert "HttpOnly" in cookie and "SameSite=Strict" in cookie
+        assert cookie == ""
         assert metadata.pid == process.pid
         assert (project / ".intent/evidence/evidence.jsonl").read_bytes()
         persisted = b"".join(
@@ -328,9 +420,141 @@ def test_fresh_repository_starts_reuses_serves_assets_and_cleans_up(tmp_path: Pa
     assert not (project / ".intent/cache/control-plane.json").exists()
 
 
-def test_reuse_does_not_open_a_browser_without_the_in_memory_bootstrap(
+def test_ordinary_dev_replaces_automatic_owner_and_opens_with_ephemeral_bootstrap(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    project = _project(tmp_path)
+    initialize_project(project)
+    assert dev_cli._start_or_reuse_background_service(
+        project,
+        dev_cli.SharedStateRestoreStatus.NOT_REQUIRED,
+    )
+    automatic_pid = 0
+    opened: list[str] = []
+    monkeypatch.setattr(
+        dev_cli.webbrowser,
+        "open",
+        lambda url, **_kwargs: opened.append(url) or True,
+    )
+    authenticated_results: list[tuple[int, str]] = []
+
+    def exercise_authenticated_browser(_started: object) -> None:
+        opened_url = opened[0]
+        origin, _separator, bootstrap = opened_url.partition("/#csrf=")
+        host = origin.removeprefix("http://")
+        with urlopen(Request(origin, headers={"Host": host}), timeout=3) as response:
+            assert response.headers.get("Set-Cookie") is None
+        exchange_body = json.dumps(
+            {"token": bootstrap}, separators=(",", ":"), sort_keys=True
+        ).encode()
+        untrusted_body = json.dumps(
+            {"token": "x" * len(bootstrap)}, separators=(",", ":"), sort_keys=True
+        ).encode()
+        untrusted_exchange = Request(
+            origin + dev_cli._BROWSER_BOOTSTRAP_PATH,
+            data=untrusted_body,
+            headers={
+                "Content-Type": "application/json",
+                "Content-Length": str(len(untrusted_body)),
+                "Host": host,
+                "Origin": origin,
+            },
+            method="POST",
+        )
+        with pytest.raises(HTTPError) as untrusted:
+            urlopen(untrusted_exchange, timeout=3)
+        assert untrusted.value.code == 403
+        assert untrusted.value.headers.get("Set-Cookie") is None
+        exchange = Request(
+            origin + dev_cli._BROWSER_BOOTSTRAP_PATH,
+            data=exchange_body,
+            headers={
+                "Content-Type": "application/json",
+                "Content-Length": str(len(exchange_body)),
+                "Host": host,
+                "Origin": origin,
+            },
+            method="POST",
+        )
+        with urlopen(exchange, timeout=3) as response:
+            cookie = response.headers["Set-Cookie"].partition(";")[0]
+            assert response.status == 204
+        with pytest.raises(HTTPError) as replay:
+            urlopen(exchange, timeout=3)
+        assert replay.value.code == 403
+        request = Request(
+            origin + "/api/v1/development/tests/run",
+            data=json.dumps({"command_id": "test:sha256:" + "f" * 64}).encode(),
+            headers={
+                "Content-Type": "application/json",
+                "Cookie": cookie,
+                "Host": host,
+                "Origin": origin,
+                "X-Intent-CSRF": bootstrap,
+            },
+            method="POST",
+        )
+        try:
+            with urlopen(request, timeout=3) as response:
+                authenticated_results.append(
+                    (response.status, json.loads(response.read())["status"])
+                )
+        except HTTPError as error:
+            authenticated_results.append((error.code, "http_error"))
+
+    monkeypatch.setattr(dev_cli, "_wait_for_exit", exercise_authenticated_browser)
+    try:
+        automatic = ControlPlaneProcessMetadata.model_validate(
+            json.loads((project / ".intent/cache/control-plane.json").read_bytes())
+        )
+        automatic_pid = automatic.pid
+
+        result = CliRunner().invoke(app, ["dev", "--project", str(project)])
+
+        assert result.exit_code == 0, repr(result.exception)
+        assert result.stdout.startswith("intent dev: ready at http://localhost:")
+        assert result.stderr == ""
+        assert len(opened) == 1
+        assert opened[0].startswith("http://localhost:")
+        assert "/#csrf=" in opened[0]
+        assert automatic.origin not in opened[0]
+        # This project has no reviewed command, so behavior is unavailable only
+        # after the authenticated write boundary accepts the ephemeral token.
+        assert authenticated_results == [(503, "http_error")]
+        deadline = time.monotonic() + 3
+        exited = False
+        while time.monotonic() < deadline:
+            try:
+                waited, _status = os.waitpid(automatic.pid, os.WNOHANG)
+            except ChildProcessError:
+                waited = automatic.pid
+            if waited == automatic.pid:
+                exited = True
+                break
+            time.sleep(0.02)
+        assert exited is True
+        persisted = b"".join(
+            path.read_bytes()
+            for path in (project / ".intent").rglob("*")
+            if path.is_file() and not path.name.startswith(".control-plane.json.lock")
+        )
+        assert opened[0].partition("#csrf=")[2].encode() not in persisted
+    finally:
+        if automatic_pid:
+            try:
+                os.kill(automatic_pid, signal.SIGINT)
+            except ProcessLookupError:
+                pass
+            try:
+                os.waitpid(automatic_pid, os.WNOHANG)
+            except ChildProcessError:
+                pass
+
+
+def test_ordinary_dev_reuses_a_manually_headless_owner_without_signaling(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Catches takeover broadening from attested automatic owners to manual services."""
     project = _project(tmp_path)
     owner = subprocess.Popen(
         _command(project, "--prd", "docs/PRD.md", "--no-open", "--offline"),
@@ -341,9 +565,7 @@ def test_reuse_does_not_open_a_browser_without_the_in_memory_bootstrap(
     )
     opened: list[str] = []
     monkeypatch.setattr(
-        dev_cli.webbrowser,
-        "open",
-        lambda url, **_kwargs: opened.append(url) or True,
+        dev_cli.webbrowser, "open", lambda url, **_kwargs: opened.append(url) or True
     )
     try:
         metadata = ControlPlaneProcessMetadata.model_validate(_wait_for_metadata(project, owner))
@@ -353,9 +575,48 @@ def test_reuse_does_not_open_a_browser_without_the_in_memory_bootstrap(
         assert result.exit_code == 0, repr(result.exception)
         assert result.stdout == f"intent dev: already running at {metadata.origin}\n"
         assert result.stderr == ""
+        assert metadata.launch_mode == "manual_headless"
+        assert owner.poll() is None
         assert opened == []
     finally:
         _stop(owner)
+
+
+def test_direct_dev_refuses_to_reuse_a_service_with_contradictory_shared_health(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catches direct dev bypassing restore by returning an old local-only owner."""
+    project = _project(tmp_path)
+    initialize_project(project)
+    _project_id, repository_id = _repository_binding(project)
+    metadata = ControlPlaneProcessMetadata(
+        pid=os.getpid(),
+        process_start_id="sha256:" + "a" * 64,
+        instance_id="instance:" + "b" * 64,
+        project_id=project.name,
+        repository_id=repository_id,
+        origin="http://localhost:43127",
+        launch_mode="manual_headless",
+        shared_state_status=dev_cli.SharedStateRestoreStatus.NOT_REQUIRED,
+    )
+    monkeypatch.setattr(
+        dev_cli,
+        "_shared_restore",
+        lambda _root, **_kwargs: dev_cli.SharedStateRestoreResult(
+            status=dev_cli.SharedStateRestoreStatus.INVALID
+        ),
+    )
+    monkeypatch.setattr(dev_cli, "_live_repository_process", lambda _directory: metadata)
+
+    result = CliRunner().invoke(
+        app,
+        ["dev", "--project", str(project), "--no-open"],
+    )
+
+    assert result.exit_code == 1
+    assert result.stdout == ""
+    assert result.stderr == "intent dev: unavailable\n"
 
 
 def test_stale_and_foreign_pid_metadata_is_not_reused(tmp_path: Path) -> None:
@@ -836,6 +1097,34 @@ def test_browser_open_failure_is_fixed_and_server_cleanup_still_runs(
     assert not (project / ".intent/cache/control-plane.json").exists()
 
 
+def test_real_dev_start_activates_passive_observation_before_reporting_ready(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Catches passive observation existing only as a directly-invoked Python method."""
+    project = _project(tmp_path)
+    started: list[ControlPlaneService] = []
+
+    def record_start(service: ControlPlaneService) -> None:
+        started.append(service)
+
+    monkeypatch.setattr(
+        ControlPlaneService,
+        "start_development_observation",
+        record_start,
+        raising=False,
+    )
+    monkeypatch.setattr(dev_cli, "_wait_for_exit", lambda _started: None)
+
+    result = CliRunner().invoke(
+        app,
+        ["dev", "--project", str(project), "--prd", "docs/PRD.md", "--no-open"],
+    )
+
+    assert result.exit_code == 0, repr(result.exception)
+    assert len(started) == 1
+    assert result.stdout.startswith("intent dev: ready at http://localhost:")
+
+
 def test_cancelled_wait_preserves_identity_cleans_metadata_and_scrubs_bootstrap(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -901,7 +1190,12 @@ def test_fresh_repository_milestone_one_release_journey_uses_one_runtime(
         load_calls.append(path)
         return original_load_runtime(path)
 
-    def service_factory(runtime: object, *, origin: str) -> ControlPlaneService:
+    def service_factory(
+        runtime: object,
+        *,
+        origin: str,
+        shared_state_status: dev_cli.SharedStateRestoreStatus,
+    ) -> ControlPlaneService:
         verifier = _ReleaseVerifier()
         nonce = iter(range(1, 64))
         service = ControlPlaneService(
@@ -910,6 +1204,7 @@ def test_fresh_repository_milestone_one_release_journey_uses_one_runtime(
             clock=lambda: NOW,
             challenge_source=lambda: bytes([next(nonce)]) * 32,
             webauthn_verifier=verifier,
+            shared_state_status=shared_state_status,
         )
         captured.append((runtime, service, verifier))
         return service

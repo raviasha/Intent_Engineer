@@ -8,6 +8,8 @@ import hashlib
 import json
 import multiprocessing
 import os
+import threading
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -31,6 +33,7 @@ from intent_engineering.control_plane.webauthn_service import (
 from intent_engineering.core.models import (
     ChangeSet,
     EvidenceSide,
+    Graph,
     Node,
     NodeType,
     ProjectConfig,
@@ -44,6 +47,7 @@ from intent_engineering.core.models import (
 )
 from intent_engineering.core.policy.project import initialize_project
 from intent_engineering.intent_workflow.bootstrap import BootstrapService, BootstrapSubmission
+from intent_engineering.intent_workflow.check import SharedStateRestoreStatus
 from intent_engineering.intent_workflow.clarification import (
     ClarificationCoordinator,
     ProposalConfirmationPreview,
@@ -60,10 +64,134 @@ from intent_engineering.reconcile.service import transition_case
 from intent_engineering.storage.executor import LocalChangeSetExecutor
 from intent_engineering.storage.jsonl.approval_store import JsonlApprovalStore
 from tests.e2e.test_cli_write_approval import _approval_project
+from tests.helpers.readiness import apply_baseline
 from tests.unit.mutations.test_planner import base_plan
 
 NOW = datetime(2026, 8, 30, 12, 0, tzinfo=UTC)
 ORIGIN = "http://localhost:43127"
+
+
+def test_restored_member_opens_control_plane_as_active_v2_without_legacy_enrollment(tmp_path):
+    from intent_engineering.team_state.restore import GitSharedStateRestorer
+    from tests.integration.team_state.test_restore import enrolled_candidate
+
+    f = enrolled_candidate(tmp_path)
+    assert (
+        GitSharedStateRestorer(
+            f.provider,
+            clock=lambda: f.at,
+            device_key_store=f.b._device_store,
+            governance_registry=f.governance,
+        )
+        .verify_and_restore_approved_baseline(f.target)
+        .status
+        is SharedStateRestoreStatus.VERIFIED
+    )
+    runtime = load_runtime(f.target)
+    try:
+        service = ControlPlaneService(runtime, origin=ORIGIN, clock=lambda: f.at)
+        try:
+            status = service.team_enrollment_status()
+            assert status["status"] == "active"
+            assert status["member_id"] == f.pending.response.proposed_member.member_id
+            assert status["repository_id"] == "github.com/acme/project"
+        finally:
+            service.close()
+    finally:
+        runtime.close()
+
+
+@pytest.mark.parametrize("later_remote", [False, True])
+def test_team_reconciliation_binds_current_local_remote_and_fresh_webauthn(tmp_path, later_remote):
+    from intent_engineering.team_state.reconciliation import ReconciliationService
+    from tests.unit.team_state.test_reconciliation import _changed, reconciliation_fixture
+
+    f, common, remote, local, authority = reconciliation_fixture(tmp_path)
+    if later_remote:
+        from tests.integration.team_state.test_restore import ordinary_descendant
+
+        remote = ordinary_descendant(f, ordinary_descendant(f))
+    local = _changed(
+        local,
+        "approvals/policy.yaml",
+        yaml.safe_dump(_policy("github:100"), sort_keys=True).encode(),
+    )
+    for name in ("cache", "connectors", "renders"):
+        (f.target / ".intent" / name).mkdir(exist_ok=True)
+    for item in local.files:
+        target = f.target / ".intent" / item.path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(item.content)
+    runtime = load_runtime(f.target)
+    verifier = _Verifier()
+    current = [remote]
+    service = ControlPlaneService(
+        runtime,
+        origin=ORIGIN,
+        clock=lambda: f.at,
+        webauthn_verifier=verifier,
+        team_repository_id=remote.manifest.repository_id,
+        reconciliation_service=ReconciliationService(
+            authority_provider=authority, device_signer=f.a._device_store, clock=lambda: f.at
+        ),
+        reconciliation_remote=lambda: current[0],
+    )
+    runtime.webauthn_credentials.put(
+        CredentialRecord(
+            id="credential:alice",
+            project_id="project",
+            repository_id=service.repository_id,
+            actor="github:100",
+            credential_id="Y29udHJvbC1wbGFuZS1jcmVkZW50aWFs",
+            public_key="cHVibGljLWtleQ",
+            sign_count=0,
+            created_at=f.at,
+        )
+    )
+    try:
+        unresolved = service.team_reconciliation_preview(common=common)
+        assert unresolved["conflicts"] == ["graph.yaml"]
+        assert "payload" not in unresolved
+        preview = service.team_reconciliation_preview(
+            common=common, choices={"graph.yaml": "local"}
+        )
+        assert "private local choice" not in json.dumps(preview)
+        payload = HumanDecisionPayload.model_validate_json(json.dumps(preview["payload"]))
+        with pytest.raises(ControlPlaneError):
+            service.team_reconciliation_prepare(b"signed-assertion", payload)
+
+        class Cancelled(BaseException):
+            pass
+
+        cancellation = Cancelled("private-reconciliation-signal")
+        cancellation.private = "private-reconciliation-signal"
+
+        def cancel():
+            raise cancellation
+
+        service._reconciliation_remote = cancel
+        with pytest.raises(Cancelled) as caught:
+            service.team_reconciliation_preview(common=common)
+        assert caught.value is cancellation
+        assert caught.value.args == ()
+        assert caught.value.__dict__ == {}
+        service._reconciliation_remote = lambda: current[0]
+        service.team_reconciliation_options(payload)
+        assert verifier.authentication_requests[-1].payload_bytes == payload.canonical_bytes()
+        current[0] = common
+        with pytest.raises(ControlPlaneError):
+            service.team_reconciliation_prepare(b"signed-assertion", payload)
+        current[0] = remote
+        prepared = service.team_reconciliation_prepare(b"signed-assertion", payload)
+        assert prepared.manifest.parent_bundle_digest == remote.manifest.bundle_digest
+        assert (f.target / ".intent/graph.yaml").read_bytes() == next(
+            i.content for i in local.files if i.path == "graph.yaml"
+        )
+        with pytest.raises(ControlPlaneError):
+            service.team_reconciliation_prepare(b"signed-assertion", payload)
+    finally:
+        service.close()
+        runtime.close()
 
 
 @dataclass
@@ -164,6 +292,7 @@ def _harness(
     *,
     actor: str = "local:owner",
     aliases: tuple[str, ...] = (),
+    shared_state_status: SharedStateRestoreStatus = SharedStateRestoreStatus.NOT_REQUIRED,
 ) -> _Harness:
     project = tmp_path / "project"
     project.mkdir()
@@ -198,6 +327,7 @@ def _harness(
         clock=lambda: NOW,
         challenge_source=lambda: bytes([next(nonce)]) * 32,
         webauthn_verifier=verifier,
+        shared_state_status=shared_state_status,
     )
     assert runtime.webauthn_credentials.put(
         CredentialRecord(
@@ -212,6 +342,65 @@ def _harness(
         )
     )
     return _Harness(runtime, service, verifier, project)
+
+
+@pytest.mark.parametrize(
+    ("shared_status", "visible_status", "route"),
+    [
+        (SharedStateRestoreStatus.INVALID, "shared_state_invalid", "team_state"),
+        (SharedStateRestoreStatus.UPGRADE_REQUIRED, "upgrade_required", "team_state"),
+        (SharedStateRestoreStatus.DIVERGED, "human_attention_required", "team_state"),
+        (SharedStateRestoreStatus.STALE, "offline_stale", "team_state"),
+        (SharedStateRestoreStatus.UNAVAILABLE, "offline_stale", "team_state"),
+    ],
+)
+def test_service_preserves_exact_shared_state_health_in_its_visible_projection(
+    tmp_path: Path,
+    shared_status: SharedStateRestoreStatus,
+    visible_status: str,
+    route: str,
+) -> None:
+    """Catches the running UI downgrading governed state to local-only readiness."""
+    harness = _harness(tmp_path, shared_state_status=shared_status)
+    try:
+        result = harness.service.status()
+        assert result["status"] == visible_status
+        assert result["attention_route"] == route
+    finally:
+        harness.service.close()
+        harness.runtime.close()
+
+
+def test_service_projects_a_verified_shared_baseline_as_ready(tmp_path: Path) -> None:
+    """Catches verified shared health being downgraded to local-only after local validation."""
+    harness = _harness(tmp_path, shared_state_status=SharedStateRestoreStatus.VERIFIED)
+    try:
+        apply_baseline(
+            harness.runtime,
+            Graph(
+                id="graph:shared-service",
+                version=1,
+                nodes=(
+                    Node(
+                        id="intent:shared-service",
+                        type=NodeType.PRODUCT_INTENT,
+                        label="Preserve verified shared readiness",
+                        status="active",
+                        created_by="local:owner",
+                        created_at=NOW,
+                        last_modified_by="local:owner",
+                        last_modified_at=NOW,
+                    ),
+                ),
+                edges=(),
+            ),
+        )
+        result = harness.service.status()
+        assert result["status"] == "ready"
+        assert result["attention_route"] == "home"
+    finally:
+        harness.service.close()
+        harness.runtime.close()
 
 
 def _preview_digest(preview: dict[str, object]) -> str:
@@ -328,6 +517,34 @@ def _approval_harness(tmp_path: Path) -> _ApprovalHarness:
     plan = WritePlan.model_validate_json(json.dumps({"id": write_plan_id(material), **material}))
     assert workflow.plans.put(plan)
     return _ApprovalHarness(project, runtime, service, verifier, workflow, plan)
+
+
+def test_passive_observation_polls_without_browser_requests_and_stops_cleanly(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Catches the ordinary service lifecycle leaving passive evidence unreachable."""
+    harness = _harness(tmp_path)
+    calls: list[int] = []
+    polled = threading.Event()
+
+    def observe(_service: ControlPlaneService):
+        calls.append(len(calls) + 1)
+        polled.set()
+
+    monkeypatch.setattr(ControlPlaneService, "observe_development", observe)
+    harness.service.start_development_observation(interval_seconds=0.01)
+    assert polled.wait(timeout=1)
+    deadline = time.monotonic() + 1
+    while len(calls) < 2 and time.monotonic() < deadline:
+        time.sleep(0.01)
+
+    harness.service.close()
+    stopped_at = len(calls)
+    time.sleep(0.05)
+
+    assert stopped_at >= 2
+    assert len(calls) == stopped_at
+    harness.runtime.close()
 
 
 def test_registration_wrappers_own_actor_origin_time_and_return_detached_records(

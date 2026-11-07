@@ -5,12 +5,13 @@ from __future__ import annotations
 import json
 import mmap
 import os
+import re
 import signal
 import stat
 import subprocess
 import sys
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -20,7 +21,17 @@ from jsonschema import Draft7Validator
 from intent_engineering.cli.runtime import load_runtime
 from intent_engineering.core.models import Graph, Node, NodeType
 from intent_engineering.core.policy.project import initialize_project
-from intent_engineering.integrations.agent_host.advisory import codex_conversation_ref
+from intent_engineering.integrations.agent_host.advisory import (
+    codex_conversation_ref,
+    readiness_context,
+)
+from intent_engineering.intent_workflow.readiness import (
+    EnsureResult,
+    EnsureStatus,
+    ReadinessTarget,
+)
+from tests.helpers.readiness import apply_baseline, put_pending_proposal
+from tests.helpers.shared_state import ready_project
 
 REPO_ROOT = Path(__file__).parents[3]
 PLUGIN_ROOT = REPO_ROOT / "plugins" / "intent-advisor"
@@ -30,6 +41,21 @@ FALLBACK = (
     "Intent advisory prompt routing is unavailable. Do not mutate the intent graph, "
     "infer authorization, or treat this advisory as enforcement."
 )
+
+
+@pytest.fixture(autouse=True)
+def _stop_test_control_planes(tmp_path: Path) -> Iterator[None]:
+    """Stop any real developer service started by the prompt-hook contract."""
+    yield
+    for metadata in tmp_path.rglob("control-plane.json"):
+        if metadata.parent.name != "cache" or metadata.parent.parent.name != ".intent":
+            continue
+        try:
+            pid = json.loads(metadata.read_bytes())["pid"]
+            if type(pid) is int and pid > 1 and pid != os.getpid():
+                os.kill(pid, signal.SIGINT)
+        except (FileNotFoundError, KeyError, ProcessLookupError, TypeError, ValueError):
+            continue
 
 
 def _official_event(
@@ -145,7 +171,8 @@ def _durable_bytes(project: Path) -> dict[str, bytes]:
 def _ready_project(project: Path) -> None:
     initialize_project(project)
     runtime = load_runtime(project)
-    runtime.graph_store.initialize(
+    apply_baseline(
+        runtime,
         Graph(
             id="graph:plugin-test",
             version=1,
@@ -163,8 +190,9 @@ def _ready_project(project: Path) -> None:
                 ),
             ),
             edges=(),
-        )
+        ),
     )
+    runtime.close()
 
 
 def _fake_intent(directory: Path, source: str) -> Path:
@@ -242,6 +270,26 @@ def test_real_hook_offers_onboarding_without_writes_or_prompt_echo(tmp_path: Pat
     assert _durable_bytes(project) == before
 
 
+def test_real_hook_blocks_implementation_when_local_readiness_is_invalid(tmp_path: Path) -> None:
+    """Catches corrupt local state weakening the developer preset into bare advisory fallback."""
+    project = tmp_path / "project"
+    project.mkdir()
+    initialize_project(project)
+    marker = "PRIVATE-INVALID-READINESS-8197"
+    (project / ".intent" / "config.yaml").write_text(f"local_actor: [{marker}", encoding="utf-8")
+    before = _durable_bytes(project)
+
+    completed = _run_official_hook(project, prompt=marker)
+
+    assert _additional_context(completed) == (
+        "action=human_attention_required. Intent Engineering cannot verify local readiness. "
+        "Open the local Team state view before governed implementation; do not implement or "
+        "resolve intent work automatically."
+    )
+    assert marker.encode() not in completed.stdout + completed.stderr
+    assert _durable_bytes(project) == before
+
+
 def test_real_hook_routes_ready_prompt_to_preflight_without_secret_or_echo(
     tmp_path: Path,
 ) -> None:
@@ -265,16 +313,76 @@ def test_real_hook_routes_ready_prompt_to_preflight_without_secret_or_echo(
     assert "capability" not in lowered
     assert "token" not in lowered
     after = _durable_bytes(project)
-    assert after.keys() - before.keys() == {".config.yaml.lock", "evidence/evidence.jsonl"}
-    assert "evidence/evidence.jsonl" not in before
-    assert after["evidence/evidence.jsonl"]
+    assert after.keys() - before.keys() == {".config.yaml.lock"}
+    assert after["evidence/evidence.jsonl"].startswith(before["evidence/evidence.jsonl"])
     for path in before:
-        assert after[path] == before[path]
+        if path != "evidence/evidence.jsonl":
+            assert after[path] == before[path]
     captured = load_runtime(project).evidence_store.ledger("conversation:codex")
     assert len(captured) == 1
     assert captured[0].evidence.external_object_id == expected_ref
     assert captured[0].evidence.author == "agent:codex"
     assert captured[0].evidence.payload == {"role": "agent", "content": marker}
+
+
+def test_real_hook_blocks_capture_for_a_pending_proposal_on_an_approved_graph(
+    tmp_path: Path,
+) -> None:
+    """Catches real first-prompt readiness bypassing a durable undecided proposal."""
+    project = tmp_path / "project"
+    project.mkdir()
+    ready_project(project)
+    runtime = load_runtime(project)
+    try:
+        put_pending_proposal(runtime)
+    finally:
+        runtime.close()
+    before = _durable_bytes(project)
+    marker = "PRIVATE-PENDING-PROMPT-8197"
+
+    first = _run_official_hook(project, prompt=marker)
+    replay = _run_official_hook(project, prompt=marker)
+
+    assert _additional_context(first) == (
+        "action=human_attention_required. Intent Engineering requires human review in the "
+        "local Proposal review view before implementation. Do not implement or resolve the "
+        "intent work automatically."
+    )
+    assert first.stdout == replay.stdout
+    assert marker.encode() not in first.stdout + first.stderr
+    assert b"PRIVATE-PENDING-PROPOSAL-8197" not in first.stdout + first.stderr
+    assert _durable_bytes(project) == before
+
+
+@pytest.mark.parametrize(
+    "path",
+    (
+        "evidence/evidence.jsonl",
+        "history/changesets.jsonl",
+        "approvals/receipts.jsonl",
+        "cache/checkpoints.yaml",
+    ),
+)
+def test_real_hook_blocks_capture_for_corrupt_canonical_state(tmp_path: Path, path: str) -> None:
+    """Catches the actual prompt hook classifying while canonical validation has failed."""
+    project = tmp_path / "project"
+    project.mkdir()
+    ready_project(project)
+    marker = "PRIVATE-CORRUPT-CANONICAL-8197"
+    (project / ".intent" / path).write_text(f'{{"{marker}":', encoding="utf-8")
+    before = _durable_bytes(project)
+
+    completed = _run_official_hook(project, prompt=marker)
+    replay = _run_official_hook(project, prompt=marker)
+
+    assert _additional_context(completed) == (
+        "action=human_attention_required. Intent Engineering cannot verify local readiness. "
+        "Open the local Team state view before governed implementation; do not implement or "
+        "resolve intent work automatically."
+    )
+    assert marker.encode() not in completed.stdout + completed.stderr
+    assert replay.stdout == completed.stdout
+    assert _durable_bytes(project) == before
 
 
 def test_real_hook_uses_retry_stable_turn_specific_ref_without_host_id_leakage(
@@ -397,6 +505,34 @@ def test_missing_cli_returns_fixed_fallback_with_strict_streams(tmp_path: Path) 
     assert _additional_context(completed) == FALLBACK
 
 
+def test_hook_runs_one_exact_developer_preset_process_without_mcp_recursion(
+    tmp_path: Path,
+) -> None:
+    """Catches readiness and advisory routing splitting into recursive plugin or MCP processes."""
+    project = tmp_path / "project"
+    fake_bin = tmp_path / "fake-bin"
+    calls = tmp_path / "calls.jsonl"
+    project.mkdir()
+    fake_bin.mkdir()
+    context = "action=classify. Fixed fake advisory guidance."
+    _fake_intent(
+        fake_bin,
+        "import json, pathlib, sys\n"
+        f"path = pathlib.Path({str(calls)!r})\n"
+        "with path.open('a', encoding='utf-8') as stream:\n"
+        "    stream.write(json.dumps(sys.argv[1:]) + '\\n')\n"
+        f"print(json.dumps({{'hookSpecificOutput': {{'hookEventName': "
+        f"'UserPromptSubmit', 'additionalContext': {context!r}}}}}, separators=(',', ':')))",
+    )
+
+    completed = _run_official_hook(project, path=f"{fake_bin}:/usr/bin:/bin")
+
+    assert _additional_context(completed) == context
+    assert [json.loads(line) for line in calls.read_text(encoding="utf-8").splitlines()] == [
+        ["agent-prompt-hook", "--preset", "developer"]
+    ]
+
+
 def test_unbounded_child_output_returns_bounded_fallback(tmp_path: Path) -> None:
     project = tmp_path / "project"
     fake_bin = tmp_path / "fake-bin"
@@ -477,7 +613,12 @@ def test_special_project_files_fail_promptly_without_replacement(
 
     completed = _run_official_hook(project, timeout=3)
 
-    assert _additional_context(completed) == FALLBACK
+    expected = (
+        "action=human_attention_required. Intent Engineering cannot verify local readiness. "
+        "Open the local Team state view before governed implementation; do not implement or "
+        "resolve intent work automatically."
+    )
+    assert _additional_context(completed) == expected
     after = os.lstat(config)
     assert stat.S_IFMT(after.st_mode) == stat.S_IFMT(before.st_mode)
 
@@ -611,3 +752,48 @@ def test_skill_routes_clarifications_and_states_advisory_mcp_failure_boundary() 
     assert "capability token" in skill
     assert "advisory" in skill.casefold()
     assert "independently authenticated non-MCP local human" in skill
+
+
+def test_skill_human_attention_guidance_defers_to_the_route_selected_view() -> None:
+    """The skill must not replace a bounded readiness route with a fixed destination."""
+    skill = (PLUGIN_ROOT / "skills" / "intent-advisor" / "SKILL.md").read_text(encoding="utf-8")
+    start = skill.index("- For `action=human_attention_required`")
+    end = skill.index("\n- For `action=", start + 1)
+    guidance = skill[start:end]
+    results = (
+        EnsureResult(
+            status=EnsureStatus.HUMAN_ATTENTION_REQUIRED,
+            attention_route=ReadinessTarget.TEAM_STATE,
+            graph_version=7,
+            pending_proposal_ids=(),
+            open_case_ids=("case:private",),
+        ),
+        EnsureResult(
+            status=EnsureStatus.HUMAN_ATTENTION_REQUIRED,
+            attention_route=ReadinessTarget.PROPOSAL,
+            graph_version=7,
+            pending_proposal_ids=("proposal:private",),
+            open_case_ids=(),
+        ),
+    )
+    contexts = tuple(readiness_context(result) for result in results)
+    route_views = {
+        match.group("view")
+        for context in contexts
+        if (match := re.search(r"local (?P<view>.+?) view", context)) is not None
+    }
+
+    assert route_views == {"Proposal review", "Team state"}
+    narrowed_views = {
+        view
+        for view in {"Inbox", *route_views}
+        if f"local {view}".casefold() in guidance.casefold()
+    }
+    assert narrowed_views == set(), (
+        "human-attention skill guidance must not override the route-selected local view"
+    )
+    guidance_words = set(re.findall(r"[a-z]+", guidance.casefold()))
+    assert {"exact", "bounded", "local", "view", "route"} <= guidance_words
+    assert {"later", "prompt", "durable", "state"} <= guidance_words
+    assert all("case:private" not in context for context in contexts)
+    assert all("proposal:private" not in context for context in contexts)

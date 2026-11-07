@@ -7,6 +7,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import traceback
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import cast
@@ -15,13 +16,20 @@ import anyio
 import structlog
 import typer
 
+from intent_engineering.assessment.service import GraphAssessmentService
 from intent_engineering.capture.base import Connector
+from intent_engineering.cli.assessment import assess_command, assessment_gate_command
 from intent_engineering.cli.connectors import (
     configured_actor_principals,
     connector_catalog,
     connectors_app,
 )
-from intent_engineering.cli.dev import dev_command
+from intent_engineering.cli.dev import (
+    _developer_readiness,
+    _shared_restore,
+    dev_command,
+    ensure_command,
+)
 from intent_engineering.cli.github import GitHubDoctorResult, check_github
 from intent_engineering.cli.intent_workflow import (
     bootstrap_command,
@@ -30,16 +38,21 @@ from intent_engineering.cli.intent_workflow import (
     sources_app,
 )
 from intent_engineering.cli.output import OutputFormat, emit
+from intent_engineering.cli.refine import refine_command
 from intent_engineering.cli.runtime import (
+    AssessmentRuntime,
+    CheckRuntimeAdapter,
     GitHubConfigurationError,
     Runtime,
     github_repository_scope,
+    load_assessment_runtime,
     load_runtime,
     new_run_id,
     parse_sources,
     run_selected_sync,
     validate_github_environment,
 )
+from intent_engineering.cli.team import team_app
 from intent_engineering.cli.writes import policy_actor_aliases, write_app
 from intent_engineering.context import ContextProvider
 from intent_engineering.core.models import (
@@ -67,19 +80,34 @@ from intent_engineering.integrations.agent_host.advisory import (
     codex_prompt_output,
     parse_codex_prompt_event,
     parse_prompt_event,
+    readiness_prompt_route,
+    readiness_unavailable_prompt_route,
     repository_matches,
     unavailable_prompt_route,
+)
+from intent_engineering.intent_workflow.check import (
+    CheckReason,
+    CheckRequest,
+    CheckResult,
+    CheckService,
+    CheckStatus,
+    SharedStateRestoreResult,
 )
 from intent_engineering.intent_workflow.onboarding import (
     OnboardingRuntime,
     OnboardingState,
     inspect_onboarding,
 )
+from intent_engineering.intent_workflow.readiness import (
+    EnsurePreset,
+    EnsureStatus,
+)
 from intent_engineering.reconcile import ResolutionUnavailable
 from intent_engineering.render import GraphRenderer, render_drift_report
 from intent_engineering.storage.interfaces import GraphStore
 from intent_engineering.storage.secure import SecureDirectory
 from intent_engineering.sync.models import SyncRunResult, SyncRunStatus
+from intent_engineering.team_state.restore import EnvironmentTrustProvider, GitSharedStateRestorer
 from intent_engineering.validation import validate_project
 
 app = typer.Typer(
@@ -97,9 +125,14 @@ app.add_typer(connectors_app, name="connectors")
 app.add_typer(write_app, name="write")
 app.add_typer(sources_app, name="sources")
 app.add_typer(proposals_app, name="proposals")
+app.add_typer(team_app, name="team")
 app.command("bootstrap")(bootstrap_command)
 app.command("onboard")(onboard_command)
 app.command("dev")(dev_command)
+app.command("ensure")(ensure_command)
+app.command("assess")(assess_command)
+app.command("refine")(refine_command)
+app.command("assessment-gate", hidden=True)(assessment_gate_command)
 
 _MAX_PROMPT_HOOK_BYTES = 64 * 1024
 
@@ -121,8 +154,34 @@ def _prompt_hook_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
     return result
 
 
+def _onboarding_prompt_route() -> PromptRoute:
+    """Return the established no-write offer for an uninitialized repository."""
+    return PromptRoute(
+        action="offer_onboarding",
+        message=(
+            "This repository has not been onboarded into Intent Engineering. "
+            "Start guided onboarding now?"
+        ),
+        mcp_tool=None,
+        arguments={},
+    )
+
+
+def _prompt_readiness_route(project: Path, preset: EnsurePreset) -> PromptRoute | None:
+    """Return a fixed route after bounded restore, readiness and service startup."""
+    try:
+        result = _developer_readiness(project, preset)
+    except Exception:  # noqa: BLE001 - readiness errors must block implementation
+        return readiness_unavailable_prompt_route()
+    if result.status is EnsureStatus.READY:
+        return None
+    return readiness_prompt_route(result)
+
+
 @app.command("agent-prompt-hook", hidden=True)
-def agent_prompt_hook_command() -> None:
+def agent_prompt_hook_command(
+    preset: EnsurePreset = typer.Option(EnsurePreset.DEVELOPER, "--preset"),
+) -> None:
     """Route exactly one bounded advisory prompt event over stdin/stdout."""
     raw: bytes | None = None
     parsed: object = None
@@ -154,51 +213,39 @@ def agent_prompt_hook_command() -> None:
             codex_event = parse_codex_prompt_event(parsed)
             if not repository_matches(current, codex_event.cwd):
                 raise ValueError("advisory repository mismatch")
-            try:
-                runtime = load_runtime(Path.cwd())
-            except ProjectNotInitialized:
-                if (Path.cwd() / ".intent").exists():
-                    raise
-                route = PromptRoute(
-                    action="offer_onboarding",
-                    message=(
-                        "This repository has not been onboarded into Intent Engineering. "
-                        "Start guided onboarding now?"
-                    ),
-                    mcp_tool=None,
-                    arguments={},
-                )
+            route = _prompt_readiness_route(Path.cwd(), preset)
+            if route is None:
+                try:
+                    runtime = load_runtime(Path.cwd())
+                except Exception:  # noqa: BLE001 - a post-readiness race must block work
+                    route = readiness_unavailable_prompt_route()
+                else:
+                    event = PromptEvent(
+                        session_id=codex_event.session_id,
+                        turn_id=codex_event.turn_id,
+                        repository=codex_event.cwd,
+                        actor=runtime.config.local_actor,
+                        prompt=codex_event.prompt,
+                        created_at=datetime.now(UTC),
+                    )
+                    route = AdvisoryPromptRouter(runtime).route(event)
             else:
-                event = PromptEvent(
-                    session_id=codex_event.session_id,
-                    turn_id=codex_event.turn_id,
-                    repository=codex_event.cwd,
-                    actor=runtime.config.local_actor,
-                    prompt=codex_event.prompt,
-                    created_at=datetime.now(UTC),
-                )
-                route = AdvisoryPromptRouter(runtime).route(event)
+                event = None
             output = codex_prompt_output(codex_prompt_context(route))
         else:
             event = parse_prompt_event(parsed)
             if not repository_matches(current, event.repository):
                 raise ValueError("advisory repository mismatch")
-            try:
-                runtime = load_runtime(Path.cwd())
-            except ProjectNotInitialized:
-                if (Path.cwd() / ".intent").exists():
-                    raise
-                route = PromptRoute(
-                    action="offer_onboarding",
-                    message=(
-                        "This repository has not been onboarded into Intent Engineering. "
-                        "Start guided onboarding now?"
-                    ),
-                    mcp_tool=None,
-                    arguments={},
-                )
+            route = _prompt_readiness_route(Path.cwd(), preset)
+            if route is None:
+                try:
+                    runtime = load_runtime(Path.cwd())
+                except Exception:  # noqa: BLE001 - a post-readiness race must block work
+                    route = readiness_unavailable_prompt_route()
+                else:
+                    route = AdvisoryPromptRouter(runtime).route(event)
             else:
-                route = AdvisoryPromptRouter(runtime).route(event)
+                event = None
         ok = True
     except Exception:  # noqa: BLE001 - one fixed prompt-hook denial
         if official:
@@ -212,6 +259,8 @@ def agent_prompt_hook_command() -> None:
         caught.__context__ = None
         signal = caught
     finally:
+        if runtime is not None:
+            runtime.close()
         if current is not None:
             current.close()
         raw = None
@@ -434,11 +483,69 @@ def sync_command(
     _sync_command(_runtime(project), sources, output_format)
 
 
+class _CliCheckRuntimeAdapter(CheckRuntimeAdapter):
+    """Keep local team verification inside CheckService's ordered readiness gate."""
+
+    def restore(self, *, require_shared: bool) -> SharedStateRestoreResult:
+        if require_shared or not os.path.lexists(self._root / ".intent/team-trust.json"):
+            return super().restore(require_shared=require_shared)
+        return _shared_restore(self._root)
+
+
+@app.command("check")
+def check_command(
+    project: Path = typer.Option(Path("."), "--project"),
+    ci: bool = typer.Option(False, "--ci"),
+    require_review: bool = typer.Option(False, "--require-review"),
+    sources: str = typer.Option("markdown,git", "--sources"),
+    test_results: Path | None = typer.Option(None, "--test-results"),
+    run_test: str | None = typer.Option(None, "--run-test"),
+    output_format: OutputFormat = typer.Option(OutputFormat.JSON, "--format"),
+) -> None:
+    """Run readiness, capture, validation, assurance, and bounded drift reporting."""
+    adapter = _CliCheckRuntimeAdapter(
+        project,
+        principal_resolver=_authorized_principals,
+        mcp_connector_resolver=lambda runtime: connector_catalog(runtime).read_connectors(),
+        shared_state_restorer=GitSharedStateRestorer(EnvironmentTrustProvider()),
+    )
+
+    async def run() -> CheckResult:
+        return await CheckService(adapter).run(
+            CheckRequest(
+                ci=ci,
+                require_review=require_review,
+                sources=parse_sources(sources),
+                test_results=test_results,
+                run_test=run_test,
+            )
+        )
+
+    try:
+        _validate_sources(sources)
+        _validate_github_scope(sources)
+        result = anyio.run(run)
+    except (TypeError, ValueError, typer.BadParameter):
+        result = CheckResult(
+            status=CheckStatus.FAILED,
+            reason=CheckReason.OPERATION_FAILED,
+            exit_code=1,
+        )
+    finally:
+        adapter.close()
+    emit(result, output_format)
+    if result.exit_code:
+        raise typer.Exit(result.exit_code)
+
+
 @app.command("mcp")
 def mcp_command(
     project: Path = typer.Option(Path("."), "--project"),
 ) -> None:
     """Serve authorized local Intent context over the protocol-clean MCP stdio transport."""
+    if not (project / ".intent").exists():
+        typer.echo("intent error: MCP server failed", err=True)
+        raise typer.Exit(1) from None
     from intent_engineering.integrations.mcp_server import run_stdio
 
     abort: BaseException | None = None
@@ -728,25 +835,208 @@ def reconcile_resolve_command(
 def render_command(
     project: Path = typer.Option(Path("."), "--project"),
     output: Path | None = typer.Option(None, "--output"),
+    assessment: bool = typer.Option(
+        False,
+        "--assessment",
+        help="Add a detached, non-canonical assessment overlay.",
+    ),
     output_format: OutputFormat = typer.Option(OutputFormat.TEXT, "--format"),
 ) -> None:
     """Render non-canonical Markdown and Mermaid graph views through the safe renderer."""
-    runtime = _runtime(project)
-    principals = _authorized_principals(runtime)
-    output_dir = output if output is not None else runtime.workspace / "cache" / "render"
+    if assessment:
+        _render_assessed(project, output, output_format)
+        return
+    _render_legacy(_runtime(project), output, output_format)
+
+
+def _scrub_render_signal(error: BaseException) -> BaseException:
+    old_traceback = error.__traceback__
+    error.args = ()
+    error.__dict__.clear()
+    error.__traceback__ = None
+    error.__cause__ = None
+    error.__context__ = None
+    if old_traceback is not None:
+        traceback.clear_frames(old_traceback)
+    old_traceback = None
+    return error
+
+
+def _render_legacy(
+    runtime: Runtime,
+    output: Path | None,
+    output_format: OutputFormat,
+) -> None:
+    """Render the established projection while deterministically owning its runtime."""
+    principals: frozenset[str] = frozenset()
+    output_dir = Path()
+    markdown: Path | None = None
+    mermaid: Path | None = None
+    signal: BaseException | None = None
+    cleanup_signal: BaseException | None = None
+    failed = False
     try:
+        principals = _authorized_principals(runtime)
+        output_dir = output if output is not None else runtime.workspace / "cache" / "render"
 
         class _ProjectionStore:
             def load(self) -> Graph:
+                if runtime is None:
+                    raise ValueError("local runtime unavailable")
                 return _authorized_graph(runtime, principals)
 
         markdown, mermaid = GraphRenderer(
             cast(GraphStore, _ProjectionStore()), _authorized_cases(runtime, principals)
         ).render_all(output_dir)
-    except Exception as error:
-        _runtime_error(error)
-        raise typer.Exit(1) from error
-    emit({"markdown": str(markdown), "mermaid": str(mermaid)}, output_format)
+    except Exception:  # noqa: BLE001 - one fixed legacy-render failure boundary
+        failed = True
+    except BaseException as error:  # noqa: BLE001 - preserve cancellation identity
+        signal = _scrub_render_signal(error)
+    finally:
+        try:
+            runtime.close()
+        except Exception:  # noqa: BLE001 - closing failure is a fixed public failure
+            failed = True
+            markdown = None
+            mermaid = None
+        except BaseException as error:  # noqa: BLE001 - preserve cancellation identity
+            cleanup_signal = _scrub_render_signal(error)
+            if signal is None:
+                signal = cleanup_signal
+            cleanup_signal = None
+        runtime = None  # type: ignore[assignment]
+        principals = frozenset()
+        output_dir = Path()
+        output = None
+
+    if signal is not None:
+        detached = signal
+        signal = None
+        markdown = None
+        mermaid = None
+        raise detached.with_traceback(None)
+    if failed or markdown is None or mermaid is None:
+        markdown = None
+        mermaid = None
+        typer.echo("intent error: local operation failed", err=True)
+        raise typer.Exit(1) from None
+
+    try:
+        emit({"markdown": str(markdown), "mermaid": str(mermaid)}, output_format)
+    except Exception:  # noqa: BLE001 - one fixed legacy-render output failure
+        failed = True
+    except BaseException as error:  # noqa: BLE001 - preserve cancellation identity
+        signal = _scrub_render_signal(error)
+    finally:
+        markdown = None
+        mermaid = None
+    if signal is not None:
+        detached = signal
+        signal = None
+        raise detached.with_traceback(None)
+    if failed:
+        typer.echo("intent error: local operation failed", err=True)
+        raise typer.Exit(1) from None
+
+
+def _render_assessed(
+    project: Path,
+    output: Path | None,
+    output_format: OutputFormat,
+) -> None:
+    """Render one descriptor-held assessment snapshot without recovery."""
+    runtime: AssessmentRuntime | None = None
+    snapshot = None
+    assessment_report = None
+    projection = None
+    cases: tuple[ReconciliationCase, ...] = ()
+    output_dir = Path()
+    markdown: Path | None = None
+    mermaid: Path | None = None
+    signal: BaseException | None = None
+    cleanup_signal: BaseException | None = None
+    failed = False
+    try:
+        runtime = load_assessment_runtime(project)
+        snapshot = runtime.assessment_snapshot(runtime.config.local_actor)
+        assessment_report = GraphAssessmentService().assess(snapshot)
+        if (
+            assessment_report.project_id != snapshot.project_id
+            or assessment_report.graph_id != snapshot.graph.id
+            or assessment_report.graph_version != snapshot.graph.version
+            or assessment_report.graph_digest != snapshot.graph_digest
+            or assessment_report.snapshot_digest != snapshot.aggregate_digest
+            or assessment_report.principal_projection_digest != snapshot.principal_projection_digest
+        ):
+            raise ValueError("assessment projection mismatch")
+        projection = snapshot.graph
+        cases = snapshot.cases
+        output_dir = output if output is not None else runtime.root / ".intent/cache/render"
+
+        class _AssessmentProjectionStore:
+            def load(self) -> Graph:
+                if projection is None:
+                    raise ValueError("assessment projection unavailable")
+                return projection
+
+        markdown, mermaid = GraphRenderer(
+            cast(GraphStore, _AssessmentProjectionStore()),
+            cases,
+            assessment=assessment_report,
+        ).render_all(output_dir)
+    except Exception:  # noqa: BLE001 - one fixed assessed-render failure boundary
+        failed = True
+    except BaseException as error:  # noqa: BLE001 - preserve cancellation identity
+        signal = _scrub_render_signal(error)
+    finally:
+        if runtime is not None:
+            try:
+                runtime.close()
+            except Exception:  # noqa: BLE001 - closing failure is a fixed public failure
+                failed = True
+                markdown = None
+                mermaid = None
+            except BaseException as error:  # noqa: BLE001 - preserve cancellation identity
+                cleanup_signal = _scrub_render_signal(error)
+                if signal is None:
+                    signal = cleanup_signal
+                cleanup_signal = None
+        runtime = None
+        snapshot = None
+        assessment_report = None
+        projection = None
+        cases = ()
+        output_dir = Path()
+        project = Path()
+        output = None
+
+    if signal is not None:
+        detached = signal
+        signal = None
+        markdown = None
+        mermaid = None
+        raise detached.with_traceback(None)
+    if failed or markdown is None or mermaid is None:
+        markdown = None
+        mermaid = None
+        typer.echo("intent error: assessment unavailable", err=True)
+        raise typer.Exit(1) from None
+    try:
+        emit({"markdown": str(markdown), "mermaid": str(mermaid)}, output_format)
+    except Exception:  # noqa: BLE001 - one fixed assessed-render output failure
+        failed = True
+    except BaseException as error:  # noqa: BLE001 - preserve cancellation identity
+        signal = _scrub_render_signal(error)
+    finally:
+        markdown = None
+        mermaid = None
+    if signal is not None:
+        detached = signal
+        signal = None
+        raise detached.with_traceback(None)
+    if failed:
+        typer.echo("intent error: assessment unavailable", err=True)
+        raise typer.Exit(1) from None
 
 
 @doctor_app.callback(invoke_without_command=True)

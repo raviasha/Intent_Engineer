@@ -9,8 +9,7 @@ from pydantic import ConfigDict, Field
 
 from intent_engineering.core.models import Graph
 from intent_engineering.core.models._base import StrictModel
-from intent_engineering.intent_workflow.proposal_store import IntentProposalStore
-from intent_engineering.storage.interfaces import GraphStore
+from intent_engineering.intent_workflow.models import IntentProposal, ProposalDecisionRecord
 
 _MAX_PENDING_PROPOSALS = 256
 
@@ -42,11 +41,28 @@ class OnboardingStatus(StrictModel):
     pending_proposal_ids: Annotated[tuple[str, ...], Field(max_length=_MAX_PENDING_PROPOSALS)]
 
 
+class OnboardingGraphStore(Protocol):
+    """Minimal graph reader required by onboarding inspection."""
+
+    def load(self) -> Graph: ...
+
+
+class OnboardingProposalStore(Protocol):
+    """Minimal proposal reader required by onboarding inspection."""
+
+    def list(self) -> tuple[IntentProposal, ...]: ...
+
+    def decision_for(self, proposal_id: str) -> ProposalDecisionRecord | None: ...
+
+
 class OnboardingRuntime(Protocol):
     """Read-only runtime surface required to inspect onboarding readiness."""
 
-    graph_store: GraphStore
-    intent_proposals: IntentProposalStore
+    @property
+    def graph_store(self) -> OnboardingGraphStore: ...
+
+    @property
+    def intent_proposals(self) -> OnboardingProposalStore: ...
 
 
 def _validated_graph(runtime: OnboardingRuntime) -> Graph:

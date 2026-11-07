@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import re
+import traceback
 from dataclasses import dataclass
 from typing import Annotated, Literal, Never, cast
 
@@ -11,6 +13,8 @@ from mcp.server.mcpserver import MCPServer
 from mcp.types import INTERNAL_ERROR, INVALID_PARAMS, ToolAnnotations
 from pydantic import BaseModel, WithJsonSchema
 
+from intent_engineering.assessment.models import AssessmentHealth, AssessmentReport
+from intent_engineering.assessment.service import GraphAssessmentService
 from intent_engineering.capture.mcp.profile_loader import load_strict_yaml_mapping_bytes
 from intent_engineering.cli.connectors import configured_actor_principals
 from intent_engineering.cli.runtime import Runtime
@@ -27,6 +31,7 @@ from intent_engineering.core.models import (
 )
 from intent_engineering.core.models.schemas import schema_bytes
 from intent_engineering.core.policy import evidence_allowed, refs_allowed
+from intent_engineering.intent_workflow.enrichment import GraphEnrichmentService
 from intent_engineering.render import render_drift_report
 from intent_engineering.storage.jsonl.case_store import parse_case_versions
 from intent_engineering.storage.jsonl.evidence_store import parse_evidence_lines
@@ -40,6 +45,23 @@ _READ_ONLY = ToolAnnotations(
     open_world_hint=False,
 )
 _SCHEMA_VERSION = "1"
+_MAX_ASSESSMENT_GAPS = 100
+_MAX_ASSESSMENT_RESPONSE_BYTES = 32 * 1024 * 1024
+_MAX_ENRICHMENT_RESPONSE_BYTES = 4 * 1024 * 1024
+_ENRICHMENT_SESSION_PATTERN = re.compile(r"^refine:[^\x00-\x20\x7f]{1,249}$")
+_ASSESSMENT_TOOL_NAMES = frozenset(
+    {
+        "intent_assessment_summary",
+        "intent_assessment_scorecard",
+        "intent_assessment_gaps",
+    }
+)
+_ENRICHMENT_TOOL_NAMES = frozenset(
+    {
+        "intent_enrichment_status",
+        "intent_enrichment_next_question",
+    }
+)
 type _IdentifierInput = Annotated[
     object,
     WithJsonSchema({"type": "string", "minLength": 1, "maxLength": 512}),
@@ -61,6 +83,26 @@ type _StatusInput = Annotated[
         }
     ),
 ]
+type _AssessmentHealthInput = Annotated[
+    object,
+    WithJsonSchema({"type": "string", "enum": ["green", "orange", "red"]}),
+]
+type _AssessmentLimitInput = Annotated[
+    object,
+    WithJsonSchema({"type": "integer", "minimum": 1, "maximum": _MAX_ASSESSMENT_GAPS}),
+]
+type _EnrichmentSessionInput = Annotated[
+    object,
+    WithJsonSchema(
+        {
+            "type": "string",
+            "minLength": 8,
+            "maxLength": 256,
+            "pattern": r"^refine:[^\x00-\x20\x7f]{1,249}$",
+            "description": "Canonical refine session ID, at most 256 UTF-8 bytes.",
+        }
+    ),
+]
 
 
 def _valid_identifier(value: str) -> bool:
@@ -71,11 +113,18 @@ def _input_string(
     value: object,
     *,
     maximum: int,
+    maximum_bytes: int | None = None,
     identifier: bool = False,
     choices: frozenset[str] | None = None,
 ) -> str | None:
     if type(value) is not str or not value.strip() or len(value) > maximum:
         return None
+    if maximum_bytes is not None:
+        try:
+            if len(value.encode("utf-8")) > maximum_bytes:
+                return None
+        except UnicodeError:
+            return None
     if identifier and value != value.strip():
         return None
     if choices is not None and value not in choices:
@@ -83,8 +132,94 @@ def _input_string(
     return value
 
 
+def _enrichment_session_id(value: object) -> str | None:
+    selected = _input_string(
+        value,
+        maximum=256,
+        maximum_bytes=256,
+        identifier=True,
+    )
+    if selected is None or _ENRICHMENT_SESSION_PATTERN.fullmatch(selected) is None:
+        return None
+    return selected
+
+
 def _invalid_input() -> Never:
     raise MCPError(INVALID_PARAMS, "invalid intent tool arguments") from None
+
+
+def _scrub_signal(error: BaseException) -> BaseException:
+    """Remove retained private material while preserving cancellation object identity."""
+    old_traceback = error.__traceback__
+    error.args = ()
+    error.__traceback__ = None
+    error.__cause__ = None
+    error.__context__ = None
+    error.__dict__.clear()
+    if old_traceback is not None:
+        traceback.clear_frames(old_traceback)
+    old_traceback = None
+    return error
+
+
+def _bounded_assessment_response(payload: dict[str, object]) -> dict[str, object] | None:
+    """Return one canonically encodable response within the shared public byte bound."""
+    encoded = b""
+    bounded: dict[str, object] | None = None
+    signal: BaseException | None = None
+    try:
+        encoded = json.dumps(
+            payload,
+            allow_nan=False,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        if len(encoded) <= _MAX_ASSESSMENT_RESPONSE_BYTES:
+            bounded = payload
+    except Exception:  # noqa: BLE001 - one fixed response-encoding failure boundary
+        bounded = None
+    except BaseException as caught:  # noqa: BLE001 - preserve cancellation identity
+        signal = _scrub_signal(caught)
+    finally:
+        payload = {}
+        encoded = b""
+    if signal is not None:
+        caught_signal = signal
+        signal = None
+        bounded = None
+        raise caught_signal.with_traceback(None)
+    return bounded
+
+
+def _bounded_enrichment_response(payload: dict[str, object]) -> dict[str, object] | None:
+    """Return one canonical, bounded, secret-free enrichment projection."""
+    encoded = b""
+    bounded: dict[str, object] | None = None
+    signal: BaseException | None = None
+    try:
+        encoded = json.dumps(
+            payload,
+            allow_nan=False,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        if len(encoded) <= _MAX_ENRICHMENT_RESPONSE_BYTES:
+            bounded = payload
+    except Exception:  # noqa: BLE001 - one fixed response-encoding failure boundary
+        bounded = None
+    except BaseException as caught:  # noqa: BLE001 - preserve cancellation identity
+        signal = _scrub_signal(caught)
+    finally:
+        payload = {}
+        encoded = b""
+    if signal is not None:
+        caught_signal = signal
+        signal = None
+        bounded = None
+        raise caught_signal.with_traceback(None)
+    return bounded
 
 
 @dataclass(frozen=True)
@@ -121,6 +256,208 @@ class McpReadServices:
 
     def __init__(self, runtime: Runtime) -> None:
         self.runtime = runtime
+        self._assessment_service = GraphAssessmentService()
+        self._enrichment_service: GraphEnrichmentService | None = None
+
+    def _enrichment(self) -> GraphEnrichmentService:
+        """Load enrichment only when requested so narrow read runtimes stay compatible."""
+        if self._enrichment_service is None:
+            self._enrichment_service = GraphEnrichmentService(
+                self.runtime,
+                actor=self.runtime.config.local_actor,
+            )
+        return self._enrichment_service
+
+    def enrichment_status(self, session_id: str) -> dict[str, object] | None:
+        """Return one fresh session projection without recovering or advancing it."""
+        session = None
+        bounded: dict[str, object] | None = None
+        signal: BaseException | None = None
+        failed = False
+        service = None
+        try:
+            service = self._enrichment()
+            session = service.read_status(session_id)
+            bounded = _bounded_enrichment_response(
+                {
+                    "schema_version": _SCHEMA_VERSION,
+                    "session": session.model_dump(mode="json"),
+                }
+            )
+        except Exception as caught:  # noqa: BLE001 - expose one fixed enrichment-read failure
+            _scrub_signal(caught)
+            failed = True
+        except BaseException as caught:  # noqa: BLE001 - preserve cancellation identity
+            signal = _scrub_signal(caught)
+        finally:
+            session_id = ""
+            session = None
+            service = None
+        if signal is not None:
+            caught_signal = signal
+            signal = None
+            bounded = None
+            del self
+            raise caught_signal.with_traceback(None)
+        return None if failed else bounded
+
+    def enrichment_next_question(self, session_id: str) -> dict[str, object] | None:
+        """Return one deterministic current question without durable mutation."""
+        question = None
+        bounded: dict[str, object] | None = None
+        signal: BaseException | None = None
+        failed = False
+        service = None
+        try:
+            service = self._enrichment()
+            question = service.read_next_question(session_id)
+            bounded = _bounded_enrichment_response(
+                {
+                    "schema_version": _SCHEMA_VERSION,
+                    "session_id": session_id,
+                    "question": question.model_dump(mode="json"),
+                }
+            )
+        except Exception as caught:  # noqa: BLE001 - expose one fixed enrichment-read failure
+            _scrub_signal(caught)
+            failed = True
+        except BaseException as caught:  # noqa: BLE001 - preserve cancellation identity
+            signal = _scrub_signal(caught)
+        finally:
+            session_id = ""
+            question = None
+            service = None
+        if signal is not None:
+            caught_signal = signal
+            signal = None
+            bounded = None
+            del self
+            raise caught_signal.with_traceback(None)
+        return None if failed else bounded
+
+    def _assessment_report(self) -> AssessmentReport | None:
+        """Assess one fresh no-recovery snapshot behind a fixed public failure boundary."""
+        snapshot = None
+        report: AssessmentReport | None = None
+        signal: BaseException | None = None
+        failed = False
+        try:
+            snapshot = self.runtime.assessment_snapshot(self.runtime.config.local_actor)
+            report = self._assessment_service.assess(snapshot)
+        except Exception:  # noqa: BLE001 - expose one fixed assessment-read failure
+            failed = True
+        except BaseException as caught:  # noqa: BLE001 - preserve cancellation identity
+            signal = _scrub_signal(caught)
+        finally:
+            snapshot = None
+        if signal is not None:
+            caught_signal = signal
+            signal = None
+            report = None
+            del self
+            raise caught_signal.with_traceback(None)
+        if failed:
+            return None
+        return report
+
+    def assessment_summary(self) -> dict[str, object] | None:
+        """Return the complete deterministic report for one current visible snapshot."""
+        report = self._assessment_report()
+        if report is None:
+            return None
+        bounded: dict[str, object] | None = None
+        signal: BaseException | None = None
+        try:
+            bounded = _bounded_assessment_response(
+                {
+                    "schema_version": _SCHEMA_VERSION,
+                    "assessment": report.model_dump(mode="json"),
+                    "semantic_digest": report.semantic_digest,
+                }
+            )
+        except BaseException as caught:  # noqa: BLE001 - preserve cancellation identity
+            signal = _scrub_signal(caught)
+        finally:
+            report = None
+        if signal is not None:
+            caught_signal = signal
+            signal = None
+            bounded = None
+            del self
+            raise caught_signal.with_traceback(None)
+        return bounded
+
+    def assessment_scorecard(self, reference: str) -> dict[str, object] | None:
+        """Return visible node and branch scorecards sharing one exact stable reference."""
+        report = self._assessment_report()
+        if report is None:
+            return None
+        node = next((item for item in report.nodes if item.node_id == reference), None)
+        branch = next((item for item in report.branches if item.branch_id == reference), None)
+        if node is None and branch is None:
+            return None
+        bounded: dict[str, object] | None = None
+        signal: BaseException | None = None
+        try:
+            bounded = _bounded_assessment_response(
+                {
+                    "schema_version": _SCHEMA_VERSION,
+                    "semantic_digest": report.semantic_digest,
+                    "reference": reference,
+                    "node": None if node is None else node.model_dump(mode="json"),
+                    "branch": None if branch is None else branch.model_dump(mode="json"),
+                }
+            )
+        except BaseException as caught:  # noqa: BLE001 - preserve cancellation identity
+            signal = _scrub_signal(caught)
+        finally:
+            report = None
+            node = None
+            branch = None
+            reference = ""
+        if signal is not None:
+            caught_signal = signal
+            signal = None
+            bounded = None
+            del self
+            raise caught_signal.with_traceback(None)
+        return bounded
+
+    def assessment_gaps(
+        self,
+        *,
+        limit: int = 20,
+        health: AssessmentHealth | None = None,
+    ) -> dict[str, object] | None:
+        """Return a bounded stable prefix of visible rubric gaps."""
+        report = self._assessment_report()
+        if report is None:
+            return None
+        gaps = tuple(item for item in report.gaps if health is None or item.severity is health)
+        bounded: dict[str, object] | None = None
+        signal: BaseException | None = None
+        try:
+            bounded = _bounded_assessment_response(
+                {
+                    "schema_version": _SCHEMA_VERSION,
+                    "semantic_digest": report.semantic_digest,
+                    "health": None if health is None else health.value,
+                    "limit": limit,
+                    "gaps": [item.model_dump(mode="json") for item in gaps[:limit]],
+                }
+            )
+        except BaseException as caught:  # noqa: BLE001 - preserve cancellation identity
+            signal = _scrub_signal(caught)
+        finally:
+            report = None
+            gaps = ()
+        if signal is not None:
+            caught_signal = signal
+            signal = None
+            bounded = None
+            del self
+            raise caught_signal.with_traceback(None)
+        return bounded
 
     def _snapshot(self) -> _ReadSnapshot | None:
         try:
@@ -423,6 +760,96 @@ def _found(payload: dict[str, object] | None) -> dict[str, object]:
     return payload
 
 
+def validate_assessment_tool_call(name: str, arguments: dict[str, object]) -> None:
+    """Validate exact raw assessment arguments before SDK coercion or handler lookup."""
+    from intent_engineering.integrations.mcp_server.intent_workflow import (
+        _require_exact_json,
+    )
+
+    signal: BaseException | None = None
+    try:
+        if type(name) is not str or name not in _ASSESSMENT_TOOL_NAMES:
+            raise ValueError("invalid assessment request")
+        if type(arguments) is not dict:
+            raise ValueError("invalid assessment request")
+        _require_exact_json(arguments)
+        keys = set(dict.keys(arguments))
+        if name == "intent_assessment_summary":
+            if keys:
+                raise ValueError("invalid assessment request")
+        elif name == "intent_assessment_scorecard":
+            if (
+                keys != {"reference"}
+                or _input_string(
+                    dict.__getitem__(arguments, "reference"),
+                    maximum=512,
+                    identifier=True,
+                )
+                is None
+            ):
+                raise ValueError("invalid assessment request")
+        else:
+            if not keys.issubset({"limit", "health"}):
+                raise ValueError("invalid assessment request")
+            if "limit" in keys:
+                limit = dict.__getitem__(arguments, "limit")
+                if type(limit) is not int or not 1 <= limit <= _MAX_ASSESSMENT_GAPS:
+                    raise ValueError("invalid assessment request")
+            if "health" in keys:
+                health = dict.__getitem__(arguments, "health")
+                if (
+                    health is not None
+                    and _input_string(
+                        health,
+                        maximum=6,
+                        choices=frozenset({"green", "orange", "red"}),
+                    )
+                    is None
+                ):
+                    raise ValueError("invalid assessment request")
+    except Exception:  # noqa: BLE001 - one fixed raw assessment boundary
+        raise ValueError("invalid intent tool arguments") from None
+    except BaseException as caught:  # noqa: BLE001 - preserve cancellation identity
+        signal = _scrub_signal(caught)
+    finally:
+        name = ""
+        arguments = {}
+    if signal is not None:
+        caught_signal = signal
+        signal = None
+        raise caught_signal.with_traceback(None)
+
+
+def validate_enrichment_tool_call(name: str, arguments: dict[str, object]) -> None:
+    """Validate exact raw enrichment arguments before SDK coercion or handler lookup."""
+    from intent_engineering.integrations.mcp_server.intent_workflow import (
+        _require_exact_json,
+    )
+
+    signal: BaseException | None = None
+    try:
+        if type(name) is not str or name not in _ENRICHMENT_TOOL_NAMES:
+            raise ValueError("invalid enrichment request")
+        if type(arguments) is not dict:
+            raise ValueError("invalid enrichment request")
+        _require_exact_json(arguments)
+        if set(dict.keys(arguments)) != {"session_id"}:
+            raise ValueError("invalid enrichment request")
+        if _enrichment_session_id(dict.__getitem__(arguments, "session_id")) is None:
+            raise ValueError("invalid enrichment request")
+    except Exception:  # noqa: BLE001 - one fixed raw enrichment boundary
+        raise ValueError("invalid intent tool arguments") from None
+    except BaseException as caught:  # noqa: BLE001 - preserve cancellation identity
+        signal = _scrub_signal(caught)
+    finally:
+        name = ""
+        arguments = {}
+    if signal is not None:
+        caught_signal = signal
+        signal = None
+        raise caught_signal.with_traceback(None)
+
+
 def register_read_tools(server: MCPServer, services: McpReadServices) -> None:
     """Register the exact version-1 read-only tool surface."""
 
@@ -502,6 +929,95 @@ def register_read_tools(server: MCPServer, services: McpReadServices) -> None:
     def intent_status() -> dict[str, object]:
         """Summarize the authorized durable graph, evidence, and case state."""
         return _available(services.status())
+
+    @server.tool(
+        name="intent_enrichment_status",
+        annotations=_READ_ONLY,
+        structured_output=True,
+    )
+    def intent_enrichment_status(session_id: _EnrichmentSessionInput) -> dict[str, object]:
+        """Return one authorized enrichment session without changing durable state."""
+        selected = _enrichment_session_id(session_id)
+        del session_id
+        if selected is None:
+            _invalid_input()
+        payload = services.enrichment_status(selected)
+        del selected
+        return _available(payload)
+
+    @server.tool(
+        name="intent_enrichment_next_question",
+        annotations=_READ_ONLY,
+        structured_output=True,
+    )
+    def intent_enrichment_next_question(
+        session_id: _EnrichmentSessionInput,
+    ) -> dict[str, object]:
+        """Return one authorized next question without advancing the session."""
+        selected = _enrichment_session_id(session_id)
+        del session_id
+        if selected is None:
+            _invalid_input()
+        payload = services.enrichment_next_question(selected)
+        del selected
+        return _available(payload)
+
+    @server.tool(
+        name="intent_assessment_summary",
+        annotations=_READ_ONLY,
+        structured_output=True,
+    )
+    def intent_assessment_summary() -> dict[str, object]:
+        """Return the current explainable assessment for one authorized snapshot."""
+        return _available(services.assessment_summary())
+
+    @server.tool(
+        name="intent_assessment_scorecard",
+        annotations=_READ_ONLY,
+        structured_output=True,
+    )
+    def intent_assessment_scorecard(reference: _IdentifierInput) -> dict[str, object]:
+        """Return one authorized node and branch assessment by exact reference."""
+        selected = _input_string(reference, maximum=512, identifier=True)
+        del reference
+        if selected is None:
+            _invalid_input()
+        payload = services.assessment_scorecard(selected)
+        del selected
+        return _found(payload)
+
+    @server.tool(
+        name="intent_assessment_gaps",
+        annotations=_READ_ONLY,
+        structured_output=True,
+    )
+    def intent_assessment_gaps(
+        limit: _AssessmentLimitInput = 20,
+        health: _AssessmentHealthInput | None = None,
+    ) -> dict[str, object]:
+        """Return a bounded stable list of authorized assessment gaps."""
+        selected_limit = (
+            limit if type(limit) is int and 1 <= limit <= _MAX_ASSESSMENT_GAPS else None
+        )
+        selected_health = (
+            None
+            if health is None
+            else _input_string(
+                health,
+                maximum=6,
+                choices=frozenset({"green", "orange", "red"}),
+            )
+        )
+        health_was_supplied = health is not None
+        del limit, health
+        if selected_limit is None or (health_was_supplied and selected_health is None):
+            _invalid_input()
+        payload = services.assessment_gaps(
+            limit=selected_limit,
+            health=None if selected_health is None else AssessmentHealth(selected_health),
+        )
+        del selected_limit, selected_health
+        return _available(payload)
 
     @server.tool(name="intent_validate", annotations=_READ_ONLY, structured_output=True)
     def intent_validate() -> dict[str, object]:

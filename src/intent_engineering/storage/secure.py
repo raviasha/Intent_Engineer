@@ -256,12 +256,16 @@ class SecureDirectory:
                         _DIRECTORY_FLAGS,
                         dir_fd=descriptor,
                     )
-                _require_directory(os.fstat(next_descriptor))
+                try:
+                    _require_directory(os.fstat(next_descriptor))
+                except BaseException:
+                    os.close(next_descriptor)
+                    raise
                 os.close(descriptor)
                 descriptor = next_descriptor
         except BaseException as error:
             os.close(descriptor)
-            if isinstance(error, UnsafePathError):
+            if not isinstance(error, Exception) or isinstance(error, UnsafePathError):
                 raise
             raise UnsafePathError() from error
         return cls(descriptor, absolute)
@@ -318,13 +322,17 @@ class SecureDirectory:
                         _DIRECTORY_FLAGS,
                         dir_fd=descriptor,
                     )
-                _require_directory(os.fstat(next_descriptor))
+                try:
+                    _require_directory(os.fstat(next_descriptor))
+                except BaseException:
+                    os.close(next_descriptor)
+                    raise
                 os.close(descriptor)
                 descriptor = next_descriptor
                 traversed /= component
         except BaseException as error:
             os.close(descriptor)
-            if isinstance(error, UnsafePathError):
+            if not isinstance(error, Exception) or isinstance(error, UnsafePathError):
                 raise
             raise UnsafePathError() from error
         return SecureDirectory(descriptor, traversed)
@@ -363,8 +371,8 @@ class SecureDirectory:
             raise UnsafePathError()
         parts = _relative_parts(relative)
         descriptor = os.dup(self.descriptor)
-        identities: list[FileIdentity] = [self.identity]
         try:
+            identities: list[FileIdentity] = [self.identity]
             for component in parts[:-1]:
                 try:
                     next_descriptor = os.open(
@@ -374,9 +382,13 @@ class SecureDirectory:
                     )
                 except OSError as error:
                     raise UnsafePathError() from error
-                metadata = os.fstat(next_descriptor)
-                _require_directory(metadata)
-                identities.append(_identity(metadata))
+                try:
+                    metadata = os.fstat(next_descriptor)
+                    _require_directory(metadata)
+                    identities.append(_identity(metadata))
+                except BaseException:
+                    os.close(next_descriptor)
+                    raise
                 os.close(descriptor)
                 descriptor = next_descriptor
             reader = _read_named_nonblocking if nonblocking else _read_named
@@ -1082,7 +1094,7 @@ class SecureFile:
             raise failure from None
         raise AtomicWriteRollbackError() from None
 
-    def _atomic_write_unverified(self, content: bytes) -> None:
+    def _atomic_write_unverified(self, content: bytes, *, mode: int) -> None:
         temporary_name: str | None = None
         descriptor = -1
         temporary_metadata: os.stat_result | None = None
@@ -1093,7 +1105,7 @@ class SecureFile:
                     descriptor = os.open(
                         candidate,
                         os.O_WRONLY | os.O_CREAT | os.O_EXCL | _NOFOLLOW | _CLOEXEC,
-                        0o644,
+                        mode,
                         dir_fd=self.parent_fd,
                     )
                 except FileExistsError:
@@ -1135,7 +1147,7 @@ class SecureFile:
                 except BaseException:  # noqa: BLE001, S110 - preserve the primary failure
                     pass
 
-    def _atomic_write_strict(self, content: memoryview) -> None:
+    def _atomic_write_strict(self, content: memoryview, *, mode: int) -> None:
         temporary_name: str | None = None
         report_descriptor = -1
         displaced_descriptor = -1
@@ -1151,7 +1163,7 @@ class SecureFile:
                     report_descriptor = os.open(
                         temporary_name,
                         os.O_WRONLY | os.O_CREAT | os.O_EXCL | _NOFOLLOW | _CLOEXEC,
-                        0o644,
+                        mode,
                         dir_fd=self.parent_fd,
                     )
                 except FileExistsError:
@@ -1224,17 +1236,25 @@ class SecureFile:
             raise UnsafePathError() from os_failure
         raise failure from None
 
-    def atomic_write(self, content: bytes, *, reject_target_races: bool = False) -> None:
+    def atomic_write(
+        self,
+        content: bytes,
+        *,
+        reject_target_races: bool = False,
+        mode: int = 0o644,
+    ) -> None:
+        if type(mode) is not int or mode not in {0o600, 0o644}:
+            raise ValueError("invalid atomic write mode")
         if reject_target_races:
             payload = memoryview(content)
             content = b""
             try:
-                self._atomic_write_strict(payload)
+                self._atomic_write_strict(payload, mode=mode)
             finally:
                 payload.release()
                 payload = memoryview(b"")
             return
-        self._atomic_write_unverified(content)
+        self._atomic_write_unverified(content, mode=mode)
 
     def append(self, content: bytes) -> None:
         payload = memoryview(content)

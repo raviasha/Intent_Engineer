@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from datetime import UTC, datetime, timedelta
@@ -40,6 +41,7 @@ class DecisionAction(StrEnum):
     RESOLVE_CONFLICT = "resolve_conflict"
     PUBLISH_STATE = "publish_state"
     APPROVE_EXTERNAL_WRITE = "approve_external_write"
+    RECONCILE_STATE = "reconcile_state"
 
 
 class DevStatus(StrEnum):
@@ -123,6 +125,54 @@ def _canonical_json_bytes(value: object) -> bytes:
         ).encode("utf-8")
         + b"\n"
     )
+
+
+class TeamStateDivergenceCaseV2(_ControlPlaneModel):
+    """Bounded digest-only evidence of competing shared-state children."""
+
+    repository_id: Annotated[
+        str, Field(pattern=r"^[a-z0-9.-]+/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$", max_length=255)
+    ]
+    project_id: Annotated[str, Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")]
+    common_parent_bundle_digest: Annotated[str, Field(pattern=_DIGEST_PATTERN.pattern)]
+    remote_manifest_digest: Annotated[str, Field(pattern=_DIGEST_PATTERN.pattern)]
+    local_manifest_digest: Annotated[str, Field(pattern=_DIGEST_PATTERN.pattern)]
+    remote_authority_digest: Annotated[str, Field(pattern=_DIGEST_PATTERN.pattern)]
+    local_authority_digest: Annotated[str, Field(pattern=_DIGEST_PATTERN.pattern)]
+    remote_commit: Annotated[str, Field(pattern=r"^[0-9a-f]{40}(?:[0-9a-f]{24})?$")]
+    local_publication_commit: (
+        Annotated[str, Field(pattern=r"^[0-9a-f]{40}(?:[0-9a-f]{24})?$")] | None
+    )
+    changed_paths: Annotated[tuple[str, ...], Field(max_length=32)]
+
+    @field_validator("changed_paths")
+    @classmethod
+    def require_public_paths(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        from intent_engineering.team_state.models import CANONICAL_STATE_PATHS
+
+        if value != tuple(sorted(set(value))) or not set(value) <= set(CANONICAL_STATE_PATHS) | {
+            "authority/team-authority.json"
+        }:
+            raise ValueError("invalid divergence paths")
+        return value
+
+    def canonical_bytes(self) -> bytes:
+        return _canonical_json_bytes(self.model_dump(mode="json"))
+
+    @classmethod
+    def parse(cls, content: bytes) -> TeamStateDivergenceCaseV2:
+        from intent_engineering.storage.jsonl.strict import loads_strict_object
+
+        if type(content) is not bytes or len(content) > 4096:
+            raise ValueError("invalid divergence case")
+        try:
+            loads_strict_object(content.decode("utf-8"))
+            result = cls.model_validate_json(content)
+            if result.canonical_bytes() != content:
+                raise ValueError("invalid divergence case")
+            return result
+        except (ValueError, UnicodeError):
+            raise ValueError("invalid divergence case") from None
 
 
 class DecisionSubject(_ControlPlaneModel):
@@ -218,6 +268,25 @@ class HumanDecisionPayload(_ControlPlaneModel):
     def canonical_bytes(self) -> bytes:
         """Return the exact UTF-8 JSON bytes that an authenticator binds."""
         return _canonical_json_bytes(self.model_dump(mode="json"))
+
+
+def credential_identity_digest(credential: CredentialRecord) -> str:
+    """Commit to immutable WebAuthn identity; counters belong to assertion verification."""
+    identity = credential.model_dump(mode="json", exclude={"id", "sign_count"})
+    return (
+        "sha256:"
+        + hashlib.sha256(
+            b"intent.webauthn-credential-identity.v2\0" + _canonical_json_bytes(identity)
+        ).hexdigest()
+    )
+
+
+def credential_matches_digest(credential: CredentialRecord, digest: str) -> bool:
+    """Accept stable identity or an exactly matching legacy full-record commitment."""
+    return digest in {
+        credential_identity_digest(credential),
+        "sha256:" + hashlib.sha256(credential.canonical_bytes()).hexdigest(),
+    }
 
 
 class CredentialRecord(_ControlPlaneModel):
@@ -340,8 +409,6 @@ class ChallengeRecord(_ControlPlaneModel):
             raise ValueError("repository identifier must be canonical")
         if not _BASE64URL_PATTERN.fullmatch(self.challenge):
             raise ValueError("challenge must be base64url")
-        if self.ceremony == "registration" and self.payload_digest is not None:
-            raise ValueError("registration challenge cannot bind a decision payload")
         if self.ceremony == "authentication" and self.payload_digest is None:
             raise ValueError("authentication challenge must bind a decision payload")
         if (

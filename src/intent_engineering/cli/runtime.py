@@ -5,10 +5,13 @@ from __future__ import annotations
 import json
 import os
 import re
+import stat
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from pathlib import Path
-from typing import Any, cast
+from datetime import datetime
+from pathlib import Path, PurePosixPath
+from types import MappingProxyType
+from typing import TYPE_CHECKING, Any, Protocol, cast
 
 import anyio
 import yaml  # type: ignore[import-untyped]
@@ -37,32 +40,108 @@ from intent_engineering.core.models import (
     Graph,
     ProjectConfig,
     ReconciliationCase,
+    is_nonterminal_case_status,
 )
 from intent_engineering.core.policy.access import refs_allowed
 from intent_engineering.core.policy.project import ProjectNotInitialized, workspace_path
 from intent_engineering.extract.deterministic import DeterministicReasoner
 from intent_engineering.intent_workflow.assurance import AssuranceService
-from intent_engineering.intent_workflow.proposal_store import IntentProposalStore
+from intent_engineering.intent_workflow.check import (
+    MAX_TEST_RESULT_BYTES,
+    SharedStateRestorer,
+    SharedStateRestoreResult,
+    SharedStateRestoreStatus,
+    TestResultArtifact,
+    TestResultBinding,
+    evidence_repository_id,
+)
+from intent_engineering.intent_workflow.dev_observer import DevObserver, TestRunStatus
+from intent_engineering.intent_workflow.enrichment_store import EnrichmentSessionStore
+from intent_engineering.intent_workflow.models import (
+    ClarificationEvent,
+    IntentProposal,
+    ProposalDecisionRecord,
+)
+from intent_engineering.intent_workflow.proposal_store import (
+    IntentProposalStore,
+    parse_intent_ledger,
+)
+from intent_engineering.intent_workflow.readiness import (
+    EnsureRequest,
+    EnsureResult,
+    ReadinessError,
+    ReadinessService,
+)
 from intent_engineering.reconcile import LocalResolutionService
 from intent_engineering.reconcile.evidence_detection import detect_evidence_drift
 from intent_engineering.storage.executor import LocalChangeSetExecutor
-from intent_engineering.storage.jsonl.case_store import JsonlCaseStore
+from intent_engineering.storage.jsonl.case_store import JsonlCaseStore, parse_case_versions
 from intent_engineering.storage.jsonl.evidence_store import JsonlEvidenceStore
 from intent_engineering.storage.secure import (
     SecureDirectory,
+    SecureFile,
     UnsafePathError,
+    _read_descriptor,
     configured_graph_relative,
 )
 from intent_engineering.storage.transaction import LocalTransactionCoordinator
 from intent_engineering.storage.yaml.checkpoint_store import YamlCheckpointStore
-from intent_engineering.storage.yaml.graph_store import YamlGraphStore
+from intent_engineering.storage.yaml.graph_store import YamlGraphStore, parse_graph
 from intent_engineering.sync import SyncOrchestrator
-from intent_engineering.sync.models import SyncRunResult
+from intent_engineering.sync.models import ConnectorRunResult, SyncRunResult, SyncRunStatus
+from intent_engineering.validation import (
+    MAX_CANONICAL_FILE_BYTES,
+    MAX_CANONICAL_SNAPSHOT_BYTES,
+    ValidationReport,
+    validate_canonical_snapshot,
+    validate_project_directory,
+)
+
+if TYPE_CHECKING:
+    from intent_engineering.assessment import AssessmentSnapshot
 
 _GITHUB_OWNER = re.compile(r"(?!-)(?!.*--)[A-Za-z0-9-]{1,39}(?<!-)\Z")
 _GITHUB_REPOSITORY = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}\Z")
 
 type GitHubClientFactory = Callable[[GitHubCredentials], GitHubClient]
+type PrincipalResolver = Callable[[Runtime], frozenset[str]]
+type McpConnectorResolver = Callable[[Runtime], Sequence[Connector]]
+
+
+class AssessmentRuntimeProtocol(Protocol):
+    """The descriptor-held surface required by assessment snapshot acquisition."""
+
+    @property
+    def config(self) -> ProjectConfig: ...
+
+    @property
+    def workspace_directory(self) -> SecureDirectory: ...
+
+    @property
+    def transactions(self) -> LocalTransactionCoordinator: ...
+
+
+@dataclass(frozen=True)
+class AssessmentRuntime:
+    """Minimal no-recovery runtime for read-only graph assessment."""
+
+    root: Path
+    config: ProjectConfig
+    project_directory: SecureDirectory
+    workspace_directory: SecureDirectory
+    transactions: LocalTransactionCoordinator
+
+    def assessment_snapshot(self, actor: str) -> AssessmentSnapshot:
+        """Build one descriptor-held projection without recovering canonical state."""
+        from intent_engineering.assessment.snapshot import build_assessment_snapshot
+
+        return build_assessment_snapshot(self, actor)
+
+    def close(self) -> None:
+        """Release every descriptor held by this read-only runtime."""
+        self.transactions.close()
+        self.workspace_directory.close()
+        self.project_directory.close()
 
 
 class GitHubConfigurationError(ValueError):
@@ -177,6 +256,7 @@ class Runtime:
     evidence_store: JsonlEvidenceStore
     case_store: JsonlCaseStore
     intent_proposals: IntentProposalStore
+    enrichment_sessions: EnrichmentSessionStore
     webauthn_credentials: WebAuthnCredentialStore
     webauthn_challenges: WebAuthnChallengeStore
     checkpoint_store: YamlCheckpointStore
@@ -198,9 +278,16 @@ class Runtime:
         """Build a fresh, conservative context provider from durable state."""
         return ContextProvider(self.graph_store.load(), self.cases(), self.config, self.evidence())
 
+    def assessment_snapshot(self, actor: str) -> AssessmentSnapshot:
+        """Build one descriptor-held ACL projection for deterministic assessment."""
+        from intent_engineering.assessment.snapshot import build_assessment_snapshot
+
+        return build_assessment_snapshot(self, actor)
+
     def close(self) -> None:
         """Release every descriptor owned by this assembled runtime after it quiesces."""
         self.sync.close()
+        self.enrichment_sessions.close()
         self.intent_proposals.close()
         self.webauthn_credentials.close()
         self.webauthn_challenges.close()
@@ -213,17 +300,289 @@ class Runtime:
         self.project_directory.close()
 
 
-def load_runtime(root: Path) -> Runtime:
+@dataclass(frozen=True)
+class _ReadinessSnapshot:
+    """One raw, no-write read of every readiness input."""
+
+    canonical: Mapping[str, bytes | None]
+    intent_proposals: bytes | None
+
+
+def _readiness_change_token(metadata: os.stat_result) -> tuple[int, ...]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_nlink,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
+class _ReadinessCapture:
+    """Hold every canonical inode and ancestor until the complete snapshot is validated."""
+
+    def __init__(self, project: SecureDirectory, workspace: SecureDirectory) -> None:
+        self.project = project
+        self.files: dict[str, int | None] = {}
+        self.tokens: dict[int, tuple[int, ...]] = {
+            project.descriptor: _readiness_change_token(os.fstat(project.descriptor)),
+            workspace.descriptor: _readiness_change_token(os.fstat(workspace.descriptor)),
+        }
+        self.names: list[tuple[int, str, tuple[int, ...] | None]] = [
+            (project.descriptor, ".intent", self.tokens[workspace.descriptor])
+        ]
+        self.total_bytes = 0
+        # Acquire ownership only after fallible metadata setup completes: a failed
+        # constructor has no caller to close this duplicate.
+        self.directories = {"": workspace.duplicate()}
+
+    def pin(self, path: str, *, optional: bool = False) -> None:
+        parts = Path(path).parts
+        if path in self.files or len(parts) > 32 or len(path.encode("utf-8")) > 4096:
+            raise UnsafePathError()
+        prefix = ""
+        for part in parts[:-1]:
+            next_prefix = f"{prefix}/{part}" if prefix else part
+            if next_prefix not in self.directories:
+                ancestor = self.directories[prefix]
+                directory = ancestor.subdirectory(part)
+                self.directories[next_prefix] = directory
+                token = _readiness_change_token(os.fstat(directory.descriptor))
+                self.tokens[directory.descriptor] = token
+                self.names.append((ancestor.descriptor, part, token))
+            prefix = next_prefix
+        parent = self.directories[prefix]
+        try:
+            descriptor = os.open(
+                parts[-1],
+                os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
+                dir_fd=parent.descriptor,
+            )
+        except FileNotFoundError:
+            if not optional:
+                raise
+            self.files[path] = None
+            self.names.append((parent.descriptor, parts[-1], None))
+            return
+        self.files[path] = descriptor
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_nlink != 1
+            or metadata.st_size > MAX_CANONICAL_FILE_BYTES
+        ):
+            raise UnsafePathError()
+        self.total_bytes += metadata.st_size
+        if self.total_bytes > MAX_CANONICAL_SNAPSHOT_BYTES:
+            raise UnsafePathError()
+        token = _readiness_change_token(metadata)
+        self.tokens[descriptor] = token
+        self.names.append((parent.descriptor, parts[-1], token))
+
+    def read(self, path: str) -> bytes | None:
+        descriptor = self.files[path]
+        if descriptor is None:
+            return None
+        # Bound reads to the authenticated size as well as the aggregate reservation;
+        # growth or truncation during the read is an invalid snapshot.
+        expected_size = self.tokens[descriptor][4]
+        content = _read_descriptor(descriptor, max_bytes=expected_size)
+        if len(content) != expected_size:
+            raise UnsafePathError()
+        return content
+
+    def verify(self) -> None:
+        observed = SecureDirectory.open(self.project.path)
+        try:
+            if observed.identity != self.project.identity:
+                raise UnsafePathError()
+        finally:
+            observed.close()
+        # No content reads or callbacks follow this whole-snapshot metadata barrier.
+        # ctime also detects a writer restoring the original bytes and mtime.
+        for parent, name, expected in self.names:
+            try:
+                token = _readiness_change_token(os.stat(name, dir_fd=parent, follow_symlinks=False))
+            except FileNotFoundError:
+                token = None
+            if token != expected:
+                raise UnsafePathError()
+        if any(
+            _readiness_change_token(os.fstat(descriptor)) != expected
+            for descriptor, expected in self.tokens.items()
+        ):
+            raise UnsafePathError()
+
+    def close(self) -> None:
+        for descriptor in self.files.values():
+            if descriptor is not None:
+                os.close(descriptor)
+        self.files.clear()
+        for directory in self.directories.values():
+            directory.close()
+        self.directories.clear()
+
+
+@dataclass(frozen=True)
+class _ReadinessGraphStore:
+    """Detached graph reader backed only by one validated readiness snapshot."""
+
+    graph: Graph
+
+    def load(self) -> Graph:
+        return self.graph
+
+
+@dataclass(frozen=True)
+class _ReadinessProposalStore:
+    """Detached proposal reader backed only by one validated readiness snapshot."""
+
+    proposals: tuple[IntentProposal, ...]
+    decisions: Mapping[str, ProposalDecisionRecord]
+    events: tuple[ClarificationEvent, ...]
+
+    def list(self) -> tuple[IntentProposal, ...]:
+        return self.proposals
+
+    def decision_for(self, proposal_id: str) -> ProposalDecisionRecord | None:
+        return self.decisions.get(proposal_id)
+
+    def clarification_events(self) -> tuple[ClarificationEvent, ...]:
+        return self.events
+
+
+@dataclass(frozen=True)
+class ReadinessRuntime:
+    """Detached coherent snapshot used by the read-only readiness gate."""
+
+    graph_store: _ReadinessGraphStore
+    intent_proposals: _ReadinessProposalStore
+    case_items: tuple[ReconciliationCase, ...]
+
+    def cases(self) -> tuple[ReconciliationCase, ...]:
+        return self.case_items
+
+    def close(self) -> None:
+        """Match the ordinary runtime lifecycle; detached snapshots own no descriptors."""
+
+
+def _capture_readiness_snapshot(
+    capture: _ReadinessCapture,
+) -> _ReadinessSnapshot:
+    """Read all readiness inputs once without recovery, locking, or local writes."""
+    capture.pin("config.yaml")
+    config = capture.read("config.yaml")
+    if config is None:  # pragma: no cover - required file invariant
+        raise ValueError("project configuration is unavailable")
+    loaded = yaml.safe_load(config.decode("utf-8"))
+    if not isinstance(loaded, dict):
+        raise TypeError("project configuration is invalid")
+    project_config = ProjectConfig.model_validate_json(
+        json.dumps(cast(dict[str, Any], loaded), ensure_ascii=False, separators=(",", ":"))
+    )
+    graph_relative = configured_graph_relative(project_config.graph_path).as_posix()
+    paths = {
+        "graph": graph_relative,
+        "history": "history/changesets.jsonl",
+        "cases": "reconciliation/cases.jsonl",
+        "evidence": "evidence/evidence.jsonl",
+        "receipts": "approvals/receipts.jsonl",
+        "checkpoints": "cache/checkpoints.yaml",
+    }
+    proposal_path = "history/intent-proposals.jsonl"
+    journal_path = "history/.local-transaction.json"
+    for name, path in paths.items():
+        capture.pin(path, optional=name != "graph")
+    capture.pin(proposal_path, optional=True)
+    capture.pin(journal_path, optional=True)
+    if capture.files[journal_path] is not None:
+        raise ValueError("unrecovered local transaction")
+    return _ReadinessSnapshot(
+        canonical=MappingProxyType(
+            {"config": config, **{name: capture.read(path) for name, path in paths.items()}}
+        ),
+        intent_proposals=capture.read(proposal_path),
+    )
+
+
+def load_readiness_runtime(root: Path) -> ReadinessRuntime:
+    """Return a stable no-write snapshot or fail closed when local state changes."""
+    signal: BaseException | None = None
+    try:
+        return _load_readiness_runtime(root)
+    except ProjectNotInitialized:
+        signal = ProjectNotInitialized("local project is not initialized")
+    except Exception:  # noqa: BLE001 - discard parser contents and unsafe filesystem details
+        signal = ReadinessError()
+    except BaseException as caught:  # noqa: BLE001 - preserve exact cancellation without plaintext
+        caught.__traceback__ = None
+        caught.__cause__ = None
+        caught.__context__ = None
+        signal = caught
+    if signal is not None:
+        raise signal from None
+    raise ReadinessError() from None
+
+
+def _load_readiness_runtime(root: Path) -> ReadinessRuntime:
+    project_directory: SecureDirectory | None = None
+    workspace_directory: SecureDirectory | None = None
+    capture: _ReadinessCapture | None = None
+    try:
+        root = Path(os.path.abspath(root))
+        try:
+            project_directory = SecureDirectory.open(root)
+            workspace_directory = project_directory.subdirectory(".intent")
+        except UnsafePathError as error:
+            raise ProjectNotInitialized("local project is not initialized") from error
+        capture = _ReadinessCapture(project_directory, workspace_directory)
+        snapshot = _capture_readiness_snapshot(capture)
+        if not validate_canonical_snapshot(snapshot.canonical).valid:
+            raise ValueError("canonical state is invalid")
+        graph_bytes = snapshot.canonical["graph"]
+        assert graph_bytes is not None
+        graph = parse_graph(graph_bytes)
+        latest_cases = {case.id: case for case in parse_case_versions(snapshot.canonical["cases"])}
+        ledger = parse_intent_ledger(snapshot.intent_proposals or b"")
+        if ledger is None:
+            raise ValueError("intent proposal ledger is invalid")
+        result = ReadinessRuntime(
+            graph_store=_ReadinessGraphStore(graph),
+            intent_proposals=_ReadinessProposalStore(
+                proposals=tuple(ledger.proposals.values()),
+                decisions=MappingProxyType(ledger.decisions),
+                events=ledger.clarification_events,
+            ),
+            case_items=tuple(sorted(latest_cases.values(), key=lambda case: case.id)),
+        )
+        capture.verify()
+        return result
+    finally:
+        if capture is not None:
+            capture.close()
+        if workspace_directory is not None:
+            workspace_directory.close()
+        if project_directory is not None:
+            project_directory.close()
+
+
+def load_runtime(root: Path, *, assurance_workspace: Path | None = None) -> Runtime:
     """Locate one initialized workspace and assemble only reviewed local adapters."""
     root = Path(os.path.abspath(root))
     try:
         project_directory = SecureDirectory.open(root)
-        workspace_directory = project_directory.subdirectory(".intent")
+        workspace_directory = (
+            project_directory.subdirectory(".intent")
+            if assurance_workspace is None
+            else SecureDirectory.open(assurance_workspace)
+        )
         config_file = workspace_directory.file("config.yaml")
         loaded = yaml.safe_load(config_file.read_bytes().decode("utf-8"))
     except UnsafePathError as error:
         raise ProjectNotInitialized("local project is not initialized") from error
-    workspace = workspace_path(root)
+    workspace = workspace_path(root) if assurance_workspace is None else assurance_workspace
     if not isinstance(loaded, dict):
         raise TypeError("project configuration is invalid")
     config = ProjectConfig.model_validate_json(
@@ -240,6 +599,7 @@ def load_runtime(root: Path) -> Runtime:
     receipts_file = workspace_directory.file("approvals/receipts.jsonl")
     approvals_file = workspace_directory.file("approvals/approvals.jsonl")
     intent_proposals_file = workspace_directory.file("history/intent-proposals.jsonl")
+    enrichment_sessions_file = workspace_directory.file("history/enrichment-sessions.jsonl")
     webauthn_credentials_file = workspace_directory.file("approvals/webauthn-credentials.jsonl")
     webauthn_challenges_file = workspace_directory.file("approvals/webauthn-challenges.jsonl")
     transactions = LocalTransactionCoordinator(
@@ -252,6 +612,7 @@ def load_runtime(root: Path) -> Runtime:
             "receipts": receipts_file,
             "approvals": approvals_file,
             "intent_proposals": intent_proposals_file,
+            "enrichment_sessions": enrichment_sessions_file,
             "webauthn_credentials": webauthn_credentials_file,
             "webauthn_challenges": webauthn_challenges_file,
         },
@@ -271,6 +632,19 @@ def load_runtime(root: Path) -> Runtime:
                     "webauthn_challenges",
                 }
             ),
+            frozenset(
+                {
+                    "graph",
+                    "history",
+                    "cases",
+                    "evidence",
+                    "receipts",
+                    "approvals",
+                    "intent_proposals",
+                    "webauthn_credentials",
+                    "webauthn_challenges",
+                }
+            ),
         ),
     )
     # Raw preimages must be restored before a torn YAML or JSONL file reaches a parser.
@@ -283,13 +657,19 @@ def load_runtime(root: Path) -> Runtime:
     evidence_store = JsonlEvidenceStore(evidence_file, transactions=transactions)
     case_store = JsonlCaseStore(case_file)
     intent_proposals_target = transactions.target_file("intent_proposals")
+    enrichment_sessions_target = transactions.target_file("enrichment_sessions")
     try:
         intent_proposals = IntentProposalStore(
             intent_proposals_target,
             transactions=transactions,
         )
+        enrichment_sessions = EnrichmentSessionStore(
+            enrichment_sessions_target,
+            transactions=transactions,
+        )
     finally:
         intent_proposals_target.close()
+        enrichment_sessions_target.close()
     credentials_target = transactions.target_file("webauthn_credentials")
     challenges_target = transactions.target_file("webauthn_challenges")
     try:
@@ -330,6 +710,7 @@ def load_runtime(root: Path) -> Runtime:
         evidence_store=evidence_store,
         case_store=case_store,
         intent_proposals=intent_proposals,
+        enrichment_sessions=enrichment_sessions,
         webauthn_credentials=webauthn_credentials,
         webauthn_challenges=webauthn_challenges,
         checkpoint_store=checkpoint_store,
@@ -339,6 +720,320 @@ def load_runtime(root: Path) -> Runtime:
         workspace_directory=workspace_directory,
         transactions=transactions,
     )
+
+
+def load_assessment_runtime(root: Path) -> AssessmentRuntime:
+    """Open descriptor-held assessment inputs without performing any recovery."""
+    root = Path(os.path.abspath(root))
+    project_directory: SecureDirectory | None = None
+    workspace_directory: SecureDirectory | None = None
+    transactions: LocalTransactionCoordinator | None = None
+    opened: list[SecureFile] = []
+    try:
+        project_directory = SecureDirectory.open(root)
+        workspace_directory = project_directory.subdirectory(".intent")
+        config_file = workspace_directory.file("config.yaml")
+        opened.append(config_file)
+        config_content = config_file.read_optional_nonblocking(max_bytes=MAX_CANONICAL_FILE_BYTES)
+        if config_content is None:
+            raise ProjectNotInitialized("local project is not initialized")
+        loaded = yaml.safe_load(config_content.decode("utf-8"))
+        if not isinstance(loaded, dict):
+            raise TypeError("project configuration is invalid")
+        config = ProjectConfig.model_validate_json(
+            json.dumps(cast(dict[str, Any], loaded), ensure_ascii=False, separators=(",", ":"))
+        )
+        paths: Mapping[str, str | PurePosixPath] = {
+            "graph": configured_graph_relative(config.graph_path),
+            "history": "history/changesets.jsonl",
+            "cases": "reconciliation/cases.jsonl",
+            "evidence": "evidence/evidence.jsonl",
+            "receipts": "approvals/receipts.jsonl",
+            "approvals": "approvals/approvals.jsonl",
+            "intent_proposals": "history/intent-proposals.jsonl",
+            "enrichment_sessions": "history/enrichment-sessions.jsonl",
+            "webauthn_credentials": "approvals/webauthn-credentials.jsonl",
+            "webauthn_challenges": "approvals/webauthn-challenges.jsonl",
+        }
+        targets = {name: workspace_directory.file(path) for name, path in paths.items()}
+        opened.extend(targets.values())
+        journal = workspace_directory.file("history/.local-transaction.json")
+        opened.append(journal)
+        transactions = LocalTransactionCoordinator(
+            journal,
+            targets,
+            legacy_target_sets=(
+                frozenset({"graph", "history", "cases"}),
+                frozenset({"graph", "history", "cases", "evidence", "receipts"}),
+                frozenset(
+                    {"graph", "history", "cases", "evidence", "receipts", "intent_proposals"}
+                ),
+                frozenset(
+                    {
+                        "graph",
+                        "history",
+                        "cases",
+                        "evidence",
+                        "receipts",
+                        "intent_proposals",
+                        "webauthn_credentials",
+                        "webauthn_challenges",
+                    }
+                ),
+                frozenset(
+                    {
+                        "graph",
+                        "history",
+                        "cases",
+                        "evidence",
+                        "receipts",
+                        "approvals",
+                        "intent_proposals",
+                        "webauthn_credentials",
+                        "webauthn_challenges",
+                    }
+                ),
+            ),
+        )
+        return AssessmentRuntime(
+            root=root,
+            config=config,
+            project_directory=project_directory,
+            workspace_directory=workspace_directory,
+            transactions=transactions,
+        )
+    except UnsafePathError as error:
+        if transactions is not None:
+            transactions.close()
+        if workspace_directory is not None:
+            workspace_directory.close()
+        if project_directory is not None:
+            project_directory.close()
+        raise ProjectNotInitialized("local project is not initialized") from error
+    except BaseException:
+        if transactions is not None:
+            transactions.close()
+        if workspace_directory is not None:
+            workspace_directory.close()
+        if project_directory is not None:
+            project_directory.close()
+        raise
+    finally:
+        for target in opened:
+            target.close()
+
+
+class CheckRuntimeAdapter:
+    """Lazy production adapter for the consolidated non-authoritative check service."""
+
+    def __init__(
+        self,
+        root: Path,
+        *,
+        principal_resolver: PrincipalResolver | None = None,
+        mcp_connector_resolver: McpConnectorResolver | None = None,
+        shared_state_restorer: SharedStateRestorer | None = None,
+        assurance_workspace: Path | None = None,
+    ) -> None:
+        self._root = Path(os.path.abspath(root))
+        self._runtime: Runtime | None = None
+        self._principal_resolver = principal_resolver
+        self._mcp_connector_resolver = mcp_connector_resolver
+        self._shared_state_restorer = shared_state_restorer
+        self._assurance_workspace = assurance_workspace
+
+    def _opened(self) -> Runtime:
+        if self._runtime is None:
+            self._runtime = load_runtime(self._root, assurance_workspace=self._assurance_workspace)
+        return self._runtime
+
+    @property
+    def repository_id(self) -> str:
+        return evidence_repository_id(self._opened().config)
+
+    @property
+    def principals(self) -> frozenset[str]:
+        runtime = self._opened()
+        if self._principal_resolver is None:
+            return frozenset({runtime.config.local_actor})
+        resolved = self._principal_resolver(runtime)
+        if type(resolved) is not frozenset or any(
+            type(value) is not str or not value for value in resolved
+        ):
+            raise ValueError("check principals are unavailable")
+        return resolved
+
+    def restore(self, *, require_shared: bool) -> SharedStateRestoreResult:
+        if require_shared:
+            if self._shared_state_restorer is None:
+                return SharedStateRestoreResult(status=SharedStateRestoreStatus.UNAVAILABLE)
+            result = self._shared_state_restorer.verify_and_restore_approved_baseline(self._root)
+            if type(result) is not SharedStateRestoreResult:
+                return SharedStateRestoreResult(status=SharedStateRestoreStatus.INVALID)
+            if result.status is not SharedStateRestoreStatus.VERIFIED:
+                return result
+        # CheckService runs the bounded immutable readiness guard next. Opening
+        # mutable stores here would read/recover unverified local state first.
+        return SharedStateRestoreResult(
+            status=(
+                SharedStateRestoreStatus.VERIFIED
+                if require_shared
+                else SharedStateRestoreStatus.NOT_REQUIRED
+            )
+        )
+
+    def ensure(self) -> EnsureResult:
+        readiness = load_readiness_runtime(self._root)
+        try:
+            return ReadinessService(readiness).ensure(EnsureRequest())
+        finally:
+            readiness.close()
+
+    def read_test_results(self, path: Path) -> bytes:
+        return (
+            self._opened()
+            .project_directory.read_relative(
+                path,
+                nonblocking=True,
+                max_bytes=MAX_TEST_RESULT_BYTES,
+            )
+            .content
+        )
+
+    def current_revision(self) -> str:
+        observer = self._test_observer()
+        try:
+            return observer.current_revision()
+        finally:
+            observer.close()
+
+    def _test_observer(self) -> DevObserver:
+        runtime = self._opened()
+        observer = DevObserver(
+            runtime.root,
+            runtime.config,
+            repository_id=self.repository_id,
+            principals=self.principals,
+        )
+        if self._assurance_workspace is not None:
+            try:
+                observer.require_immutable_execution()
+            except BaseException:
+                observer.close()
+                raise
+        return observer
+
+    def test_result_binding(self) -> TestResultBinding:
+        observer = self._test_observer()
+        try:
+            return observer.test_result_binding()
+        finally:
+            observer.close()
+
+    def require_ci_environment(self) -> None:
+        observer = self._test_observer()
+        try:
+            observer.require_immutable_execution()
+        finally:
+            observer.close()
+
+    async def run_reviewed_tests(self, command_id: str, *, at: datetime) -> TestResultArtifact:
+        observer = self._test_observer()
+        try:
+            result = await observer.run_reviewed_tests(command_id, at=at)
+        finally:
+            observer.close()
+        if result.status is not TestRunStatus.PASSED or result.artifact is None:
+            raise ValueError("reviewed test execution failed")
+        return result.artifact
+
+    async def capture(
+        self,
+        sources: tuple[str, ...],
+        test_result: TestResultArtifact | None,
+    ) -> SyncRunResult:
+        runtime = self._opened()
+        mcp_connectors: Sequence[Connector] = ()
+        if "mcp" in sources:
+            if self._mcp_connector_resolver is None:
+                raise ValueError("MCP connector selection is unavailable")
+            mcp_connectors = self._mcp_connector_resolver(runtime)
+        captured = await run_selected_sync(
+            runtime,
+            ",".join(sources),
+            new_run_id(),
+            mcp_connectors=mcp_connectors,
+        )
+        if test_result is None:
+            return captured
+        test_result_new = runtime.evidence_store.associate(
+            "test-results",
+            test_result.evidence(),
+        )
+        connector_results = {
+            **captured.connectors,
+            "test-results": ConnectorRunResult.succeeded(
+                evidence_added=int(test_result_new),
+                changes_applied=0,
+                cases_created=0,
+                checkpoint_advanced=False,
+            ),
+        }
+        return SyncRunResult.from_connector_results(
+            captured.run_id,
+            connector_results,
+            captured.duration_ms,
+        )
+
+    def validate(self) -> ValidationReport:
+        if self._assurance_workspace is not None:
+            directory = SecureDirectory.open(self._assurance_workspace.parent)
+            try:
+                return validate_project_directory(directory)
+            finally:
+                directory.close()
+        return validate_project_directory(self._opened().project_directory)
+
+    async def assure(self) -> SyncRunResult:
+        runtime = self._opened()
+        observations = AssuranceService(actor=runtime.config.local_actor).detect(
+            graph=runtime.graph_store.load(),
+            records=runtime.evidence(),
+            ingestions=runtime.evidence_store.ingestions(),
+            existing_cases=runtime.cases(),
+        )
+        status = SyncRunStatus.SUCCESS if not observations else SyncRunStatus.FAILED
+        return SyncRunResult(
+            run_id=new_run_id(),
+            status=status,
+            connectors={},
+            evidence_added=0,
+            changes_applied=0,
+            cases_created=0,
+            duration_ms=0,
+        )
+
+    def authorized_cases(self) -> tuple[ReconciliationCase, ...]:
+        runtime = self._opened()
+        records = runtime.evidence()
+        principals = self.principals
+        return tuple(
+            case
+            for case in runtime.cases()
+            if is_nonterminal_case_status(case.status)
+            and refs_allowed(case.all_evidence_refs, records, principals)
+        )
+
+    @staticmethod
+    def render_drift(cases: tuple[ReconciliationCase, ...]) -> str:
+        from intent_engineering.render import render_drift_report
+
+        return render_drift_report(cases)
+
+    def close(self) -> None:
+        if self._runtime is not None:
+            self._runtime.close()
+            self._runtime = None
 
 
 def resolve_connectors(

@@ -5,10 +5,12 @@ from __future__ import annotations
 import json
 import re
 import secrets
+import traceback
 from collections.abc import Awaitable, Callable
 from typing import Any, cast
-from urllib.parse import quote, urlsplit
+from urllib.parse import quote, unquote_to_bytes, urlsplit
 
+import anyio
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
 from starlette.requests import Request
@@ -18,16 +20,29 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from intent_engineering.control_plane.http_models import (
     MAX_HTTP_BODY_BYTES,
+    AssessmentNodeResponse,
+    AssessmentResponse,
     ClarificationAnswerDiscardRequest,
     ClarificationAnswerDiscardResponse,
     ClarificationAnswerPreviewRequest,
     ClarificationAnswerPreviewResponse,
     DecisionOptionsRequest,
     DecisionVerifyRequest,
+    EnrichmentAnswerRequest,
+    EnrichmentGapRequest,
+    EnrichmentProposalRequest,
+    EnrichmentProposalResponse,
+    EnrichmentSessionRequest,
+    EnrichmentSessionResponse,
+    EnrichmentStartRequest,
     InboxResponse,
     RegistrationOptionsRequest,
     RegistrationVerifyRequest,
+    ReviewedTestRunRequest,
     StatusResponse,
+    TeamEnrollmentCancelRequest,
+    TeamEnrollmentOptionsRequest,
+    TeamEnrollmentVerifyRequest,
     canonical_json_object,
     detach_response_mapping,
     parse_request_bytes,
@@ -35,8 +50,10 @@ from intent_engineering.control_plane.http_models import (
 )
 from intent_engineering.control_plane.models import CredentialRecord
 from intent_engineering.control_plane.service import ControlPlaneService
+from intent_engineering.team_state.models import RecipientRecord as TeamRecipientRecord
 
 _BODY_STATE_KEY = "intent.control-plane.raw-body"
+_QUERY_STATE_KEY = "intent.control-plane.query"
 _CSRF_COOKIE = "intent_csrf"
 _CSRF_HEADER = b"x-intent-csrf"
 _FIXED_ERROR = {
@@ -57,17 +74,72 @@ _CSP = (
     "style-src 'self'; connect-src 'self'"
 )
 _STATIC_METHODS = {
+    "/api/v1/team/membership": "GET",
+    **{
+        f"/api/v1/team/membership/{action}": "POST"
+        for action in (
+            "register-options",
+            "register-verify",
+            "preview",
+            "options",
+            "verify",
+            "cancel",
+            "create-invite",
+            "migration-preview",
+            "migration-restart",
+            "reconcile",
+            "restart",
+            "publish-preview",
+            "publish-options",
+            "publish-verify",
+            "publish-reconcile",
+            "publish-restart",
+        )
+    },
+    "/api/v1/assessment": "GET",
     "/api/v1/status": "GET",
     "/api/v1/inbox": "GET",
+    "/api/v1/development/observation": "GET",
+    "/api/v1/development/tests/run": "POST",
+    "/api/v1/enrichment/start": "POST",
+    "/api/v1/enrichment/current": "POST",
+    "/api/v1/enrichment/answer": "POST",
+    "/api/v1/enrichment/skip": "POST",
+    "/api/v1/enrichment/pause": "POST",
+    "/api/v1/enrichment/resume": "POST",
+    "/api/v1/enrichment/propose": "POST",
     "/api/v1/clarifications/answers/preview": "POST",
     "/api/v1/clarifications/answers/discard": "POST",
     "/api/v1/webauthn/register/options": "POST",
     "/api/v1/webauthn/register/verify": "POST",
+    "/api/v1/team/enrollment": "GET",
+    "/api/v1/team/enrollment/options": "POST",
+    "/api/v1/team/enrollment/verify": "POST",
+    "/api/v1/team/enrollment/cancel": "POST",
+    "/api/v1/team/publication/preview": "GET",
+    "/api/v1/team/setup": "GET",
+    **{
+        f"/api/v1/team/setup/{action}": "POST"
+        for action in (
+            "inspect",
+            "enroll",
+            "protection-preview",
+            "publication-preview",
+            "options",
+            "verify",
+            "cancel",
+        )
+    },
     "/api/v1/decisions/options": "POST",
     "/api/v1/decisions/verify": "POST",
 }
 _PROPOSAL_PATH = re.compile(r"^/api/v1/proposals/([A-Za-z0-9:._-]{1,512})$")
 _PROPOSAL_PREFIX = "/api/v1/proposals/"
+_ASSESSMENT_NODE_PATH = re.compile(r"^/api/v1/assessment/nodes/([A-Za-z0-9:._-]{1,512})$")
+_ASSESSMENT_NODE_PREFIX = "/api/v1/assessment/nodes/"
+_ASSESSMENT_REFERENCE = re.compile(r"^[A-Za-z0-9:._-]{1,512}$")
+_ASSESSMENT_CURSOR = re.compile(r"^page:[0-9a-f]{64}:[1-9][0-9]{0,3}$")
+_MAX_RAW_TARGET_BYTES = 4_096
 _CSRF_VALUE = re.compile(r"^[A-Za-z0-9_-]{1,512}$")
 
 
@@ -179,18 +251,74 @@ def _expected_method(path: str) -> str:
         return method
     if _PROPOSAL_PATH.fullmatch(path) is not None:
         return "GET"
+    if _ASSESSMENT_NODE_PATH.fullmatch(path) is not None:
+        return "GET"
     raise _HttpBoundaryError(404)
 
 
 def _canonical_raw_path(path: str) -> bytes:
     proposal = _PROPOSAL_PATH.fullmatch(path)
-    if proposal is None:
+    assessment_node = _ASSESSMENT_NODE_PATH.fullmatch(path)
+    if proposal is None and assessment_node is None:
         try:
             return path.encode("ascii")
         except UnicodeError:
             raise _HttpBoundaryError(404) from None
-    identifier = proposal.group(1)
-    return f"{_PROPOSAL_PREFIX}{quote(identifier, safe='._-')}".encode("ascii")
+    if proposal is not None:
+        identifier = proposal.group(1)
+        prefix = _PROPOSAL_PREFIX
+    else:
+        if assessment_node is None:  # pragma: no cover - narrowed above
+            raise _HttpBoundaryError(404)
+        identifier = assessment_node.group(1)
+        prefix = _ASSESSMENT_NODE_PREFIX
+    return f"{prefix}{quote(identifier, safe='._-')}".encode("ascii")
+
+
+def _assessment_query(path: str, query: bytes) -> dict[str, str]:
+    if path != "/api/v1/assessment":
+        if query:
+            raise _HttpBoundaryError(400)
+        return {}
+    if not query:
+        return {}
+    if len(query) > _MAX_RAW_TARGET_BYTES:
+        raise _HttpBoundaryError(414)
+    result: dict[str, str] = {}
+    parts = query.split(b"&")
+    if len(parts) > 2:
+        raise _HttpBoundaryError(400)
+    for part in parts:
+        name, separator, raw_value = part.partition(b"=")
+        if separator != b"=" or name not in {b"focus", b"cursor"}:
+            raise _HttpBoundaryError(400)
+        key = name.decode("ascii")
+        if key in result or not raw_value:
+            raise _HttpBoundaryError(400)
+        try:
+            decoded_bytes = unquote_to_bytes(raw_value)
+            decoded = decoded_bytes.decode("ascii", errors="strict")
+        except (UnicodeError, ValueError):
+            raise _HttpBoundaryError(400) from None
+        if raw_value != quote(decoded, safe="._-").encode("ascii"):
+            raise _HttpBoundaryError(400)
+        if key == "focus":
+            if (
+                _ASSESSMENT_REFERENCE.fullmatch(decoded) is None
+                or len(decoded.encode("utf-8")) > 512
+            ):
+                raise _HttpBoundaryError(400)
+        elif _ASSESSMENT_CURSOR.fullmatch(decoded) is None:
+            raise _HttpBoundaryError(400)
+        result[key] = decoded
+    expected = b"&".join(
+        name.encode("ascii") + b"=" + quote(result[name], safe="._-").encode("ascii")
+        for name in ("focus", "cursor")
+        if name in result
+    )
+    if query != expected:
+        raise _HttpBoundaryError(400)
+    return result
 
 
 def _validate_scope_and_headers(
@@ -199,7 +327,7 @@ def _validate_scope_and_headers(
     expected_host: bytes,
     expected_origin: bytes,
     csrf_secret: bytes,
-) -> tuple[list[tuple[bytes, bytes]], int | None]:
+) -> tuple[list[tuple[bytes, bytes]], int | None, dict[str, str]]:
     headers: list[tuple[bytes, bytes]] = []
     try:
         if type(scope) is not dict or scope.get("type") != "http":
@@ -214,14 +342,16 @@ def _validate_scope_and_headers(
             or type(path) is not str
             or type(raw_path) is not bytes
             or type(query) is not bytes
-            or query
         ):
             raise _HttpBoundaryError(400)
+        if len(raw_path) + len(query) + (1 if query else 0) > _MAX_RAW_TARGET_BYTES:
+            raise _HttpBoundaryError(414)
         if type(scheme) is not str or scheme != "http":
             raise _HttpBoundaryError(403)
         required_method = _expected_method(path)
         if raw_path != _canonical_raw_path(path):
             raise _HttpBoundaryError(404)
+        query_values = _assessment_query(path, query)
         if method != required_method:
             raise _HttpBoundaryError(405)
         raw_headers = scope.get("headers")
@@ -267,7 +397,7 @@ def _validate_scope_and_headers(
                 raise _HttpBoundaryError(403)
         elif content_types or (length is not None and length != 0):
             raise _HttpBoundaryError(400)
-        return headers, length
+        return headers, length, query_values
     except _HttpBoundaryError:
         raise
     except (KeyError, TypeError, UnicodeError, ValueError):
@@ -431,16 +561,14 @@ class _StrictLoopbackMiddleware:
         state: dict[str, object] | None = None
         secured_send: Send | None = None
         signal: BaseException | None = None
-        trusted = False
         failure_status: int | None = None
         try:
-            headers, length = _validate_scope_and_headers(
+            headers, length, query_values = _validate_scope_and_headers(
                 scope,
                 expected_host=self._expected_host,
                 expected_origin=self._expected_origin,
                 csrf_secret=self._csrf_bytes,
             )
-            trusted = True
             body = await _read_body(receive, length)
             if scope["method"] == "GET" and body:
                 raise _HttpBoundaryError(400)
@@ -452,10 +580,11 @@ class _StrictLoopbackMiddleware:
                 state = raw_state
             else:
                 raise _HttpBoundaryError(400)
-            if _BODY_STATE_KEY in state:
+            if _BODY_STATE_KEY in state or _QUERY_STATE_KEY in state:
                 raise _HttpBoundaryError(400)
             state[_BODY_STATE_KEY] = body
-            secured_send = _secure_sender(send, self._csrf_secret, set_cookie=True)
+            state[_QUERY_STATE_KEY] = query_values
+            secured_send = _secure_sender(send, self._csrf_secret, set_cookie=False)
             await self._app(scope, _empty_receive, secured_send)
         except _HttpBoundaryError as error:
             failure_status = error.status_code
@@ -470,6 +599,7 @@ class _StrictLoopbackMiddleware:
             body.clear()
             if state is not None:
                 state.pop(_BODY_STATE_KEY, None)
+                state.pop(_QUERY_STATE_KEY, None)
             headers.clear()
             scope = {}
             receive = cast(Receive, None)
@@ -485,7 +615,7 @@ class _StrictLoopbackMiddleware:
             error_send = _secure_sender(
                 downstream_send,
                 self._csrf_secret,
-                set_cookie=trusted,
+                set_cookie=False,
             )
             error_signal: BaseException | None = None
             try:
@@ -514,6 +644,18 @@ def _request_bytes(request: Request) -> bytes:
     return bytes(value)
 
 
+def _request_query(request: Request) -> dict[str, str]:
+    state = request.scope.get("state")
+    if type(state) is not dict:
+        raise _HandlerRequestError()
+    value = state.get(_QUERY_STATE_KEY)
+    if type(value) is not dict or any(
+        type(key) is not str or type(item) is not str for key, item in value.items()
+    ):
+        raise _HandlerRequestError()
+    return cast(dict[str, str], value)
+
+
 def _scrub_request(request: Request | None) -> None:
     if request is None:
         return
@@ -524,6 +666,9 @@ def _scrub_request(request: Request | None) -> None:
             if body:
                 body[:] = b"\x00" * len(body)
             body.clear()
+        query = state.pop(_QUERY_STATE_KEY, None)
+        if type(query) is dict:
+            query.clear()
     if hasattr(request, "_body"):
         request._body = b""
 
@@ -593,9 +738,33 @@ def _raise_signal(signal: BaseException | None) -> None:
         raise signal.with_traceback(None)
 
 
+def _scrub_enrichment_signal(error: BaseException) -> BaseException:
+    old_traceback = error.__traceback__
+    error.args = ()
+    error.__dict__.clear()
+    error.__traceback__ = None
+    error.__cause__ = None
+    error.__context__ = None
+    if old_traceback is not None:
+        traceback.clear_frames(old_traceback)
+    old_traceback = None
+    return error
+
+
 def _proposal_id(request: Request) -> str:
     value = request.path_params.get("proposal_id")
     if type(value) is not str or _PROPOSAL_PATH.fullmatch(f"/api/v1/proposals/{value}") is None:
+        raise _HandlerRequestError()
+    return value
+
+
+def _assessment_node_id(request: Request) -> str:
+    value = request.path_params.get("node_id")
+    if (
+        type(value) is not str
+        or _ASSESSMENT_NODE_PATH.fullmatch(f"{_ASSESSMENT_NODE_PREFIX}{value}") is None
+        or len(value.encode("utf-8")) > 512
+    ):
         raise _HandlerRequestError()
     return value
 
@@ -616,6 +785,8 @@ def _end_handler(
 def _make_handlers(
     service: ControlPlaneService,
 ) -> dict[str, Callable[[Request], Awaitable[Response]]]:
+    membership_guard = anyio.Lock()
+
     async def status_endpoint(request: Request) -> Response:
         response: Response | None = None
         signal: BaseException | None = None
@@ -634,6 +805,138 @@ def _make_handlers(
             result = None
         return _end_handler(request, signal, response)
 
+    async def assessment_endpoint(request: Request) -> Response:
+        response: Response | None = None
+        signal: BaseException | None = None
+        result: dict[str, object] | None = None
+        detached: AssessmentResponse | None = None
+        query: dict[str, str] = {}
+        try:
+            query = _request_query(request)
+            result = service.assessment(
+                query.get("focus"),
+                page_cursor=query.get("cursor"),
+            )
+            detached = AssessmentResponse.model_validate(result)
+            response = _json_response(detached.model_dump(mode="json"))
+        except _HandlerRequestError:
+            response = _fixed_response(400)
+        except Exception:  # noqa: BLE001 - fixed browser boundary
+            response = _fixed_response(503)
+        except BaseException as caught:  # noqa: BLE001 - scrub exact cancellation path
+            caught.__traceback__ = None
+            caught.__cause__ = None
+            caught.__context__ = None
+            signal = caught
+        finally:
+            query.clear()
+            result = None
+            detached = None
+        return _end_handler(request, signal, response)
+
+    async def assessment_node_endpoint(request: Request) -> Response:
+        response: Response | None = None
+        signal: BaseException | None = None
+        result: dict[str, object] | None = None
+        detached: AssessmentNodeResponse | None = None
+        node_id = ""
+        try:
+            node_id = _assessment_node_id(request)
+            result = service.assessment_node(node_id)
+            detached = AssessmentNodeResponse.model_validate(result)
+            response = _json_response(detached.model_dump(mode="json"))
+        except (_HandlerRequestError, LookupError):
+            response = _fixed_response(404)
+        except Exception:  # noqa: BLE001 - fixed browser boundary
+            response = _fixed_response(503)
+        except BaseException as caught:  # noqa: BLE001 - scrub exact cancellation path
+            caught.__traceback__ = None
+            caught.__cause__ = None
+            caught.__context__ = None
+            signal = caught
+        finally:
+            node_id = ""
+            result = None
+            detached = None
+        return _end_handler(request, signal, response)
+
+    async def enrichment_endpoint(request: Request) -> Response:
+        response: Response | None = None
+        signal: BaseException | None = None
+        model: object = None
+        result: dict[str, object] | None = None
+        detached: object = None
+        action = request.url.path.rpartition("/")[2]
+        try:
+            if action == "start":
+                model = _parse_body(request, EnrichmentStartRequest)
+                start = cast(EnrichmentStartRequest, model)
+                result = service.enrichment_start(start.minutes, start.focus)
+                detached = EnrichmentSessionResponse.model_validate(result)
+            elif action == "current":
+                model = _parse_body(request, EnrichmentSessionRequest)
+                current = cast(EnrichmentSessionRequest, model)
+                result = service.enrichment_current(current.session_id)
+                detached = EnrichmentSessionResponse.model_validate(result)
+            elif action == "answer":
+                model = _parse_body(request, EnrichmentAnswerRequest)
+                answered = cast(EnrichmentAnswerRequest, model)
+                result = service.enrichment_answer(
+                    answered.session_id,
+                    answered.gap_id,
+                    answered.answer,
+                )
+                detached = EnrichmentSessionResponse.model_validate(result)
+            elif action == "skip":
+                model = _parse_body(request, EnrichmentGapRequest)
+                skipped = cast(EnrichmentGapRequest, model)
+                result = service.enrichment_skip(skipped.session_id, skipped.gap_id)
+                detached = EnrichmentSessionResponse.model_validate(result)
+            elif action == "pause":
+                model = _parse_body(request, EnrichmentSessionRequest)
+                paused = cast(EnrichmentSessionRequest, model)
+                result = service.enrichment_pause(paused.session_id)
+                detached = EnrichmentSessionResponse.model_validate(result)
+            elif action == "resume":
+                model = _parse_body(request, EnrichmentSessionRequest)
+                resumed = cast(EnrichmentSessionRequest, model)
+                result = service.enrichment_resume(resumed.session_id)
+                detached = EnrichmentSessionResponse.model_validate(result)
+            elif action == "propose":
+                model = _parse_body(request, EnrichmentProposalRequest)
+                proposed = cast(EnrichmentProposalRequest, model)
+                result = service.enrichment_propose(proposed.session_id, proposed.submission)
+                detached = EnrichmentProposalResponse.model_validate(result)
+            else:  # pragma: no cover - exact static routes only
+                raise _HandlerRequestError()
+            response = _json_response(cast(Any, detached).model_dump(mode="json"))
+        except _HandlerRequestError:
+            response = _fixed_response(400)
+        except Exception:  # noqa: BLE001 - fixed browser boundary
+            response = _fixed_response(503)
+        except BaseException as caught:  # noqa: BLE001 - preserve cancellation identity
+            signal = _scrub_enrichment_signal(caught)
+        finally:
+            action = ""
+            if "answered" in locals():
+                answered = cast(EnrichmentAnswerRequest, None)
+            if "start" in locals():
+                start = cast(EnrichmentStartRequest, None)
+            if "current" in locals():
+                current = cast(EnrichmentSessionRequest, None)
+            if "skipped" in locals():
+                skipped = cast(EnrichmentGapRequest, None)
+            if "paused" in locals():
+                paused = cast(EnrichmentSessionRequest, None)
+            if "resumed" in locals():
+                resumed = cast(EnrichmentSessionRequest, None)
+            if "proposed" in locals():
+                proposed = cast(EnrichmentProposalRequest, None)
+            model = None
+            result = None
+            detached = None
+        return _end_handler(request, signal, response)
+
     async def inbox_endpoint(request: Request) -> Response:
         response: Response | None = None
         signal: BaseException | None = None
@@ -649,6 +952,47 @@ def _make_handlers(
             caught.__context__ = None
             signal = caught
         finally:
+            result = None
+        return _end_handler(request, signal, response)
+
+    async def development_observation_endpoint(request: Request) -> Response:
+        response: Response | None = None
+        signal: BaseException | None = None
+        result: object = None
+        try:
+            result = service.development_observation()
+            response = _json_response(result.model_dump(mode="json"))
+        except Exception:  # noqa: BLE001 - fixed browser boundary
+            response = _fixed_response(503)
+        except BaseException as caught:  # noqa: BLE001 - scrub exact cancellation path
+            caught.__traceback__ = None
+            caught.__cause__ = None
+            caught.__context__ = None
+            signal = caught
+        finally:
+            result = None
+        return _end_handler(request, signal, response)
+
+    async def reviewed_tests_endpoint(request: Request) -> Response:
+        response: Response | None = None
+        signal: BaseException | None = None
+        model: ReviewedTestRunRequest | None = None
+        result: object = None
+        try:
+            model = cast(ReviewedTestRunRequest, _parse_body(request, ReviewedTestRunRequest))
+            result = await service.run_reviewed_tests(model.command_id)
+            response = _json_response(result.model_dump(mode="json"))
+        except _HandlerRequestError:
+            response = _fixed_response(400)
+        except Exception:  # noqa: BLE001 - fixed browser boundary
+            response = _fixed_response(503)
+        except BaseException as caught:  # noqa: BLE001 - scrub exact cancellation path
+            caught.__traceback__ = None
+            caught.__cause__ = None
+            caught.__context__ = None
+            signal = caught
+        finally:
+            model = None
             result = None
         return _end_handler(request, signal, response)
 
@@ -788,6 +1132,230 @@ def _make_handlers(
                 detached = cast(CredentialRecord, None)
         return _end_handler(request, signal, response)
 
+    async def membership_endpoint(request: Request) -> Response:
+        from intent_engineering.control_plane.team_enrollment import (
+            MembershipSession,
+            enrollment_status,
+            load_enrollment_request,
+        )
+
+        response: Response | None = None
+        signal: BaseException | None = None
+        body = None
+        try:
+            async with membership_guard:
+                if request.url.path == "/api/v1/team/membership":
+                    result = enrollment_status(service._runtime)
+                else:
+                    from intent_engineering.storage.jsonl.strict import loads_strict_object
+
+                    body = loads_strict_object(_request_bytes(request).decode())
+                    action = request.url.path.rsplit("/", 1)[-1]
+                    if set(body) not in (
+                        {"session_id"},
+                        {"session_id", "response"},
+                    ) or not isinstance(body["session_id"], str):
+                        raise _HandlerRequestError()
+                    if re.fullmatch(r"[0-9a-f]{64}", body["session_id"]) is None:
+                        raise _HandlerRequestError()
+                    if ("response" in body) != (
+                        action in {"verify", "register-verify", "publish-verify"}
+                    ):
+                        raise _HandlerRequestError()
+                    authoritative = load_enrollment_request(service._runtime)
+                    active = service._membership_session
+                    if active is not None and active.request != authoritative:
+                        active.close()
+                        service._membership_session = None
+                    if service._membership_session is None:
+                        service._membership_session = MembershipSession(service)
+                    result = await service._membership_session.action(
+                        action,
+                        body["session_id"],
+                        response=(
+                            canonical_json_object(body["response"]) if "response" in body else b""
+                        ),
+                    )
+                    if action == "cancel":
+                        service._membership_session.close()
+                        service._membership_session = None
+            response = _json_response(result)
+        except _HandlerRequestError:
+            response = _fixed_response(400)
+        except Exception:  # noqa: BLE001 - fixed enrollment HTTP boundary
+            response = _fixed_response(503)
+        except BaseException as caught:  # noqa: BLE001 - preserve scrubbed cancellation
+            caught.__traceback__ = None
+            caught.__cause__ = None
+            caught.__context__ = None
+            signal = caught
+        finally:
+            body = None
+        return _end_handler(request, signal, response)
+
+    async def github_setup_endpoint(request: Request) -> Response:
+        response: Response | None = None
+        signal: BaseException | None = None
+        encoded = b""
+        model: (
+            RegistrationOptionsRequest | DecisionOptionsRequest | DecisionVerifyRequest | None
+        ) = None
+        result: dict[str, object] | None = None
+        try:
+            if request.url.path == "/api/v1/team/setup":
+                result = service.github_setup_status()
+            else:
+                action = request.url.path.rsplit("/", 1)[-1]
+                if action == "options":
+                    model = cast(
+                        DecisionOptionsRequest, _parse_body(request, DecisionOptionsRequest)
+                    )
+                    result = await service.github_setup_action(action, payload=model.payload)
+                elif action == "verify":
+                    model = cast(DecisionVerifyRequest, _parse_body(request, DecisionVerifyRequest))
+                    encoded = canonical_json_object(model.response)
+                    result = await service.github_setup_action(
+                        action, payload=model.payload, response=encoded
+                    )
+                else:
+                    model = cast(
+                        RegistrationOptionsRequest, _parse_body(request, RegistrationOptionsRequest)
+                    )
+                    result = await service.github_setup_action(action)
+            response = _json_response(result)
+        except _HandlerRequestError:
+            response = _fixed_response(400)
+        except Exception:  # noqa: BLE001 - fixed browser boundary
+            response = _fixed_response(503)
+        except BaseException as caught:  # noqa: BLE001 - preserve scrubbed cancellation
+            caught.__traceback__ = None
+            caught.__cause__ = None
+            caught.__context__ = None
+            signal = caught
+        finally:
+            encoded = b""
+            model = None
+            result = None
+        return _end_handler(request, signal, response)
+
+    async def team_enrollment_status_endpoint(request: Request) -> Response:
+        response: Response | None = None
+        signal: BaseException | None = None
+        result: dict[str, object] | None = None
+        try:
+            result = service.team_enrollment_status()
+            response = _json_response(result)
+        except Exception:  # noqa: BLE001 - fixed browser boundary
+            response = _fixed_response(503)
+        except BaseException as caught:  # noqa: BLE001 - scrub exact cancellation path
+            caught.__traceback__ = None
+            caught.__cause__ = None
+            caught.__context__ = None
+            signal = caught
+        finally:
+            result = None
+        return _end_handler(request, signal, response)
+
+    async def team_publication_preview_endpoint(request: Request) -> Response:
+        response: Response | None = None
+        signal: BaseException | None = None
+        result: dict[str, object] | None = None
+        try:
+            result = service.team_publication_preview()
+            response = _json_response(result)
+        except Exception:  # noqa: BLE001 - fixed browser boundary
+            response = _fixed_response(503)
+        except BaseException as caught:  # noqa: BLE001 - preserve cancellation identity
+            caught.__traceback__ = None
+            caught.__cause__ = None
+            caught.__context__ = None
+            signal = caught
+        finally:
+            result = None
+        return _end_handler(request, signal, response)
+
+    async def team_enrollment_options_endpoint(request: Request) -> Response:
+        response: Response | None = None
+        signal: BaseException | None = None
+        model: TeamEnrollmentOptionsRequest | None = None
+        proof = b""
+        options = b""
+        try:
+            model = cast(
+                TeamEnrollmentOptionsRequest,
+                _parse_body(request, TeamEnrollmentOptionsRequest),
+            )
+            proof = model.identity_proof.encode("utf-8")
+            options = service.team_enrollment_options(proof)
+            response = _json_response(parse_response_bytes(options))
+        except _HandlerRequestError:
+            response = _fixed_response(400)
+        except Exception:  # noqa: BLE001 - fixed browser boundary
+            response = _fixed_response(503)
+        except BaseException as caught:  # noqa: BLE001 - scrub exact cancellation path
+            caught.__traceback__ = None
+            caught.__cause__ = None
+            caught.__context__ = None
+            signal = caught
+        finally:
+            model = None
+            proof = b""
+            options = b""
+        return _end_handler(request, signal, response)
+
+    async def team_enrollment_verify_endpoint(request: Request) -> Response:
+        response: Response | None = None
+        signal: BaseException | None = None
+        model: TeamEnrollmentVerifyRequest | None = None
+        encoded_response = b""
+        recipient: TeamRecipientRecord | None = None
+        try:
+            model = cast(
+                TeamEnrollmentVerifyRequest,
+                _parse_body(request, TeamEnrollmentVerifyRequest),
+            )
+            encoded_response = canonical_json_object(model.response)
+            enrolled = service.complete_team_enrollment(encoded_response)
+            recipient = TeamRecipientRecord.model_validate(enrolled.model_dump(mode="python"))
+            response = _json_response(recipient.model_dump(mode="json"))
+        except _HandlerRequestError:
+            response = _fixed_response(400)
+        except Exception:  # noqa: BLE001 - fixed browser boundary
+            response = _fixed_response(503)
+        except BaseException as caught:  # noqa: BLE001 - scrub exact cancellation path
+            caught.__traceback__ = None
+            caught.__cause__ = None
+            caught.__context__ = None
+            signal = caught
+        finally:
+            model = None
+            encoded_response = b""
+            recipient = None
+            if "enrolled" in locals():
+                enrolled = cast(TeamRecipientRecord, None)
+        return _end_handler(request, signal, response)
+
+    async def team_enrollment_cancel_endpoint(request: Request) -> Response:
+        response: Response | None = None
+        signal: BaseException | None = None
+        result: dict[str, object] | None = None
+        try:
+            _parse_body(request, TeamEnrollmentCancelRequest)
+            result = service.cancel_team_enrollment()
+            response = _json_response(result)
+        except _HandlerRequestError:
+            response = _fixed_response(400)
+        except Exception:  # noqa: BLE001 - fixed browser boundary
+            response = _fixed_response(503)
+        except BaseException as caught:  # noqa: BLE001 - scrub exact cancellation path
+            caught.__traceback__ = None
+            caught.__cause__ = None
+            caught.__context__ = None
+            signal = caught
+        finally:
+            result = None
+        return _end_handler(request, signal, response)
+
     async def decision_options_endpoint(request: Request) -> Response:
         response: Response | None = None
         signal: BaseException | None = None
@@ -838,13 +1406,25 @@ def _make_handlers(
         return _end_handler(request, signal, response)
 
     return {
+        "assessment": assessment_endpoint,
+        "assessment_node": assessment_node_endpoint,
+        "enrichment": enrichment_endpoint,
         "status": status_endpoint,
         "inbox": inbox_endpoint,
+        "development_observation": development_observation_endpoint,
+        "reviewed_tests": reviewed_tests_endpoint,
         "proposal": proposal_endpoint,
         "clarification_answer_preview": clarification_answer_preview_endpoint,
         "clarification_answer_discard": clarification_answer_discard_endpoint,
         "registration_options": registration_options_endpoint,
         "registration_verify": registration_verify_endpoint,
+        "team_enrollment_status": team_enrollment_status_endpoint,
+        "github_setup": github_setup_endpoint,
+        "team_enrollment_options": team_enrollment_options_endpoint,
+        "team_enrollment_verify": team_enrollment_verify_endpoint,
+        "team_enrollment_cancel": team_enrollment_cancel_endpoint,
+        "team_publication_preview": team_publication_preview_endpoint,
+        "membership": membership_endpoint,
         "decision_options": decision_options_endpoint,
         "decision_verify": decision_verify_endpoint,
     }
@@ -872,8 +1452,67 @@ def build_control_plane_app(
     app = Starlette(
         debug=False,
         routes=[
+            Route("/api/v1/team/membership", handlers["membership"], methods=["GET"]),
+            *[
+                Route(f"/api/v1/team/membership/{action}", handlers["membership"], methods=["POST"])
+                for action in (
+                    "register-options",
+                    "register-verify",
+                    "preview",
+                    "options",
+                    "verify",
+                    "cancel",
+                    "create-invite",
+                    "migration-preview",
+                    "migration-restart",
+                    "reconcile",
+                    "restart",
+                    "publish-preview",
+                    "publish-options",
+                    "publish-verify",
+                    "publish-reconcile",
+                    "publish-restart",
+                )
+            ],
+            Route("/api/v1/assessment", handlers["assessment"], methods=["GET"]),
+            Route(
+                "/api/v1/assessment/nodes/{node_id}",
+                handlers["assessment_node"],
+                methods=["GET"],
+            ),
+            *[
+                Route(
+                    f"/api/v1/enrichment/{action}",
+                    handlers["enrichment"],
+                    methods=["POST"],
+                )
+                for action in ("start", "current", "answer", "skip", "pause", "resume", "propose")
+            ],
+            Route("/api/v1/team/setup", handlers["github_setup"], methods=["GET"]),
+            *[
+                Route(f"/api/v1/team/setup/{action}", handlers["github_setup"], methods=["POST"])
+                for action in (
+                    "inspect",
+                    "enroll",
+                    "protection-preview",
+                    "publication-preview",
+                    "options",
+                    "verify",
+                    "cancel",
+                )
+            ],
             Route("/api/v1/status", handlers["status"], methods=["GET"]),
             Route("/api/v1/inbox", handlers["inbox"], methods=["GET"]),
+            Route(
+                "/api/v1/development/observation",
+                handlers["development_observation"],
+                methods=["GET"],
+            ),
+            Route(
+                "/api/v1/development/tests/run",
+                handlers["reviewed_tests"],
+                methods=["POST"],
+            ),
             Route(
                 "/api/v1/proposals/{proposal_id}",
                 handlers["proposal"],
@@ -898,6 +1537,31 @@ def build_control_plane_app(
                 "/api/v1/webauthn/register/verify",
                 handlers["registration_verify"],
                 methods=["POST"],
+            ),
+            Route(
+                "/api/v1/team/enrollment",
+                handlers["team_enrollment_status"],
+                methods=["GET"],
+            ),
+            Route(
+                "/api/v1/team/enrollment/options",
+                handlers["team_enrollment_options"],
+                methods=["POST"],
+            ),
+            Route(
+                "/api/v1/team/enrollment/verify",
+                handlers["team_enrollment_verify"],
+                methods=["POST"],
+            ),
+            Route(
+                "/api/v1/team/enrollment/cancel",
+                handlers["team_enrollment_cancel"],
+                methods=["POST"],
+            ),
+            Route(
+                "/api/v1/team/publication/preview",
+                handlers["team_publication_preview"],
+                methods=["GET"],
             ),
             Route(
                 "/api/v1/decisions/options",

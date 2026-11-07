@@ -100,7 +100,7 @@ def _invoke(raw: bytes) -> bytes:
     selector = selectors.DefaultSelector()
     try:
         process = subprocess.Popen(
-            ["intent", "agent-prompt-hook"],
+            ["intent", "agent-prompt-hook", "--preset", "developer"],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
