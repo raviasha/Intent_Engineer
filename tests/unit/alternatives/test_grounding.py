@@ -1,0 +1,80 @@
+"""Grounding must remain bounded to one visible intent branch."""
+
+import pytest
+
+from intent_engineering.alternatives.grounding import (
+    AlternativeRequestBuilder,
+    AlternativeSubjectUnavailable,
+)
+from intent_engineering.alternatives.models import AlternativeMode, AlternativeUnavailable
+from tests.unit.alternatives.fixtures import assessment_pair
+
+
+def test_request_contains_only_visible_bounded_intent_and_requirement_grounding() -> None:
+    snapshot, report = assessment_pair()
+    request = AlternativeRequestBuilder().build(
+        snapshot=snapshot,
+        report=report,
+        subject_ref="req:export",
+        requested_modes=(AlternativeMode.CHANGE_APPROACH,),
+    )
+    encoded = request.model_dump_json()
+
+    assert request.intent_refs == ("intent:portable-report",)
+    assert request.desired_outcome_refs == ("outcome:portable-report",)
+    assert request.constraint_refs == ("constraint:weekly",)
+    assert request.evidence_summaries[0].evidence_ref == "evidence:visible"
+    assert "PRIVATE-SENTINEL" not in encoded
+    assert "/private/workspace" not in encoded
+    assert len(encoded.encode("utf-8")) <= 64 * 1024
+
+
+def test_hidden_and_unknown_subjects_have_one_fixed_result() -> None:
+    snapshot, report = assessment_pair()
+    builder = AlternativeRequestBuilder()
+
+    assert (
+        builder.try_build(snapshot=snapshot, report=report, subject_ref="req:hidden")
+        == AlternativeUnavailable.SUBJECT_UNAVAILABLE
+    )
+    assert (
+        builder.try_build(snapshot=snapshot, report=report, subject_ref="req:unknown")
+        == AlternativeUnavailable.SUBJECT_UNAVAILABLE
+    )
+    with pytest.raises(
+        AlternativeSubjectUnavailable, match="alternative subject unavailable"
+    ) as captured:
+        builder.build(snapshot=snapshot, report=report, subject_ref="req:unknown")
+    assert captured.value.__context__ is None
+
+
+def test_builder_rejects_mismatched_report_before_using_subject_data() -> None:
+    snapshot, report = assessment_pair()
+    material = report.model_dump()
+    material["graph_digest"] = "sha256:" + "f" * 64
+    mismatched = report.model_validate(material)
+
+    with pytest.raises(AlternativeSubjectUnavailable, match="alternative subject unavailable"):
+        AlternativeRequestBuilder().build(
+            snapshot=snapshot,
+            report=mismatched,
+            subject_ref="req:export",
+        )
+
+
+def test_builder_requires_exact_strings_and_explicit_modes() -> None:
+    snapshot, report = assessment_pair()
+
+    with pytest.raises(AlternativeSubjectUnavailable):
+        AlternativeRequestBuilder().build(
+            snapshot=snapshot,
+            report=report,
+            subject_ref=True,  # type: ignore[arg-type]
+        )
+    with pytest.raises(AlternativeSubjectUnavailable):
+        AlternativeRequestBuilder().build(
+            snapshot=snapshot,
+            report=report,
+            subject_ref="req:export",
+            requested_modes=(),
+        )
