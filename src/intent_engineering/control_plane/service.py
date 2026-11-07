@@ -2429,17 +2429,24 @@ class ControlPlaneService:
         service = self._confirmation_service(authority)
         try:
             proposal = self._runtime.intent_proposals.get(proposal_id)
-            if not isinstance(proposal, ClarificationIntentProposal):
-                raise TypeError("clarification proposal unavailable")
-            allowed = tuple(sorted(proposal.core_node_ids))
-            if not selected:
-                selected = allowed
-            if (
-                not selected
-                or tuple(sorted(set(selected))) != selected
-                or not set(selected).issubset(set(allowed))
-            ):
-                raise ValueError("proposal selection unavailable")
+            if proposal.kind is not ProposalKind.REQUIREMENT:
+                raise TypeError("requirement proposal unavailable")
+            if isinstance(proposal, ClarificationIntentProposal):
+                allowed = tuple(sorted(proposal.core_node_ids))
+                if not selected:
+                    selected = allowed
+                if (
+                    not selected
+                    or tuple(sorted(set(selected))) != selected
+                    or not set(selected).issubset(set(allowed))
+                ):
+                    raise ValueError("proposal selection unavailable")
+            else:
+                allowed = ProposalConfirmationService._selectable_node_ids(proposal)
+                if not selected:
+                    selected = allowed
+                if selected != allowed or not selected:
+                    raise ValueError("requirement update selection unavailable")
             authenticated = service.preview_confirmation(
                 proposal_id,
                 proposal_digest=proposal.digest,
@@ -2447,15 +2454,17 @@ class ControlPlaneService:
                 at=at,
                 selected_node_ids=selected,
             )
-            if authenticated.high_risk or authenticated.review_case is not None:
-                raise ValueError("conflicting proposal requires a case decision")
             if authenticated.proposal != proposal or authenticated.selected_node_ids != selected:
                 raise ValueError("proposal confirmation preview changed")
             changeset = authenticated.activation_changeset
         finally:
             service.close()
         body: dict[str, object] = {
-            "kind": "clarification_proposal",
+            "kind": (
+                "clarification_proposal"
+                if isinstance(proposal, ClarificationIntentProposal)
+                else "requirement_alternative_proposal"
+            ),
             "proposal": {
                 **proposal.model_dump(mode="json"),
                 "proposal_digest": proposal.digest,
@@ -2464,6 +2473,18 @@ class ControlPlaneService:
             "result_changeset_id": changeset.id,
             "result_changeset_digest": _digest(changeset.model_dump(mode="json")),
         }
+        if not isinstance(proposal, ClarificationIntentProposal):
+            body.update(
+                {
+                    "high_risk": authenticated.high_risk,
+                    "risk_reasons": list(authenticated.risk_reasons),
+                    "review_case": (
+                        None
+                        if authenticated.review_case is None
+                        else authenticated.review_case.model_dump(mode="json")
+                    ),
+                }
+            )
         return _DecisionMaterial(
             DecisionSubject(kind="proposal", id=proposal.id),
             proposal.digest,
@@ -2697,9 +2718,10 @@ class ControlPlaneService:
             if proposal_id.startswith("proposal:"):
                 proposal = self._runtime.intent_proposals.get(proposal_id)
                 action = (
-                    DecisionAction.CONFIRM_PROPOSAL
-                    if isinstance(proposal, ClarificationIntentProposal)
-                    else DecisionAction.CONFIRM_BASELINE
+                    DecisionAction.CONFIRM_BASELINE
+                    if proposal.kind is ProposalKind.BOOTSTRAP
+                    and not isinstance(proposal, ClarificationIntentProposal)
+                    else DecisionAction.CONFIRM_PROPOSAL
                 )
             elif proposal_id.startswith("case:"):
                 action = DecisionAction.RESOLVE_CONFLICT
@@ -3130,7 +3152,20 @@ class ControlPlaneService:
         decision = self._runtime.intent_proposals.decision_for(payload.subject.id)
         if decision is None:
             raise ValueError("proposal decision unavailable")
-        history = self._runtime.graph_store.history(payload.selected_node_ids[0])
+        proposal = self._runtime.intent_proposals.get(payload.subject.id)
+        affected = tuple(
+            dict.fromkeys(
+                (
+                    *payload.selected_node_ids,
+                    *(item.node_id for item in proposal.changeset.nodes_updated),
+                    *proposal.changeset.nodes_superseded,
+                    *(item.id for item in proposal.changeset.nodes_added),
+                )
+            )
+        )
+        if not affected:
+            raise ValueError("proposal result subject unavailable")
+        history = self._runtime.graph_store.history(affected[0])
         if not history or _digest(history[-1].model_dump(mode="json")) != material.result_digest:
             raise ValueError("proposal result changed")
         return {
