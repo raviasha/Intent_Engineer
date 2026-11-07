@@ -23,6 +23,17 @@ def _workflow(name):
     return yaml.safe_load(path.read_text())
 
 
+def test_hosted_ci_uses_the_release_import_boundary() -> None:
+    workflow = _workflow("ci.yml")
+    commands = [step.get("run") for step in workflow["jobs"]["test"]["steps"]]
+
+    assert commands[-1] == (
+        "PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest "
+        "-p anyio.pytest_plugin -p pytest_cov.plugin --import-mode=importlib "
+        "--cov=intent_engineering --cov-report=term-missing"
+    )
+
+
 def test_state_workflow_is_the_exact_reviewed_setup_suggestion(tmp_path):
     preview = build_github_enable_preview(_project(tmp_path), "acme/project")
     path = ROOT / ".github/workflows/intent-state.yml"

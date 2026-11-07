@@ -15,4 +15,4 @@ jobs:
       - run: python -m pip install -e '.[dev]'
       - run: ruff check .
       - run: mypy src/intent_engineering
-      - run: pytest --cov=intent_engineering --cov-report=term-missing
+      - run: PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest -p anyio.pytest_plugin -p pytest_cov.plugin --import-mode=importlib --cov=intent_engineering --cov-report=term-missing
