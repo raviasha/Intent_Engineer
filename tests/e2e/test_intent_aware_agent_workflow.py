@@ -147,10 +147,11 @@ def test_guided_onboarding_plugin_and_assurance_share_one_project(
         turn_id="turn-1",
     )
     transcript.extend(("hook-submitted: Implement CSV export", offer_stdout, offer_stderr))
-    assert offer == (
+    assert offer.startswith(
         "This repository has not been onboarded into Intent Engineering. "
         "Start guided onboarding now?"
     )
+    assert "Create now or Defer for now" in offer
     assert offer_stderr == ""
     assert not (project / ".intent").exists()
 

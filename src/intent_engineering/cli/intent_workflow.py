@@ -14,7 +14,7 @@ from enum import StrEnum
 from fnmatch import fnmatchcase
 from hashlib import sha256
 from pathlib import Path, PurePosixPath
-from typing import Literal, Protocol, cast
+from typing import Annotated, Literal, Protocol, cast
 from urllib.parse import unquote, urlsplit, urlunsplit
 
 import typer
@@ -24,6 +24,7 @@ from pydantic import ConfigDict
 from intent_engineering.capture.base import RawSourceObject
 from intent_engineering.capture.github.connector import GitHubCheckpoint
 from intent_engineering.capture.markdown.connector import MarkdownConnector
+from intent_engineering.capture.markdown.provenance import is_inferred_prd, markdown_author
 from intent_engineering.capture.mcp.profile_loader import load_strict_yaml_mapping_bytes
 from intent_engineering.cli.connectors import configured_actor_principals, connector_catalog
 from intent_engineering.cli.output import OutputFormat, emit
@@ -83,6 +84,7 @@ class OnboardingCommandResult(StrictModel):
     next_action: str | None = None
     message: str | None = None
     authorization_issued: Literal[False] = False
+    evidence_refs: tuple[str, ...] = ()
 
 
 class ProposalTerminal(Protocol):
@@ -255,7 +257,13 @@ def _excluded(config: ProjectConfig, relative: PurePosixPath) -> bool:
     )
 
 
-def _capture_prd(runtime: Runtime, config: ProjectConfig, relative_path: str) -> str:
+def _capture_prd(
+    runtime: Runtime,
+    config: ProjectConfig,
+    relative_path: str,
+    *,
+    inferred: bool = False,
+) -> str:
     relative = PurePosixPath(_canonical_scope(relative_path, markdown_file=True))
     if _excluded(config, relative):
         raise ValueError("excluded source")
@@ -267,13 +275,15 @@ def _capture_prd(runtime: Runtime, config: ProjectConfig, relative_path: str) ->
     content = snapshot.content
     reauthenticated: SecureRead | None = None
     try:
+        if inferred and not is_inferred_prd(content):
+            raise ValueError("inferred PRD requires a source-visible provenance marker")
         text = content.decode("utf-8")
         digest = f"sha256:{sha256(content).hexdigest()}"
         raw = RawSourceObject(
             connector_type="markdown",
             external_object_id=f"path:{relative_path}",
             external_version=digest,
-            author=config.local_actor,
+            author=markdown_author(content, config.local_actor),
             observed_at=datetime.fromtimestamp(
                 snapshot.modified_ns / 1_000_000_000,
                 tz=UTC,
@@ -313,6 +323,8 @@ def _capture_prd(runtime: Runtime, config: ProjectConfig, relative_path: str) ->
 def _bootstrap_result(
     project: Path,
     prd: str,
+    *,
+    inferred: bool = False,
 ) -> tuple[bool, dict[str, object] | None, BaseException | None]:
     runtime: Runtime | None = None
     payload: dict[str, object] | None = None
@@ -321,7 +333,16 @@ def _bootstrap_result(
         config, _ = _snapshot_config(runtime)
         graph_version = runtime.graph_store.load().version
         proposal_bytes = runtime.intent_proposals.bytes()
-        evidence_ref = _capture_prd(runtime, config, prd)
+        evidence_ref = (
+            _capture_prd(runtime, config, prd, inferred=True)
+            if inferred
+            else _capture_prd(runtime, config, prd)
+        )
+        captured = runtime.evidence_store.get(evidence_ref)
+        captured_content = captured.payload.get("content")
+        inferred = type(captured_content) is str and is_inferred_prd(
+            captured_content.encode("utf-8")
+        )
         if (
             runtime.graph_store.load().version != graph_version
             or runtime.intent_proposals.bytes() != proposal_bytes
@@ -336,7 +357,11 @@ def _bootstrap_result(
                 "repository_id": config.project_id,
                 "connector_id": "markdown",
                 "scope": prd,
-                "source_role": SourceRole.DECLARED_INTENT.value,
+                "source_role": (
+                    SourceRole.PROPOSED_INTENT.value
+                    if inferred
+                    else SourceRole.DECLARED_INTENT.value
+                ),
             },
         }
         return True, payload, None
@@ -563,6 +588,8 @@ def _onboard_result(
     project: Path,
     prd: str,
     yes: bool,
+    *,
+    inferred: bool = False,
 ) -> tuple[bool, OnboardingCommandResult | None, BaseException | None]:
     """Compose existing capture and source-role paths around read-only onboarding state."""
     runtime: Runtime | None = None
@@ -604,10 +631,23 @@ def _onboard_result(
         status = _inspect_onboarding(runtime)
         if status.state is not OnboardingState.REQUIRED:
             return True, _existing_onboarding_result(runtime, status), None
-        captured, bootstrap_payload, abort = _bootstrap_result(project, prd)
+        captured, bootstrap_payload, abort = (
+            _bootstrap_result(project, prd, inferred=True)
+            if inferred
+            else _bootstrap_result(project, prd)
+        )
         if abort is not None:
             return False, None, abort
         if not captured or bootstrap_payload is None:
+            return False, None, None
+        context_packet = bootstrap_payload.get("context_packet")
+        if type(context_packet) is not dict:
+            return False, None, None
+        captured_role = context_packet.get("source_role")
+        if captured_role not in {
+            SourceRole.PROPOSED_INTENT.value,
+            SourceRole.DECLARED_INTENT.value,
+        }:
             return False, None, None
 
         status = _inspect_onboarding(runtime)
@@ -617,7 +657,11 @@ def _onboard_result(
             project,
             "markdown",
             prd,
-            SourceRole.DECLARED_INTENT,
+            (
+                SourceRole.PROPOSED_INTENT
+                if captured_role == SourceRole.PROPOSED_INTENT.value
+                else SourceRole.DECLARED_INTENT
+            ),
             False,
         )
         if abort is not None:
@@ -644,6 +688,7 @@ def _onboard_result(
             _inspect_onboarding(runtime),
             source_role,
         )
+        payload = payload.model_copy(update={"evidence_refs": tuple(evidence_refs)})
         return True, payload, None
     except Exception:  # noqa: BLE001 - public CLI receives one fixed failure
         return False, None, None
@@ -659,13 +704,50 @@ def _onboard_result(
 
 
 def onboard_command(
-    prd: str = typer.Option(..., "--prd"),
-    project: Path = typer.Option(Path("."), "--project"),
-    output_format: OutputFormat = typer.Option(OutputFormat.TEXT, "--format"),
-    yes: bool = typer.Option(False, "--yes"),
+    prd: Annotated[str | None, typer.Option("--prd")] = None,
+    project: Annotated[Path, typer.Option("--project")] = Path("."),
+    output_format: Annotated[OutputFormat, typer.Option("--format")] = OutputFormat.TEXT,
+    yes: Annotated[bool, typer.Option("--yes")] = False,
+    discover: Annotated[bool, typer.Option("--discover")] = False,
+    defer: Annotated[bool, typer.Option("--defer")] = False,
+    after_tasks: Annotated[int, typer.Option("--after-tasks", min=1, max=100)] = 3,
+    inferred: Annotated[bool, typer.Option("--inferred")] = False,
+    submission: Annotated[str | None, typer.Option("--submission")] = None,
+    submission_schema: Annotated[bool, typer.Option("--submission-schema")] = False,
 ) -> None:
     """Guide source capture and proposal review without approving a baseline."""
-    ok, payload, abort = _onboard_result(project, prd, yes)
+    modes = sum((discover, defer, submission is not None, submission_schema, prd is not None))
+    if modes != 1 or ((inferred or yes) and prd is None):
+        raise typer.BadParameter(
+            "Choose --discover, --defer, --prd, --submission or --submission-schema"
+        )
+    if prd is None:
+        from intent_engineering.cli.onboarding_assistance import (
+            defer_result,
+            discover_onboarding,
+            submit_onboarding,
+        )
+        from intent_engineering.intent_workflow.bootstrap import BootstrapSubmission
+
+        try:
+            if submission_schema:
+                extra = BootstrapSubmission.model_json_schema()
+            elif discover:
+                extra = discover_onboarding(project)
+            elif defer:
+                extra = defer_result(project, after_tasks)
+            else:
+                assert submission is not None
+                extra = submit_onboarding(project, submission)
+        except Exception:  # noqa: BLE001 - keep source and authority failures context-free
+            _fixed_error()
+        emit(extra, output_format)
+        return
+    ok, payload, abort = (
+        _onboard_result(project, prd, yes, inferred=True)
+        if inferred
+        else _onboard_result(project, prd, yes)
+    )
     del project, prd, yes
     if abort is not None:
         try:

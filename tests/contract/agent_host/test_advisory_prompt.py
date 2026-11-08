@@ -114,7 +114,8 @@ def test_uninitialized_repository_returns_onboarding_offer_without_writes(
     route = router.route(_event(project))
 
     assert route.action == "offer_onboarding"
-    assert route.message == OFFER
+    assert route.message.startswith(OFFER)
+    assert "Defer for now" in route.message
     assert route.mcp_tool is None
     assert route.arguments == {}
     assert _durable_bytes(project) == before
@@ -178,7 +179,8 @@ def test_readiness_onboarding_reuses_the_guided_onboarding_offer() -> None:
     )
 
     assert route.action == "offer_onboarding"
-    assert route.message == OFFER
+    assert route.message.startswith(OFFER)
+    assert "Defer for now" in route.message
     assert route.mcp_tool is None
     assert route.arguments == {}
 

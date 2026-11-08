@@ -38,6 +38,10 @@ from intent_engineering.cli.intent_workflow import (
     proposals_app,
     sources_app,
 )
+from intent_engineering.cli.onboarding_hooks import (
+    agent_stop_hook_command,
+    onboarding_prompt_route,
+)
 from intent_engineering.cli.output import OutputFormat, emit
 from intent_engineering.cli.refine import refine_command
 from intent_engineering.cli.runtime import (
@@ -140,6 +144,7 @@ app.command("assess")(assess_command)
 app.command("refine")(refine_command)
 app.command("alternatives")(alternatives_command)
 app.command("assessment-gate", hidden=True)(assessment_gate_command)
+app.command("agent-stop-hook", hidden=True)(agent_stop_hook_command)
 
 _MAX_PROMPT_HOOK_BYTES = 64 * 1024
 
@@ -226,6 +231,7 @@ def agent_prompt_hook_command(
             if not repository_matches(current, codex_event.cwd):
                 raise ValueError("advisory repository mismatch")
             route = _prompt_readiness_route(Path.cwd(), preset)
+            route = onboarding_prompt_route(Path.cwd(), codex_event, route)
             if route is None:
                 try:
                     runtime = load_runtime(Path.cwd())

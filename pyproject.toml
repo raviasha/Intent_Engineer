@@ -39,7 +39,10 @@ intent = "intent_engineering.cli.app:app"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/intent_engineering"]
-artifacts = ["src/intent_engineering/control_plane/assets/**"]
+artifacts = [
+  "src/intent_engineering/control_plane/assets/**",
+  "src/intent_engineering/integrations/ci-runtime.lock",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

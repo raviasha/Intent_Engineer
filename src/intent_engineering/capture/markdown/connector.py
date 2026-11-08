@@ -18,6 +18,7 @@ from intent_engineering.capture.base import (
     SourceObject,
     normalize_raw_source,
 )
+from intent_engineering.capture.markdown.provenance import markdown_author
 from intent_engineering.core.models import EvidenceRecord, ProjectConfig
 from intent_engineering.storage.secure import SecureDirectory, SecureRead, UnsafePathError
 
@@ -164,7 +165,7 @@ class MarkdownConnector:
             connector_type=self.connector_id,
             external_object_id=object_id,
             external_version=version,
-            author=self.config.local_actor,
+            author=markdown_author(content, self.config.local_actor),
             observed_at=datetime.fromtimestamp(snapshot.modified_ns / 1_000_000_000, tz=UTC),
             source_locator=relative_path,
             content_hash=content_hash,

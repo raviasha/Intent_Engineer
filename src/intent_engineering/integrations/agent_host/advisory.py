@@ -54,7 +54,11 @@ _MAX_EVENT_BYTES = 64 * 1024
 _MAX_JSON_DEPTH = 128
 _MAX_JSON_NODES = 65_536
 _OFFER = (
-    "This repository has not been onboarded into Intent Engineering. Start guided onboarding now?"
+    "This repository has not been onboarded into Intent Engineering. Start guided onboarding now? "
+    "Offer Create now or Defer for now. Reuse an answer already given to this offer. "
+    "On deferral, run intent onboard --defer --project . and continue the original task. "
+    "On acceptance, run intent onboard --discover --project . --format json, find or draft the "
+    "PRD, then follow the intent-advisor onboarding skill through graph review."
 )
 CODEX_ADVISORY_FALLBACK = (
     "Intent advisory prompt routing is unavailable. Do not mutate the intent graph, "
@@ -321,6 +325,7 @@ class PromptRoute(_HostModel):
     schema_version: Literal[1] = 1
     action: Literal[
         "offer_onboarding",
+        "start_onboarding",
         "classify",
         "human_attention_required",
         "human_confirmation_required",
@@ -361,6 +366,7 @@ class PromptRoute(_HostModel):
     def validate_route(self) -> PromptRoute:
         expected_tool = {
             "offer_onboarding": None,
+            "start_onboarding": None,
             "classify": "intent_advisory_preflight",
             "human_attention_required": None,
             "human_confirmation_required": None,
@@ -491,6 +497,8 @@ def codex_prompt_context(route: PromptRoute) -> str:
     """Render a bounded prompt-free instruction for the Codex hook response."""
     if route.action == "offer_onboarding":
         return _OFFER
+    if route.action == "start_onboarding":
+        return f"action=start_onboarding. {route.message}"
     if route.action == "classify":
         conversation_ref = route.arguments.get("conversation_ref")
         request_evidence_ref = route.arguments.get("request_evidence_ref")

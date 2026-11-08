@@ -17,7 +17,7 @@ codex plugin add intent-advisor@intent-engineering-local
 ```
 
 Restart the ChatGPT desktop app after installing the plugin. Open **Plugins Directory**, select
-**Intent Engineering Local**, enable `intent-advisor`, and review and trust its prompt hook.
+**Intent Engineering Local**, enable `intent-advisor`, and review and trust its prompt and completion hooks.
 
 A wheel-only installation provides the CLI and MCP server, but not the Codex plugin assets:
 
@@ -27,7 +27,23 @@ python -m pip install intent-engineering
 
 ## 2. Onboard a project
 
-Change to the repository and point Intent Engineering at its product requirements document:
+Open a chat rooted in your repository and give the agent a task. If the repository has no
+approved intent graph, Intent Advisor offers **Create now** or **Defer for now**.
+
+- **Create now:** the agent finds an existing PRD. If there is none, it drafts one from relevant
+  code, tests and docs, citing its sources and clearly marking inferred intent and unknowns.
+  It prepares the graph and opens the existing local dashboard for your review and activation.
+- **Defer for now:** normal work continues. The preference survives new chats in that checkout;
+  the next prompt after three completed top-level work turns offers setup again. Repeated hook
+  events and subagent turns do not count. The reminder never creates `.intent` on its own.
+- **Create whenever you want:** say **“create intent graph”**, including while setup is deferred.
+  An existing graph is reused and a pending graph proposal resumes its review.
+
+You do not need to run setup commands for this plugin flow. If several PRDs are plausible, the
+agent asks you to choose. If there is no useful code or documentation, it asks about the project's
+purpose. Code-derived drafts are proposed intent, not proof of your intended product behavior.
+
+For manual onboarding with an existing PRD, change to the repository and run:
 
 ```bash
 cd /absolute/path/to/your-repository
@@ -43,6 +59,20 @@ and opens the local review UI. In the UI:
 
 Capturing a PRD does not approve it. The agent proposes graph content; the human confirms the
 exact proposal. Omit `--offline` when the repository already uses shared GitHub team state.
+
+The agent can finish setup through the CLI even if the plugin's MCP connection started before
+the project was initialized. After graph activation, start a new chat if Intent tools have not
+connected. The CLI options below are also available for manual use:
+
+```bash
+intent onboard --project . --discover --format json
+intent onboard --project . --defer --after-tasks 3
+```
+
+The completion counter uses Codex's `Stop` event as a completed work turn, not a semantic claim
+that an entire feature is finished. Both prompt and completion hooks must be enabled/trusted.
+Deferral is user-local and checkout-specific; it does not change team intent or bypass an
+existing proposal review.
 
 Useful variants:
 

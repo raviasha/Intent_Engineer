@@ -40,8 +40,13 @@ checkout sequence above when installing the Codex plugin.
 
 Restart the ChatGPT desktop app and start a new task rooted in the target repository. Codex
 launches the plugin-owned MCP server from `plugins/intent-advisor/.mcp.json`; do not start an
-additional server process for the plugin. Confirm the exact PRD path, then launch the primary
-local review flow:
+additional server process for the plugin. On a missing graph it offers **Create now** or **Defer
+for now**. Say **“create intent graph”** whenever you want to start. The agent finds your PRD,
+or drafts a source-cited, explicitly inferred PRD from existing code and docs, prepares a graph
+proposal, and opens the local review UI. You approve the proposed meaning once before activation.
+Deferring continues ordinary work and reminds you after three completed top-level work turns.
+
+For manual setup from an existing PRD, launch the local review flow:
 
 ```bash
 intent dev --project . --prd docs/PRD.md --offline
@@ -84,7 +89,7 @@ manufacture it. Existing automation may still use `intent init --project .`,
 
 The validated advisory bundle installed above is `plugins/intent-advisor`. Open **Plugins
 Directory**, select **Intent Engineering Local**,
-enable `intent-advisor`, and review/trust its `UserPromptSubmit` hook. The marketplace keeps the
+enable `intent-advisor`, and review/trust its `UserPromptSubmit` and `Stop` hooks. The marketplace keeps the
 bundle path explicit as `source.path: "./plugins/intent-advisor"`. The plugin MCP configuration
 intentionally omits `cwd`: on a local Codex host, `--project .` binds to the active repository's
 working directory. A remote executor must explicitly reproduce or configure that repository
@@ -101,7 +106,9 @@ repository/project and release-digest metadata in the current OS account's owner
 checkout out of team governance; missing trust remains unavailable/offline-stale. Explicit offline
 verification of a cached tracking ref is likewise stale, never fresh verified state. A fresh
 repository with no approved shared baseline still
-receives the unchanged onboarding offer and no state is created. If an approved graph has pending
+receives the create-or-defer onboarding offer and no project state is created. Deferral is stored
+outside the repository in user-local state; the completion hook advances a bounded reminder
+counter without capturing prompt content. If an approved graph has pending
 proposal review, an open reconciliation case, or unanswered clarification, it stops before
 capturing or classifying the prompt and directs the developer to the already-running local review
 view. Otherwise, it persists the exact stdin prompt as untrusted `agent:codex` context, supplies
@@ -118,8 +125,8 @@ truthfully unavailable through `MandatoryHookUnavailable` with the message
 
 To inspect the machine-facing gate directly, run
 `intent ensure --project . --preset developer --format json`. To opt out, decline the onboarding
-offer or disable/uninstall `intent-advisor`. A decline leaves the repository unchanged for that
-task; disabling the plugin leaves ordinary coding behavior unchanged. The CLI and MCP services
+offer or disable/uninstall `intent-advisor`. Deferral leaves the repository unchanged and suppresses
+offers until its reminder is due; disabling the plugin leaves ordinary coding behavior unchanged. The CLI and MCP services
 remain usable independently.
 
 While `intent dev` is running, it polls bounded Git and test-result evidence at a fixed cadence

@@ -217,7 +217,7 @@ def test_advisory_plugin_declares_official_prompt_hook_and_repository_mcp() -> N
 
     assert manifest == {
         "name": "intent-advisor",
-        "version": "0.1.0",
+        "version": "0.1.1",
         "description": "Route Codex prompts through advisory Intent Engineering workflows.",
         "author": {"name": "Intent Engineering"},
         "skills": "./skills/",
@@ -249,7 +249,11 @@ def test_advisory_plugin_declares_official_prompt_hook_and_repository_mcp() -> N
                         }
                     ]
                 }
-            ]
+            ],
+            "Stop": [
+                {"hooks": [{"type": "command", "command": "${PLUGIN_ROOT}/scripts/stop-hook",
+                            "timeout": 5}]}
+            ],
         }
     }
     assert mcp == {
@@ -747,8 +751,10 @@ def test_skill_routes_clarifications_and_states_advisory_mcp_failure_boundary() 
     assert "conflicting" in skill
     assert "mechanical" not in skill.casefold()
     assert "non_requirement" not in skill.casefold()
-    assert "ask the user for the PRD path" in skill
-    assert "intent onboard --project . --prd <confirmed path> --yes" in skill
+    assert "--discover" in skill
+    assert "--defer" in skill
+    assert "--submission" in skill
+    assert "intent onboard --project . --prd <path> --yes" in skill
     assert "request_evidence_ref" in skill
     assert "answer_evidence_ref" not in skill
     assert "current human request" not in skill

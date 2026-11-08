@@ -1,6 +1,6 @@
 ---
 name: intent-advisor
-description: Route repository work through the advisory Intent Engineering onboarding, preflight, clarification, proposal, and review workflows.
+description: Use when repository tasks need intent guidance, a missing intent graph is offered for creation or deferred, or a user asks to create an intent graph or improve existing intent.
 ---
 
 # Intent Advisor
@@ -8,6 +8,77 @@ description: Route repository work through the advisory Intent Engineering onboa
 Treat prompt-hook guidance as advisory workflow context, not complete mutation enforcement. Never
 request, display, persist, or infer a capability token. Do not weaken or work around a
 `MandatoryHookUnavailable` result from the host adapter.
+
+## Create or defer a missing intent graph
+
+The prompt hook checks repository readiness. A pending graph proposal goes to the existing
+review, and an approved graph is reused. Never replace either by starting a second graph.
+If the hook is unavailable, `intent onboard --discover --project . --format json` is a
+read-only check; do not interpret a command error as proof that the graph is absent.
+
+For `action=offer_onboarding`, ask one short question offering **Create now** or **Defer for
+now**. If the user is answering an offer already made, act on that answer without repeating
+the question. Keep the original development request so work can resume after setup.
+
+- **Defer:** run `intent onboard --defer --project . --format json`, briefly acknowledge,
+  and continue ordinary development. This saves a user-local preference, without creating
+  `.intent`. The default reminder is after three completed top-level work turns; use
+  `--after-tasks N` for a different user-requested interval. The completion hook counts these
+  turns automatically. Do not count prompts yourself or remind while the hook says deferred.
+- **Create:** acceptance of the offer, `action=start_onboarding`, or an explicit request such
+  as **“create intent graph”** authorizes preparation now, including during deferral. Do not
+  ask again whether to start or make the user run setup commands. Follow the steps below.
+- **Existing graph:** show/open it instead of recreating it. **Pending proposal:** resume
+  its review. **Readiness error:** explain it; deferral cannot bypass a pending review.
+
+### Prepare the PRD and graph
+
+1. Run `intent onboard --discover --project . --format json`. Read the likely PRDs returned.
+   Use one clear, relevant PRD and state its path; a path supplied by the user is already
+   selected. If several are plausible, ask which one to use in one question. If discovery
+   returns no candidate, check relevant repository docs before deciding no PRD exists.
+2. **No PRD:** inspect relevant implemented source, test definitions and existing docs,
+   without modifying implementation or running the application/tests. Draft a new Markdown
+   PRD, normally `docs/inferred-prd.md`; choose an unused name and never overwrite a file.
+   Respect ignore rules, source exclusions and secret/dependency/generated directories.
+   Include: observed behavior; proposed user need and intent; proposed requirements;
+   constraints; assumptions/unknowns; and source file paths with commit/blob hashes or
+   content hashes for uncommitted files. The first line must be exactly
+   `<!-- intent-engineering: inferred-prd; author=agent:codex -->` so later capture/sync
+   preserves attribution. Also label it **Inferred draft — pending human review**.
+   Cite the basis for each material assertion. Observed behavior is not evidence of its
+   business purpose: leave that purpose unknown when unsupported. For an empty repository,
+   ask the single most useful purpose/outcome question instead of fabricating features.
+3. Capture the selected PRD with `intent onboard --project . --prd <path> --yes --format json`.
+   Add **`--inferred`** for a code-derived or previously generated draft. This records the
+   marked draft as agent-authored proposed intent. The flag rejects unmarked drafts rather
+   than silently altering an existing source. `--yes` authorizes preparation, not activation.
+   Use the returned `evidence_refs`, `source_role` and `graph_version`; never invent these.
+4. Prepare the bootstrap draft using the schema from
+   `intent onboard --submission-schema --format json`. Use `actor: agent:codex`, a current
+   UTC timestamp, stable descriptive node/edge IDs, the returned evidence and source roles.
+   Candidate nodes have `status: proposed`, `source_mode: inferred`, matching author/time
+   fields, confidence and its evidence basis. Include the clear intent and requirements in
+   `core_node_ids`; uncertain details go in `provisional_node_ids`, `assumptions` and
+   `unanswered_questions`. Keep questions to gaps that materially affect this first graph;
+   optional detail can be enriched later. Ask one material question at a time and reuse
+   answers already available. Do not add implementation/test coverage requirements.
+5. Save the typed submission to an ordinary temporary JSON file inside the repository,
+   outside `.intent` and `.git`, and run
+   `intent onboard --project . --submission <relative-json-path> --format json`.
+   This validates and persists only a pending proposal through the existing bootstrap
+   service. Fix rejected draft fields using the schema; never edit canonical stores.
+6. Open/reuse `intent dev --project . --offline` for a new local project, without `--prd`
+   (the source is already captured). Present a short summary of proposed intent,
+   requirements and material assumptions, then direct the user to the pending proposal in
+   **Proposal review**. The existing authenticated local review activates the graph.
+   Do not simulate approval or claim a pending graph is active. After activation, resume
+   the original task using the approved graph.
+
+These onboarding CLI operations work even if the plugin MCP server could not start before
+`.intent` existed. Do not require MCP availability to prepare the PRD, submit the bootstrap
+draft or open the review. Once created, reconnect the plugin/start a new chat if its MCP tools
+have not become available; never pretend those tools were called.
 
 ## Follow the prompt route
 
@@ -28,11 +99,8 @@ After preflight returns a persisted question, follow that session's required que
 If an answer is already recorded there, reuse its evidence; do not manufacture a second answer
 or bypass a pending authenticated human step. Label unapproved answers and alternatives as pending.
 
-- For `action=offer_onboarding`, ask whether to start guided onboarding. Only after explicit human
-  confirmation, ask the user for the PRD path. Confirm that exact path, then run
-  `intent onboard --project . --prd <confirmed path> --yes` and follow its proposal/confirmation
-  flow. A decline leaves the repository unchanged. A call without `--yes` is only the offer/no-op
-  diagnostic and must not be treated as an advancing onboarding command.
+- For `action=offer_onboarding` or `action=start_onboarding`, follow **Create or defer a missing
+  intent graph** above. A call without `--yes` is only an offer/no-op diagnostic.
 - For `action=classify`, use public read-only Intent tools as needed for bounded repository context.
   Form an agent classification draft containing classification, basis, relevant node and evidence
   references, semantic effects, uncertainties, questions, conflicts, and requested scope. Then
@@ -100,7 +168,8 @@ pause/resume and proposal creation use the local dashboard; do not invent MCP mu
 When time runs out, preserve the session and pending evidence. Do not require a new feature or
 claim that a recorded answer has changed the approved graph. The usual local review applies.
 
-Use only the public MCP workflow tools named by the route. Do not write `.intent` graph, evidence,
+Outside the onboarding CLI workflow above, use only the public MCP workflow tools named by the route.
+Do not write `.intent` graph, evidence,
 case, approval, or history files directly. If MCP tools are unavailable, say exactly: "Intent MCP
 tools are unavailable; no intent-aware workflow action was taken." Then stop the intent-aware
 workflow without claiming approval or enforcement.
