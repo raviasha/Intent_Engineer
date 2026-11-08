@@ -102,7 +102,7 @@ def _plugin_prompt(
         input=json.dumps(event, separators=(",", ":")).encode(),
         capture_output=True,
         check=False,
-        timeout=5,
+        timeout=15,
     )
     assert completed.returncode == 0
     assert completed.stderr == b""

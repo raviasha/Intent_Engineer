@@ -14,7 +14,9 @@ from typing import Any
 
 MAX_INPUT_BYTES = 64 * 1024
 MAX_OUTPUT_BYTES = 4096
-CHILD_TIMEOUT_SECONDS = 2.0
+# Allow the local service's ten-second startup window plus CLI import overhead.
+# The host grants fifteen seconds, leaving time for bounded process cleanup.
+CHILD_TIMEOUT_SECONDS = 12.0
 FALLBACK = (
     "Intent advisory prompt routing is unavailable. Do not mutate the intent graph, "
     "infer authorization, or treat this advisory as enforcement."
@@ -117,6 +119,9 @@ def _invoke(raw: bytes) -> bytes:
         stdout_open = True
         deadline = time.monotonic() + CHILD_TIMEOUT_SECONDS
         while stdout_open or process.poll() is None:
+            # A failed CLI cannot provide guidance; reap descendants immediately.
+            if process.poll() not in (None, 0):
+                raise ValueError
             if _cancelled or time.monotonic() >= deadline:
                 raise TimeoutError
             for key, _events in selector.select(timeout=0.05):

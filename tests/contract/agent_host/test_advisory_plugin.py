@@ -90,7 +90,7 @@ def _run_hook(
     payload: bytes,
     *,
     path: str | None = None,
-    timeout: float = 5,
+    timeout: float = 15,
 ) -> subprocess.CompletedProcess[bytes]:
     environment = os.environ.copy()
     environment["PATH"] = path or f"{REPO_ROOT / '.venv' / 'bin'}:/usr/bin:/bin"
@@ -132,7 +132,7 @@ def _run_official_hook(
     event_project: Path | None = None,
     prompt: str = "Add team sharing",
     path: str | None = None,
-    timeout: float = 5,
+    timeout: float = 15,
 ) -> subprocess.CompletedProcess[bytes]:
     payload = _official_event(event_project or project, prompt=prompt)
     return _run_hook(
@@ -217,7 +217,7 @@ def test_advisory_plugin_declares_official_prompt_hook_and_repository_mcp() -> N
 
     assert manifest == {
         "name": "intent-advisor",
-        "version": "0.1.1",
+        "version": "0.1.2",
         "description": "Route Codex prompts through advisory Intent Engineering workflows.",
         "author": {"name": "Intent Engineering"},
         "skills": "./skills/",
@@ -243,7 +243,7 @@ def test_advisory_plugin_declares_official_prompt_hook_and_repository_mcp() -> N
                         {
                             "type": "command",
                             "command": "${PLUGIN_ROOT}/scripts/prompt-hook",
-                            "timeout": 5,
+                            "timeout": 15,
                             "statusMessage": "Checking repository intent",
                             "additionalContextLimit": 2048,
                         }
@@ -569,6 +569,25 @@ def test_unbounded_child_output_returns_bounded_fallback(tmp_path: Path) -> None
     assert marker.encode() not in completed.stdout + completed.stderr
 
 
+def test_slow_valid_startup_returns_guidance_instead_of_timeout_fallback(tmp_path: Path) -> None:
+    """A cold local service may need more than two seconds on a busy machine."""
+    project = tmp_path / "project"
+    fake_bin = tmp_path / "fake-bin"
+    project.mkdir()
+    fake_bin.mkdir()
+    context = "action=classify. Fixed fake advisory guidance."
+    _fake_intent(
+        fake_bin,
+        "import json, time\ntime.sleep(3)\n"
+        f"print(json.dumps({{'hookSpecificOutput': {{'hookEventName': "
+        f"'UserPromptSubmit', 'additionalContext': {context!r}}}}}))",
+    )
+
+    completed = _run_official_hook(project, path=f"{fake_bin}:/usr/bin:/bin")
+
+    assert _additional_context(completed) == context
+
+
 def test_child_timeout_returns_fixed_fallback_promptly(tmp_path: Path) -> None:
     project = tmp_path / "project"
     fake_bin = tmp_path / "fake-bin"
@@ -581,9 +600,9 @@ def test_child_timeout_returns_fixed_fallback_promptly(tmp_path: Path) -> None:
     )
 
     started = time.monotonic()
-    completed = _run_official_hook(project, path=f"{fake_bin}:/usr/bin:/bin", timeout=5)
+    completed = _run_official_hook(project, path=f"{fake_bin}:/usr/bin:/bin", timeout=15)
 
-    assert 1.5 < time.monotonic() - started < 4
+    assert 11.5 < time.monotonic() - started < 14
     assert _additional_context(completed) == FALLBACK
     assert marker.encode() not in completed.stdout + completed.stderr
 
