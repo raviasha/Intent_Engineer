@@ -99,10 +99,99 @@ def _with_snapshot(
     )
 
 
+def test_intent_scope_excludes_code_test_penalties_and_questions(rubric_snapshot):
+    from intent_engineering.assessment.service import GraphAssessmentService
+    from intent_engineering.intent_workflow.enrichment import _candidates
+
+    policy = AssessmentPolicy.for_scope("intent_requirements")
+    report = GraphAssessmentService().assess(rubric_snapshot.snapshot, policy)
+    assert report.assessment_scope == "intent_requirements"
+    for node in report.nodes:
+        for name in (
+            AssessmentDimension.IMPLEMENTATION_TRACEABILITY,
+            AssessmentDimension.TEST_VERIFICATION,
+        ):
+            assert node.dimension(name).applicability == DimensionApplicability.NOT_APPLICABLE
+            assert node.dimension(name).score is None
+    questions = _candidates(report, rubric_snapshot.snapshot, focus_id=None, excluded=frozenset())
+    assert all(
+        item.question.dimension
+        not in {
+            AssessmentDimension.IMPLEMENTATION_TRACEABILITY,
+            AssessmentDimension.TEST_VERIFICATION,
+        }
+        for item in questions
+    )
+    assert any(
+        node.dimension(AssessmentDimension.EVIDENCE_STRENGTH).score is not None
+        for node in report.nodes
+    )
+
+
+def test_scope_separates_cached_reports(rubric_snapshot):
+    from intent_engineering.assessment.service import GraphAssessmentService
+
+    service = GraphAssessmentService()
+    full = service.assess(rubric_snapshot.snapshot, AssessmentPolicy.v1())
+    focused = service.assess(
+        rubric_snapshot.snapshot, AssessmentPolicy.for_scope("intent_requirements")
+    )
+    assert full.policy_digest != focused.policy_digest
+    assert full.semantic_digest != focused.semantic_digest
+    assert service.cache_entry_count == 2
+    assert full.assessment_scope == "full_lifecycle"
+
+
+@pytest.mark.parametrize("case_type", [ReconciliationCaseType.CODE_LAG, ReconciliationCaseType.TEST_LAG])
+def test_focused_scope_ignores_implementation_only_cases(rubric_snapshot, case_type):
+    from intent_engineering.assessment.service import GraphAssessmentService
+    from intent_engineering.intent_workflow.enrichment import _candidates
+    from tests.unit.intent_workflow.test_coverage import case
+
+    original = rubric_snapshot.snapshot
+    pending = case(ReconciliationStatus.OPEN).model_copy(update={
+        "subject_ref": "req:csv", "affected_refs": ("req:csv",), "case_type": case_type})
+    changed = original.model_copy(update={"cases": (pending,)})
+    policy = AssessmentPolicy.for_scope("intent_requirements")
+    baseline = GraphAssessmentService().assess(original, policy).node("req:csv")
+    report = GraphAssessmentService().assess(changed, policy)
+    assert report.node("req:csv") == baseline
+    assert not any(item.question.rule_id.endswith("blocking_conflict") for item in
+                   _candidates(report, changed, focus_id="req:csv", excluded=frozenset()))
+    assert GraphAssessmentService().assess(changed, AssessmentPolicy.v1()).node("req:csv").health == AssessmentHealth.RED
+
+
+def test_focused_scope_keeps_intent_source_conflicts(rubric_snapshot):
+    from tests.unit.intent_workflow.test_coverage import case
+
+    pending = case(ReconciliationStatus.OPEN).model_copy(update={
+        "subject_ref": "req:csv", "affected_refs": ("req:csv",)})
+    changed = rubric_snapshot.snapshot.model_copy(update={"cases": (pending,)})
+    assert assess_node(changed, "req:csv", AssessmentPolicy.for_scope("intent_requirements")).health == AssessmentHealth.RED
+
+
+def test_focused_scope_does_not_prompt_about_implementation_nodes(rubric_snapshot):
+    from intent_engineering.assessment.service import GraphAssessmentService
+    from intent_engineering.intent_workflow.enrichment import _candidates
+    from tests.unit.intent_workflow.test_reading import node
+
+    original = rubric_snapshot.snapshot
+    missing_code = node("file:unmapped", NodeType.FILE, "Legacy implementation")
+    graph = original.graph.model_copy(update={"nodes": (*original.graph.nodes, missing_code)})
+    snapshot = original.model_copy(update={"graph": graph})
+    policy = AssessmentPolicy.for_scope("intent_requirements")
+    report = GraphAssessmentService().assess(snapshot, policy)
+    assert not any(item.question.node_id == "file:unmapped" for item in
+                   _candidates(report, snapshot, focus_id=None, excluded=frozenset()))
+    assert report.assessment_complete == GraphAssessmentService().assess(original, policy).assessment_complete
+
+
 def _replace_node(graph: Graph, replacement: Node) -> Graph:
     return graph.model_copy(
         update={
-            "nodes": tuple(replacement if node.id == replacement.id else node for node in graph.nodes)
+            "nodes": tuple(
+                replacement if node.id == replacement.id else node for node in graph.nodes
+            )
         }
     )
 
@@ -200,7 +289,9 @@ def test_v1_dimension_boundaries_are_literal(
             tuple(edge for edge in graph.edges if edge.id != "edge:implemented-by"),
         )
     if dimension is AssessmentDimension.FRESHNESS:
-        current = next(item for item in rubric_snapshot.snapshot.evidence if item.id == "evidence:req")
+        current = next(
+            item for item in rubric_snapshot.snapshot.evidence if item.id == "evidence:req"
+        )
         newer = current.model_copy(
             update={
                 "id": "evidence:req:new",
@@ -236,21 +327,31 @@ def test_v1_scores_start_at_one_hundred_and_clamp_at_zero(rubric_snapshot: Rubri
     """Catches score initialization or clamping that changes bounded deductions."""
     baseline = assess_node(rubric_snapshot.snapshot, "req:csv", AssessmentPolicy.v1())
     contradiction = rubric_snapshot.graph.edges[0].model_copy(
-        update={"id": "edge:contradiction", "relation": RelationType.CONTRADICTS, "to_id": "req:csv"}
+        update={
+            "id": "edge:contradiction",
+            "relation": RelationType.CONTRADICTS,
+            "to_id": "req:csv",
+        }
     )
     graph = _replace_edges(rubric_snapshot.graph, (*rubric_snapshot.graph.edges, contradiction))
-    blocked = assess_node(_with_snapshot(rubric_snapshot, graph=graph), "req:csv", AssessmentPolicy.v1())
+    blocked = assess_node(
+        _with_snapshot(rubric_snapshot, graph=graph), "req:csv", AssessmentPolicy.v1()
+    )
 
     assert baseline.dimension(AssessmentDimension.EVIDENCE_STRENGTH).score == 100
     assert blocked.dimension(AssessmentDimension.CONSISTENCY).score == 0
 
 
-def test_duplicate_evidence_references_are_not_double_counted(rubric_snapshot: RubricFixture) -> None:
+def test_duplicate_evidence_references_are_not_double_counted(
+    rubric_snapshot: RubricFixture,
+) -> None:
     """Catches duplicate visible references making a stable score change."""
     duplicate = rubric_snapshot.node("req:csv").model_copy(
         update={"evidence_refs": ("evidence:req", "evidence:req")}
     )
-    snapshot = _with_snapshot(rubric_snapshot, graph=_replace_node(rubric_snapshot.graph, duplicate))
+    snapshot = _with_snapshot(
+        rubric_snapshot, graph=_replace_node(rubric_snapshot.graph, duplicate)
+    )
 
     baseline = assess_node(rubric_snapshot.snapshot, "req:csv", AssessmentPolicy.v1())
     repeated = assess_node(snapshot, "req:csv", AssessmentPolicy.v1())
@@ -284,7 +385,9 @@ def test_later_recapture_of_the_same_provider_revision_is_not_stale(
     )
     ingestions = (
         EvidenceIngestion(connector_id="fixture:main", sequence=1, evidence=original),
-        EvidenceIngestion(connector_id="fixture:main", sequence=2, predecessor_id=original.id, evidence=recapture),
+        EvidenceIngestion(
+            connector_id="fixture:main", sequence=2, predecessor_id=original.id, evidence=recapture
+        ),
     )
 
     freshness = assess_node(
@@ -320,11 +423,16 @@ def test_newer_provider_revision_at_the_same_time_is_stale_for_freshness_and_tes
         update={"id": "edge:verified-by", "relation": RelationType.VERIFIED_BY, "to_id": test.id}
     )
     graph = rubric_snapshot.graph.model_copy(
-        update={"nodes": (*rubric_snapshot.graph.nodes, test), "edges": (*rubric_snapshot.graph.edges, verification)}
+        update={
+            "nodes": (*rubric_snapshot.graph.nodes, test),
+            "edges": (*rubric_snapshot.graph.edges, verification),
+        }
     )
     ingestions = (
         EvidenceIngestion(connector_id="fixture:main", sequence=1, evidence=original),
-        EvidenceIngestion(connector_id="fixture:main", sequence=2, predecessor_id=original.id, evidence=newer),
+        EvidenceIngestion(
+            connector_id="fixture:main", sequence=2, predecessor_id=original.id, evidence=newer
+        ),
     )
 
     scorecard = assess_node(
@@ -344,14 +452,20 @@ def test_newer_provider_revision_at_the_same_time_is_stale_for_freshness_and_tes
 
 def test_dimension_health_uses_the_active_policy_thresholds(rubric_snapshot: RubricFixture) -> None:
     """Catches a custom policy yielding contradictory node and dimension health colors."""
-    policy = AssessmentPolicy.model_validate({**AssessmentPolicy.v1().model_dump(), "red_below": 40})
+    policy = AssessmentPolicy.model_validate(
+        {**AssessmentPolicy.v1().model_dump(), "red_below": 40}
+    )
     scorecard = assess_node(rubric_snapshot.snapshot, "req:csv", policy)
 
-    assert scorecard.dimension(AssessmentDimension.TEST_VERIFICATION).health is AssessmentHealth.ORANGE
+    assert (
+        scorecard.dimension(AssessmentDimension.TEST_VERIFICATION).health is AssessmentHealth.ORANGE
+    )
     assert scorecard.health is AssessmentHealth.ORANGE
 
 
-def test_external_relation_without_a_visible_target_is_ignored(rubric_snapshot: RubricFixture) -> None:
+def test_external_relation_without_a_visible_target_is_ignored(
+    rubric_snapshot: RubricFixture,
+) -> None:
     """Catches a visible external edge making assessment dereference hidden topology."""
     external = rubric_snapshot.graph.edges[0].model_copy(
         update={"to_id": "req:hidden", "external": True}
@@ -408,23 +522,34 @@ def test_unknown_node_types_are_unassessed(rubric_snapshot: RubricFixture) -> No
     )
     graph = rubric_snapshot.graph.model_copy(
         update={
-            "nodes": (rubric_snapshot.node("intent:export"), unknown, rubric_snapshot.node("file:export")),
+            "nodes": (
+                rubric_snapshot.node("intent:export"),
+                unknown,
+                rubric_snapshot.node("file:export"),
+            ),
             "edges": (),
             "type_registry": TypeRegistry(extensions=frozenset({"vendor:FUTURE_REQUIREMENT"})),
         }
     )
 
-    scorecard = assess_node(_with_snapshot(rubric_snapshot, graph=graph), "future:csv", AssessmentPolicy.v1())
+    scorecard = assess_node(
+        _with_snapshot(rubric_snapshot, graph=graph), "future:csv", AssessmentPolicy.v1()
+    )
 
     assert scorecard.health is AssessmentHealth.UNASSESSED
     assert scorecard.robustness is None
     assert all(result.score is None for result in scorecard.dimensions)
 
 
-def test_assessment_is_stable_under_visible_input_permutation(rubric_snapshot: RubricFixture) -> None:
+def test_assessment_is_stable_under_visible_input_permutation(
+    rubric_snapshot: RubricFixture,
+) -> None:
     """Catches traversal or collection order leaking into detached scorecards."""
     permuted_graph = rubric_snapshot.graph.model_copy(
-        update={"nodes": tuple(reversed(rubric_snapshot.graph.nodes)), "edges": tuple(reversed(rubric_snapshot.graph.edges))}
+        update={
+            "nodes": tuple(reversed(rubric_snapshot.graph.nodes)),
+            "edges": tuple(reversed(rubric_snapshot.graph.edges)),
+        }
     )
     permuted = _with_snapshot(
         rubric_snapshot,

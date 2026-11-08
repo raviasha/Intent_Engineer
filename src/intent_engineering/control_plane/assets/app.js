@@ -81,6 +81,9 @@
     overlay: "approved",
     unavailable: false,
     generation: 0,
+    readingPage: null,
+    readingUnavailable: false,
+    readingGeneration: 0,
   });
   const enrichmentState = Object.seal({
     session: null,
@@ -462,6 +465,9 @@
       return;
     }
     assessmentState.selectedNodeId = nodeId;
+    assessmentState.readingPage = null;
+    assessmentState.readingUnavailable = false;
+    assessmentState.readingGeneration += 1;
     if (alternativeState.subjectRef !== nodeId) {
       alternativeState.subjectRef = null;
       alternativeState.result = null;
@@ -671,6 +677,110 @@
     section.append(region);
   }
 
+  function renderUnderstanding(parent, assertions) {
+    if (!Array.isArray(assertions) || assertions.length === 0) return;
+    addText(parent, "h4", "Recorded understanding");
+    addText(parent, "p", "Check this summary and correct any assumption in your answer. Recorded assertions are not proof of satisfaction.");
+    for (const item of assertions.slice(0, 24)) {
+      const card = document.createElement("article");
+      addText(card, "p", `${item.type}: ${item.label}`);
+      addText(card, "p", `${item.interpretation} · ${item.id}`);
+      if (Array.isArray(item.evidence_refs) && item.evidence_refs.length) {
+        addText(card, "p", `Evidence: ${item.evidence_refs.join(", ")}`);
+      }
+      parent.append(card);
+    }
+  }
+
+  function renderCoverage(parent, coverage, title = "Outcome and constraint coverage") {
+    if (!coverage || !Array.isArray(coverage.rows)) return;
+    addText(parent, "h4", title);
+    addText(parent, "p", coverage.note || "Links are structural evidence; review their meaning.");
+    if (!coverage.rows.length) {
+      addText(parent, "p", "No outcomes or constraints are recorded in this view. Coverage has not been established.");
+      return;
+    }
+    const table = document.createElement("table");
+    table.className = "coverage-table";
+    const header = document.createElement("tr");
+    for (const label of ["Outcome or constraint", "Requirements", "Review status", "Reason"]) {
+      addText(header, "th", label);
+    }
+    table.append(header);
+    const labels = {linked_unreviewed: "Linked — review meaning", missing: "Missing coverage",
+      disputed: "Unresolved disagreement", deferred: "Deliberately deferred", incomplete: "Incomplete view"};
+    for (const row of coverage.rows.slice(0, 128)) {
+      const tr = document.createElement("tr");
+      tr.className = assessmentClass(row.health in assessmentHealth ? row.health : "unassessed", "coverage-row");
+      addText(tr, "td", `${row.label} (${row.subject_id})`);
+      addText(tr, "td", (row.requirement_ids || []).join(", ") || "None recorded");
+      addText(tr, "td", labels[row.status] || "Review required");
+      addText(tr, "td", `${row.reason}${row.truncated ? " View limited." : ""}${row.case_ids?.length ? ` Cases: ${row.case_ids.join(", ")}` : ""}`);
+      table.append(tr);
+    }
+    parent.append(table);
+    if (coverage.truncated) addText(parent, "p", "Coverage view limited; inspect individual topics for more detail.");
+  }
+
+  function renderReadingPage(parent, page) {
+    const article = document.createElement("article");
+    article.className = "intent-reading-page";
+    addText(article, "h3", page.title);
+    addText(article, "p", "Read-only view of the approved graph.");
+    addText(article, "p", page.scope_note || "");
+    renderUnderstanding(article, page.assertions);
+    const links = document.createElement("nav");
+    links.setAttribute("aria-label", "Related intent topics");
+    for (const item of page.assertions || []) {
+      if (item.id !== page.node_id) links.append(actionButton(`Read ${item.label}`, async () => {
+        await loadAssessment(null, item.id, null, item.id);
+        if (assessmentState.selectedNodeId === item.id) await loadReadingPage(item.id);
+      }));
+    }
+    article.append(links);
+    renderCoverage(article, page.coverage);
+    addText(article, "h4", "Decisions and relationships");
+    for (const link of page.relationships || []) {
+      addText(article, "p", `${link.from} → ${link.relation} → ${link.to} (${link.id})`);
+    }
+    addText(article, "h4", "Open questions");
+    for (const gap of page.open_questions || []) {
+      addText(article, "p", `${gap.node_id}: ${gap.reason}`);
+    }
+    addText(article, "h4", "Supporting sources");
+    for (const source of page.evidence || []) {
+      addText(article, "p", `${source.id}: ${source.source} · version ${source.version || "unspecified"} · ${source.author || "author unspecified"}`);
+    }
+    addText(article, "p", page.score_note || "");
+    parent.append(article);
+  }
+
+  async function loadReadingPage(nodeId) {
+    const generation = ++assessmentState.readingGeneration;
+    const snapshot = assessmentState.report?.snapshot_digest;
+    assessmentState.readingPage = null;
+    assessmentState.readingUnavailable = false;
+    try {
+      const result = await fetchJson(`${api.assessment}/nodes/${encodeURIComponent(nodeId)}`);
+      if (generation !== assessmentState.readingGeneration || assessmentState.selectedNodeId !== nodeId) return;
+      const page = result.reading_page;
+      if (!page || result.snapshot_digest !== snapshot || page.snapshot_digest !== snapshot
+          || page.node_id !== nodeId || result.node?.node_id !== nodeId) {
+        throw new Error("Reading snapshot changed");
+      }
+      boundedAssessmentArray(page.assertions, 24, "reading assertions");
+      boundedAssessmentArray(page.evidence, 64, "reading evidence");
+      boundedAssessmentArray(page.relationships, 128, "reading relationships");
+      boundedAssessmentArray(page.open_questions, 64, "reading questions");
+      boundedAssessmentArray(page.coverage.rows, 128, "coverage rows");
+      assessmentState.readingPage = page;
+    } catch (_error) {
+      if (generation !== assessmentState.readingGeneration) return;
+      assessmentState.readingUnavailable = true;
+    }
+    if (state.view === "assessment") render();
+  }
+
   function renderAssessmentDetail(section) {
     const node = assessmentNode(assessmentState.selectedNodeId);
     const detail = document.createElement("aside");
@@ -684,6 +794,13 @@
       return;
     }
     addText(detail, "p", node.node_id);
+    detail.append(actionButton("Read intent and requirements", () => loadReadingPage(node.node_id)));
+    if (assessmentState.readingUnavailable) {
+      addText(detail, "p", "Reading page unavailable or changed. Refresh the assessment and try again.");
+    }
+    if (assessmentState.readingPage) {
+      renderReadingPage(detail, assessmentState.readingPage);
+    }
     const healthLine = document.createElement("p");
     addAssessmentHealth(healthLine, displayedAssessmentHealth(node), "");
     if (assessmentState.overlay === "projected") {
@@ -721,14 +838,14 @@
       addText(detail, "p", `Recommended next action: ${node.recommended_next_action}`);
     }
     if (
-      node.node_type === "requirement" &&
+      node.node_type.toUpperCase() === "REQUIREMENT" &&
       (node.health === "orange" || node.health === "red")
     ) {
       detail.append(
         actionButton("Suggest alternatives", () => requestAlternatives(node.node_id))
       );
     }
-    if (node.node_type === "requirement") {
+    if (node.node_type.toUpperCase() === "REQUIREMENT") {
       detail.append(
         actionButton("Validate host candidate", () => openHostAlternativeImport(node.node_id))
       );
@@ -827,7 +944,7 @@
     const node = assessmentNode(subjectRef);
     if (
       !node ||
-      node.node_type !== "requirement" ||
+      node.node_type.toUpperCase() !== "REQUIREMENT" ||
       !["orange", "red"].includes(node.health)
     ) {
       return;
@@ -912,7 +1029,7 @@
     let body = "";
     field.value = "";
     try {
-      if (!node || node.node_type !== "requirement" || !raw) {
+      if (!node || node.node_type.toUpperCase() !== "REQUIREMENT" || !raw) {
         throw new Error("Host candidate is unavailable.");
       }
       candidate = JSON.parse(raw);
@@ -984,7 +1101,7 @@
 
   function openHostAlternativeImport(subjectRef) {
     const node = assessmentNode(subjectRef);
-    if (!node || node.node_type !== "requirement") {
+    if (!node || node.node_type.toUpperCase() !== "REQUIREMENT") {
       return;
     }
     alternativeState.generation += 1;
@@ -1137,6 +1254,10 @@
       "p",
       "Scores are derived, explainable, ACL-filtered, noncanonical, and model-independent."
     );
+    addText(section, "p", assessmentState.report.assessment_scope === "intent_requirements"
+      ? "Intent vs requirements — code and test dimensions are outside this assessment."
+      : "Full lifecycle — includes implementation and test dimensions.");
+    addText(section, "p", "Scores measure structural completeness. Review coverage separately to judge whether requirements meet the intended outcomes.");
     const project = assessmentState.report.project;
     if (project && typeof project === "object") {
       const summary = document.createElement("p");
@@ -1555,6 +1676,7 @@
       if (question) {
         const current = document.createElement("article");
         current.className = "enrichment-question";
+        renderUnderstanding(current, question.context || []);
         addText(current, "h3", question.prompt);
         addText(current, "p", `Why this matters: ${question.reason}`);
         addText(current, "p", `Score dimension: ${question.dimension}`);
@@ -1774,6 +1896,12 @@
         section.append(actionButton("Open inbox", () => showView("inbox")));
       }
       return section;
+    }
+    if (state.preview.preview.coverage_review) {
+      addText(section, "h3", "Intent coverage review");
+      addText(section, "p", "Review this with the proposed change. No additional approval step is required.");
+      renderCoverage(section, state.preview.preview.coverage_review.current, "Current coverage");
+      renderCoverage(section, state.preview.preview.coverage_review.proposed, "Proposed coverage");
     }
     addText(section, "h3", "Exact preview");
     addProjection(section, state.preview.preview);
@@ -2511,6 +2639,9 @@
         nextSelection = accepted.rows[0].node_id;
       }
       assessmentState.report = accepted.report;
+      assessmentState.readingPage = null;
+      assessmentState.readingUnavailable = false;
+      assessmentState.readingGeneration += 1;
       assessmentState.pageRows = accepted.rows;
       assessmentState.pageCursor = cursor;
       assessmentState.pageFocus = focus;
@@ -2529,6 +2660,9 @@
         return;
       }
       assessmentState.report = null;
+      assessmentState.readingPage = null;
+      assessmentState.readingUnavailable = false;
+      assessmentState.readingGeneration += 1;
       assessmentState.pageRows = [];
       assessmentState.pageCursor = null;
       assessmentState.pageFocus = null;

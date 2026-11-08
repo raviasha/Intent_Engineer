@@ -22,7 +22,7 @@ def test_framework_graph_is_valid_and_provenance_backed() -> None:
 
     assert graph.id == "intent-engineering-framework"
     assert graph.schema_version == "0.1.0"
-    assert graph.version == 2
+    assert graph.version == 3
     assert graph.created_at == date(2026, 8, 25)
     assert graph.source_spec == "INTENT_ENGINEERING.md"
     assert all(node.evidence_refs for node in graph.nodes if node.source_mode is not None)
@@ -31,6 +31,10 @@ def test_framework_graph_is_valid_and_provenance_backed() -> None:
         "cap-automatic-member-restore",
         "cap-reviewed-team-reconciliation",
         "cap-grounded-requirement-alternatives",
+        "req-intent-assessment-scope",
+        "req-contextual-clarification",
+        "req-visible-intent-coverage",
+        "req-readable-intent-pages",
     } <= {node.id for node in graph.nodes}
     graph.assert_invariants()
 
@@ -128,6 +132,8 @@ def test_framework_graph_spec_references_import_as_section_backed_versioned_evid
     alternatives_path = Path(
         "docs/superpowers/specs/2026-09-02-intent-graph-assessment-enrichment-design.md"
     )
+    focused_reference = "design:2026-11-08-intent-focused-workflow"
+    focused_path = Path("docs/superpowers/specs/2026-11-08-intent-focused-workflow.md")
 
     imported = import_foundational_evidence(
         graph,
@@ -137,6 +143,7 @@ def test_framework_graph_spec_references_import_as_section_backed_versioned_evid
         referenced_markdown={
             design_reference: design_path,
             alternatives_reference: alternatives_path,
+            focused_reference: focused_path,
         },
     )
 
@@ -162,6 +169,7 @@ def test_framework_graph_spec_references_import_as_section_backed_versioned_evid
         resolve_foundational_reference(store, alternatives_reference).payload["content"]
         == alternatives_path.read_text()
     )
+    assert resolve_foundational_reference(store, focused_reference).payload["content"] == focused_path.read_text()
 
 
 def test_foundational_evidence_retains_changed_section_versions_and_dedupes_unchanged(

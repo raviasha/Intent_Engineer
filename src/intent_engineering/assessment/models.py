@@ -29,6 +29,7 @@ from intent_engineering.core.models import (
     ReconciliationCase,
 )
 from intent_engineering.core.models._base import StrictModel
+from intent_engineering.core.models.project import AssessmentScope
 from intent_engineering.intent_workflow import ClarificationEvent
 
 _DIGEST_PATTERN = re.compile(r"^sha256:[0-9a-f]{64}$")
@@ -413,6 +414,7 @@ class AssessmentReport(_AssessmentModel):
     """A version-bound, detached report with canonically ordered scorecards."""
 
     schema_version: Literal[1] = 1
+    assessment_scope: AssessmentScope = "full_lifecycle"
     project_id: str
     graph_id: str
     graph_version: int = Field(ge=0)
@@ -505,6 +507,8 @@ class AssessmentReport(_AssessmentModel):
         """Return canonical report content excluding the presentation timestamp."""
         material = self.model_dump(mode="json")
         material.pop("generated_at")
+        if self.assessment_scope == "full_lifecycle":
+            material.pop("assessment_scope")
         return _canonical_json(material)
 
     @property
@@ -531,6 +535,7 @@ class AssessmentSnapshot(_AssessmentModel):
     """An immutable, ACL-filtered preimage consumed by the assessment service."""
 
     schema_version: Literal[1] = 1
+    assessment_scope: AssessmentScope = "full_lifecycle"
     project_id: str
     graph: Graph
     evidence: tuple[EvidenceRecord, ...]

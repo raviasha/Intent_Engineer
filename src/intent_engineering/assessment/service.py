@@ -21,7 +21,7 @@ from intent_engineering.assessment.models import (
 )
 from intent_engineering.assessment.policy import AssessmentPolicy
 from intent_engineering.assessment.rollup import roll_up
-from intent_engineering.assessment.rubric import assess_node
+from intent_engineering.assessment.rubric import assess_node, outside_scope
 from intent_engineering.assessment.snapshot import AssessmentUnavailable
 from intent_engineering.core.models import Graph
 
@@ -154,7 +154,7 @@ class GraphAssessmentService:
         policy: AssessmentPolicy | None = None,
     ) -> AssessmentReport:
         """Assess exactly one detached snapshot without acquiring or mutating canonical state."""
-        active_policy = policy or AssessmentPolicy.v1()
+        active_policy = policy or AssessmentPolicy.for_scope(snapshot.assessment_scope)
         key = (
             snapshot.aggregate_digest,
             snapshot.principal_projection_digest,
@@ -179,8 +179,13 @@ class GraphAssessmentService:
                     for check in result.failed
                 )
             )
-            incomplete = any(node.health is AssessmentHealth.UNASSESSED for node in nodes)
+            incomplete = any(
+                node.health is AssessmentHealth.UNASSESSED
+                and not outside_scope(node.node_type, active_policy)
+                for node in nodes
+            )
             report = AssessmentReport(
+                assessment_scope=active_policy.scope,
                 project_id=snapshot.project_id,
                 graph_id=snapshot.graph.id,
                 graph_version=snapshot.graph.version,

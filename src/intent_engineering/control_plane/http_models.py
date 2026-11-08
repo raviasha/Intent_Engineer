@@ -898,6 +898,7 @@ class AssessmentNodeResponse(_HttpResponseModel):
     schema_version: Literal[1] = 1
     snapshot_digest: str = Field(pattern=_DIGEST_PATTERN.pattern)
     node: dict[str, object]
+    reading_page: dict[str, object] | None = None
 
     @field_validator("snapshot_digest", mode="before")
     @classmethod

@@ -113,7 +113,9 @@ def _model_material(value: BaseModel) -> object:
 def _parse_config(content: bytes | None) -> ProjectConfig:
     if content is None:
         raise ValueError("missing assessment config")
-    return ProjectConfig.model_validate(load_strict_yaml_mapping_bytes(content))
+    return ProjectConfig.model_validate_json(
+        _canonical_json(load_strict_yaml_mapping_bytes(content))
+    )
 
 
 def _parse_history(content: bytes | None) -> tuple[ChangeSet, ...]:
@@ -541,6 +543,7 @@ def _snapshot_model(
         "principal_projection": principal_projection_digest,
     }
     return AssessmentSnapshot(
+        assessment_scope=config.assessment_scope,
         project_id=config.project_id,
         graph=graph,
         evidence=evidence,

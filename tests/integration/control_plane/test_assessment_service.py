@@ -183,6 +183,9 @@ def test_assessment_focus_and_node_lookup_share_the_visible_report(
     assert focused["focus"]["reference"] == "intent:export"
     assert focused["focus"]["node"]["node_id"] == "intent:export"
     assert node["node"]["node_id"] == "intent:export"
+    assert node["reading_page"]["node_id"] == "intent:export"
+    assert node["reading_page"]["snapshot_digest"] == node["snapshot_digest"]
+    assert node["reading_page"]["non_canonical"] is True
     assert node["snapshot_digest"] == focused["assessment"]["snapshot_digest"]
 
 
@@ -354,6 +357,9 @@ def test_acl_hidden_and_unknown_node_lookup_fail_identically(
     before = _durable_bytes(project)
 
     failures: list[tuple[type[BaseException], str]] = []
+    visible_page = service.assessment_node("intent:export")["reading_page"]
+    assert "req:hidden" not in json.dumps(visible_page)
+    assert "evidence:hidden" not in json.dumps(visible_page)
     for node_id in ("req:hidden", "req:unknown"):
         with pytest.raises(LookupError, match="^assessment node unavailable$") as caught:
             service.assessment_node(node_id)

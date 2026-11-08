@@ -66,6 +66,64 @@ function installAssessmentFocusProbe() {
 """
 
 
+def test_reading_page_shows_scope_citations_assumptions_and_coverage_safely() -> None:
+    result = _run(
+        _FIXTURE
+        + r"""
+await openAssessment();
+const response = assessmentResponse([red, green]);
+response.assessment.assessment_scope = "intent_requirements";
+respond(take("/api/v1/assessment"), response); await settle();
+button("Read intent and requirements").click(); await settle();
+respond(take("/api/v1/assessment/nodes/req%3Acsv"), {
+  snapshot_digest: "sha256:snapshot", node: red,
+  reading_page: { node_id: "req:csv", title: "Monthly export", snapshot_digest: "sha256:snapshot",
+    assertions: [{id: "req:csv", type: "REQUIREMENT", label: "Monthly export", interpretation: "explicit", evidence_refs: ["evidence:one"]},
+      {id: "assumption", type: "ASSUMPTION", label: "<img src=x onerror=alert(1)>", interpretation: "assumption", evidence_refs: []}],
+    evidence: [{id: "evidence:one", source: "docs/finance.md", version: "7", author: "Finance"}],
+    relationships: [], open_questions: [], scope_note: "Two semantic links",
+    score_note: "Links do not prove satisfaction.",
+    coverage: {rows: [{subject_id: "outcome", label: "Faster close", requirement_ids: ["req:csv"],
+      status: "linked_unreviewed", health: "orange", reason: "Review meaning", case_ids: []}],
+      note: "Structural evidence", semantic_alignment: "requires_human_review", truncated: false}}
+}); await settle();
+process.stdout.write(JSON.stringify({text: app.textContent, tags: walk(app).map(n => n.tagName)}));
+"""
+    )
+    assert "Intent vs requirements" in result["text"]
+    assert "Monthly export" in result["text"]
+    assert "docs/finance.md" in result["text"]
+    assert "assumption" in result["text"]
+    assert "Review meaning" in result["text"]
+    assert "img" not in result["tags"]
+
+
+def test_reading_page_rejects_a_changed_snapshot_without_showing_its_content() -> None:
+    result = _run(_FIXTURE + r"""
+await openAssessment();
+respond(take("/api/v1/assessment"), assessmentResponse([red, green])); await settle();
+button("Read intent and requirements").click(); await settle();
+respond(take("/api/v1/assessment/nodes/req%3Acsv"), {
+  snapshot_digest: "sha256:changed", node: red,
+  reading_page: {node_id: "req:csv", snapshot_digest: "sha256:changed", title: "STALE-CONTENT"}
+}); await settle();
+process.stdout.write(JSON.stringify({text: app.textContent}));
+""")
+    assert "STALE-CONTENT" not in result["text"]
+    assert "Reading page unavailable or changed" in result["text"]
+
+
+def test_real_requirement_type_can_request_simpler_alternatives() -> None:
+    result = _run(_FIXTURE + r"""
+await openAssessment();
+respond(take("/api/v1/assessment"), assessmentResponse([red, green])); await settle();
+button("Suggest alternatives").click(); await settle();
+const request = take("/api/v1/alternatives");
+process.stdout.write(JSON.stringify({body: JSON.parse(request.init.body)}));
+""")
+    assert result["body"]["subject_ref"] == "req:csv"
+
+
 def test_graph_table_and_detail_share_selection_and_server_scorecard_objects() -> None:
     """Catches divergent score copies, one-way selection, or unsafe assessment rendering."""
     result = _run(

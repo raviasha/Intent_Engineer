@@ -107,6 +107,31 @@ def test_assess_json_is_read_only_versioned_and_explainable(initialized_project:
     assert _durable_bytes(initialized_project) == before
 
 
+def test_assess_defaults_to_intent_scope_and_explicit_full_lifecycle_is_separate(initialized_project):
+    focused = run_intent(initialized_project, "assess", "--format", "json")
+    full = run_intent(initialized_project, "assess", "--scope", "full_lifecycle", "--format", "json")
+    assert focused.returncode == full.returncode == 0
+    focused_report = json.loads(focused.stdout)["assessment"]
+    full_report = json.loads(full.stdout)["assessment"]
+    assert focused_report["assessment_scope"] == "intent_requirements"
+    assert full_report["assessment_scope"] == "full_lifecycle"
+    assert focused_report["policy_digest"] != full_report["policy_digest"]
+    assert all(result["applicability"] == "not_applicable"
+               for node in focused_report["nodes"] for result in node["dimensions"]
+               if result["dimension"] in {"implementation_traceability", "test_verification"})
+
+
+def test_old_full_lifecycle_report_without_scope_remains_readable(initialized_project):
+    result = run_intent(initialized_project, "assess", "--scope", "full_lifecycle", "--format", "json")
+    assert result.returncode == 0
+    payload = json.loads(result.stdout)
+    payload["assessment"].pop("assessment_scope")
+    content = json.dumps(payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode() + b"\n"
+    restored = assessment_cli._parse_assessment_report(content)
+    assert restored.assessment_scope == "full_lifecycle"
+    assert restored.semantic_digest == payload["semantic_digest"]
+
+
 @pytest.mark.parametrize("output_format", ("text", "markdown"))
 def test_assess_human_formats_remain_versioned_and_explainable(
     initialized_project: Path,

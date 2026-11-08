@@ -72,6 +72,10 @@ from intent_engineering.control_plane.webauthn_service import (
     WebAuthnService,
     WebAuthnVerifier,
 )
+from intent_engineering.core.graph.applier import apply_changeset_with_case_effects
+from intent_engineering.core.models import ChangeSet
+from intent_engineering.intent_workflow.coverage import build_coverage
+from intent_engineering.intent_workflow.reading import build_reading_page
 
 if TYPE_CHECKING:
     from intent_engineering.control_plane.team_enrollment import MembershipSession
@@ -2110,6 +2114,7 @@ class ControlPlaneService:
                 detached = AssessmentNodeResponse(
                     snapshot_digest=report.snapshot_digest,
                     node=scorecard.model_dump(mode="json"),
+                    reading_page=build_reading_page(snapshot, scorecard.node_id, report),
                 )
             if not self._read_only_authority_matches(authority):
                 raise ValueError("assessment authority changed")
@@ -2393,6 +2398,19 @@ class ControlPlaneService:
             raise ControlPlaneError() from None
         return result
 
+    def _coverage_review(
+        self, authority: _Authority, changeset: ChangeSet, actor: str,
+    ) -> dict[str, object]:
+        snapshot = self._assessment_snapshot_from_authority(
+            authority, actor, self._principals(authority, actor)
+        )
+        proposed = apply_changeset_with_case_effects(snapshot.graph, changeset)
+        return {
+            "snapshot_digest": snapshot.aggregate_digest,
+            "current": build_coverage(snapshot.graph, snapshot.cases),
+            "proposed": build_coverage(proposed, snapshot.cases),
+        }
+
     def _baseline_material(
         self,
         proposal_id: str,
@@ -2417,6 +2435,7 @@ class ControlPlaneService:
         changeset = BootstrapService._activation_changeset(proposal, selected, actor, at)
         body: dict[str, object] = {
             "kind": "baseline",
+            "coverage_review": self._coverage_review(authority, changeset, actor),
             "proposal": preview,
             "selected_node_ids": list(selected),
             "result_changeset_id": changeset.id,
@@ -2477,6 +2496,7 @@ class ControlPlaneService:
                 if isinstance(proposal, ClarificationIntentProposal)
                 else "requirement_alternative_proposal"
             ),
+            "coverage_review": self._coverage_review(authority, changeset, actor),
             "proposal": {
                 **proposal.model_dump(mode="json"),
                 "proposal_digest": proposal.digest,

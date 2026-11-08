@@ -193,6 +193,11 @@ never initializes and reports a clean graph version 0.
 
 Inspect the current visible graph's deterministic robustness without changing it:
 
+The default assessment focuses on intent versus requirements. In Intent Dev, select a scorecard
+and choose **Read intent and requirements** for cited context, assumptions and outcome coverage.
+The same coverage review appears alongside proposed graph changes. Scores measure structural
+completeness; they do not prove that a requirement satisfies its intended outcome.
+
 ```bash
 intent assess --project . --format json
 intent assess --project . --focus <node-or-branch-id> --format json

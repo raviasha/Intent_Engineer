@@ -1,5 +1,45 @@
 created_at: '2026-08-25'
 edges:
+- created_at: '2026-11-08T00:00:00Z'
+  created_by: approved-intent-focused-design
+  external: false
+  from: intent-preserve-fidelity
+  id: e-focused-1
+  last_modified_at: '2026-11-08T00:00:00Z'
+  last_modified_by: approved-intent-focused-design
+  relation: SPECIFIED_BY
+  status: active
+  to: req-intent-assessment-scope
+- created_at: '2026-11-08T00:00:00Z'
+  created_by: approved-intent-focused-design
+  external: false
+  from: intent-preserve-fidelity
+  id: e-focused-2
+  last_modified_at: '2026-11-08T00:00:00Z'
+  last_modified_by: approved-intent-focused-design
+  relation: SPECIFIED_BY
+  status: active
+  to: req-contextual-clarification
+- created_at: '2026-11-08T00:00:00Z'
+  created_by: approved-intent-focused-design
+  external: false
+  from: intent-preserve-fidelity
+  id: e-focused-3
+  last_modified_at: '2026-11-08T00:00:00Z'
+  last_modified_by: approved-intent-focused-design
+  relation: SPECIFIED_BY
+  status: active
+  to: req-visible-intent-coverage
+- created_at: '2026-11-08T00:00:00Z'
+  created_by: approved-intent-focused-design
+  external: false
+  from: intent-preserve-fidelity
+  id: e-focused-4
+  last_modified_at: '2026-11-08T00:00:00Z'
+  last_modified_by: approved-intent-focused-design
+  relation: SPECIFIED_BY
+  status: active
+  to: req-readable-intent-pages
 - created_at: '2026-08-25T00:00:00'
   created_by: founding-spec
   external: false
@@ -262,7 +302,8 @@ nodes:
   source_mode: explicit
   status: active
   type: CAPABILITY
-- confidence_basis: Approved grounded-alternatives design and reviewed activation boundary
+- confidence_basis: Approved grounded-alternatives design and reviewed activation
+    boundary
   created_at: '2026-09-02T00:00:00Z'
   created_by: approved-assessment-enrichment-design
   evidence_refs:
@@ -270,8 +311,8 @@ nodes:
   id: cap-grounded-requirement-alternatives
   implementation_status: implemented_baseline
   intent_fidelity_confidence: 0.99
-  label: Compare grounded simpler or different requirements against the same intent before reviewed
-    activation
+  label: Compare grounded simpler or different requirements against the same intent
+    before reviewed activation
   last_modified_at: '2026-09-02T00:00:00Z'
   last_modified_by: approved-assessment-enrichment-design
   last_reassessed_at: null
@@ -569,6 +610,37 @@ nodes:
   source_mode: explicit
   status: active
   type: REQUIREMENT
+- confidence_basis: User approved the four recommendations on 2026-11-08
+  created_at: '2026-11-08T00:00:00Z'
+  created_by: approved-intent-focused-design
+  evidence_refs:
+  - design:2026-11-08-intent-focused-workflow
+  id: req-contextual-clarification
+  implementation_status: null
+  intent_fidelity_confidence: 0.99
+  label: Reuse existing intent context and show cited assumptions before consequential
+    questions
+  last_modified_at: '2026-11-08T00:00:00Z'
+  last_modified_by: approved-intent-focused-design
+  last_reassessed_at: null
+  source_mode: explicit
+  status: active
+  type: REQUIREMENT
+- confidence_basis: User approved the four recommendations on 2026-11-08
+  created_at: '2026-11-08T00:00:00Z'
+  created_by: approved-intent-focused-design
+  evidence_refs:
+  - design:2026-11-08-intent-focused-workflow
+  id: req-intent-assessment-scope
+  implementation_status: null
+  intent_fidelity_confidence: 0.99
+  label: Assess intent against requirements without paused code/test penalties
+  last_modified_at: '2026-11-08T00:00:00Z'
+  last_modified_by: approved-intent-focused-design
+  last_reassessed_at: null
+  source_mode: explicit
+  status: active
+  type: REQUIREMENT
 - confidence_basis: MVP requirement
   created_at: '2026-08-25T00:00:00'
   created_by: founding-spec
@@ -602,9 +674,40 @@ nodes:
   source_mode: explicit
   status: active
   type: REQUIREMENT
+- confidence_basis: User approved the four recommendations on 2026-11-08
+  created_at: '2026-11-08T00:00:00Z'
+  created_by: approved-intent-focused-design
+  evidence_refs:
+  - design:2026-11-08-intent-focused-workflow
+  id: req-readable-intent-pages
+  implementation_status: null
+  intent_fidelity_confidence: 0.99
+  label: Read authorized intent topics with requirements, decisions, questions and
+    evidence
+  last_modified_at: '2026-11-08T00:00:00Z'
+  last_modified_by: approved-intent-focused-design
+  last_reassessed_at: null
+  source_mode: explicit
+  status: active
+  type: REQUIREMENT
+- confidence_basis: User approved the four recommendations on 2026-11-08
+  created_at: '2026-11-08T00:00:00Z'
+  created_by: approved-intent-focused-design
+  evidence_refs:
+  - design:2026-11-08-intent-focused-workflow
+  id: req-visible-intent-coverage
+  implementation_status: null
+  intent_fidelity_confidence: 0.99
+  label: Review explicit outcome and constraint coverage alongside proposed requirements
+  last_modified_at: '2026-11-08T00:00:00Z'
+  last_modified_by: approved-intent-focused-design
+  last_reassessed_at: null
+  source_mode: explicit
+  status: active
+  type: REQUIREMENT
 purpose: Dogfood graph describing the framework's own intent and design.
 schema_version: 0.1.0
 source_spec: INTENT_ENGINEERING.md
 type_registry:
   extensions: []
-version: 2
+version: 3

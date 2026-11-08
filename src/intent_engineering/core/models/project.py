@@ -6,11 +6,14 @@ from collections.abc import Mapping
 from datetime import datetime
 from pathlib import PurePosixPath
 from types import MappingProxyType
+from typing import Literal
 
 from pydantic import ConfigDict, Field, field_serializer, field_validator
 
 from intent_engineering.core.models._base import StrictModel
 from intent_engineering.core.models.source_roles import SourceRoleAssignment
+
+type AssessmentScope = Literal["intent_requirements", "full_lifecycle"]
 
 _DEFAULT_CONTEXT_LIMITS = {
     "relevant_intent": 10,
@@ -92,6 +95,7 @@ class ProjectConfig(StrictModel):
     project_id: str
     graph_path: str = ".intent/graph.yaml"
     local_actor: str
+    assessment_scope: AssessmentScope = "intent_requirements"
     source_exclusions: tuple[str, ...] = ()
     auto_apply_metadata: bool = True
     auto_apply_semantic: bool = False

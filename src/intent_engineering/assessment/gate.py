@@ -206,6 +206,7 @@ class AssessmentGate:
             base.project_id != head.project_id
             or base.graph_id != head.graph_id
             or base.policy_digest != head.policy_digest
+            or base.assessment_scope != head.assessment_scope
             or base.principal_projection_digest != head.principal_projection_digest
         ):
             raise ValueError("assessment gate unavailable")

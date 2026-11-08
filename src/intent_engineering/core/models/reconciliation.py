@@ -44,6 +44,16 @@ def is_nonterminal_case_status(status: ReconciliationStatus) -> bool:
     return status in NONTERMINAL_CASE_STATUSES
 
 
+def is_intent_requirement_case(case_type: ReconciliationCaseType) -> bool:
+    """Exclude implementation-only observations from the focused intent review."""
+    return case_type not in {
+        ReconciliationCaseType.CODE_LAG,
+        ReconciliationCaseType.TEST_LAG,
+        ReconciliationCaseType.UNDOCUMENTED_CODE,
+        ReconciliationCaseType.ORPHAN_REQUIREMENT,
+    }
+
+
 class EvidenceSide(StrictModel):
     """One independently attributable position used to classify drift."""
 

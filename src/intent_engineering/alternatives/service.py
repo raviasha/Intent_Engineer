@@ -59,7 +59,7 @@ class RequirementAlternativeService:
         self._snapshot_loader = snapshot_loader
         self._reasoner = reasoner
         self._assessment = assessment or GraphAssessmentService()
-        self._policy = policy or AssessmentPolicy.v1()
+        self._policy = policy
         self._request_builder = request_builder or AlternativeRequestBuilder()
         self._validator = validator or AlternativeValidator()
         self._contexts: OrderedDict[str, _RequestContext] = OrderedDict()

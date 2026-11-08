@@ -1115,6 +1115,7 @@ def test_authenticated_clarified_proposal_confirmation_has_one_graph_transition(
     harness = _harness(tmp_path)
     proposal = _create_clarified_proposal(harness)
     preview = harness.service.proposal_preview(proposal.id)
+    assert preview["preview"]["coverage_review"]["proposed"]["semantic_alignment"] == "requires_human_review"
     payload = harness.sign(preview)
     version = harness.runtime.graph_store.load().version
     history_path = harness.project / ".intent/history/changesets.jsonl"

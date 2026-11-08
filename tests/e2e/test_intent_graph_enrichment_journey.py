@@ -31,7 +31,8 @@ pytestmark = pytest.mark.anyio
 
 def _initialize(project: Path) -> Path:
     initialized = initialize_project(project)
-    config = ProjectConfig(project_id="project:enrichment", local_actor="local:asha")
+    config = ProjectConfig(project_id="project:enrichment", local_actor="local:asha",
+                           assessment_scope="full_lifecycle")
     initialized.config_path.write_text(
         yaml.safe_dump(config.model_dump(mode="json"), sort_keys=True),
         encoding="utf-8",

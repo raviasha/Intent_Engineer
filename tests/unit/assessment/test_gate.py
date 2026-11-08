@@ -24,6 +24,13 @@ _NOW = datetime(2026, 9, 2, 12, 0, tzinfo=UTC)
 _DIGEST = "sha256:" + "1" * 64
 
 
+def test_gate_rejects_different_assessment_scopes():
+    base = _report(AssessmentHealth.GREEN)
+    head = base.model_copy(update={"assessment_scope": "intent_requirements"})
+    with pytest.raises(ValueError):
+        AssessmentGate().evaluate(base=base, head=head)
+
+
 def _report(
     health: AssessmentHealth,
     *,

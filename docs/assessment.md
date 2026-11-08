@@ -38,7 +38,8 @@ or update canonical state.
 
 ## Read the scorecard
 
-Rubric version 1 evaluates seven dimensions:
+Rubric version 1 defines seven dimensions. The default **Intent vs requirements** mode excludes
+implementation traceability and test verification; the optional full-lifecycle mode includes them:
 
 1. intent clarity;
 2. evidence strength;
@@ -196,3 +197,43 @@ over this foundation. This alternatives increment focuses on intent-to-requireme
 does not establish requirement-to-code or requirement-to-test matching. That traceability work,
 automatic activation beyond existing reviewed governance, and the broader state-hardening backlog
 remain deferred.
+# Intent-focused workflow
+
+Assessments now default to **Intent vs requirements**. The dashboard, `intent assess`,
+enrichment questions and alternative comparisons use the project's `assessment_scope`.
+The default `intent_requirements` excludes implementation traceability and test verification
+from scores and questions. Evidence, consistency and freshness remain relevant.
+Implementation/test records remain visible but unscored. Implementation-only cases (`CODE_LAG`,
+`TEST_LAG`, `UNDOCUMENTED_CODE`, `ORPHAN_REQUIREMENT`) do not penalize focused scores or become
+intent-coverage disputes. Their original records and full-lifecycle behavior are retained.
+
+For an explicit full-lifecycle report, use `intent assess --scope full_lifecycle`.
+To use that mode throughout a project, set `assessment_scope: full_lifecycle` in its existing
+`.intent/config.yaml` and restart Intent Dev. Reports carry the mode and a distinct policy
+identity; the assessment gate rejects comparisons between modes. Older reports without a
+scope field retain their full-lifecycle interpretation.
+
+In **Graph assessment**, select a scorecard and choose **Read intent and requirements**.
+The read-only topic page shows related intent, requirements, decisions, assumptions,
+relationships, open gaps and source references. Related-topic buttons navigate the same graph.
+It uses the same authorized snapshot as the scorecard; if the snapshot changes, refresh the
+assessment. The page is bounded to 24 assertions within two semantic links and identifies
+limited coverage. It does not replace canonical YAML or invent a generated narrative.
+
+Coverage appears on reading pages and in the existing onboarding/requirement proposal review:
+
+- **Linked — review meaning:** an active graph path connects an outcome/constraint to requirements.
+- **Missing coverage:** no such path is recorded in the inspected scope.
+- **Unresolved disagreement:** an open case or contradiction needs review.
+- **Deliberately deferred:** an existing reconciliation case records a deferral; this is not satisfaction.
+- **Incomplete view:** traversal limits prevent a complete conclusion.
+
+The scorecards retain their green/orange/red structural health. Coverage review is separate:
+even a high score or an approved link is not proof that a requirement satisfies intent.
+No additional approval round is introduced, and coverage rendering never applies graph changes.
+
+**Improve graph** supports time-boxed improvement without a new feature request. Questions now
+include a short, cited view of existing context, with assumptions and inferred assertions labeled.
+Resume the existing session to retain answered/skipped questions. Correct that understanding in
+your answer, then review the resulting proposal through the existing local approval flow.
+Recording an answer preserves evidence; it does not by itself change approved meaning or scores.

@@ -177,3 +177,19 @@ of the local plugin, so disabling the plugin does not bypass repository assuranc
 
 For recovery procedures, provider integrations, and the full security model, see the
 [intent-aware agent adoption guide](intent-aware-agent.md).
+# Read and improve existing intent
+
+In the existing Intent Dev dashboard:
+
+1. Open **Graph assessment**. Its default scope is **Intent vs requirements**.
+2. Select a graph scorecard or table row, then **Read intent and requirements** to inspect its
+   purpose, assumptions, related requirements and source references.
+3. Use the coverage table to find missing links, disputes and deliberate deferrals. Scores measure
+   structural completeness; review the meaning of a requirement separately.
+4. Choose **Improve graph** for a five-minute session, even when you have no new feature to add.
+   Resume a prior session to retain its answers. Review the cited understanding and answer the
+   next relevant question, or pause when convenient.
+5. Inspect current and proposed coverage during the existing proposal review before approval.
+
+No extra command sequence is needed. For an optional report that also examines implementation
+and tests, run `intent assess --scope full_lifecycle`; this does not change the project setting.

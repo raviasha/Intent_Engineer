@@ -143,7 +143,9 @@ def runtime(tmp_path: Path) -> Iterator[Runtime]:
     project = tmp_path / "project"
     project.mkdir()
     initialized = initialize_project(project)
-    config = ProjectConfig(project_id="project:enrichment", local_actor="local:asha")
+    config = ProjectConfig(
+        project_id="project:enrichment", local_actor="local:asha", assessment_scope="full_lifecycle"
+    )
     initialized.config_path.write_text(
         yaml.safe_dump(config.model_dump(mode="json"), sort_keys=True), encoding="utf-8"
     )
@@ -172,6 +174,20 @@ def runtime(tmp_path: Path) -> Iterator[Runtime]:
 
 def _service(runtime: Runtime, clock: Clock) -> GraphEnrichmentService:
     return GraphEnrichmentService(runtime, actor="local:asha", clock=clock)
+
+
+def test_question_playback_reuses_cited_graph_context(runtime):
+    clock = Clock()
+    service = _service(runtime, clock)
+    session = service.start(minutes=5, focus="req:owners")
+    question = service.next_question(session.id)
+    known = {item.id: item for item in question.context}
+    assert known["req:owners"].label == "Owners"
+    assert known["intent:product"].evidence_refs == ("evidence:intent",)
+    answered = service.answer(session.id, question.gap_id, "The reviewed answer is recorded.")
+    assert question.gap_id in answered.answered_gap_ids
+    if answered.status == "open":
+        assert service.next_question(session.id).gap_id != question.gap_id
 
 
 def _target_bytes(runtime: Runtime, name: str) -> bytes:

@@ -20,6 +20,7 @@ from pydantic import (
 from intent_engineering.assessment.models import AssessmentDimension
 from intent_engineering.core.models import NodeType, RelationType
 from intent_engineering.core.models._base import StrictModel
+from intent_engineering.core.models.project import AssessmentScope
 
 
 class AssessmentPolicy(StrictModel):
@@ -29,6 +30,7 @@ class AssessmentPolicy(StrictModel):
 
     schema_version: Literal[1] = 1
     rubric_version: Literal["rubric:v1"] = "rubric:v1"
+    scope: AssessmentScope = "full_lifecycle"
     red_below: int = 50
     green_at: int = 75
     green_confidence_at: int = 75
@@ -59,6 +61,11 @@ class AssessmentPolicy(StrictModel):
                 RelationType.HAS_ACCEPTANCE_CRITERION,
             ),
         )
+
+    @classmethod
+    def for_scope(cls, scope: str) -> AssessmentPolicy:
+        """Select one of two named scopes without changing legacy rubric semantics."""
+        return cls.model_validate({**cls.v1().model_dump(), "scope": scope})
 
     @field_validator(
         "schema_version",
@@ -157,8 +164,11 @@ class AssessmentPolicy(StrictModel):
 
     def canonical_bytes(self) -> bytes:
         """Return the canonical JSON policy representation used for its digest."""
+        material = self.model_dump(mode="json")
+        if self.scope == "full_lifecycle":
+            material.pop("scope")
         return json.dumps(
-            self.model_dump(mode="json"),
+            material,
             allow_nan=False,
             ensure_ascii=False,
             separators=(",", ":"),

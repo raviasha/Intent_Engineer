@@ -11,6 +11,23 @@ request, display, persist, or infer a capability token. Do not weaken or work ar
 
 ## Follow the prompt route
 
+Before drafting a classification, read the relevant approved intent, requirements, decisions,
+constraints and any existing clarification answers through the public read-only context tools.
+Use a short playback: **who needs what and why**, the supporting node/evidence references,
+and any **proposed assumptions**. Omit a slot when the sources do not establish it; never invent
+the beneficiary or outcome. Invite corrections through the existing clarification/review flow.
+
+Draft a question only when an unanswered point could change an outcome, requirement or constraint.
+Use known answers rather than asking for them again. A clear, aligned request can have no questions;
+an ambiguous request starts with its most consequential question. Do not infer scheduling,
+delivery channels or extra features from a narrow request. In intent-versus-requirements mode,
+missing code or tests is not a clarification gap. Keep structural scores separate from reviewed
+meaning: a high score or a graph link does not establish that a requirement satisfies intent.
+
+After preflight returns a persisted question, follow that session's required question flow.
+If an answer is already recorded there, reuse its evidence; do not manufacture a second answer
+or bypass a pending authenticated human step. Label unapproved answers and alternatives as pending.
+
 - For `action=offer_onboarding`, ask whether to start guided onboarding. Only after explicit human
   confirmation, ask the user for the PRD path. Confirm that exact path, then run
   `intent onboard --project . --prd <confirmed path> --yes` and follow its proposal/confirmation
@@ -69,6 +86,19 @@ then click **Validate host candidate locally**. After the same candidate is re-g
 can create and inspect its pending proposal in the local Proposal review view.
 Do not implement the selection or claim it is approved until the existing
 independently authenticated local review completes.
+
+## Improve existing intent without a new feature
+
+An explicit request to improve existing intent is an enrichment session, not a new requirement.
+Direct the user to **Improve graph** in the existing Intent Dev dashboard, where they can choose
+5, 15 or 30 minutes or a topic. Resume an existing session when available: it retains answered
+and skipped questions. With that session's ID, use `intent_enrichment_status` and
+`intent_enrichment_next_question` to read its current state and single question. These read-only
+tools are also permitted for this explicit enrichment request, even without a classification route.
+Summarize the question's cited context and mark assumptions before presenting it. Answers,
+pause/resume and proposal creation use the local dashboard; do not invent MCP mutation tools.
+When time runs out, preserve the session and pending evidence. Do not require a new feature or
+claim that a recorded answer has changed the approved graph. The usual local review applies.
 
 Use only the public MCP workflow tools named by the route. Do not write `.intent` graph, evidence,
 case, approval, or history files directly. If MCP tools are unavailable, say exactly: "Intent MCP

@@ -51,6 +51,18 @@ def _service(reasoner=None):
     return RequirementAlternativeService(snapshot_loader=loader, reasoner=reasoner), loader
 
 
+def test_alternative_projection_uses_the_project_assessment_scope():
+    from intent_engineering.assessment.models import AssessmentDimension, DimensionApplicability
+
+    service, loader = _service(RecordingReasoner())
+    loader.snapshot = loader.snapshot.model_copy(update={"assessment_scope": "intent_requirements"})
+    result = service.request(subject_ref="req:export", modes=(AlternativeMode.CHANGE_APPROACH,))
+    assert result.status is AlternativeStatus.AVAILABLE
+    for scorecard in (result.alternatives[0].current_scorecard,
+                      result.alternatives[0].projected_scorecard):
+        assert scorecard.dimension(AssessmentDimension.TEST_VERIFICATION).applicability == DimensionApplicability.NOT_APPLICABLE
+
+
 def test_manual_alternative_preserves_outcome_and_gets_hypothetical_scores() -> None:
     reasoner = RecordingReasoner()
     service, loader = _service(reasoner)

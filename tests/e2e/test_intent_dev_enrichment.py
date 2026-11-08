@@ -290,7 +290,8 @@ def test_default_control_plane_clock_can_start_enrichment(
     project = tmp_path / "project"
     project.mkdir()
     initialized = initialize_project(project)
-    config = ProjectConfig(project_id="project:default-clock", local_actor="local:asha")
+    config = ProjectConfig(project_id="project:default-clock", local_actor="local:asha",
+                           assessment_scope="full_lifecycle")
     initialized.config_path.write_text(
         yaml.safe_dump(config.model_dump(mode="json"), sort_keys=True), encoding="utf-8"
     )
@@ -331,7 +332,8 @@ def test_five_minute_answer_pause_restart_resume_keeps_only_evidence_reference(
     project = tmp_path / "project"
     project.mkdir()
     initialized = initialize_project(project)
-    config = ProjectConfig(project_id="project:enrichment", local_actor="local:asha")
+    config = ProjectConfig(project_id="project:enrichment", local_actor="local:asha",
+                           assessment_scope="full_lifecycle")
     initialized.config_path.write_text(
         yaml.safe_dump(config.model_dump(mode="json"), sort_keys=True), encoding="utf-8"
     )

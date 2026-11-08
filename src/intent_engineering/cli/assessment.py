@@ -11,6 +11,7 @@ import typer
 
 from intent_engineering.assessment.gate import AssessmentGate, GateResult
 from intent_engineering.assessment.models import AssessmentReport
+from intent_engineering.assessment.policy import AssessmentPolicy
 from intent_engineering.assessment.service import GraphAssessmentService
 from intent_engineering.cli.output import OutputFormat, emit
 from intent_engineering.cli.runtime import AssessmentRuntime, load_assessment_runtime
@@ -74,9 +75,12 @@ def _parse_assessment_report(content: bytes) -> AssessmentReport:
     )
     if report.semantic_digest != semantic_digest:
         raise ValueError("invalid assessment report")
+    report_material = report.model_dump(mode="json")
+    if "assessment_scope" not in assessment:
+        report_material.pop("assessment_scope")
     expected = json.dumps(
         {
-            "assessment": report.model_dump(mode="json"),
+            "assessment": report_material,
             "semantic_digest": report.semantic_digest,
             "version": "1",
         },
@@ -107,6 +111,9 @@ def assess_command(
     project: Path = typer.Option(Path("."), "--project"),
     focus: str | None = typer.Option(None, "--focus"),
     output_format: OutputFormat = typer.Option(OutputFormat.TEXT, "--format"),
+    scope: str | None = typer.Option(
+        None, "--scope", help="intent_requirements or full_lifecycle; defaults to project settings."
+    ),
 ) -> None:
     """Assess one ACL-visible snapshot without changing canonical project state."""
     runtime: AssessmentRuntime | None = None
@@ -116,7 +123,8 @@ def assess_command(
     try:
         runtime = load_assessment_runtime(project)
         snapshot = runtime.assessment_snapshot(runtime.config.local_actor)
-        report = GraphAssessmentService().assess(snapshot)
+        policy = None if scope is None else AssessmentPolicy.for_scope(scope)
+        report = GraphAssessmentService().assess(snapshot, policy)
         payload = _assessment_payload(report, focus)
     except Exception:  # noqa: BLE001 - one fixed public assessment failure
         failed = True

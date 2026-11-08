@@ -25,6 +25,7 @@ from intent_engineering.core.models import (
     RelationType,
     is_nonterminal_case_status,
 )
+from intent_engineering.core.models.reconciliation import is_intent_requirement_case
 
 
 @dataclass(frozen=True)
@@ -76,6 +77,13 @@ _IMPLEMENTATION_TYPES = frozenset(
     }
 )
 _ACTIVE = "active"
+
+
+def outside_scope(node_type: NodeType | str, policy: AssessmentPolicy) -> bool:
+    """Keep implementation records visible but unscored in the focused mode."""
+    return policy.scope == "intent_requirements" and node_type in {
+        *_IMPLEMENTATION_TYPES, NodeType.TEST,
+    }
 
 
 def applicability(
@@ -134,6 +142,14 @@ def assess_node(
     """Evaluate exactly one visible node without reading stores or inferring unstated facts."""
     node = _node_index(snapshot.graph)[node_id]
     matrix = applicability(node, snapshot.graph)
+    if outside_scope(node.type, policy):
+        return _unassessed_scorecard(node, matrix)
+    if policy.scope == "intent_requirements":
+        matrix = {
+            **matrix,
+            AssessmentDimension.IMPLEMENTATION_TRACEABILITY: DimensionApplicability.NOT_APPLICABLE,
+            AssessmentDimension.TEST_VERIFICATION: DimensionApplicability.NOT_APPLICABLE,
+        }
     if not isinstance(node.type, NodeType):
         return _unassessed_scorecard(node, matrix)
 
@@ -157,7 +173,7 @@ def assess_node(
     confidence = sum(
         policy.dimension_weights[result.dimension] * _confidence(result) for result in contributors
     ) // total_weight
-    blocking_refs = tuple(case.id for case in _blocking_cases(snapshot.cases, {node.id}))
+    blocking_refs = tuple(case.id for case in _blocking_cases(snapshot.cases, {node.id}, policy))
     has_blocking_conflict = any(
         result.dimension is AssessmentDimension.CONSISTENCY and result.failed for result in contributors
     )
@@ -256,7 +272,7 @@ def _context(
         related_nodes=related_nodes,
         related_edges=related_edges,
         evidence_refs=refs,
-        blocking_cases=_blocking_cases(snapshot.cases, subject_ids),
+        blocking_cases=_blocking_cases(snapshot.cases, subject_ids, policy),
         input_checks=_input_checks(
             dimension,
             clarity_resolved=clarity_resolved,
@@ -505,13 +521,14 @@ def _has_current_test_link(
     return False
 
 
-def _blocking_cases(cases: tuple[ReconciliationCase, ...], subject_ids: set[str]) -> tuple[ReconciliationCase, ...]:
+def _blocking_cases(cases: tuple[ReconciliationCase, ...], subject_ids: set[str], policy: AssessmentPolicy) -> tuple[ReconciliationCase, ...]:
     return tuple(
         sorted(
             (
                 case
                 for case in cases
                 if is_nonterminal_case_status(case.status)
+                and (policy.scope == "full_lifecycle" or is_intent_requirement_case(case.case_type))
                 and (case.subject_ref in subject_ids or set(case.affected_refs) & subject_ids)
             ),
             key=lambda case: case.id,

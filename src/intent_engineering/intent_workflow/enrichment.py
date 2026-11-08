@@ -38,6 +38,7 @@ from intent_engineering.intent_workflow.models import (
     ClarificationIntentProposal,
     ClarificationProposalSubmission,
 )
+from intent_engineering.intent_workflow.reading import ContextAssertion, topic_context
 from intent_engineering.storage.secure import SecureFile
 from intent_engineering.storage.transaction import (
     LocalTransaction,
@@ -166,6 +167,7 @@ class EnrichmentQuestion(StrictModel):
     reason: Annotated[str, Field(min_length=1, max_length=_MAX_QUESTION_TEXT_BYTES)]
     requested_fields: Annotated[tuple[str, ...], Field(min_length=1, max_length=16)]
     evidence_scope: Annotated[tuple[str, ...], Field(max_length=256)] = ()
+    context: Annotated[tuple[ContextAssertion, ...], Field(max_length=24)] = ()
 
     @field_validator("requested_fields", "evidence_scope")
     @classmethod
@@ -313,6 +315,7 @@ def _candidates(
                     reason=check.explanation,
                     requested_fields=fields,
                     evidence_scope=tuple(sorted({*dimension.evidence_refs, *check.references})),
+                    context=topic_context(snapshot, scorecard.node_id),
                 )
                 confidence_impact = 100 - (dimension.confidence or 0)
                 robustness_impact = check.points
