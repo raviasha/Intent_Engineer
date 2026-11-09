@@ -4030,6 +4030,8 @@ async def test_production_port_proposes_shows_and_activates_without_propose_time
         "status": "activated",
         "proposal_id": proposal_id,
         "graph_version": 1,
+        "initial_reconciliation_status": "not_started",
+        "next_action": "intent_initial_reconciliation",
     }
     assert runtime.graph_store.load().version == 1
 

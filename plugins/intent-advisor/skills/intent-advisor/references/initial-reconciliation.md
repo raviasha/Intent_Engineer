@@ -28,13 +28,20 @@ that reconciliation is complete.
    unique turn IDs, a human-readable `scope`, and `files` containing relative paths
    with role `requirements` or `code`. The tool snapshots real local file content
    and selected source manifests, and returns versioned evidence, code node IDs,
-   and every required comparison slot. Read referenced evidence when necessary.
+   and every required comparison slot. `requirements_refs` identifies each document
+   snapshot. Read referenced evidence when necessary.
 5. Interpret all five directions: intent→requirements, requirements→intent,
    requirements→code, code→requirements and intent→code. The last direction catches
    PRD/code agreement that still violates source intent. Check missing, partial,
    contradictory and unsupported coverage, not only existing links. Mappings can
    be many-to-many. Label intended future work `deferred`, and unavailable evidence
    `unknown`; never label either as verified alignment.
+   Also complete a `document_requirements` comparison for **each** declared requirements
+   file: compare all its requirements with captured graph requirements, flag uncaptured
+   or contradictory requirements and cite its current snapshot. Use its returned
+   `node_id` as subject and the relevant requirement node IDs as related references.
+   Downstream comparisons involving those requirements must cite the current document
+   evidence too. Merely capturing a PRD does not count as reviewing it.
 6. Submit `action=checkpoint` with the returned `run_id` and comparison batches.
    Each record needs `axis`, `subject_ref`, `related_refs`, `status`, `evidence_refs`,
    `explanation`, `authority_basis` and `confidence` (at most 0.85). Cite snapshot
@@ -54,9 +61,13 @@ that reconciliation is complete.
    files or selected sources changed: refresh/re-read the affected inputs, start a
    new assessment with a new turn ID and reassess. Do not relabel old comparisons
    as current. These conditions affect setup, not unrelated developer work.
+   `unavailable` returns no cached assessment details when evidence access has been
+   lost. Restore authorized access or start a new assessment of accessible scope.
 9. Only `ready` or `ready_with_findings` publishes the code nodes/mappings and open
    reconciliation cases through a validated ChangeSet. Recommendations do not
-   close issues or authorize edits. Finish reports the inspected scope, limitations,
+   close issues or authorize edits. Reassessment retires obsolete service-owned traces
+   only inside the assessed scope and preserves other owners' mappings and old cases.
+   Finish reports the inspected scope, limitations,
    evidence, findings and recommendations; it is host-reported semantic assessment,
    not proof that every repository behavior is correct. Present consolidated
    findings after graph readiness, then run

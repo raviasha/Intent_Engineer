@@ -91,6 +91,10 @@ def reviews(result, *, mismatch=False):
         ("code_requirements", code, ["req:local"]),
         ("intent_code", "intent:privacy", [code]),
     ]
+    rows.extend(
+        ("document_requirements", f["node_id"], ["req:local"])
+        for f in result.get("requirements_refs", [])
+    )
     return [
         {
             "axis": axis,
@@ -118,7 +122,7 @@ def test_checkpoint_resumes_and_publishes_evidence_backed_cases_without_code_wri
     checkpoint = call(
         env, "checkpoint", run_id=started["run_id"], comparisons=reviews(started, mismatch=True)
     )
-    assert checkpoint["completed_comparisons"] == 5
+    assert checkpoint["completed_comparisons"] == 6
     assert env.cases() == ()
     finished = call(env, "finish", run_id=started["run_id"])
     assert finished["status"] == "ready_with_findings"
@@ -144,7 +148,7 @@ def test_incomplete_review_never_finishes_even_with_nonempty_graph(env):
     result = call(env, "finish", run_id=started["run_id"])
     assert result["status"] == "incomplete"
     assert result["notify_user"] is False
-    assert len(result["missing_comparisons"]) == 3
+    assert len(result["missing_comparisons"]) == 4
     assert env.cases() == ()
 
 
@@ -430,3 +434,264 @@ def test_conflicting_authoritative_sources_remain_open_and_are_not_rewritten(env
     assert {local, cloud} <= {r for side in case.evidence_sides for r in side.evidence_refs}
     assert env.evidence_store.ledger("background:notion") == before
     assert validate_project_directory(env.project_directory).valid
+
+
+def test_every_declared_prd_requires_its_own_evidence_backed_comparison(env):
+    (env.root / "extra.md").write_text("A new uncaptured requirement.")
+    result = call(
+        env,
+        "start",
+        scope="Both PRDs and production code",
+        files=[
+            {"path": "prd.md", "role": "requirements"},
+            {"path": "extra.md", "role": "requirements"},
+            {"path": "app.py", "role": "code"},
+        ],
+    )
+    rows = [c for c in reviews(result) if c["axis"] != "document_requirements"]
+    call(env, "checkpoint", run_id=result["run_id"], comparisons=rows)
+    assert call(env, "finish", run_id=result["run_id"])["status"] == "incomplete"
+    documents = [c for c in reviews(result) if c["axis"] == "document_requirements"]
+    assert len(documents) == 2
+    documents[1].update(
+        status="missing",
+        related_refs=[],
+        recommendation="Capture the additional PRD requirement and assess its intent.",
+        recommendation_target="requirements",
+    )
+    omitted = {
+        **documents[0],
+        "evidence_refs": [
+            r
+            for r in result["evidence_refs"]
+            if r != result["requirements_refs"][0]["evidence_ref"]
+        ],
+    }
+    with pytest.raises(ValueError, match="endpoint"):
+        call(env, "checkpoint", turn_id="omit-doc", run_id=result["run_id"], comparisons=[omitted])
+    call(env, "checkpoint", turn_id="docs", run_id=result["run_id"], comparisons=documents)
+    finished = call(env, "finish", run_id=result["run_id"])
+    assert finished["status"] == "ready_with_findings"
+    assert finished["findings"][0]["axis"] == "document_requirements"
+    assert env.cases()[0].subject_ref == result["requirements_refs"][1]["node_id"]
+    assert validate_project_directory(env.project_directory).valid
+
+
+def test_requirement_comparisons_must_consider_the_related_current_prd(env):
+    result = start(env)
+    rows = reviews(result)
+    prd_ref = next(e.id for e in env.evidence() if e.source_locator == "prd.md")
+    rows[2]["evidence_refs"] = [r for r in rows[2]["evidence_refs"] if r != prd_ref]
+    call(env, "checkpoint", run_id=result["run_id"], comparisons=rows)
+    with pytest.raises(ValueError, match="current requirements document"):
+        call(env, "finish", run_id=result["run_id"])
+
+
+def test_reassessment_supersedes_and_restores_only_owned_scoped_mappings(env):
+    result = start(env)
+    call(env, "checkpoint", run_id=result["run_id"], comparisons=reviews(result))
+    call(env, "finish", run_id=result["run_id"])
+    edge = next(e for e in env.graph_store.load().edges if e.relation.value == "IMPLEMENTED_BY")
+    (env.root / "app.py").write_text("pass\n")
+    result = call(
+        env,
+        "start",
+        turn_id="scan2",
+        scope="All production files in this fixture",
+        files=[{"path": "prd.md", "role": "requirements"}, {"path": "app.py", "role": "code"}],
+    )
+    rows = reviews(result)
+    for row in rows:
+        if row["axis"] in {"requirements_code", "code_requirements", "intent_code"}:
+            row.update(
+                status="missing",
+                related_refs=[],
+                recommendation="Restore local persistence.",
+                recommendation_target="code",
+            )
+    call(env, "checkpoint", turn_id="review2", run_id=result["run_id"], comparisons=rows)
+    call(env, "finish", turn_id="finish2", run_id=result["run_id"])
+    assert next(e for e in env.graph_store.load().edges if e.id == edge.id).status == "superseded"
+    cases = env.cases()
+    (env.root / "app.py").write_text("def store(data):\n    save_locally(data)\n")
+    result = call(
+        env,
+        "start",
+        turn_id="scan3",
+        scope="All production files in this fixture",
+        files=[{"path": "prd.md", "role": "requirements"}, {"path": "app.py", "role": "code"}],
+    )
+    call(env, "checkpoint", turn_id="review3", run_id=result["run_id"], comparisons=reviews(result))
+    call(env, "finish", turn_id="finish3", run_id=result["run_id"])
+    restored = [e for e in env.graph_store.load().edges if e.id == edge.id]
+    assert len(restored) == 1 and restored[0].status == "active"
+    assert env.cases() == cases  # New alignment never silently resolves historical issues.
+    assert validate_project_directory(env.project_directory).valid
+
+
+def test_regular_filenames_with_spaces_can_be_assessed(env):
+    (env.root / "Product Requirements.md").write_text("Keep project data local.")
+    (env.root / "source files").mkdir()
+    (env.root / "source files" / "main.py").write_text("pass\n")
+    result = call(
+        env,
+        "start",
+        scope="Paths with spaces",
+        files=[
+            {"path": "Product Requirements.md", "role": "requirements"},
+            {"path": "source files/main.py", "role": "code"},
+        ],
+    )
+    assert result["status"] == "running"
+    assert result["code_refs"][0]["path"] == "source files/main.py"
+
+
+@pytest.mark.parametrize("action", ["status", "start", "checkpoint", "finish"])
+@pytest.mark.parametrize("complete", [False, True])
+def test_revoked_evidence_cannot_leak_through_status_or_exact_retry(env, action, complete):
+    import yaml
+
+    from intent_engineering.capture.base import RawSourceObject, normalize_raw_source
+
+    policy = env.root / ".intent" / "approvals" / "policy.yaml"
+    policy.parent.mkdir(exist_ok=True)
+    policy_data = {
+        "schema_version": 1,
+        "contributors": ["local"],
+        "approvers": ["local"],
+        "executors": ["local"],
+        "identities": {"local": ["local", "team:private"]},
+    }
+    policy.write_text(yaml.safe_dump(policy_data))
+    record = normalize_raw_source(
+        RawSourceObject(
+            connector_type="private-fixture",
+            external_object_id="private",
+            external_version="1",
+            source_locator="PRIVATE-LOCATOR",
+            author="team:alice",
+            observed_at=NOW,
+            content_hash="sha256:" + "a" * 64,
+            payload={"content": "PRIVATE-CONTENT"},
+            acl=("team:private",),
+        )
+    )
+    env.evidence_store.associate("private-fixture", record)
+    BackgroundIntentService(env, clock=lambda: NOW).submit(
+        BackgroundSubmission.model_validate(
+            {
+                "session_id": "setup",
+                "turn_id": "private-req",
+                "graph_version": 1,
+                "user_statement": "Capture the private requirement.",
+                "classification": "clear",
+                "understanding": "PRIVATE-INTERPRETATION",
+                "evidence_refs": [record.id],
+                "nodes": [
+                    {
+                        "id": "req:private",
+                        "type": "REQUIREMENT",
+                        "label": "Private need",
+                        "source_mode": "inferred",
+                        "confidence": 0.8,
+                        "basis": "Private source",
+                        "evidence_refs": [record.id],
+                    }
+                ],
+            }
+        )
+    )
+    result = start(env)
+    rows = reviews(result)
+    rows[0]["explanation"] = "PRIVATE-INTERPRETATION"
+    rows.extend(
+        {
+            "axis": axis,
+            "subject_ref": "req:private",
+            "status": "missing",
+            "evidence_refs": result["evidence_refs"],
+            "explanation": "PRIVATE-INTERPRETATION",
+            "authority_basis": "Private source",
+            "recommendation": "Clarify private intent.",
+            "recommendation_target": "clarify_intent",
+            "confidence": 0.8,
+        }
+        for axis in ("requirements_intent", "requirements_code")
+    )
+    call(env, "checkpoint", run_id=result["run_id"], comparisons=rows)
+    if complete:
+        assert call(env, "finish", run_id=result["run_id"])["status"] == "ready_with_findings"
+    policy_data["identities"] = {"local": ["local"]}
+    policy.write_text(yaml.safe_dump(policy_data))
+    if action == "start":
+        response = start(env)
+    elif action == "checkpoint":
+        response = call(env, action, run_id=result["run_id"], comparisons=rows)
+    else:
+        response = call(env, action, run_id=result["run_id"])
+    assert response == {"status": "unavailable", "notify_user": False, "findings": []}
+
+
+def test_reassessment_preserves_user_owned_and_out_of_scope_edges(env):
+    from intent_engineering.core.models import ChangeSet
+    from intent_engineering.storage.executor import LocalChangeSetExecutor
+
+    result = start(env)
+    call(env, "checkpoint", run_id=result["run_id"], comparisons=reviews(result))
+    call(env, "finish", run_id=result["run_id"])
+    graph = env.graph_store.load()
+    template = next(e for e in graph.edges if e.relation.value == "IMPLEMENTED_BY")
+    node = next(n for n in graph.nodes if n.id == template.to_id)
+    outside_node = node.model_copy(update={"id": "code:outside", "label": "outside.py"})
+    manual = template.model_copy(
+        update={"id": "trace:manual", "created_by": "local", "last_modified_by": "local"}
+    )
+    outside = template.model_copy(update={"id": "trace:outside", "to_id": outside_node.id})
+    change = ChangeSet(
+        id="changeset:manual-traces",
+        actor="local",
+        timestamp=NOW,
+        baseline_graph_version=graph.version,
+        evidence_refs=node.evidence_refs,
+        nodes_added=(outside_node,),
+        nodes_updated=(),
+        nodes_superseded=(),
+        edges_added=(manual, outside),
+        edges_updated=(),
+        edges_superseded=(),
+        confidence_changes=(),
+        implementation_status_changes=(),
+        reconciliation_cases_created=(),
+        reconciliation_cases_resolved=(),
+        validation_status="validated",
+    )
+    LocalChangeSetExecutor(env.graph_store, env.case_store, env.transactions).apply(change)
+    (env.root / "app.py").write_text("pass\n")
+    result = call(
+        env,
+        "start",
+        turn_id="scan2",
+        scope="Declared files only",
+        files=[{"path": "prd.md", "role": "requirements"}, {"path": "app.py", "role": "code"}],
+    )
+    rows = reviews(result)
+    for row in rows:
+        if row["axis"] in {"requirements_code", "code_requirements", "intent_code"}:
+            row.update(
+                status="missing",
+                related_refs=[],
+                recommendation="Restore behavior.",
+                recommendation_target="code",
+            )
+    call(env, "checkpoint", turn_id="review2", run_id=result["run_id"], comparisons=rows)
+    call(env, "finish", turn_id="finish2", run_id=result["run_id"])
+    edges = {e.id: e for e in env.graph_store.load().edges}
+    assert edges[template.id].status == "superseded"
+    assert edges[manual.id] == manual
+    assert edges[outside.id] == outside
+
+
+@pytest.mark.parametrize("path", ["doc\nname.md", "doc\tname.md", "doc\x7fname.md"])
+def test_control_characters_are_not_valid_assessment_paths(env, path):
+    with pytest.raises(ValueError):
+        call(env, "start", scope="Invalid path", files=[{"path": path, "role": "requirements"}])

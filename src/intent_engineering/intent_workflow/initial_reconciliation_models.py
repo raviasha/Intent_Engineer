@@ -13,11 +13,12 @@ Axis = Literal[
     "code_requirements",
     "intent_code",
     "source_conflict",
+    "document_requirements",
 ]
 
 
 class AssessmentFile(BackgroundModel):
-    path: Identity
+    path: Annotated[str, Field(min_length=1, max_length=4096, pattern=r"^[^\x00-\x1f\x7f]+$")]
     role: Literal["requirements", "code"]
 
 

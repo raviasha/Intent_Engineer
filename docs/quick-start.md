@@ -121,16 +121,23 @@ implementation, unsupported behavior, partial coverage and PRD/code agreement th
 intent. Source intent governs recommendations. Conflicting sources remain explicit for your
 decision. Assessed code and source documents are not edited.
 
+Every declared PRD also requires a `document_requirements` comparison against captured
+requirements, using its current snapshot evidence. This flags newly added or contradictory
+requirements absent from the graph. Related downstream comparisons must cite that current
+document too; capturing a document without comparing it cannot complete the assessment.
+
 `incomplete` means missing comparisons, unknown evidence or pending source reads; `stale`
 means a graph, source or file snapshot changed. Continue the work or report an unavailable
 scope, and reassess changed inputs. Neither state can mark setup complete. `ready` or
-`ready_with_findings` publishes verified file nodes, trace relationships and open issues
+`ready_with_findings` publishes verified artifact nodes, trace relationships and open issues
 through a validated ChangeSet. Present the consolidated findings and recommended changes,
 then mark the setup chat finished with `intent background-onboarding --finished`.
 
 Readiness means a host-reported semantic assessment with validated evidence within the
 declared scope, not universal proof of correctness. Missing PRDs or external sources remain
 explicit limitations. Intended future work stays distinguishable from an observed mismatch.
+Revoked evidence access returns `unavailable` without cached details. Reassessment retires
+obsolete service-owned mappings within the assessed scope; unrelated mappings are preserved.
 Existing issues are not automatically closed. Governed bootstrap activation likewise exposes
 the pending reconciliation step; activating a graph alone does not compare it with code.
 

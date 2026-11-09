@@ -181,6 +181,7 @@ class BackgroundIntentService:
         principals = _principals(self.runtime, config)
         graph = self.runtime.graph_store.load()
         context_types = SEMANTIC_TYPES | {
+            NodeType.SOURCE_ARTIFACT,
             NodeType.FILE,
             NodeType.SYMBOL,
             NodeType.MODULE,
@@ -197,7 +198,8 @@ class BackgroundIntentService:
                     for e in graph.edges
                     if e.from_id in semantic_ids
                     and e.to_id in semantic_ids
-                    and e.relation.value in SEMANTIC_RELATIONS | {"IMPLEMENTED_BY", "LOCATED_IN"}
+                    and e.relation.value
+                    in SEMANTIC_RELATIONS | {"IMPLEMENTED_BY", "LOCATED_IN", "EVIDENCES"}
                 ),
             }
         )

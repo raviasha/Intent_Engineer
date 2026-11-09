@@ -25,7 +25,7 @@ from intent_engineering.core.models import (
     RelationType,
     SourceMode,
 )
-from intent_engineering.core.models.changeset import NodeUpdate
+from intent_engineering.core.models.changeset import EdgeUpdate, NodeUpdate
 from intent_engineering.core.policy.access import refs_allowed
 from intent_engineering.intent_workflow.background import BackgroundIntentService, _digest
 from intent_engineering.intent_workflow.conversation import (
@@ -180,6 +180,8 @@ class InitialReconciliationService:
             )
             previous = next((e for e in evidence if e.id == record.id), None)
             if previous is not None:
+                if not refs_allowed((previous.id,), evidence, principals):
+                    raise ValueError("unavailable artifact evidence")
                 record = previous
             self.runtime.evidence_store.associate("initial:local", record)
             files.append(
@@ -187,7 +189,8 @@ class InitialReconciliationService:
                     **item.model_dump(),
                     "digest": digest,
                     "evidence_ref": record.id,
-                    "node_id": "code:file:" + _digest(item.path) if item.role == "code" else None,
+                    "node_id": ("code:file:" if item.role == "code" else "requirements:file:")
+                    + _digest(item.path),
                 }
             )
             refs.append(record.id)
@@ -200,9 +203,11 @@ class InitialReconciliationService:
             )
             expected.extend({"axis": axis, "subject_ref": node.id} for axis in axes)
         expected.extend(
-            {"axis": "code_requirements", "subject_ref": f["node_id"]}
+            {
+                "axis": "code_requirements" if f["role"] == "code" else "document_requirements",
+                "subject_ref": f["node_id"],
+            }
             for f in files
-            if f["role"] == "code"
         )
         state: dict[str, Any] = {
             "scope": draft.scope,
@@ -242,6 +247,7 @@ class InitialReconciliationService:
         intents = {n["id"] for n in state["nodes"] if n["type"] in INTENT_TYPES}
         requirements = {n["id"] for n in state["nodes"] if n["type"] in REQUIREMENT_TYPES}
         codes = {f["node_id"] for f in state["files"] if f["role"] == "code"}
+        documents = {f["node_id"] for f in state["files"] if f["role"] == "requirements"}
         allowed = {
             "intent_requirements": (intents, requirements),
             "requirements_intent": (requirements, intents),
@@ -249,6 +255,7 @@ class InitialReconciliationService:
             "code_requirements": (codes, requirements),
             "intent_code": (intents, codes),
             "source_conflict": (intents | requirements, intents | requirements),
+            "document_requirements": (documents, requirements),
         }
         left, right = allowed[c.axis]
         if c.subject_ref not in left or not set(c.related_refs) <= right:
@@ -258,9 +265,7 @@ class InitialReconciliationService:
         ):
             raise ValueError("comparison needs accessible snapshot evidence")
         references = {n["id"]: set(n["evidence_refs"]) for n in state["nodes"]}
-        references.update(
-            {f["node_id"]: {f["evidence_ref"]} for f in state["files"] if f["role"] == "code"}
-        )
+        references.update({f["node_id"]: {f["evidence_ref"]} for f in state["files"]})
         if any(
             not references[r].intersection(c.evidence_refs)
             for r in (c.subject_ref, *c.related_refs)
@@ -297,6 +302,7 @@ class InitialReconciliationService:
             "comparisons": rows,
             "evidence_refs": state["evidence_refs"],
             "code_refs": [f for f in state["files"] if f["role"] == "code"],
+            "requirements_refs": [f for f in state["files"] if f["role"] == "requirements"],
             "sources": state["sources"],
             "limitations": state["limitations"],
             "findings": [r for r in rows if r["status"] != "aligned"] if ready else [],
@@ -323,6 +329,8 @@ class InitialReconciliationService:
             )
             if prior is not None:
                 state = states[prior["state"]["run_id"]]
+                if not refs_allowed(state["evidence_refs"], self.runtime.evidence(), principals):
+                    return {"status": "unavailable", "notify_user": False, "findings": []}
                 return self._result(
                     state, status=None if self._fresh(state, actor, principals) else "stale"
                 )
@@ -340,6 +348,8 @@ class InitialReconciliationService:
                 if draft.action == "status" and draft.run_id is None:
                     return {"status": "not_started", "notify_user": False, "findings": []}
                 raise ValueError("unknown assessment")
+            if not refs_allowed(state["evidence_refs"], self.runtime.evidence(), principals):
+                return {"status": "unavailable", "notify_user": False, "findings": []}
             if not self._fresh(state, actor, principals):
                 return self._result(state, status="stale")
             if draft.action == "status" or state["status"] in {"ready", "ready_with_findings"}:
@@ -369,6 +379,29 @@ class InitialReconciliationService:
 
     def _publish(self, state: dict[str, Any], actor: str, now: datetime) -> None:
         graph = self.runtime.graph_store.load()
+        # Every declared PRD has its own required document-to-requirements review.
+        # Downstream comparisons must also consider the documents it maps to a requirement.
+        documents = {
+            f["node_id"]: f["evidence_ref"] for f in state["files"] if f["role"] == "requirements"
+        }
+        requirement_documents: dict[str, set[str]] = {}
+        for review in state["comparisons"].values():
+            if review["axis"] == "document_requirements":
+                for requirement in review["related_refs"]:
+                    requirement_documents.setdefault(requirement, set()).add(
+                        documents[review["subject_ref"]]
+                    )
+        for review in state["comparisons"].values():
+            if review["axis"] == "document_requirements":
+                continue
+            required = set().union(
+                *(
+                    requirement_documents.get(ref, set())
+                    for ref in (review["subject_ref"], *review["related_refs"])
+                )
+            )
+            if not required <= set(review["evidence_refs"]):
+                raise ValueError("cite the related current requirements document")
         inverse = {
             "intent_requirements": "requirements_intent",
             "requirements_intent": "intent_requirements",
@@ -412,14 +445,13 @@ class InitialReconciliationService:
         added = []
         updated = []
         for f in state["files"]:
-            if f["role"] != "code":
-                continue
+            node_type = "FILE" if f["role"] == "code" else "SOURCE_ARTIFACT"
             prior = existing.get(f["node_id"])
-            if prior and (prior.type != "FILE" or prior.created_by != ACTOR):
-                raise ValueError("preserve existing code node ownership")
+            if prior and (prior.type != node_type or prior.created_by != ACTOR):
+                raise ValueError("preserve existing artifact node ownership")
             node = Node(
                 id=f["node_id"],
-                type="FILE",
+                type=node_type,
                 label=f["path"],
                 **stamp,
                 source_mode=SourceMode.DERIVED,
@@ -430,31 +462,63 @@ class InitialReconciliationService:
                 updated.append(NodeUpdate(node_id=node.id, replacement=node))
             else:
                 added.append(node)
-        edges = []
+        edges: list[Edge] = []
+        edge_updates: list[EdgeUpdate] = []
+        relations = {
+            "intent_requirements": "SPECIFIED_BY",
+            "requirements_code": "IMPLEMENTED_BY",
+            "document_requirements": "EVIDENCES",
+        }
+        supported = {
+            (c["subject_ref"], relations[c["axis"]], target)
+            for c in state["comparisons"].values()
+            if c["axis"] in relations and c["status"] in {"aligned", "partial"}
+            for target in c["related_refs"]
+        }
+        intents = {n["id"] for n in state["nodes"] if n["type"] in INTENT_TYPES}
+        requirements = {n["id"] for n in state["nodes"] if n["type"] in REQUIREMENT_TYPES}
+        codes = {f["node_id"] for f in state["files"] if f["role"] == "code"}
+        scopes = {
+            "SPECIFIED_BY": (intents, requirements),
+            "IMPLEMENTED_BY": (requirements, codes),
+            "EVIDENCES": (set(documents), requirements),
+        }
+        superseded = tuple(
+            e.id
+            for e in graph.edges
+            if e.created_by == ACTOR
+            and e.status == "active"
+            and e.relation.value in scopes
+            and e.from_id in scopes[e.relation.value][0]
+            and e.to_id in scopes[e.relation.value][1]
+            and (e.from_id, e.relation.value, e.to_id) not in supported
+        )
         pairs = {
             (e.from_id, e.relation.value, e.to_id) for e in graph.edges if e.status == "active"
         }
-        for c in state["comparisons"].values():
-            if c["status"] not in {"aligned", "partial"}:
-                continue
-            if c["axis"] not in {"intent_requirements", "requirements_code"}:
-                continue
-            relation = "SPECIFIED_BY" if c["axis"] == "intent_requirements" else "IMPLEMENTED_BY"
-            for target in c["related_refs"]:
-                pair = (c["subject_ref"], relation, target)
-                if pair not in pairs:
-                    edges.append(
-                        Edge.model_validate(
-                            {
-                                "id": "trace:" + _digest(pair),
-                                "from": pair[0],
-                                "relation": RelationType(relation),
-                                "to": target,
-                                **stamp,
-                            }
-                        )
+        existing_edges = {e.id: e for e in graph.edges}
+        for pair in sorted(supported - pairs):
+            edge = Edge.model_validate(
+                {
+                    "id": "trace:" + _digest(pair),
+                    "from": pair[0],
+                    "relation": RelationType(pair[1]),
+                    "to": pair[2],
+                    **stamp,
+                }
+            )
+            prior_edge = existing_edges.get(edge.id)
+            if prior_edge is not None:
+                if prior_edge.created_by != ACTOR:
+                    raise ValueError("preserve existing trace ownership")
+                edge_updates.append(
+                    EdgeUpdate(
+                        edge_id=edge.id,
+                        replacement=edge.model_copy(update={"created_at": prior_edge.created_at}),
                     )
-                    pairs.add(pair)
+                )
+            else:
+                edges.append(edge)
         cases = []
         evidence = {e.id: e for e in self.runtime.evidence()}
         for c in state["comparisons"].values():
@@ -510,8 +574,8 @@ class InitialReconciliationService:
             nodes_updated=tuple(updated),
             nodes_superseded=(),
             edges_added=tuple(edges),
-            edges_updated=(),
-            edges_superseded=(),
+            edges_updated=tuple(edge_updates),
+            edges_superseded=superseded,
             confidence_changes=(),
             implementation_status_changes=(),
             reconciliation_cases_created=tuple(c.id for c in cases),

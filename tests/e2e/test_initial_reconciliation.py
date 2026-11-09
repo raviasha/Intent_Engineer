@@ -121,7 +121,7 @@ async def test_mcp_assessment_reads_checkpoint_across_cli_and_server(env):
         },
     )
     assert not checkpoint.is_error
-    assert checkpoint.structured_content["completed_comparisons"] == 5
+    assert checkpoint.structured_content["completed_comparisons"] == 6
     finished = await server.call_tool(
         "intent_initial_reconciliation",
         {
