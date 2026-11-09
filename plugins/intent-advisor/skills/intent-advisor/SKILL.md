@@ -10,8 +10,10 @@ relevance check for each new task. For development, check selected source freshn
 [source refresh](references/source-refresh.md) before dependent work. Routine checks and
 aligned work proceed silently. Do not
 announce routine checks, start a dashboard, request graph approval or
-WebAuthn, or create reports/exports unless the user asks. Code/test matching is deferred;
-missing code or test coverage is not an intent question.
+WebAuthn, or create reports/exports unless the user asks. Match intent, requirements and
+code and flag evidence-backed gaps. Requirements-to-code tracing is included through the
+[initial reconciliation workflow](references/initial-reconciliation.md); test-to-code tracing
+remains deferred. A link alone does not prove semantic coverage.
 
 ## First use: offer source-connected setup in a separate chat
 
@@ -72,9 +74,15 @@ sources disagree, show both positions with evidence and a recommended resolution
 decides. Timestamps or leadership titles alone do not resolve disagreement. Apply their
 recorded decision locally, preserving both source positions; do not edit the sources.
 
-When a usable graph exists, run `intent background-onboarding --project . --finished` in
-the setup chat and summarize there. If setup is deferred or cannot proceed, use `--defer`
-to resume reminders. Do not activate pending legacy proposals or fabricate approvals.
+After capturing initial intent and requirements, follow
+[initial reconciliation](references/initial-reconciliation.md) in the setup chat. Compare
+source intent, requirements and code thoroughly; checkpoint and resume while the original
+work continues. Flag missing or partial coverage in both directions, mismatches and source
+conflicts with evidence and recommended changes. Do not modify assessed code. Present
+consolidated findings after the graph assessment is ready. Only then run
+`intent background-onboarding --project . --finished`. A nonempty graph alone is insufficient.
+If setup is deferred or cannot proceed, use `--defer` to resume reminders. Do not activate
+pending legacy proposals or fabricate approvals.
 
 ## Consult only relevant intent
 
@@ -140,7 +148,8 @@ Inspect the live schema rather than guessing fields. Common fields:
   Source refresh requires a single source lineage with exact old/new quoted labels; changed
   authors, multiple sources or chat overrides need clarification. Preserve identity and evidence.
 - `edges`: stable `id`, `from_id`, typed `relation`, `to_id`. Do not recreate an existing
-  relationship or use implementation/test relations in this workflow.
+  relationship or insert implementation/test relations through background_submit. Use the initial
+  reconciliation service for verified requirement/code mappings; test tracing stays deferred.
 
 The service validates the baseline, access, provenance and graph invariants, then commits
 immutable conversation evidence and a semantic ChangeSet atomically. It records

@@ -1,9 +1,9 @@
 # Intent Engineering quick start
 
-Intent Engineering maintains a local evidence-backed graph of intent and requirements in the
+Intent Engineering maintains a local evidence-backed graph of intent, requirements and code in the
 background. First use offers source-connected setup in a separate chat; subsequent questions
 are limited to relevant meaning that is missing, unclear or conflicting.
-Code/test matching is deferred in the default workflow.
+Requirements-to-code matching is included in initial reconciliation. Test-to-code tracing is deferred.
 
 ## 1. Install the CLI and Codex plugin
 
@@ -89,7 +89,50 @@ or editor operations. Read receipts are host-reported, not independent provider 
 After source changes, the agent checks affected intent/requirement paths in both directions
 and compares their meaning with the source. Existing structural coverage checks do not prove
 that every source need is captured or satisfied. A refresh `ready` result verifies freshness
-and recorded interpretation, not a gap-free graph or code/test completeness.
+and recorded interpretation, not a gap-free graph or implementation completeness.
+
+### Initial reconciliation
+
+The setup chat compares the PRD, captured intent and production code before marking setup
+finished. It takes the time needed, persists checkpoints and resumes in the same host chat.
+Your original work continues. The CLI and MCP tools store the assessment; they do not launch
+a worker on their own.
+
+The host inventories relevant files, reads actual behavior and checks source freshness. It
+then uses `intent_initial_reconciliation` with `action=start` to snapshot an explicit file
+scope and obtains evidence references and required comparisons. The CLI exposes the same service:
+
+```bash
+intent initial-reconciliation --submission-schema
+intent initial-reconciliation --project . --submission assessment.json
+intent initial-reconciliation --project .
+```
+
+Each submission uses a stable `session_id` and a distinct `turn_id`. Start supplies `scope`
+and `files` with relative `path` and role `requirements` or `code`. Checkpoint supplies the
+returned `run_id` and evidence-backed `comparisons`. Inspect the live schema and the plugin's
+[complete workflow](../plugins/intent-advisor/skills/intent-advisor/references/initial-reconciliation.md)
+for a start example and comparison fields. Use `action=status` to resume and `action=finish`
+to validate and publish the scoped assessment.
+
+Required comparisons cover intent→requirements, requirements→intent, requirements→code,
+code→requirements and intent→code. This catches missing intent, unrepresented needs, missing
+implementation, unsupported behavior, partial coverage and PRD/code agreement that violates
+intent. Source intent governs recommendations. Conflicting sources remain explicit for your
+decision. Assessed code and source documents are not edited.
+
+`incomplete` means missing comparisons, unknown evidence or pending source reads; `stale`
+means a graph, source or file snapshot changed. Continue the work or report an unavailable
+scope, and reassess changed inputs. Neither state can mark setup complete. `ready` or
+`ready_with_findings` publishes verified file nodes, trace relationships and open issues
+through a validated ChangeSet. Present the consolidated findings and recommended changes,
+then mark the setup chat finished with `intent background-onboarding --finished`.
+
+Readiness means a host-reported semantic assessment with validated evidence within the
+declared scope, not universal proof of correctness. Missing PRDs or external sources remain
+explicit limitations. Intended future work stays distinguishable from an observed mismatch.
+Existing issues are not automatically closed. Governed bootstrap activation likewise exposes
+the pending reconciliation step; activating a graph alone does not compare it with code.
 
 The old review UI is optional, for explicitly requested governed review or team operations:
 

@@ -1193,6 +1193,8 @@ class McpIntentWorkflowServices:
                 "status": "activated",
                 "proposal_id": request.proposal_id,
                 "graph_version": graph.version,
+                "initial_reconciliation_status": "not_started",
+                "next_action": "intent_initial_reconciliation",
             }
         except Exception:  # noqa: BLE001 - fixed public result has no confirmation detail
             return self._rejected()

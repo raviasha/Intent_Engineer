@@ -669,8 +669,9 @@ from agent inferences and do not constitute authenticated approvals. Preserve pe
 proposals and unresolved cross-author disagreement. Routine operation requires no dashboard,
 graph approval, WebAuthn, PRD draft or exports. Reports are explicitly requested. This is an
 explicitly permitted local semantic-maintenance policy under section 13.4; governed publication
-and external write approvals remain separate. Default scope is intent versus requirements;
-code/test matching is deferred.
+and external write approvals remain separate. Default matching covers intent, requirements
+and production code. Requirements-to-code tracing is now included; test-to-code tracing is
+deferred. The earlier code-tracing deferral is superseded by the initial-reconciliation spec.
 
 If no graph exists, first offer graph creation in a separate chat with source connections
 such as Notion, Confluence and Slack. After acceptance the host opens the setup chat in the
@@ -679,6 +680,18 @@ original task continues. Deferral schedules another offer after three completed 
 Capture real authorized source reads with provider, object, revision, author, timestamp,
 locator and exact content; retain previous versions when later reads update intent. Host
 reported capture is not evidence of provider authentication. No continuous polling is implied.
+
+Initial graph creation includes a thorough, resumable assessment in the setup chat. Source
+intent has highest priority. Compare intent→requirements, requirements→intent,
+requirements→code, code→requirements and intent→code, including missing, partial and
+contradictory coverage. PRD/code agreement can still violate intent. Preserve conflicting
+source positions for a user decision. Publish actionable issues with evidence and recommended
+changes only after the scoped assessment is ready; do not modify assessed code or documents.
+Snapshots must still be current at publication. Unknown evidence keeps assessment incomplete;
+intentional deferral stays explicit. The host performs semantic comparison while the local
+service validates evidence and completeness, checkpoints progress and publishes a validated
+ChangeSet. The original user continues working. See
+`docs/superpowers/specs/2026-11-09-prd-consistency-check-design.md`.
 
 ### 17.1 Core agent queries
 

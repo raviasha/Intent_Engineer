@@ -99,4 +99,6 @@ relationships to make a coverage score pass. Raise consequential unsupported gap
 and a recommended next step, reusing existing questions. Inspect paths again after maintenance.
 Existing coverage/assessment tools help find structural gaps; they do not prove every need
 is captured or semantically satisfied. `ready` means refresh and interpretation are recorded,
-not a guarantee of a gap-free graph. Code/test coverage remains outside this workflow.
+not a guarantee of a gap-free graph. Test-to-code coverage remains deferred. Requirement/code tracing uses the initial
+reconciliation service and its verified snapshots; source refresh alone does not refresh
+implementation evidence.

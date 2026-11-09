@@ -59,13 +59,24 @@ The November 9 background-workflow spec supersedes routine approval-centric onbo
 advisory routing. Use the conversational service for clear local intent maintenance, preserving
 provenance, typed validation, history and unresolved disagreement. Never synthesize human
 approval records. Legacy governed/team publication contracts remain intact. Current normal
-scope is intent versus requirements; code/test matching is deferred.
+scope matches intent, requirements and production code. Requirement-to-code tracing is
+included; test-to-code tracing remains deferred.
 
 First use offers a separate setup chat for source selection, connections and graph creation.
 The host owns chat creation and provider authentication; the local CLI records the handoff
 and immutable source reads. The original task continues, and deferral reminds after three
 completed work turns. Do not substitute a handoff packet for an actual created chat or claim
 a provider is connected without a successful authorized read.
+
+After semantic graph creation, use the host-driven initial-reconciliation service to snapshot
+the declared PRD/code scope and selected source manifests. Checkpoint all five comparison
+directions, including intent→code, then publish supported code mappings and actionable cases
+only when coverage and input freshness pass. Source intent governs recommendations; preserve
+source conflicts and missing intent without inventing decisions. Do not edit assessed code or
+documents. A graph baseline alone cannot finish background onboarding. Governed activation
+remains separate and exposes reconciliation as the next action. Local commands persist work;
+the host setup chat runs it without blocking the original task. Numeric assessment scoring
+retains its existing configured scope; the new comparison workflow does not add test penalties.
 
 ## Initial implementation objective
 

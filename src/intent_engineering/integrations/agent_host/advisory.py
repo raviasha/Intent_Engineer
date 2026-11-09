@@ -573,7 +573,8 @@ def background_prompt_route(session_id: str, turn_id: str) -> PromptRoute:
             "--submission <relative-json>) to maintain the graph with provenance and history. "
             "Separate reported user statements from agent inferences; never invent approvals or "
             "erase unresolved disagreements. Preserve legacy pending proposals. No routine "
-            "dashboard, graph approval, WebAuthn, report or export. Code/test matching is deferred."
+            "dashboard, graph approval, WebAuthn, report or export. Match intent, requirements and code; "
+            "use initial reconciliation for verified code traces. Test-to-code tracing is deferred."
         ),
     )
 

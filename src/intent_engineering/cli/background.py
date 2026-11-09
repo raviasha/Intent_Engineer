@@ -64,7 +64,7 @@ def background_command(
                     "answers": [],
                     "disagreements": [],
                     "pending_proposal_ids": [],
-                    "scope": "intent_requirements",
+                    "scope": "intent_requirements_code",
                     "human_approval": False,
                 }
             else:

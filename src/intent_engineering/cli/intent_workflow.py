@@ -40,6 +40,10 @@ from intent_engineering.core.models import (
 from intent_engineering.core.models._base import StrictModel
 from intent_engineering.core.policy import ProjectNotInitialized, initialize_project
 from intent_engineering.intent_workflow.bootstrap import BootstrapService
+from intent_engineering.intent_workflow.initial_reconciliation import InitialReconciliationService
+from intent_engineering.intent_workflow.initial_reconciliation_models import (
+    InitialReconciliationRequest,
+)
 from intent_engineering.intent_workflow.onboarding import (
     OnboardingRuntime,
     OnboardingState,
@@ -85,6 +89,7 @@ class OnboardingCommandResult(StrictModel):
     message: str | None = None
     authorization_issued: Literal[False] = False
     evidence_refs: tuple[str, ...] = ()
+    initial_reconciliation_status: str | None = None
 
 
 class ProposalTerminal(Protocol):
@@ -493,6 +498,7 @@ def _onboarding_result(
     proposal: dict[str, JsonValue] | None = None,
     next_action: str | None = None,
     message: str | None = None,
+    initial_reconciliation_status: str | None = None,
 ) -> OnboardingCommandResult:
     """Project detached inspection data into the public guided-command envelope."""
     return OnboardingCommandResult(
@@ -504,6 +510,7 @@ def _onboarding_result(
         proposal=proposal,
         next_action=next_action,
         message=message,
+        initial_reconciliation_status=initial_reconciliation_status,
     )
 
 
@@ -513,7 +520,17 @@ def _existing_onboarding_result(
 ) -> OnboardingCommandResult:
     """Return a byte-noop review or ready projection from fresh inspected state."""
     if status.state is OnboardingState.READY:
-        return _onboarding_result(status, state=OnboardState.READY)
+        assessment = InitialReconciliationService(runtime).run(
+            InitialReconciliationRequest(action="status", session_id="onboarding", turn_id="status")
+        )
+        ready = assessment["status"] in {"ready", "ready_with_findings"}
+        return _onboarding_result(
+            status,
+            state=OnboardState.READY,
+            initial_reconciliation_status=assessment["status"],
+            next_action=None if ready else "intent_initial_reconciliation",
+            message="Graph activated; initial reconciliation is a separate scoped assessment.",
+        )
     if status.state is not OnboardingState.REVIEW_REQUIRED or not status.pending_proposal_ids:
         raise ValueError("onboarding state changed")
     config, _ = _snapshot_config(runtime)
@@ -934,6 +951,8 @@ def _confirmation_result(
                 "status": "activated",
                 "proposal_id": proposal_id,
                 "graph_version": graph.version,
+                "initial_reconciliation_status": "not_started",
+                "next_action": "intent_initial_reconciliation",
             },
             None,
         )

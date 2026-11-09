@@ -202,6 +202,8 @@ def test_onboard_ready_repository_is_a_semantic_noop(tmp_path: Path) -> None:
     )
     assert (ok, abort) == (True, None)
     assert payload is not None
+    assert payload["initial_reconciliation_status"] == "not_started"
+    assert payload["next_action"] == "intent_initial_reconciliation"
     before = _durable_bytes(project)
 
     result = CliRunner().invoke(
@@ -333,7 +335,7 @@ def test_onboard_projects_a_concurrent_activation_from_fresh_state(
     assert result.exit_code == 0, repr(result.exception)
     payload = json.loads(result.stdout)
     assert payload["state"] == "ready"
-    assert payload["next_action"] is None
+    assert payload["next_action"] == "intent_initial_reconciliation"
     assert load_runtime(project).graph_store.load().version == 1
 
 

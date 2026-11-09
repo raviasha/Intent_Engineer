@@ -10,6 +10,10 @@ from intent_engineering.cli.runtime import Runtime
 from intent_engineering.intent_workflow.background import BackgroundIntentService
 from intent_engineering.intent_workflow.background_models import BackgroundSubmission
 from intent_engineering.intent_workflow.background_sources import BackgroundSource, capture_source
+from intent_engineering.intent_workflow.initial_reconciliation import InitialReconciliationService
+from intent_engineering.intent_workflow.initial_reconciliation_models import (
+    InitialReconciliationRequest,
+)
 from intent_engineering.intent_workflow.source_refresh import (
     RefreshRequest,
     SourceRefreshService,
@@ -19,6 +23,29 @@ from intent_engineering.intent_workflow.source_refresh import (
 
 
 def register_background_tools(server: MCPServer[Any], runtime: Runtime) -> None:
+    @server.tool(
+        annotations=ToolAnnotations(
+            read_only_hint=False,
+            destructive_hint=False,
+            idempotent_hint=True,
+            open_world_hint=False,
+        )
+    )
+    def intent_initial_reconciliation(draft: InitialReconciliationRequest) -> dict[str, Any]:
+        """Start, checkpoint, inspect or finish background intent/requirements/code comparison.
+
+        The host reads selected sources and interprets meaning in the setup chat while normal
+        work continues. Use explicit scoped files, cite snapshot evidence, review all returned
+        missing comparison slots, and checkpoint to resume. Finish atomically publishes graph
+        traces and issues only after complete current comparisons. No assessed code is written.
+        Source intent has priority; test-to-code tracing remains deferred. This tool never
+        launches a worker or claims that graph links prove semantic satisfaction.
+        """
+        try:
+            return InitialReconciliationService(runtime).run(draft)
+        except Exception:  # noqa: BLE001 - fixed public boundary
+            raise ToolError("initial reconciliation unavailable") from None
+
     service = BackgroundIntentService(runtime)
     refresh = SourceRefreshService(runtime)
 

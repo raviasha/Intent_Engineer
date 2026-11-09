@@ -355,7 +355,10 @@ class InitialReconciliationService:
                 if (
                     self._result(state)["missing_comparisons"]
                     or any(c["status"] == "unknown" for c in state["comparisons"].values())
-                    or any(s["dirty"] or not s["initialized"] for s in state["sources"])
+                    or any(
+                        s["dirty"] or not s["initialized"] or not s["reconciled"]
+                        for s in state["sources"]
+                    )
                 ):
                     return self._result(state, status="incomplete")
                 self._publish(state, actor, now)

@@ -118,8 +118,11 @@ A developer asks a coding agent to implement a task. The agent retrieves:
 Background conversational capture/maintenance is the default. Relevant gaps and conflicts are
 clarified in chat; aligned and unrelated tasks stay silent. Graph changes retain provenance,
 validation and ChangeSet history without routine proposal approval. Existing governed team
-publication remains available. Intent versus requirements is the current scope; code/test
-matching in the broader phases is deferred. See the background-workflow spec in `docs/superpowers/specs`.
+publication remains available. Initial reconciliation now matches intent, requirements and
+production code, including requirements-to-code traces and missing links in both directions.
+Source intent has highest priority; findings recommend changes without editing inspected
+artifacts. Test-to-code tracing remains deferred. See the background-workflow and
+initial-reconciliation specs in `docs/superpowers/specs`.
 
 First use offers source-connected graph creation in a separate chat while the original task
 continues. Deferral reminds after three completed turns. Host connections supply versioned

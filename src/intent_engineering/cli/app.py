@@ -35,6 +35,7 @@ from intent_engineering.cli.dev import (
     ensure_command,
 )
 from intent_engineering.cli.github import GitHubDoctorResult, check_github
+from intent_engineering.cli.initial_reconciliation import initial_reconciliation_command
 from intent_engineering.cli.intent_workflow import (
     bootstrap_command,
     onboard_command,
@@ -145,6 +146,7 @@ app.add_typer(write_app, name="write")
 app.add_typer(sources_app, name="sources")
 app.add_typer(proposals_app, name="proposals")
 app.add_typer(team_app, name="team")
+app.command("initial-reconciliation")(initial_reconciliation_command)
 app.command("background")(background_command)
 app.command("background-onboarding")(background_onboarding_command)
 app.command("background-source")(background_source_command)

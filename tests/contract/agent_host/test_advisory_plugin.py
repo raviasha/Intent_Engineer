@@ -215,7 +215,7 @@ def test_advisory_plugin_declares_official_prompt_hook_and_repository_mcp() -> N
 
     assert manifest == {
         "name": "intent-advisor",
-        "version": "0.1.4",
+        "version": "0.1.5",
         "description": "Refresh selected sources and maintain relevant intent during development.",
         "author": {"name": "Intent Engineering"},
         "skills": "./skills/",

@@ -49,7 +49,12 @@ Unrelated and aligned tasks proceed silently. When relevant intent is missing, u
 conflicting, the agent shows its understanding or the specific conflict and asks one
 consequential question in the chat. It reuses your answers and maintains clear intent
 through validated ChangeSets with source evidence and history. No routine dashboard,
-graph approval, WebAuthn, PRD file or export is required. Code/test matching is deferred.
+graph approval, WebAuthn, PRD file or export is required. During initial setup, the host
+compares source intent, requirements and production code in the setup chat, checkpointing
+until the scoped assessment is complete. Source intent has highest priority. Missing or
+conflicting coverage becomes an evidence-backed issue with a recommended change; assessed
+code and documents remain unchanged. Findings are presented together after readiness.
+Requirements-to-code tracing is included; test-to-code tracing remains deferred.
 
 Existing pending proposals remain pending; upgrading never fabricates their approval.
 Chat statements are recorded as agent-reported user evidence, separately from inferences.
@@ -286,7 +291,12 @@ evidence sources still require their provider connection. The `intent-advisor` p
 when to inspect or clarify intent, but it cannot provide human approval or bypass repository ACL,
 proposal, reconciliation, or release controls.
 
-Deferred follow-up work is explicitly not shipped or reachable: requirement-to-code/test matching,
+Initial reconciliation is available through `intent_initial_reconciliation` and
+`intent initial-reconciliation`. The host performs semantic review; the local service validates
+snapshot evidence, coverage, freshness and atomic publication. It does not launch a worker or
+claim coverage beyond the declared file scope. See the [quick start](docs/quick-start.md).
+
+Deferred follow-up work is explicitly not shipped or reachable: test-to-code matching,
 automatic activation beyond the existing reviewed governance boundaries, and the broader
 state-hardening backlog.
 

@@ -326,7 +326,9 @@ def test_published_code_trace_and_findings_reach_task_context(env):
         task="local project data store app.py", session_id="developer"
     )
     assert result["context"]["code_refs"]
-    assert any(c["label"].startswith("CODE_LAG:") for c in result["context"]["open_reconciliation_cases"])
+    assert any(
+        c["label"].startswith("CODE_LAG:") for c in result["context"]["open_reconciliation_cases"]
+    )
     assert result["context"]["test_refs"] == []
 
 
@@ -348,3 +350,83 @@ def test_concurrent_code_change_during_publication_rolls_back_graph_not_user_edi
     assert env.graph_store.load().version == 1
     assert env.cases() == ()
     assert (env.root / "app.py").read_text() == "user_edited = True\n"
+
+
+def test_source_read_without_interpretation_cannot_complete_initial_reconciliation(env):
+    from intent_engineering.intent_workflow.source_refresh import SourceRefreshService
+    from tests.integration.intent_workflow.test_source_refresh import (
+        captured,
+        observe,
+        request,
+        selection,
+    )
+
+    refresh = SourceRefreshService(env, clock=lambda: NOW)
+    refresh.sources(selection())
+    refresh.refresh(request())
+    refresh.refresh(request(observations=[observe([captured(env)], generation=1)]))
+    started = start(env)
+    call(env, "checkpoint", run_id=started["run_id"], comparisons=reviews(started))
+    result = call(env, "finish", run_id=started["run_id"])
+    assert result["status"] == "incomplete"
+    assert env.graph_store.load().version == 1
+
+
+def test_conflicting_authoritative_sources_remain_open_and_are_not_rewritten(env):
+    from intent_engineering.intent_workflow.background_sources import (
+        BackgroundSource,
+        capture_source,
+    )
+    from intent_engineering.intent_workflow.source_refresh import SourceRefreshService
+    from tests.integration.intent_workflow.test_source_refresh import (
+        captured,
+        observe,
+        reconcile,
+        request,
+        selection,
+    )
+
+    refresh = SourceRefreshService(env, clock=lambda: NOW)
+    refresh.sources(selection(collection=True))
+    refresh.refresh(request())
+    local = captured(env, content="Keep all project data local.")
+    cloud = capture_source(
+        env,
+        BackgroundSource(
+            provider="notion",
+            object_id="page:sync",
+            version="1",
+            locator="https://notion.so/sync",
+            author="notion:bob",
+            observed_at=NOW,
+            content="Upload project data to the cloud.",
+        ),
+    )["evidence_ref"]
+    pending = refresh.refresh(request(observations=[observe([local, cloud], generation=1)]))
+    refresh.refresh(request(reconciliation_ref=reconcile(env, pending)))
+    before = env.evidence_store.ledger("background:notion")
+    started = start(env)
+    rows = reviews(started)
+    rows.append(
+        {
+            "axis": "source_conflict",
+            "subject_ref": "intent:privacy",
+            "related_refs": [],
+            "status": "conflicting",
+            "evidence_refs": started["evidence_refs"],
+            "explanation": "The designated sources require both local-only and cloud storage.",
+            "authority_basis": "Both authors are preserved; neither requirement nor code decides.",
+            "recommendation": "Ask the user to resolve local-only versus cloud storage.",
+            "recommendation_target": "source_conflict",
+            "confidence": 0.8,
+        }
+    )
+    call(env, "checkpoint", run_id=started["run_id"], comparisons=rows)
+    result = call(env, "finish", run_id=started["run_id"])
+    assert result["status"] == "ready_with_findings"
+    case = env.cases()[0]
+    assert case.case_type.value == "CONFLICTING_SOURCES"
+    assert case.status.value == "open"
+    assert {local, cloud} <= {r for side in case.evidence_sides for r in side.evidence_refs}
+    assert env.evidence_store.ledger("background:notion") == before
+    assert validate_project_directory(env.project_directory).valid

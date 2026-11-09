@@ -72,8 +72,10 @@ the question. Keep the original development request so work can resume after set
    (the source is already captured). Present a short summary of proposed intent,
    requirements and material assumptions, then direct the user to the pending proposal in
    **Proposal review**. The existing authenticated local review activates the graph.
-   Do not simulate approval or claim a pending graph is active. After activation, resume
-   the original task using the approved graph.
+   Do not simulate approval or claim a pending graph is active. After activation, follow
+   [initial reconciliation](initial-reconciliation.md) in the setup chat. The governed
+   `ready` state means a baseline exists; check `initial_reconciliation_status` separately.
+   The original task can continue while the setup chat compares intent, requirements and code.
 
 These onboarding CLI operations work even if the plugin MCP server could not start before
 `.intent` existed. Do not require MCP availability to prepare the PRD, submit the bootstrap

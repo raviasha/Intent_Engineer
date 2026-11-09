@@ -8,6 +8,10 @@ from pathlib import Path
 import typer
 
 from intent_engineering.cli.runtime import load_runtime
+from intent_engineering.intent_workflow.initial_reconciliation import InitialReconciliationService
+from intent_engineering.intent_workflow.initial_reconciliation_models import (
+    InitialReconciliationRequest,
+)
 from intent_engineering.intent_workflow.onboarding_reminders import (
     defer_onboarding,
     onboarding_chat_state,
@@ -30,16 +34,28 @@ def background_onboarding_command(
         project = project.resolve(strict=True)
         if defer:
             defer_onboarding(project, after_tasks=after_tasks)
+        assessment = None
         if finished:
             runtime = load_runtime(project)
             try:
                 if not runtime.graph_store.load().nodes:
                     raise ValueError("graph capture is not complete")
+                assessment = InitialReconciliationService(runtime).run(
+                    InitialReconciliationRequest(
+                        action="status",
+                        session_id="onboarding",
+                        turn_id="finish-check",
+                    )
+                )
+                if assessment["status"] not in {"ready", "ready_with_findings"}:
+                    raise ValueError("initial reconciliation is not complete and current")
             finally:
                 runtime.close()
         result = onboarding_chat_state(
             project, prepare=prepare, sources=tuple(source), chat_id=chat_id, finished=finished
         )
+        if assessment is not None:
+            result["reconciliation"] = assessment
         if prepare:
             result.update(
                 {
@@ -61,8 +77,17 @@ def background_onboarding_command(
                         "pending proposal evidence but never approve/activate old proposals. Build clear "
                         "intent and requirements using intent_background_submit / intent background; "
                         "retain agent inferences and disagreements. Ask only consequential questions "
-                        "here. No routine dashboard, WebAuthn graph approval, report/export or code/test "
-                        "matching. When a usable graph exists, record intent background-onboarding "
+                        "here. No routine dashboard, WebAuthn graph approval or report/export. "
+                        "Read the intent-advisor initial-reconciliation reference. Compare selected "
+                        "source intent, PRD requirements and current code with source intent highest. "
+                        "Use intent_initial_reconciliation / intent initial-reconciliation to start "
+                        "with explicit relevant files, checkpoint all five comparison directions, "
+                        "and finish. Flag missing, partial, contradictory and unsupported coverage "
+                        "with evidence and recommended changes; never modify assessed code or sources. "
+                        "Test-to-code tracing remains deferred. Take the time needed for quality, "
+                        "checkpoint/resume without blocking the original work, and revalidate changed "
+                        "inputs. Present consolidated issues only after graph assessment is ready. "
+                        "Only after a current ready assessment, record intent background-onboarding "
                         "--project . --finished and briefly summarize completion in this chat. If setup "
                         "is deferred or cannot proceed, use --defer so the parent can remind after three "
                         "completed turns. Do not send messages to colleagues or alter source documents."
