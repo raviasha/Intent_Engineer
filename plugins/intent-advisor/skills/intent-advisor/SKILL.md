@@ -6,7 +6,9 @@ description: Use when repository development tasks may depend on captured intent
 # Intent Advisor
 
 Intent Engineering runs in the background of normal development. Make a lightweight
-relevance check for each new task. Unrelated and aligned tasks proceed silently. Do not
+relevance check for each new task. For development, check selected source freshness using
+[source refresh](references/source-refresh.md) before dependent work. Routine checks and
+aligned work proceed silently. Do not
 announce routine checks, start a dashboard, request graph approval or
 WebAuthn, or create reports/exports unless the user asks. Code/test matching is deferred;
 missing code or test coverage is not an intent question.
@@ -41,6 +43,12 @@ user complete provider authentication in this setup chat. A source is connected 
 a real authorized read succeeds. Keep source scope bounded, and do not send messages or
 edit source documents. Connection problems stay in the setup chat.
 
+Record each explicit bounded selection with `intent_background_sources(selection)` (CLI:
+`intent background-sources --submission-schema`, then `--submission <relative-json>`).
+Include the exact reported `user_statement`, stable `source_id`, provider, locator, scope,
+whether it is a collection, and the user's authority designation. Existing source captures
+alone do not designate an authoritative scope. Reuse selections already made by the user.
+
 Capture each real read using `intent_background_capture_source(draft)` or:
 
 ```text
@@ -58,6 +66,11 @@ submissions. Configured native connectors can instead use their existing sync wo
 On later authorized reads, capture new revisions and update clear intent using the same path;
 ask about conflicts instead of silently replacing another contributor's position. These hooks
 do not create a continuous remote polling subscription.
+
+Selected authoritative material governs downstream intent and requirements. When those
+sources disagree, show both positions with evidence and a recommended resolution; the user
+decides. Timestamps or leadership titles alone do not resolve disagreement. Apply their
+recorded decision locally, preserving both source positions; do not edit the sources.
 
 When a usable graph exists, run `intent background-onboarding --project . --finished` in
 the setup chat and summarize there. If setup is deferred or cannot proceed, use `--defer`
@@ -84,6 +97,9 @@ intent background --project . --submission <relative-json-path>
 
 Read errors are not proof that intent is absent. Report a relevant persistence/read failure
 briefly, continue independent authorized development, and never claim a graph update succeeded.
+An unavailable selected source or unresolved source conflict holds dependent work pending;
+it does not prevent independent work. A refresh `ready` result confirms the recorded refresh
+workflow, not complete intent coverage or enforcement over arbitrary shell/editor actions.
 Do not call old confirmation tools as a workaround. Never write canonical `.intent` files directly.
 
 ## Ask only consequential questions in this chat

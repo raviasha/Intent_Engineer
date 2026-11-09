@@ -10,10 +10,78 @@ from intent_engineering.cli.runtime import Runtime
 from intent_engineering.intent_workflow.background import BackgroundIntentService
 from intent_engineering.intent_workflow.background_models import BackgroundSubmission
 from intent_engineering.intent_workflow.background_sources import BackgroundSource, capture_source
+from intent_engineering.intent_workflow.source_refresh import (
+    RefreshRequest,
+    SourceRefreshService,
+    SourceSelection,
+    SourceSignal,
+)
 
 
 def register_background_tools(server: MCPServer[Any], runtime: Runtime) -> None:
     service = BackgroundIntentService(runtime)
+    refresh = SourceRefreshService(runtime)
+
+    @server.tool(
+        annotations=ToolAnnotations(
+            read_only_hint=False,
+            destructive_hint=False,
+            idempotent_hint=True,
+            open_world_hint=False,
+        )
+    )
+    def intent_background_sources(selection: SourceSelection | None = None) -> dict[str, Any]:
+        """List bounded source scopes or record their explicit user designation and authority.
+
+        Does not connect a provider or subscribe to notifications. Never infer a selection
+        from arbitrary old evidence. Omit selection to list; enabled=false disables a scope.
+        """
+        try:
+            return refresh.sources(selection)
+        except Exception:  # noqa: BLE001 - fixed public boundary
+            raise ToolError("source refresh unavailable") from None
+
+    @server.tool(
+        annotations=ToolAnnotations(
+            read_only_hint=False,
+            destructive_hint=False,
+            idempotent_hint=True,
+            open_world_hint=False,
+        )
+    )
+    def intent_background_source_signal(draft: SourceSignal) -> dict[str, Any]:
+        """Invalidate a selected source after a real provider change notification.
+
+        This is a local bridge, not an authenticated webhook listener. Event silence does
+        not establish freshness. Signals never change intent or make a source fresh.
+        """
+        try:
+            return refresh.signal(draft)
+        except Exception:  # noqa: BLE001 - fixed public boundary
+            raise ToolError("source refresh unavailable") from None
+
+    @server.tool(
+        annotations=ToolAnnotations(
+            read_only_hint=False,
+            destructive_hint=False,
+            idempotent_hint=True,
+            open_world_hint=False,
+        )
+    )
+    def intent_background_refresh(draft: RefreshRequest) -> dict[str, Any]:
+        """Start a dev-task refresh, then submit actual provider checks and interpretation.
+
+        First call without observations. Host tools perform bounded reads outside this tool.
+        A metadata validator must cover the whole scope including edits, membership,
+        deletions and access changes. Otherwise fetch content; complete=false cannot be fresh.
+        Use returned generations. Cite required_evidence_refs in a current background
+        interpretation, then pass its evidence_ref as reconciliation_ref. A ready result
+        verifies this cooperative workflow, not arbitrary editor or shell actions.
+        """
+        try:
+            return refresh.refresh(draft)
+        except Exception:  # noqa: BLE001 - fixed public boundary
+            raise ToolError("source refresh unavailable") from None
 
     @server.tool(
         annotations=ToolAnnotations(

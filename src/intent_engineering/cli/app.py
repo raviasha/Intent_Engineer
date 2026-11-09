@@ -61,6 +61,11 @@ from intent_engineering.cli.runtime import (
     run_selected_sync,
     validate_github_environment,
 )
+from intent_engineering.cli.source_refresh import (
+    background_refresh_command,
+    background_source_signal_command,
+    background_sources_command,
+)
 from intent_engineering.cli.team import team_app
 from intent_engineering.cli.writes import policy_actor_aliases, write_app
 from intent_engineering.context import ContextProvider
@@ -143,6 +148,9 @@ app.add_typer(team_app, name="team")
 app.command("background")(background_command)
 app.command("background-onboarding")(background_onboarding_command)
 app.command("background-source")(background_source_command)
+app.command("background-sources")(background_sources_command)
+app.command("background-refresh")(background_refresh_command)
+app.command("background-source-signal")(background_source_signal_command)
 app.command("bootstrap")(bootstrap_command)
 app.command("onboard")(onboard_command)
 app.command("dev")(dev_command)

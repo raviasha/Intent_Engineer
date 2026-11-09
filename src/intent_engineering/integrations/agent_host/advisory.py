@@ -561,11 +561,14 @@ def background_prompt_route(session_id: str, turn_id: str) -> PromptRoute:
         arguments={"session_id": session, "turn_id": turn},
         message=(
             f"Background Intent Engineering: session_id={session}, turn_id={turn}. "
-            "Make a lightweight relevance check for this task. Consult intent_background_context "
-            "only when relevant; CLI fallback: intent background --project . --task <task> "
-            "--session-id <session_id>. Unrelated or aligned work proceeds silently. "
+            "For development tasks, follow the intent-advisor skill's source refresh workflow: "
+            "call intent_background_refresh with task/session_id/turn_id before dependent work. "
+            "Use host tools for checks; reuse content after a verified unchanged scope-wide "
+            "revision. No event is not proof of freshness. CLI: intent background-refresh "
+            "--project . --submission <relative-json>; --submission-schema shows fields. "
+            "For relevant meaning consult intent_background_context. Routine checks stay silent. "
             "For relevant missing/unclear intent or a specific conflict, show captured understanding "
-            "or existing intent and conflict, and ask only the consequential question here. Reuse "
+            "and both sources with a recommendation; the user decides the consequential question. Reuse "
             "known answers. Once clear, use intent_background_submit (or intent background "
             "--submission <relative-json>) to maintain the graph with provenance and history. "
             "Separate reported user statements from agent inferences; never invent approvals or "
