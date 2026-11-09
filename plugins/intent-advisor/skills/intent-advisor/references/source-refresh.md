@@ -75,6 +75,9 @@ both evidence refs, specific `conflict`, and a `question`; put the recommendatio
 yet, use `needs_clarification`, cite both sources, and describe both positions and the
 recommendation in `understanding` and `question`. Do not invent an accepted node merely to
 open a case. This persisted unanswered question blocks the current refresh.
+Include the current refresh receipts on the question: receipt-linked source questions
+follow the project across chats and can be answered from the current chat using their
+exact `question_ref`. Ordinary unrelated questions remain scoped to their original chat.
 
 Record the user's exact answer against `question_ref`. For a conflict case use
 `retain_existing` or `revise_intent` only when that matches their decision and graph effect;

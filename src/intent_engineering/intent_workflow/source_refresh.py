@@ -109,6 +109,7 @@ class _Source(BackgroundModel):
     evidence_refs: tuple[str, ...] = ()
     previous_refs: tuple[str, ...] = ()
     reconciled: bool = False
+    reconciled_graph_version: int | None = None
 
 
 class _Check(BackgroundModel):
@@ -316,7 +317,7 @@ class SourceRefreshService:
             )
             source = source.model_copy(
                 update={
-                    "generation": source.generation + int(source.initialized and not same),
+                    "generation": source.generation + int(not same),
                     "initialized": True,
                     "dirty": False,
                     "validator": observation.validator,
@@ -436,7 +437,10 @@ class SourceRefreshService:
                     }
                 )
             needs_review = (
-                any(not s.reconciled for s in active.values())
+                any(
+                    not s.reconciled or s.reconciled_graph_version != graph.version
+                    for s in active.values()
+                )
                 or task.graph_version != graph.version
             )
             context = BackgroundIntentService(self.runtime)._context(
@@ -485,7 +489,13 @@ class SourceRefreshService:
                         update={"graph_version": graph.version, "reconciliation_ref": review.id}
                     )
                     active = {
-                        k: s.model_copy(update={"reconciled": True, "previous_refs": ()})
+                        k: s.model_copy(
+                            update={
+                                "reconciled": True,
+                                "previous_refs": (),
+                                "reconciled_graph_version": graph.version,
+                            }
+                        )
                         for k, s in active.items()
                     }
             for source_id, source in active.items():

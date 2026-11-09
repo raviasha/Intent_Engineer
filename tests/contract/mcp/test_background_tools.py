@@ -127,7 +127,7 @@ async def test_public_refresh_reuses_metadata_and_waits_for_user_conflict_resolu
                 observations=[
                     {
                         "source_id": "source:privacy",
-                        "generation": 1,
+                        "generation": checked["sources"][0]["generation"],
                         "kind": "metadata",
                         "complete": True,
                         "validator": "scope:1",

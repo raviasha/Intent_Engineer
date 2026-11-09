@@ -74,7 +74,7 @@ def captured(runtime, version="1", content="Keep reports private."):
 def observe(refs=(), **changes):
     return {
         "source_id": "source:privacy",
-        "generation": 1,
+        "generation": 2,
         "kind": "content",
         "checked_at": NOW,
         "complete": True,
@@ -99,7 +99,7 @@ def reconcile(runtime, result, turn="review:one", **changes):
 def ready(runtime, service):
     service.sources(selection())
     assert service.refresh(request())["sources"][0]["action"] == "fetch"
-    pending = service.refresh(request(observations=[observe([captured(runtime)])]))
+    pending = service.refresh(request(observations=[observe([captured(runtime)], generation=1)]))
     assert pending["status"] == "needs_interpretation"
     review = reconcile(runtime, pending)
     result = service.refresh(request(reconciliation_ref=review))
@@ -161,13 +161,13 @@ def test_signal_is_idempotent_and_cannot_be_cleared_by_a_racing_read(runtime):
     service = SourceRefreshService(runtime, clock=lambda: NOW)
     ready(runtime, service)
     signal = SourceSignal(source_id="source:privacy", event_id="event:1", observed_at=NOW)
-    assert service.signal(signal)["generation"] == 2
-    assert service.signal(signal)["generation"] == 2
+    assert service.signal(signal)["generation"] == 3
+    assert service.signal(signal)["generation"] == 3
     stale = service.refresh(request(observations=[observe([captured(runtime)])]))
     assert stale["status"] == "refresh_required"
     assert stale["sources"][0]["action"] == "fetch"
-    assert stale["sources"][0]["generation"] == 2
-    refreshed = service.refresh(request(observations=[observe([captured(runtime)], generation=2)]))
+    assert stale["sources"][0]["generation"] == 3
+    refreshed = service.refresh(request(observations=[observe([captured(runtime)], generation=3)]))
     assert refreshed["status"] == "ready"  # identical full manifest, already interpreted
 
 
@@ -210,7 +210,7 @@ def test_deleted_collection_members_need_interpretation_and_preserve_old_evidenc
         request(
             turn_id="task:two",
             observations=[
-                observe([], generation=2, validator="empty:2"),
+                observe([], generation=3, validator="empty:2"),
             ],
         )
     )
@@ -243,7 +243,7 @@ def test_missing_foreign_and_mismatched_evidence_is_rejected_atomically(runtime)
     for ref in ("evidence:missing", wrong):
         before = durable(runtime.root / ".intent")
         with pytest.raises(ValueError, match="evidence"):
-            service.refresh(request(observations=[observe([ref])]))
+            service.refresh(request(observations=[observe([ref], generation=1)]))
         assert durable(runtime.root / ".intent") == before
 
 
@@ -253,7 +253,9 @@ def test_checks_must_follow_task_start_and_cannot_come_from_the_future(runtime):
     service.refresh(request())
     for at in (NOW - timedelta(seconds=1), NOW + timedelta(minutes=2)):
         with pytest.raises(ValueError, match="time"):
-            service.refresh(request(observations=[observe([captured(runtime)], checked_at=at)]))
+            service.refresh(
+                request(observations=[observe([captured(runtime)], generation=1, checked_at=at)])
+            )
 
 
 def test_source_reconfiguration_invalidates_readiness(runtime):
@@ -262,7 +264,7 @@ def test_source_reconfiguration_invalidates_readiness(runtime):
     service.sources(selection(scope="page:another", locator="https://notion.so/another"))
     result = service.refresh(request())
     assert result["status"] == "refresh_required"
-    assert result["sources"][0]["generation"] == 2
+    assert result["sources"][0]["generation"] == 3
 
 
 def test_open_conflict_blocks_until_exact_user_decision(runtime):
@@ -331,6 +333,71 @@ def test_actor_cannot_see_another_actors_selections_or_reuse_evidence(runtime):
         isolated.sources(selection())
         isolated.refresh(request())
         with pytest.raises(ValueError, match="evidence"):
-            isolated.refresh(request(observations=[observe([ref])]))
+            isolated.refresh(request(observations=[observe([ref], generation=1)]))
     finally:
         other.close()
+
+
+def test_initial_reads_cannot_overtake_each_other(runtime):
+    service = SourceRefreshService(runtime, clock=lambda: NOW)
+    service.sources(selection())
+    service.refresh(request())
+    service.refresh(request(turn_id="task:two"))
+    old = captured(runtime)
+    new = captured(runtime, "2", "Share reports.")
+    service.refresh(
+        request(turn_id="task:two", observations=[observe([new], generation=1, validator="2")])
+    )
+    late = service.refresh(request(observations=[observe([old], generation=1)]))
+    assert late["status"] == "refresh_required"
+    assert late["sources"][0]["evidence_refs"] == [new]
+
+
+def test_new_task_rechecks_interpretation_after_graph_change(runtime):
+    service = SourceRefreshService(runtime, clock=lambda: NOW)
+    ready(runtime, service)
+    BackgroundIntentService(runtime, clock=lambda: NOW).submit(submission(turn_id="graph:change"))
+    service.refresh(request(turn_id="task:two"))
+    result = service.refresh(request(turn_id="task:two", observations=[observe(kind="metadata")]))
+    assert result["status"] == "needs_interpretation"
+    assert result["sources"][0]["action"] == "reuse"
+
+
+def test_source_only_conflict_follows_source_across_chats_until_answered(runtime):
+    service = SourceRefreshService(runtime, clock=lambda: NOW)
+    service.sources(selection())
+    service.refresh(request())
+    pending = service.refresh(request(observations=[observe([captured(runtime)], generation=1)]))
+    background = BackgroundIntentService(runtime, clock=lambda: NOW)
+    question = background.submit(
+        submission(
+            turn_id="source:question",
+            nodes=[],
+            classification="needs_clarification",
+            evidence_refs=pending["required_evidence_refs"],
+            question="Sources disagree on visibility. Keep reports private?",
+        )
+    )
+    service.refresh(request(session_id="chat:two"))
+    checked = service.refresh(
+        request(session_id="chat:two", observations=[observe(kind="metadata")])
+    )
+    assert checked["status"] == "blocked"
+    assert checked["questions"][0]["question_ref"] == question["evidence_ref"]
+    answer = background.submit(
+        submission(
+            session_id="chat:two",
+            turn_id="source:decision",
+            nodes=[],
+            evidence_refs=checked["required_evidence_refs"],
+            answers=[
+                {"question_ref": question["evidence_ref"], "quote": "Keep all project data local."}
+            ],
+        )
+    )
+    assert (
+        service.refresh(request(session_id="chat:two", reconciliation_ref=answer["evidence_ref"]))[
+            "status"
+        ]
+        == "ready"
+    )

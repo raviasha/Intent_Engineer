@@ -112,11 +112,33 @@ class BackgroundIntentService:
         return cast(dict[str, Any], json.loads(event.model_dump_json())["payload"]["content"])
 
     def _conversation(self, session_id: str, principals: frozenset[str]) -> list[dict[str, Any]]:
+        # Source questions govern the shared project, not just the chat that found
+        # them. Only questions bound to successful refresh receipts cross sessions;
+        # ordinary conversational questions retain their existing session boundary.
+        receipts = set()
+        for entry in self.runtime.evidence_store.ledger("conversation:source-refresh"):
+            record = entry.evidence
+            if record.author != "agent:source-refresh" or not evidence_allowed(record, principals):
+                continue
+            content = self._content(record)
+            if content.get("kind") == "check" and content["value"].get("success") is True:
+                receipts.add(record.id)
+        events = [{**self._content(e), "evidence_ref": e.id} for e in self._events(principals)]
+        shared_questions = {
+            e["evidence_ref"]
+            for e in events
+            if e["question"] and receipts.intersection(e["evidence_refs"])
+        }
         result = []
-        for event in self._events(principals):
-            content = self._content(event)
+        for content in events:
             if content["session_id"] == session_id:
-                result.append({**content, "evidence_ref": event.id})
+                result.append(content)
+                continue
+            answers = [a for a in content["answers"] if a["question_ref"] in shared_questions]
+            if content["evidence_ref"] in shared_questions:
+                result.append({**content, "answers": answers})
+            elif answers:
+                result.append({**content, "answers": answers, "question": None, "conflict": None})
         return result
 
     def context(self, *, task: str, session_id: str) -> dict[str, Any]:
