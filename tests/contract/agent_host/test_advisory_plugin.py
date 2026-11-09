@@ -215,16 +215,16 @@ def test_advisory_plugin_declares_official_prompt_hook_and_repository_mcp() -> N
 
     assert manifest == {
         "name": "intent-advisor",
-        "version": "0.1.3",
-        "description": "Maintain relevant intent in the background of normal development.",
+        "version": "0.1.4",
+        "description": "Refresh selected sources and maintain relevant intent during development.",
         "author": {"name": "Intent Engineering"},
         "skills": "./skills/",
         "interface": {
             "displayName": "Intent Advisor",
             "shortDescription": "Route work through repository intent.",
             "longDescription": (
-                "Consult relevant intent, clarify consequential gaps in chat, and maintain a "
-                "provenance-backed local graph."
+                "Check source freshness before development, reuse unchanged content, surface "
+                "source conflicts for your decision, and maintain a provenance-backed local intent graph."
             ),
             "developerName": "Intent Engineering",
             "category": "Developer Tools",

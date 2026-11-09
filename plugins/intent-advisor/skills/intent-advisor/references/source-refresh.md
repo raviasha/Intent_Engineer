@@ -22,6 +22,9 @@ tools; this plugin stores local receipts and cannot perform those host reads its
    verify objects fall inside the selected scope. Search snippets or truncated results do
    not establish completeness. If the read fails, submit `unavailable`; partial reads use
    `complete=false`. Set `validator=null` when no reliable scope-wide marker exists.
+   A manifest holds at most 512 objects and a project at most 32 selected scopes. If a
+   selection exceeds those bounds, arrange bounded scopes with the user; never truncate
+   the read and mark it complete.
 4. Every observation includes `source_id`, returned `generation`, timezone-qualified
    `checked_at` at read completion, `kind` and `complete`. Start the task before reading.
    Preserve the read's generation: do not relabel an old read with a newly returned generation.
