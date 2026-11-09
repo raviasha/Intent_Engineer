@@ -180,7 +180,14 @@ class BackgroundIntentService:
         config, _ = _snapshot_config(self.runtime)
         principals = _principals(self.runtime, config)
         graph = self.runtime.graph_store.load()
-        semantic_ids = {n.id for n in graph.nodes if n.type in SEMANTIC_TYPES}
+        context_types = SEMANTIC_TYPES | {
+            NodeType.FILE,
+            NodeType.SYMBOL,
+            NodeType.MODULE,
+            NodeType.ENDPOINT,
+            NodeType.SCHEMA,
+        }
+        semantic_ids = {n.id for n in graph.nodes if n.type in context_types}
         graph = Graph.model_validate(
             {
                 **graph.model_dump(),
@@ -190,12 +197,14 @@ class BackgroundIntentService:
                     for e in graph.edges
                     if e.from_id in semantic_ids
                     and e.to_id in semantic_ids
-                    and e.relation.value in SEMANTIC_RELATIONS
+                    and e.relation.value in SEMANTIC_RELATIONS | {"IMPLEMENTED_BY", "LOCATED_IN"}
                 ),
             }
         )
         evidence = self.runtime.evidence()
-        cases = tuple(c for c in self.runtime.cases() if is_intent_requirement_case(c.case_type))
+        cases = tuple(
+            c for c in self.runtime.cases() if c.case_type is not ReconciliationCaseType.TEST_LAG
+        )
         pack = ContextProvider(graph, cases, config, evidence).for_task(task, actor=principals)
         conversation = self._conversation(session_id, principals)
         answers = [dict(a) for event in conversation for a in event["answers"]]
@@ -238,7 +247,7 @@ class BackgroundIntentService:
                 if self.runtime.intent_proposals.decision_for(p.id) is None
                 and refs_allowed(p.evidence_refs, evidence, principals)
             ][:64],
-            "scope": "intent_requirements",
+            "scope": "intent_requirements_code",
             "human_approval": False,
         }
 
