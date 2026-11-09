@@ -90,7 +90,7 @@ Expected: full suite passes; any platform-only skips reported.
 - Full suite: 3,570 passed, 9 opt-in Docker/manual checks skipped. Ruff passed; mypy passed for the five changed service/integration modules.
 - Targeted source refresh, CLI, MCP and real hook suite: 56 passed.
 - One independent whole-branch review found three important defects; each was reproduced with a failing test and fixed: concurrent first captures, source questions across chats, and graph changes between tasks.
-- Installed and enabled local plugin0.1.4 and installed the verified wheel into the existing CLI environment. Marketplace now points to this retained worktree. No remote publication.
+- Installed and enabled local plugin 0.1.4 and installed the verified wheel into the existing CLI environment. Marketplace now points to this retained worktree. No remote publication.
 - Actual installed CLI/stdio MCP smoke passed unchanged-source zero-content-fetch reuse, conflict blocking, exact user decision, signal invalidation/idempotency and canonical validation. Installed assets match the reviewed plugin source.
-- The current project graph was separately validated after correcting two supported product-intent links: 15 requirements connect to3 product intents, with no structural orphan in either direction. This is not proof of semantic completeness.
+- The current project graph was separately validated after correcting two supported product-intent links: 15 requirements connect to 3 product intents, with no structural orphan in either direction. This is not proof of semantic completeness.
 - Provider subscriptions remain a separate integration; receipts are host-reported and the hook is advisory. Restart the desktop app to load the updated local plugin.
