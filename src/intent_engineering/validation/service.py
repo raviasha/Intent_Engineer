@@ -336,7 +336,14 @@ def _evidence_diagnostics(
                 diagnostics.append(_diagnostic("evidence.content_hash_mismatch", "evidence"))
             if identity is None or record.external_version != identity[1]:
                 diagnostics.append(_diagnostic("evidence.version_mismatch", "evidence"))
-        elif record.connector_type == "markdown":
+        elif record.connector_type == "markdown" or record.connector_type in {
+            "background:notion",
+            "background:confluence",
+            "background:slack",
+            "background:google-drive",
+            "background:github",
+            "background:local",
+        }:
             content = payload.get("content") if isinstance(payload, dict) else None
             if not isinstance(content, str) or record.content_hash != (
                 f"sha256:{sha256(content.encode('utf-8')).hexdigest()}"

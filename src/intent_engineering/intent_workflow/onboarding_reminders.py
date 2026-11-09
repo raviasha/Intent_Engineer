@@ -23,6 +23,9 @@ class _Reminder(StrictModel):
     remaining_tasks: Annotated[int, Field(ge=0, le=100)]
     pending: Annotated[tuple[str, ...], Field(max_length=_LIMIT)] = ()
     completed: Annotated[tuple[str, ...], Field(max_length=_LIMIT)] = ()
+    setup_status: Literal["idle", "prepared", "running", "complete"] = "idle"
+    chat_id: Annotated[str | None, Field(max_length=512)] = None
+    sources: Annotated[tuple[str, ...], Field(max_length=16)] = ()
 
 
 def _digest(value: object) -> str:
@@ -70,6 +73,8 @@ def offer_on_prompt(project: Path, session_id: str, turn_id: str) -> bool:
     try:
         with same_path_lock(target):
             state = _load(target)
+            if state is not None and state.setup_status in {"prepared", "running", "complete"}:
+                return False
             if state is None or state.remaining_tasks == 0:
                 return True
             key = _digest((session_id, turn_id))
@@ -80,6 +85,52 @@ def offer_on_prompt(project: Path, session_id: str, turn_id: str) -> bool:
             return False
     finally:
         target.close()
+
+
+def onboarding_chat_state(
+    project: Path,
+    *,
+    prepare: bool = False,
+    sources: tuple[str, ...] = (),
+    chat_id: str | None = None,
+    finished: bool = False,
+) -> dict[str, object]:
+    """Persist a host-created chat handoff, never create a chat or imply source authentication."""
+    allowed = {"notion", "confluence", "slack", "google-drive", "github", "local"}
+    if set(sources) - allowed or len(sources) != len(set(sources)):
+        raise ValueError("unsupported onboarding sources")
+    if chat_id is not None and (
+        not chat_id or len(chat_id) > 512 or any(ord(c) < 32 for c in chat_id)
+    ):
+        raise ValueError("invalid onboarding chat ID")
+    target = _state_file(project, create=prepare or chat_id is not None or finished)
+    state = _Reminder(remaining_tasks=0)
+    if target is not None:
+        try:
+            with same_path_lock(target):
+                state = _load(target) or state
+                if prepare and state.setup_status == "idle":
+                    state = state.model_copy(
+                        update={"setup_status": "prepared", "sources": sources}
+                    )
+                if chat_id is not None:
+                    if state.chat_id is not None and state.chat_id != chat_id:
+                        raise ValueError("an onboarding chat already exists")
+                    state = state.model_copy(update={"setup_status": "running", "chat_id": chat_id})
+                if finished:
+                    if state.chat_id is None:
+                        raise ValueError("no onboarding chat is running")
+                    state = state.model_copy(update={"setup_status": "complete"})
+                if prepare or chat_id is not None or finished:
+                    target.atomic_write(state.model_dump_json().encode())
+        finally:
+            target.close()
+    return {
+        "status": state.setup_status,
+        "chat_id": state.chat_id,
+        "sources": list(state.sources),
+        "remaining_tasks": state.remaining_tasks,
+    }
 
 
 def complete_turn(project: Path, session_id: str, turn_id: str) -> None:

@@ -810,13 +810,17 @@ def test_hidden_cli_reads_one_bounded_object_and_emits_fixed_secret_free_denial(
     )
     monkeypatch.chdir(project)
     runner = CliRunner()
-    valid = runner.invoke(app, ["agent-prompt-hook"], input=_event(project).model_dump_json())
+    valid = runner.invoke(
+        app, ["agent-prompt-hook", "--preset", "developer"], input=_event(project).model_dump_json()
+    )
     assert valid.exit_code == 0
     assert json.loads(valid.stdout)["mcp_tool"] == "intent_advisory_preflight"
     assert valid.stderr == ""
 
     marker = "PRIVATE-HOOK-MALFORMED-8197"
-    malformed = runner.invoke(app, ["agent-prompt-hook"], input=f'{{"prompt":"{marker}"')
+    malformed = runner.invoke(
+        app, ["agent-prompt-hook", "--preset", "developer"], input=f'{{"prompt":"{marker}"'
+    )
     assert malformed.exit_code == 1
     assert marker not in malformed.stdout + malformed.stderr
     assert json.loads(malformed.stdout) == {
@@ -829,7 +833,9 @@ def test_hidden_cli_reads_one_bounded_object_and_emits_fixed_secret_free_denial(
         "authorization_issued": False,
     }
 
-    oversized = runner.invoke(app, ["agent-prompt-hook"], input="x" * 70_000)
+    oversized = runner.invoke(
+        app, ["agent-prompt-hook", "--preset", "developer"], input="x" * 70_000
+    )
     assert oversized.exit_code == 1
     assert "x" * 64 not in oversized.stdout + oversized.stderr
 
@@ -863,7 +869,9 @@ def test_hidden_cli_blocks_prompt_capture_when_readiness_needs_human_review(
     monkeypatch.setattr(app_module, "_developer_readiness", attention)
     monkeypatch.chdir(project)
 
-    result = CliRunner().invoke(app, ["agent-prompt-hook"], input=_event(project).model_dump_json())
+    result = CliRunner().invoke(
+        app, ["agent-prompt-hook", "--preset", "developer"], input=_event(project).model_dump_json()
+    )
 
     assert result.exit_code == 0
     assert json.loads(result.stdout) == PromptRoute(
@@ -904,7 +912,5 @@ def test_cli_logging_uses_restored_stderr_after_in_process_invocation(
     )
     assert result.exit_code == 0
 
-    structlog.get_logger("intent_engineering.logging_contract").info(
-        "post_cli_logging_probe"
-    )
+    structlog.get_logger("intent_engineering.logging_contract").info("post_cli_logging_probe")
     assert "post_cli_logging_probe" in capsys.readouterr().err

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -16,6 +17,50 @@ from intent_engineering.integrations.agent_host.advisory import (
 )
 from intent_engineering.intent_workflow.onboarding_reminders import complete_turn, offer_on_prompt
 from intent_engineering.storage.secure import SecureDirectory
+
+
+def background_onboarding_route(
+    project: Path,
+    event: CodexUserPromptSubmitEvent,
+    default: PromptRoute,
+) -> PromptRoute:
+    """Offer optional source-connected setup without gating the user's development task."""
+    if event.agent_id is not None or event.agent_type is not None:
+        return default
+    if os.path.lexists(project / ".intent"):
+        from intent_engineering.cli.runtime import load_readiness_runtime
+
+        try:
+            runtime = load_readiness_runtime(project)
+            if runtime.graph_store.load().nodes:
+                return default
+        except Exception:  # noqa: BLE001 - relevant reads report state errors, never infer absence
+            return default
+    normalized = " ".join(event.prompt.casefold().split()).rstrip(".!?")
+    create_requested = normalized in {
+        "create intent graph",
+        "create the intent graph",
+        "please create intent graph",
+        "please create the intent graph",
+    }
+    if not create_requested and not offer_on_prompt(project, event.session_id, event.turn_id):
+        return default
+    return PromptRoute(
+        action="offer_background_onboarding",
+        mcp_tool=None,
+        arguments={},
+        message=(
+            "No active intent graph is available. Offer once: create it in a separate chat and "
+            "connect existing sources such as Notion, Confluence or Slack, or defer for now. "
+            "Reuse the user's answer; continue the original task without waiting for setup. "
+            "If accepted, run intent background-onboarding --prepare --project .; use the host "
+            "create_thread tool with the returned prompt/project, then persist the returned chat ID "
+            "using --chat-id. Ask source/account/scope questions and complete connection setup in "
+            "that new chat. If deferred, run intent background-onboarding --defer --project .; "
+            "remind after three completed turns. Never fabricate a chat ID or connection. "
+            + default.message
+        )[:2048],
+    )
 
 
 def _object(pairs: list[tuple[str, object]]) -> dict[str, object]:

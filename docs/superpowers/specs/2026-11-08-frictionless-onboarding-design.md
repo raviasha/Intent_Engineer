@@ -1,5 +1,9 @@
 # Frictionless intent onboarding
 
+> Routine onboarding, clarification and graph activation are superseded by
+> [the November 9 background workflow](2026-11-09-background-intent-workflow.md).
+> The old approval path remains an explicitly selected governed workflow.
+
 The installed advisor should offer to create a missing repository intent graph, let the
 developer defer, and make creation possible at any time by saying “create intent graph”.
 The agent does the preparation; the developer reviews the inferred meaning once.

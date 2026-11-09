@@ -1,9 +1,13 @@
 # Intent-aware agent adoption
 
-Intent Engineering adds a local review layer to an existing repository. It captures immutable
-source versions, builds a reviewed intent/requirements provenance graph, gives an active agent
-task-specific context, and records disagreements for humans. It does not replace Git, your coding
-agent, or provider permissions.
+Intent Engineering maintains local intent and requirements with immutable source versions and
+provenance. The default now offers source-connected graph creation in a separate chat while the
+original task continues; deferral reminds after three completed work turns. Subsequent checks
+stay silent unless relevant meaning needs clarification. See [the quick start](quick-start.md).
+
+The review-oriented adoption journey below is retained for **explicitly requested governed
+workflows**, using the legacy `--preset developer` hook behavior. It does not describe the
+default background path or replace Git, your coding agent, or provider permissions.
 
 ## 1. Install and onboard an existing repository
 

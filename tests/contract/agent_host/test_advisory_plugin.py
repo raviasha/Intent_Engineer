@@ -23,7 +23,6 @@ from intent_engineering.cli.runtime import load_runtime
 from intent_engineering.core.models import Graph, Node, NodeType
 from intent_engineering.core.policy.project import initialize_project
 from intent_engineering.integrations.agent_host.advisory import (
-    codex_conversation_ref,
     readiness_context,
 )
 from intent_engineering.intent_workflow.readiness import (
@@ -171,8 +170,7 @@ def _durable_bytes(project: Path) -> dict[str, bytes]:
         if path.is_file()
         and not path.is_symlink()
         and not path.name.endswith(".lock")
-        and str(path.relative_to(workspace))
-        != "cache/control-plane.json"
+        and str(path.relative_to(workspace)) != "cache/control-plane.json"
     }
 
 
@@ -217,16 +215,16 @@ def test_advisory_plugin_declares_official_prompt_hook_and_repository_mcp() -> N
 
     assert manifest == {
         "name": "intent-advisor",
-        "version": "0.1.2",
-        "description": "Route Codex prompts through advisory Intent Engineering workflows.",
+        "version": "0.1.3",
+        "description": "Maintain relevant intent in the background of normal development.",
         "author": {"name": "Intent Engineering"},
         "skills": "./skills/",
         "interface": {
             "displayName": "Intent Advisor",
             "shortDescription": "Route work through repository intent.",
             "longDescription": (
-                "Adds advisory onboarding, preflight, and clarification guidance backed by "
-                "local Intent Engineering workflows."
+                "Consult relevant intent, clarify consequential gaps in chat, and maintain a "
+                "provenance-backed local graph."
             ),
             "developerName": "Intent Engineering",
             "category": "Developer Tools",
@@ -251,8 +249,15 @@ def test_advisory_plugin_declares_official_prompt_hook_and_repository_mcp() -> N
                 }
             ],
             "Stop": [
-                {"hooks": [{"type": "command", "command": "${PLUGIN_ROOT}/scripts/stop-hook",
-                            "timeout": 5}]}
+                {
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": "${PLUGIN_ROOT}/scripts/stop-hook",
+                            "timeout": 5,
+                        }
+                    ]
+                }
             ],
         }
     }
@@ -268,7 +273,7 @@ def test_advisory_plugin_declares_official_prompt_hook_and_repository_mcp() -> N
     assert stat.S_IMODE(HOOK.stat().st_mode) & stat.S_IXUSR
 
 
-def test_real_hook_offers_onboarding_without_writes_or_prompt_echo(tmp_path: Path) -> None:
+def test_real_hook_routes_background_without_writes_or_prompt_echo(tmp_path: Path) -> None:
     project = tmp_path / "project"
     project.mkdir()
     before = _durable_bytes(project)
@@ -277,12 +282,12 @@ def test_real_hook_offers_onboarding_without_writes_or_prompt_echo(tmp_path: Pat
     completed = _run_official_hook(project, prompt=marker)
 
     context = _additional_context(completed)
-    assert "Start guided onboarding now?" in context
+    assert "intent_background_context" in context
     assert marker not in completed.stdout.decode()
     assert _durable_bytes(project) == before
 
 
-def test_real_hook_blocks_implementation_when_local_readiness_is_invalid(tmp_path: Path) -> None:
+def test_real_hook_defers_invalid_state_checks_to_relevant_context_reads(tmp_path: Path) -> None:
     """Catches corrupt local state weakening the developer preset into bare advisory fallback."""
     project = tmp_path / "project"
     project.mkdir()
@@ -293,16 +298,12 @@ def test_real_hook_blocks_implementation_when_local_readiness_is_invalid(tmp_pat
 
     completed = _run_official_hook(project, prompt=marker)
 
-    assert _additional_context(completed) == (
-        "action=human_attention_required. Intent Engineering cannot verify local readiness. "
-        "Open the local Team state view before governed implementation; do not implement or "
-        "resolve intent work automatically."
-    )
+    assert "intent_background_context" in _additional_context(completed)
     assert marker.encode() not in completed.stdout + completed.stderr
     assert _durable_bytes(project) == before
 
 
-def test_real_hook_routes_ready_prompt_to_preflight_without_secret_or_echo(
+def test_real_hook_routes_ready_prompt_without_capture_or_echo(
     tmp_path: Path,
 ) -> None:
     project = tmp_path / "project"
@@ -314,30 +315,14 @@ def test_real_hook_routes_ready_prompt_to_preflight_without_secret_or_echo(
     completed = _run_official_hook(project, prompt=marker)
 
     context = _additional_context(completed)
-    assert "intent_advisory_preflight" in context
-    assert "request_evidence_ref=" in context
-    assert "current human request" not in context
-    expected_ref = codex_conversation_ref("codex:thread-3", "turn-7", marker)
-    assert f'conversation_ref="{expected_ref}"' in context
-    lowered = completed.stdout.decode().casefold()
-    assert marker.casefold() not in lowered
-    assert "authorization" not in lowered
-    assert "capability" not in lowered
-    assert "token" not in lowered
-    after = _durable_bytes(project)
-    assert after.keys() == before.keys()
-    assert after["evidence/evidence.jsonl"].startswith(before["evidence/evidence.jsonl"])
-    for path in before:
-        if path != "evidence/evidence.jsonl":
-            assert after[path] == before[path]
-    captured = load_runtime(project).evidence_store.ledger("conversation:codex")
-    assert len(captured) == 1
-    assert captured[0].evidence.external_object_id == expected_ref
-    assert captured[0].evidence.author == "agent:codex"
-    assert captured[0].evidence.payload == {"role": "agent", "content": marker}
+    assert "intent_background_context" in context
+    assert "session_id=chat:" in context
+    assert "turn_id=turn:" in context
+    assert marker not in context
+    assert _durable_bytes(project) == before
 
 
-def test_real_hook_blocks_capture_for_a_pending_proposal_on_an_approved_graph(
+def test_real_hook_preserves_pending_proposals_without_global_review_gate(
     tmp_path: Path,
 ) -> None:
     """Catches real first-prompt readiness bypassing a durable undecided proposal."""
@@ -355,11 +340,7 @@ def test_real_hook_blocks_capture_for_a_pending_proposal_on_an_approved_graph(
     first = _run_official_hook(project, prompt=marker)
     replay = _run_official_hook(project, prompt=marker)
 
-    assert _additional_context(first) == (
-        "action=human_attention_required. Intent Engineering requires human review in the "
-        "local Proposal review view before implementation. Do not implement or resolve the "
-        "intent work automatically."
-    )
+    assert "intent_background_context" in _additional_context(first)
     assert first.stdout == replay.stdout
     assert marker.encode() not in first.stdout + first.stderr
     assert b"PRIVATE-PENDING-PROPOSAL-8197" not in first.stdout + first.stderr
@@ -375,7 +356,7 @@ def test_real_hook_blocks_capture_for_a_pending_proposal_on_an_approved_graph(
         "cache/checkpoints.yaml",
     ),
 )
-def test_real_hook_blocks_capture_for_corrupt_canonical_state(tmp_path: Path, path: str) -> None:
+def test_real_hook_never_reads_or_changes_canonical_state(tmp_path: Path, path: str) -> None:
     """Catches the actual prompt hook classifying while canonical validation has failed."""
     project = tmp_path / "project"
     project.mkdir()
@@ -387,11 +368,7 @@ def test_real_hook_blocks_capture_for_corrupt_canonical_state(tmp_path: Path, pa
     completed = _run_official_hook(project, prompt=marker)
     replay = _run_official_hook(project, prompt=marker)
 
-    assert _additional_context(completed) == (
-        "action=human_attention_required. Intent Engineering cannot verify local readiness. "
-        "Open the local Team state view before governed implementation; do not implement or "
-        "resolve intent work automatically."
-    )
+    assert "intent_background_context" in _additional_context(completed)
     assert marker.encode() not in completed.stdout + completed.stderr
     assert replay.stdout == completed.stdout
     assert _durable_bytes(project) == before
@@ -440,7 +417,7 @@ def test_real_hook_uses_retry_stable_turn_specific_ref_without_host_id_leakage(
 
     assert first_context == retry_context
     assert first_context != next_context
-    assert altered_context == FALLBACK
+    assert altered_context == first_context
     assert _durable_bytes(project) == after_next
     combined = first_context + retry_context + next_context + altered_context
     assert session_marker not in combined
@@ -468,7 +445,7 @@ def test_real_hook_accepts_installed_official_optional_identity_and_multiline_pr
 
     Draft7Validator(_installed_hook_schema("output")).validate(output)
     context = _additional_context(completed)
-    assert "intent_advisory_preflight" in context
+    assert "intent_background_context" in context
     assert "host-agent-7" not in context
     assert "reviewer" not in context
     assert "workspace admins" not in context
@@ -517,7 +494,7 @@ def test_missing_cli_returns_fixed_fallback_with_strict_streams(tmp_path: Path) 
     assert _additional_context(completed) == FALLBACK
 
 
-def test_hook_runs_one_exact_developer_preset_process_without_mcp_recursion(
+def test_hook_runs_one_exact_background_preset_process_without_mcp_recursion(
     tmp_path: Path,
 ) -> None:
     """Catches readiness and advisory routing splitting into recursive plugin or MCP processes."""
@@ -541,7 +518,7 @@ def test_hook_runs_one_exact_developer_preset_process_without_mcp_recursion(
 
     assert _additional_context(completed) == context
     assert [json.loads(line) for line in calls.read_text(encoding="utf-8").splitlines()] == [
-        ["agent-prompt-hook", "--preset", "developer"]
+        ["agent-prompt-hook", "--preset", "background"]
     ]
 
 
@@ -644,12 +621,7 @@ def test_special_project_files_fail_promptly_without_replacement(
 
     completed = _run_official_hook(project, timeout=3)
 
-    expected = (
-        "action=human_attention_required. Intent Engineering cannot verify local readiness. "
-        "Open the local Team state view before governed implementation; do not implement or "
-        "resolve intent work automatically."
-    )
-    assert _additional_context(completed) == expected
+    assert "intent_background_context" in _additional_context(completed)
     after = os.lstat(config)
     assert stat.S_IFMT(after.st_mode) == stat.S_IFMT(before.st_mode)
 
@@ -756,7 +728,9 @@ def test_plugin_configured_mcp_missing_project_is_protocol_clean(tmp_path: Path)
 
 
 def test_skill_routes_clarifications_and_states_advisory_mcp_failure_boundary() -> None:
-    skill = (PLUGIN_ROOT / "skills" / "intent-advisor" / "SKILL.md").read_text(encoding="utf-8")
+    skill = (
+        PLUGIN_ROOT / "skills" / "intent-advisor" / "references" / "reviewed-workflow.md"
+    ).read_text(encoding="utf-8")
 
     assert "action=human_confirmation_required" in skill
     assert "intent_clarification_answer" not in skill
@@ -788,7 +762,9 @@ def test_skill_routes_clarifications_and_states_advisory_mcp_failure_boundary() 
 
 
 def test_skill_routes_only_explicit_alternative_requests_through_validated_projection() -> None:
-    skill = (PLUGIN_ROOT / "skills" / "intent-advisor" / "SKILL.md").read_text(encoding="utf-8")
+    skill = (
+        PLUGIN_ROOT / "skills" / "intent-advisor" / "references" / "reviewed-workflow.md"
+    ).read_text(encoding="utf-8")
 
     assert "Only enter this workflow when the user explicitly asks for alternatives" in skill
     assert "intent_alternative_context" in skill
@@ -806,7 +782,9 @@ def test_skill_routes_only_explicit_alternative_requests_through_validated_proje
 
 def test_skill_human_attention_guidance_defers_to_the_route_selected_view() -> None:
     """The skill must not replace a bounded readiness route with a fixed destination."""
-    skill = (PLUGIN_ROOT / "skills" / "intent-advisor" / "SKILL.md").read_text(encoding="utf-8")
+    skill = (
+        PLUGIN_ROOT / "skills" / "intent-advisor" / "references" / "reviewed-workflow.md"
+    ).read_text(encoding="utf-8")
     start = skill.index("- For `action=human_attention_required`")
     end = skill.index("\n- For `action=", start + 1)
     guidance = skill[start:end]

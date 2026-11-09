@@ -51,12 +51,12 @@ def test_actual_hooks_respect_defer_and_only_count_a_normal_completion(
     project = tmp_path / "repo"
     project.mkdir()
     defer_onboarding(project, after_tasks=1)
-    assert "deferred" in _context(project)
+    assert "intent_background_context" in _context(project)
     _stop(project, stop_hook_active=True)
     _stop(project, agent_id="child", agent_type="worker")
-    assert "deferred" in _context(project)
+    assert "intent_background_context" in _context(project)
     _stop(project)
-    assert "Create now" in _context(project)
+    assert "intent_background_context" in _context(project)
     assert not (project / ".intent").exists()
 
 
@@ -67,8 +67,10 @@ def test_explicit_creation_overrides_deferral_without_creating_graph(
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "cache"))
     defer_onboarding(tmp_path)
     context = _context(tmp_path, "Create intent graph")
-    assert "start_onboarding" in context
-    assert "--discover" in context
+    assert "separate chat" in context
+    assert "Notion" in context
+    assert "intent_background_context" in context
+    assert "intent_background_submit" in context
     assert not (tmp_path / ".intent").exists()
 
 
@@ -78,7 +80,7 @@ def test_quoted_or_negated_creation_does_not_override_deferral(
 ) -> None:
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "cache"))
     defer_onboarding(tmp_path)
-    assert "deferred" in _context(tmp_path, 'Do not "create intent graph" yet')
+    assert "intent_background_context" in _context(tmp_path, 'Do not "create intent graph" yet')
 
 
 def test_create_request_reuses_ready_graph_and_preserves_attention_routes(tmp_path: Path) -> None:

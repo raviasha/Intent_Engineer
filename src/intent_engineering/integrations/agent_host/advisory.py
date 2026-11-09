@@ -331,6 +331,8 @@ class PromptRoute(_HostModel):
         "human_confirmation_required",
         "review_clarification_proposal",
         "continue",
+        "background_check",
+        "offer_background_onboarding",
     ]
     message: Annotated[str, Field(min_length=1, max_length=2048)]
     mcp_tool: str | None
@@ -372,6 +374,8 @@ class PromptRoute(_HostModel):
             "human_confirmation_required": None,
             "review_clarification_proposal": "intent_clarification_show",
             "continue": None,
+            "background_check": "intent_background_context",
+            "offer_background_onboarding": None,
         }[self.action]
         if self.mcp_tool != expected_tool:
             raise ValueError("invalid advisory prompt route")
@@ -495,6 +499,8 @@ def parse_codex_prompt_event(value: object) -> CodexUserPromptSubmitEvent:
 
 def codex_prompt_context(route: PromptRoute) -> str:
     """Render a bounded prompt-free instruction for the Codex hook response."""
+    if route.action in {"background_check", "offer_background_onboarding"}:
+        return route.message
     if route.action == "offer_onboarding":
         return _OFFER
     if route.action == "start_onboarding":
@@ -540,6 +546,33 @@ def codex_prompt_context(route: PromptRoute) -> str:
             "proposal_digest and selected node IDs; decline, no, or mismatch leaves it unapplied."
         )
     return route.message
+
+
+def background_prompt_route(session_id: str, turn_id: str) -> PromptRoute:
+    """Small prompt-free route: no global readiness gate, service startup or graph export."""
+    # Opaque bounded identifiers prevent hook context injection and expose no raw host IDs.
+    from hashlib import sha256
+
+    session = "chat:" + sha256(session_id.encode()).hexdigest()
+    turn = "turn:" + sha256(turn_id.encode()).hexdigest()
+    return PromptRoute(
+        action="background_check",
+        mcp_tool="intent_background_context",
+        arguments={"session_id": session, "turn_id": turn},
+        message=(
+            f"Background Intent Engineering: session_id={session}, turn_id={turn}. "
+            "Make a lightweight relevance check for this task. Consult intent_background_context "
+            "only when relevant; CLI fallback: intent background --project . --task <task> "
+            "--session-id <session_id>. Unrelated or aligned work proceeds silently. "
+            "For relevant missing/unclear intent or a specific conflict, show captured understanding "
+            "or existing intent and conflict, and ask only the consequential question here. Reuse "
+            "known answers. Once clear, use intent_background_submit (or intent background "
+            "--submission <relative-json>) to maintain the graph with provenance and history. "
+            "Separate reported user statements from agent inferences; never invent approvals or "
+            "erase unresolved disagreements. Preserve legacy pending proposals. No routine "
+            "dashboard, graph approval, WebAuthn, report or export. Code/test matching is deferred."
+        ),
+    )
 
 
 def codex_prompt_output(context: str) -> dict[str, object]:

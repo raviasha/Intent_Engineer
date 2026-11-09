@@ -145,12 +145,23 @@ def test_public_alpha_docs_and_bindings_match_the_shipped_operating_model(
         assert "codex plugin marketplace add ." not in text
         assert "separate terminal" not in text.casefold()
         assert "launches the plugin-owned MCP server" in text
+        assert "exact human prompt as attributed" not in text
+        assert "human-authored evidence" not in text
+    for text in (guide, adoption):
         assert "agent:codex" in text
         assert "human_confirmation_required" in text
         assert "non-MCP local human" in text
         assert "no CLI command" in text or "no shipped CLI command" in text
-        assert "exact human prompt as attributed" not in text
-        assert "human-authored evidence" not in text
+    for marker in (
+        "intent_background_context",
+        "intent_background_submit",
+        "separate chat",
+        "Notion",
+        "Confluence",
+        "Slack",
+        "three completed work turns",
+    ):
+        assert marker in readme
     assert "clients that launch and connect stdio themselves" in guide
     assert "intent validate --project ." in github
     assert "intent sync --project . --sources markdown,git,github" in github
@@ -410,9 +421,7 @@ def test_scheduled_workflow_is_read_only_and_orders_capture_before_assurance() -
         "-r src/intent_engineering/integrations/ci-runtime.lock"
     )
     assert commands[3] == "python -I ci/assurance.py restore --project ."
-    assert commands[4] == (
-        "python -I ci/intent.py sync --project . --sources markdown,git,github"
-    )
+    assert commands[4] == ("python -I ci/intent.py sync --project . --sources markdown,git,github")
     assert commands[5] == "python -I ci/intent.py validate --project ."
     assert commands[6] == (
         "python -I ci/intent.py drift --project . --format markdown --output intent-drift.md"
@@ -457,7 +466,11 @@ def test_guided_adoption_docs_and_plugin_independent_assurance_are_ordered() -> 
         positions = tuple(text.index(marker) for marker in journey_markers)
         assert positions == tuple(sorted(positions)), path
         assert "plugins/intent-advisor" in text
-        assert "intent_advisory_preflight" in text
+        if path.name == "README.md":
+            assert "intent_background_context" in text
+            assert "intent_background_submit" in text
+        else:
+            assert "intent_advisory_preflight" in text
         assert "MandatoryHookUnavailable" in text
         assert "codex plugin marketplace add /absolute/path/to/Intent_Engineer" in text
         assert "codex plugin add intent-advisor@intent-engineering-local" in text

@@ -13,8 +13,8 @@ it becomes a reviewable reconciliation case with its supporting evidence.
 3. **Sync** fresh evidence through deterministic validation and mapping.
 4. **Assure** that current code and tests remain aligned with current intent and
    requirements, opening evidence-backed cases for detected gaps.
-5. **Reconcile** evidence-backed divergence with a human review step before a
-   graph-changing resolution.
+5. **Reconcile** meaningful divergence in the conversation, preserving disagreements
+   and recording clear decisions through validated ChangeSets.
 
 The supplied [framework graph](graph/framework-intent-graph.yaml) dogfoods the
 same graph model used for a project.
@@ -40,11 +40,39 @@ checkout sequence above when installing the Codex plugin.
 
 Restart the ChatGPT desktop app and start a new task rooted in the target repository. Codex
 launches the plugin-owned MCP server from `plugins/intent-advisor/.mcp.json`; do not start an
-additional server process for the plugin. On a missing graph it offers **Create now** or **Defer
-for now**. Say **“create intent graph”** whenever you want to start. The agent finds your PRD,
-or drafts a source-cited, explicitly inferred PRD from existing code and docs, prepares a graph
-proposal, and opens the local review UI. You approve the proposed meaning once before activation.
-Deferring continues ordinary work and reminds you after three completed top-level work turns.
+additional server process for the plugin. On first use, the agent offers to create the intent
+graph in a separate chat and connect sources such as Notion, Confluence and Slack. Accepting
+opens a setup chat for source selection, connection and graph creation while the original
+task continues. Deferring schedules another offer after three completed work turns.
+Normal work with an existing graph gets a lightweight relevance check.
+Unrelated and aligned tasks proceed silently. When relevant intent is missing, unclear or
+conflicting, the agent shows its understanding or the specific conflict and asks one
+consequential question in the chat. It reuses your answers and maintains clear intent
+through validated ChangeSets with source evidence and history. No routine dashboard,
+graph approval, WebAuthn, PRD file or export is required. Code/test matching is deferred.
+
+Existing pending proposals remain pending; upgrading never fabricates their approval.
+Chat statements are recorded as agent-reported user evidence, separately from inferences.
+The CLI fallback works before the MCP server has a project workspace:
+
+```bash
+intent background --project . --task "Add private reports" --session-id chat:example
+intent background --submission-schema
+intent background --project . --submission background-draft.json
+```
+
+The schema describes bounded interpretations, questions, quoted answers and graph updates.
+Missing workspaces are initialized only when relevant intent is captured. Context reads and
+unrelated tasks do not initialize them. Graph reports/exports remain explicit commands.
+
+The host creates the setup chat from `intent background-onboarding --prepare` and records
+its returned ID with `--chat-id`. Authorized connector reads can be captured using
+`intent background-source --submission-schema` and `--submission <relative-json-path>`.
+Source revisions, authors, locations and exact content become immutable evidence; new
+authorized reads can update the graph. Provider authentication happens through the host's
+connection tools. This does not install a continuous remote polling service.
+
+### Optional governed review
 
 For manual setup from an existing PRD, launch the local review flow:
 
@@ -95,48 +123,29 @@ intentionally omits `cwd`: on a local Codex host, `--project .` binds to the act
 working directory. A remote executor must explicitly reproduce or configure that repository
 working directory; it must not assume `.` refers to the user's checkout.
 
-The bundle first runs the same non-authoritative readiness check as
-`intent ensure --project . --preset developer --format json`. When approved shared-state trust is
-configured, that operation performs a bounded fetch of only `origin/intent-state`, verifies and
-restores the signed baseline, then starts or reuses the repository-bound local service before
-returning. A missing or offline protected ref reports fixed unavailable/stale guidance rather than
-silently using an older tracking ref. A successful online restore also records bounded, non-secret
-repository/project and release-digest metadata in the current OS account's owner-only
-`.intent-engineering` governance registry. Deleting the ignored repository cache cannot opt that
-checkout out of team governance; missing trust remains unavailable/offline-stale. Explicit offline
-verification of a cached tracking ref is likewise stale, never fresh verified state. A fresh
-repository with no approved shared baseline still
-receives the create-or-defer onboarding offer and no project state is created. Deferral is stored
-outside the repository in user-local state; the completion hook advances a bounded reminder
-counter without capturing prompt content. If an approved graph has pending
-proposal review, an open reconciliation case, or unanswered clarification, it stops before
-capturing or classifying the prompt and directs the developer to the already-running local review
-view. Otherwise, it persists the exact stdin prompt as untrusted `agent:codex` context, supplies
-only opaque conversation and evidence references, and routes the agent's bounded classification
-draft through token-free `intent_advisory_preflight`. The hook boundary is callable by the coding
-agent, so it never claims local-human attribution or approval. Raw prompt text never crosses that
-MCP wire boundary.
+The default hook uses `--preset background`: no dashboard startup, shared-state fetch,
+or repository-wide gate for pending reviews. It returns bounded, opaque chat/turn identifiers
+and background guidance without capturing the raw prompt. The agent consults
+`intent_background_context` when needed and submits clear interpretations or consequential
+questions through `intent_background_submit`. Ordinary chat answers can advance this flow.
+The deterministic service checks references, access, graph versions and provenance before
+atomic persistence; it never creates authentication or approval records.
 
-The advisory classifications are `no_semantic_impact`, `aligned`, `new_or_ambiguous`, and
-`conflicting`. Continue normal work for the first two. The plugin never receives a mutation
-capability and does not provide mandatory mutation enforcement. Mandatory Codex mode remains
-truthfully unavailable through `MandatoryHookUnavailable` with the message
-`Codex mandatory mutation hook is unavailable`.
-
-To inspect the machine-facing gate directly, run
-`intent ensure --project . --preset developer --format json`. To opt out, decline the onboarding
-offer or disable/uninstall `intent-advisor`. Deferral leaves the repository unchanged and suppresses
-offers until its reminder is due; disabling the plugin leaves ordinary coding behavior unchanged. The CLI and MCP services
-remain usable independently.
+The legacy `--preset developer` readiness flow, team trust, reviewed proposals and external
+writes remain available explicitly. Their independently authenticated approval contracts are
+unchanged. Mandatory Codex enforcement remains unavailable through
+`MandatoryHookUnavailable`; the advisory hook does not claim to enforce repository mutations.
+Disable the plugin to stop background guidance. CLI and MCP remain independently usable.
 
 While `intent dev` is running, it polls bounded Git and test-result evidence at a fixed cadence
 without waiting for a browser request. The Home view shows the latest detached observation and
 offers an explicit **Run reviewed tests** action for command IDs from reviewed project
 configuration. The write uses the same-origin/CSRF boundary; it supplies an identifier, never a
 shell command, and neither polling nor test execution asserts implementation completion.
-The automatic prompt-time service intentionally opens no browser and never persists its CSRF
-bootstrap. Running ordinary `intent dev` later securely replaces that attested headless owner,
-opens a browser with a new in-memory bootstrap, and keeps the protected write actions usable;
+The explicit legacy `--preset developer` path can start a headless service without persisting
+its CSRF bootstrap. The default background hook starts no service. Running ordinary `intent dev`
+later securely replaces an attested headless owner, opens a browser with a new in-memory bootstrap,
+and keeps the protected write actions usable;
 `intent dev --status` and `intent dev --no-open` continue to reuse the existing process.
 
 ### Required GitHub check
@@ -168,13 +177,15 @@ Clients other than Codex that launch and connect stdio themselves may run
 
 ### Clarification and review
 
-For `new_or_ambiguous`, the hook asks every persisted question but cannot authenticate the reply.
-Its prompt route and public MCP tools return `human_confirmation_required` without changing state.
-The `intent dev` browser is the independent, non-MCP local human integration: it records a
-WebAuthn-backed answer and confirms the exact clarified-proposal digest and selected node IDs. For
-`conflicting`, stop implementation and resolve the complete evidence packet through that same
-authenticated review UI before any graph change. There is no shipped CLI command that performs
-either human-authority act.
+The default background flow asks in the chat and retains quoted answers as versioned
+evidence. Clear meaning is maintained automatically. Agent inferences remain inferred;
+existing disputed positions and old pending proposals are preserved. A conversational
+conflict can be resolved by the answer to that question, with an auditable ChangeSet and
+without a second approval prompt. Cross-author disputes remain separate positions.
+
+The optional governed workflow still uses independently authenticated local review for
+its legacy proposals and publication. See the plugin's
+[governed workflow reference](plugins/intent-advisor/skills/intent-advisor/references/reviewed-workflow.md).
 
 ### Scheduled CLI assurance
 

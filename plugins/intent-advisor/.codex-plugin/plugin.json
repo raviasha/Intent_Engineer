@@ -1,7 +1,7 @@
 {
   "name": "intent-advisor",
-  "version": "0.1.2",
-  "description": "Route Codex prompts through advisory Intent Engineering workflows.",
+  "version": "0.1.3",
+  "description": "Maintain relevant intent in the background of normal development.",
   "author": {
     "name": "Intent Engineering"
   },
@@ -9,7 +9,7 @@
   "interface": {
     "displayName": "Intent Advisor",
     "shortDescription": "Route work through repository intent.",
-    "longDescription": "Adds advisory onboarding, preflight, and clarification guidance backed by local Intent Engineering workflows.",
+    "longDescription": "Consult relevant intent, clarify consequential gaps in chat, and maintain a provenance-backed local graph.",
     "developerName": "Intent Engineering",
     "category": "Developer Tools",
     "capabilities": [],

@@ -1,5 +1,9 @@
 # Intent-focused workflow
 
+> Routine onboarding, clarification and graph activation are superseded by
+> [the November 9 background workflow](2026-11-09-background-intent-workflow.md).
+> The old approval path remains an explicitly selected governed workflow.
+
 Approved scope: implement the four recommendations in the November 8 comparison analysis.
 
 1. Default application assessment to intent versus requirements. A named full-lifecycle

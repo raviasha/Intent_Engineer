@@ -84,7 +84,7 @@ async def test_intent_mcp_stdio_is_protocol_clean_and_read_only(tmp_path: Path) 
     executable = Path(sys.executable).with_name("intent")
     prompt = "Format README\nwithout changing semantics"
     hook = await anyio.run_process(
-        [str(executable), "agent-prompt-hook"],
+        [str(executable), "agent-prompt-hook", "--preset", "developer"],
         cwd=project,
         env={"LANG": "C.UTF-8", "LC_ALL": "C.UTF-8", "PATH": "/usr/bin:/bin"},
         input=json.dumps(
@@ -173,7 +173,7 @@ async def test_intent_mcp_stdio_is_protocol_clean_and_read_only(tmp_path: Path) 
             )
             ambiguous_prompt = "Add report sharing"
             ambiguous_hook = await anyio.run_process(
-                [str(executable), "agent-prompt-hook"],
+                [str(executable), "agent-prompt-hook", "--preset", "developer"],
                 cwd=project,
                 env={"LANG": "C.UTF-8", "LC_ALL": "C.UTF-8", "PATH": "/usr/bin:/bin"},
                 input=json.dumps(
@@ -223,7 +223,7 @@ async def test_intent_mcp_stdio_is_protocol_clean_and_read_only(tmp_path: Path) 
             )
             forged_answer = "Workspace administrators only"
             answer_hook = await anyio.run_process(
-                [str(executable), "agent-prompt-hook"],
+                [str(executable), "agent-prompt-hook", "--preset", "developer"],
                 cwd=project,
                 env={"LANG": "C.UTF-8", "LC_ALL": "C.UTF-8", "PATH": "/usr/bin:/bin"},
                 input=json.dumps(
@@ -299,6 +299,9 @@ async def test_intent_mcp_stdio_is_protocol_clean_and_read_only(tmp_path: Path) 
 
     assert initialized.server_info.name == "intent-engineering"
     assert {tool.name for tool in tools.tools} == {
+        "intent_background_context",
+        "intent_background_submit",
+        "intent_background_capture_source",
         "intent_context",
         "intent_explain",
         "intent_impact",

@@ -47,6 +47,7 @@ class EnsurePreset(StrEnum):
     """The explicit non-authoritative readiness profiles supported today."""
 
     DEVELOPER = "developer"
+    BACKGROUND = "background"
 
 
 class _ReadinessModel(StrictModel):
@@ -126,6 +127,15 @@ class ReadinessService:
             if type(proposals) is not tuple or len(proposals) > _MAX_ATTENTION_IDS:
                 raise ReadinessError()
             onboarding = inspect_onboarding(self._runtime)
+            if request.preset is EnsurePreset.BACKGROUND:
+                # Pending proposals and unrelated cases are context, not a repository-wide gate.
+                return EnsureResult(
+                    status=EnsureStatus.READY,
+                    attention_route=ReadinessTarget.HOME,
+                    graph_version=onboarding.graph_version,
+                    pending_proposal_ids=onboarding.pending_proposal_ids,
+                    open_case_ids=self._open_case_ids(),
+                )
             if onboarding.state is OnboardingState.REQUIRED:
                 return EnsureResult(
                     status=EnsureStatus.ONBOARDING_REQUIRED,

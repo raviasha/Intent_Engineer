@@ -1,8 +1,9 @@
 # Intent Engineering quick start
 
-This guide covers the normal developer journey. Intent Engineering keeps an evidence-backed graph
-of the product intent, requirements, decisions, implementation, and tests. It highlights gaps for
-human review instead of silently changing the approved graph.
+Intent Engineering maintains a local evidence-backed graph of intent and requirements in the
+background. First use offers source-connected setup in a separate chat; subsequent questions
+are limited to relevant meaning that is missing, unclear or conflicting.
+Code/test matching is deferred in the default workflow.
 
 ## 1. Install the CLI and Codex plugin
 
@@ -25,87 +26,59 @@ A wheel-only installation provides the CLI and MCP server, but not the Codex plu
 python -m pip install intent-engineering
 ```
 
-## 2. Onboard a project
+## 2. Develop normally
 
-Open a chat rooted in your repository and give the agent a task. If the repository has no
-approved intent graph, Intent Advisor offers **Create now** or **Defer for now**.
+Open a chat rooted in your repository and give the agent a task. The advisor makes a lightweight
+relevance check, consults relevant intent when needed, and proceeds silently for unrelated or
+aligned work. If no graph exists, it offers to create one in a separate chat using sources
+such as Notion, Confluence or Slack. Your original task keeps moving. The setup chat asks
+which sources and spaces, pages or channels to read and helps you connect them there.
+If you choose “Later,” it offers again after three completed work turns.
 
-- **Create now:** the agent finds an existing PRD. If there is none, it drafts one from relevant
-  code, tests and docs, citing its sources and clearly marking inferred intent and unknowns.
-  It prepares the graph and opens the existing local dashboard for your review and activation.
-- **Defer for now:** normal work continues. The preference survives new chats in that checkout;
-  the next prompt after three completed top-level work turns offers setup again. Repeated hook
-  events and subagent turns do not count. The reminder never creates `.intent` on its own.
-- **Create whenever you want:** say **“create intent graph”**, including while setup is deferred.
-  An existing graph is reused and a pending graph proposal resumes its review.
+When your task needs intent that is missing or unclear, the agent shows its captured understanding
+and asks one consequential question. For a conflict it shows the existing intent and the specific
+clash. Reply in the chat. Known answers are reused, and clear meaning is maintained automatically
+through validated ChangeSets with immutable source evidence and history.
 
-You do not need to run setup commands for this plugin flow. If several PRDs are plausible, the
-agent asks you to choose. If there is no useful code or documentation, it asks about the project's
-purpose. Code-derived drafts are proposed intent, not proof of your intended product behavior.
+Your statements remain distinguishable from agent inferences. Chat evidence is not an authenticated
+approval. Existing pending proposals and unresolved disagreements survive the update. No routine
+WebAuthn, graph approval, PRD draft, graph export or report is required.
 
-For manual onboarding with an existing PRD, change to the repository and run:
+## 3. CLI fallback and optional review
+
+The agent can read context and maintain intent before MCP connects to a new workspace:
 
 ```bash
-cd /absolute/path/to/your-repository
-intent dev --project . --prd docs/PRD.md --offline
+intent background --project . --task "Add private reports" --session-id chat:example
+intent background --submission-schema
+intent background --project . --submission background-draft.json
 ```
 
-`intent dev` initializes the local `.intent` workspace, captures the PRD as versioned evidence,
-and opens the local review UI. In the UI:
+The submission schema describes clear interpretations, consequential questions, exact quoted
+answers and typed nodes/edges. Context reads and unrelated work do not create `.intent`.
+A relevant capture initializes the workspace automatically. If MCP started before initialization,
+the CLI remains usable; a new chat can reconnect the tools later.
 
-1. Register this device with WebAuthn.
-2. Review the proposed intent graph and its evidence.
-3. Activate the baseline only when it accurately represents the project.
+The host uses `intent background-onboarding --prepare` to obtain a setup-chat prompt,
+creates the chat, and records its actual ID with `--chat-id`. It captures real authorized
+source reads with `intent background-source --submission <relative-json-path>` (inspect
+`--submission-schema` first). This retains source authors, revisions, locations and content
+as local evidence. Later reads can update intent; no continuous source polling is installed.
+Use `intent background-onboarding --defer` to postpone setup for three completed work turns.
 
-Capturing a PRD does not approve it. The agent proposes graph content; the human confirms the
-exact proposal. Omit `--offline` when the repository already uses shared GitHub team state.
-
-The agent can finish setup through the CLI even if the plugin's MCP connection started before
-the project was initialized. After graph activation, start a new chat if Intent tools have not
-connected. The CLI options below are also available for manual use:
-
-```bash
-intent onboard --project . --discover --format json
-intent onboard --project . --defer --after-tasks 3
-```
-
-The completion counter uses Codex's `Stop` event as a completed work turn, not a semantic claim
-that an entire feature is finished. Both prompt and completion hooks must be enabled/trusted.
-Deferral is user-local and checkout-specific; it does not change team intent or bypass an
-existing proposal review.
-
-Useful variants:
+The old review UI is optional, for explicitly requested governed review or team operations:
 
 ```bash
-intent dev --project . --status   # Inspect the repository-bound service
-intent dev --project . --no-open  # Start or reuse it without opening a browser
-```
-
-## 3. Develop normally
-
-With `intent-advisor` enabled, submit ordinary development prompts in Codex. You normally do not
-run another Intent command. Before work begins, the plugin checks readiness, restores approved team
-state when configured, captures the prompt as untrusted evidence, and classifies it:
-
-| Classification | What happens |
-| --- | --- |
-| `no_semantic_impact` | Work continues without graph ceremony. |
-| `aligned` | Work continues with the relevant approved intent and requirements. |
-| `new_or_ambiguous` | Implementation pauses while the agent asks the missing questions. |
-| `conflicting` | Implementation stops until the evidence-backed conflict is reviewed. |
-
-Answers and graph-changing proposals are confirmed in the local `intent dev` UI with WebAuthn.
-The plugin is advisory and cannot approve or silently mutate canonical intent.
-
-If the plugin is unavailable, check readiness manually:
-
-```bash
+intent dev --project . --offline
 intent ensure --project . --preset developer
 ```
 
-## 4. Check alignment before committing
+Those legacy proposals and team publication still require their existing independently
+authenticated approvals. They are not automatically activated by background maintenance.
 
-Run the consolidated local assurance command:
+## 4. Optional full-lifecycle assurance
+
+When explicitly working on full-lifecycle assurance, run:
 
 ```bash
 intent check --project .
@@ -122,7 +95,7 @@ intent check --project . --run-test <reviewed-command-id>
 Unresolved divergence becomes a review case; it does not automatically rewrite code,
 requirements, or the graph.
 
-## 5. View and improve graph quality
+## 5. Optional graph views and enrichment
 
 Open `intent dev` to see the visual graph and score table. Green means robust, orange needs
 attention, and red identifies a blocking or weak critical path. For a read-only CLI scorecard:

@@ -113,6 +113,18 @@ A developer asks a coding agent to implement a task. The agent retrieves:
 
 ---
 
+### Current development experience (2026-11-09)
+
+Background conversational capture/maintenance is the default. Relevant gaps and conflicts are
+clarified in chat; aligned and unrelated tasks stay silent. Graph changes retain provenance,
+validation and ChangeSet history without routine proposal approval. Existing governed team
+publication remains available. Intent versus requirements is the current scope; code/test
+matching in the broader phases is deferred. See the background-workflow spec in `docs/superpowers/specs`.
+
+First use offers source-connected graph creation in a separate chat while the original task
+continues. Deferral reminds after three completed turns. Host connections supply versioned
+Notion, Confluence, Slack and other authorized source reads; continuous polling remains separate.
+
 ## Phase 3 — Collaboration connectors
 
 ### Goal

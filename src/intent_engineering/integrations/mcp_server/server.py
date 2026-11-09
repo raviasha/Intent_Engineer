@@ -174,6 +174,7 @@ def build_server(
     *,
     mutation_services: MutationPort | None = None,
     intent_workflow_services: IntentWorkflowPort | None = None,
+    background: bool = False,
 ) -> MCPServer:
     """Build the exact version-1 read surface with optional guarded mutations."""
     if mutation_services is None and intent_workflow_services is None:
@@ -198,6 +199,17 @@ def build_server(
             "Use read tools to inspect authorized local intent. Workflow tools may persist "
             "typed proposals and activate only governed reviewed cores."
         )
+    if background:
+        description = "Background conversational intent with optional governed review tools."
+        instructions = (
+            "Use intent_background_context when relevant to the current task. Unrelated and "
+            "aligned work proceeds silently. Use intent_background_submit to persist chat "
+            "clarification or maintain clear intent through validated ChangeSets. This path "
+            "does not require graph approval or WebAuthn. Background tools cannot create approvals. "
+            "Preserve disagreements and pending legacy proposals. All other proposal, write "
+            "and publication tools retain their independently authenticated approval contracts. "
+            "Do not produce reports or graph exports unless requested."
+        )
     server = _IntentMCPServer(
         name="intent-engineering",
         title="Intent Engineering",
@@ -209,6 +221,10 @@ def build_server(
     register_read_tools(server, services)
     register_read_resources(server, services)
     register_read_prompts(server)
+    if background:
+        from intent_engineering.integrations.mcp_server.background import register_background_tools
+
+        register_background_tools(server, services.runtime)
     if mutation_services is not None:
         register_mutation_tools(server, mutation_services)
     if intent_workflow_services is not None:
@@ -228,4 +244,5 @@ def run_stdio(project: Path) -> None:
         read_services,
         mutation_services=load_mutation_services(read_services.runtime),
         intent_workflow_services=load_intent_workflow_services(read_services.runtime),
+        background=True,
     ).run(transport="stdio")

@@ -1,8 +1,14 @@
 # MCP and coding-agent workflow
 
 Intent Engineering can consume compatible MCP sources and expose its local intent graph to coding
-agents. The public developer journey is ordered so canonical approval stays distinct from advisory
-prompt guidance.
+agents. The default workflow now uses `intent_background_context`, `intent_background_submit`
+and `intent_background_capture_source`. First use offers source-connected graph creation in a
+separate chat; later tasks use silent relevance checks and consequential chat clarification.
+See [the quick start](quick-start.md) for this workflow.
+
+The approval-oriented journey below is retained for **explicitly requested governed workflows**.
+It uses the legacy `--preset developer` hook behavior. Its review gates are not requirements
+for normal background development.
 
 ## Install and onboard
 

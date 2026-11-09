@@ -658,6 +658,28 @@ Recommended integration order:
 6. IDE extension if user value justifies it;
 7. hosted GitHub App for managed cloud.
 
+### Background development policy (2026-11-09)
+
+The default development workflow checks task relevance lightly and consults intent only when
+needed. Unrelated/aligned work stays silent. Relevant missing/unclear intent and conflicts get
+one consequential question in the chat, with cited understanding or the specific clash. Reuse
+known answers. Clear intent is maintained automatically by the conversational service using
+validated ChangeSets, immutable evidence and history. Reported user statements remain distinct
+from agent inferences and do not constitute authenticated approvals. Preserve pending legacy
+proposals and unresolved cross-author disagreement. Routine operation requires no dashboard,
+graph approval, WebAuthn, PRD draft or exports. Reports are explicitly requested. This is an
+explicitly permitted local semantic-maintenance policy under section 13.4; governed publication
+and external write approvals remain separate. Default scope is intent versus requirements;
+code/test matching is deferred.
+
+If no graph exists, first offer graph creation in a separate chat with source connections
+such as Notion, Confluence and Slack. After acceptance the host opens the setup chat in the
+same repository, where source/account/scope choices and authentication take place while the
+original task continues. Deferral schedules another offer after three completed work turns.
+Capture real authorized source reads with provider, object, revision, author, timestamp,
+locator and exact content; retain previous versions when later reads update intent. Host
+reported capture is not evidence of provider authentication. No continuous polling is implied.
+
 ### 17.1 Core agent queries
 
 Expose queries such as:

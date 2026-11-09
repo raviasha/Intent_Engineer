@@ -20,6 +20,9 @@ from intent_engineering.assessment.service import GraphAssessmentService
 from intent_engineering.capture.base import Connector
 from intent_engineering.cli.alternatives import alternatives_command
 from intent_engineering.cli.assessment import assess_command, assessment_gate_command
+from intent_engineering.cli.background import background_command
+from intent_engineering.cli.background_onboarding import background_onboarding_command
+from intent_engineering.cli.background_sources import background_source_command
 from intent_engineering.cli.connectors import (
     configured_actor_principals,
     connector_catalog,
@@ -40,6 +43,7 @@ from intent_engineering.cli.intent_workflow import (
 )
 from intent_engineering.cli.onboarding_hooks import (
     agent_stop_hook_command,
+    background_onboarding_route,
     onboarding_prompt_route,
 )
 from intent_engineering.cli.output import OutputFormat, emit
@@ -136,6 +140,9 @@ app.add_typer(write_app, name="write")
 app.add_typer(sources_app, name="sources")
 app.add_typer(proposals_app, name="proposals")
 app.add_typer(team_app, name="team")
+app.command("background")(background_command)
+app.command("background-onboarding")(background_onboarding_command)
+app.command("background-source")(background_source_command)
 app.command("bootstrap")(bootstrap_command)
 app.command("onboard")(onboard_command)
 app.command("dev")(dev_command)
@@ -197,7 +204,7 @@ def _prompt_readiness_route(project: Path, preset: EnsurePreset) -> PromptRoute 
 
 @app.command("agent-prompt-hook", hidden=True)
 def agent_prompt_hook_command(
-    preset: EnsurePreset = typer.Option(EnsurePreset.DEVELOPER, "--preset"),
+    preset: EnsurePreset = typer.Option(EnsurePreset.BACKGROUND, "--preset"),
 ) -> None:
     """Route exactly one bounded advisory prompt event over stdin/stdout."""
     raw: bytes | None = None
@@ -230,8 +237,16 @@ def agent_prompt_hook_command(
             codex_event = parse_codex_prompt_event(parsed)
             if not repository_matches(current, codex_event.cwd):
                 raise ValueError("advisory repository mismatch")
-            route = _prompt_readiness_route(Path.cwd(), preset)
-            route = onboarding_prompt_route(Path.cwd(), codex_event, route)
+            if preset is EnsurePreset.BACKGROUND:
+                from intent_engineering.integrations.agent_host.advisory import (
+                    background_prompt_route,
+                )
+
+                route = background_prompt_route(codex_event.session_id, codex_event.turn_id)
+                route = background_onboarding_route(Path.cwd(), codex_event, route)
+            else:
+                route = _prompt_readiness_route(Path.cwd(), preset)
+                route = onboarding_prompt_route(Path.cwd(), codex_event, route)
             if route is None:
                 try:
                     runtime = load_runtime(Path.cwd())
@@ -254,7 +269,14 @@ def agent_prompt_hook_command(
             event = parse_prompt_event(parsed)
             if not repository_matches(current, event.repository):
                 raise ValueError("advisory repository mismatch")
-            route = _prompt_readiness_route(Path.cwd(), preset)
+            if preset is EnsurePreset.BACKGROUND:
+                from intent_engineering.integrations.agent_host.advisory import (
+                    background_prompt_route,
+                )
+
+                route = background_prompt_route(event.session_id, event.turn_id)
+            else:
+                route = _prompt_readiness_route(Path.cwd(), preset)
             if route is None:
                 try:
                     runtime = load_runtime(Path.cwd())

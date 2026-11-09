@@ -53,6 +53,20 @@ If an implementation simplification conflicts with these invariants, preserve th
 
 ---
 
+## Current background workflow
+
+The November 9 background-workflow spec supersedes routine approval-centric onboarding and
+advisory routing. Use the conversational service for clear local intent maintenance, preserving
+provenance, typed validation, history and unresolved disagreement. Never synthesize human
+approval records. Legacy governed/team publication contracts remain intact. Current normal
+scope is intent versus requirements; code/test matching is deferred.
+
+First use offers a separate setup chat for source selection, connections and graph creation.
+The host owns chat creation and provider authentication; the local CLI records the handoff
+and immutable source reads. The original task continues, and deferral reminds after three
+completed work turns. Do not substitute a handoff packet for an actual created chat or claim
+a provider is connected without a successful authorized read.
+
 ## Initial implementation objective
 
 Build **MVP 0 / foundation**, not the entire roadmap.

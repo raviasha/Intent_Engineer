@@ -9,6 +9,7 @@ import os
 import re
 import stat
 import subprocess
+import sys
 from datetime import timedelta
 from pathlib import Path
 from typing import cast
@@ -50,7 +51,6 @@ from tests.e2e.intent_aware_agent_harness import (
 from tests.helpers.cli import run_intent
 
 ROOT = Path(__file__).resolve().parents[2]
-PLUGIN_HOOK = ROOT / "plugins/intent-advisor/scripts/prompt-hook"
 _CONVERSATION_REF = re.compile(r'conversation_ref="([^"]+)"')
 _REQUEST_EVIDENCE_REF = re.compile(r'request_evidence_ref="([^"]+)"')
 
@@ -77,7 +77,7 @@ def guided_onboarding_harness(tmp_path: Path):
         structlog.reset_defaults()
 
 
-def _plugin_prompt(
+def _governed_prompt(
     project: Path,
     prompt: str,
     *,
@@ -96,7 +96,12 @@ def _plugin_prompt(
     environment = os.environ.copy()
     environment["PATH"] = f"{ROOT / '.venv/bin'}:/usr/bin:/bin"
     completed = subprocess.run(
-        [str(PLUGIN_HOOK)],
+        [
+            str(Path(sys.executable).with_name("intent")),
+            "agent-prompt-hook",
+            "--preset",
+            "developer",
+        ],
         cwd=project,
         env=environment,
         input=json.dumps(event, separators=(",", ":")).encode(),
@@ -125,7 +130,7 @@ def _request_evidence_ref(context: str) -> str:
     return matched.group(1)
 
 
-def test_guided_onboarding_plugin_and_assurance_share_one_project(
+def test_explicit_governed_onboarding_and_assurance_share_one_project(
     guided_onboarding_harness: GuidedOnboardingHarness,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -141,7 +146,7 @@ def test_guided_onboarding_plugin_and_assurance_share_one_project(
     assert not (project / ".intent").exists()
     assert not (project / ".intent/graph.yaml").exists()
     assert not (project / ".intent/evidence/evidence.jsonl").exists()
-    offer, offer_stdout, offer_stderr = _plugin_prompt(
+    offer, offer_stdout, offer_stderr = _governed_prompt(
         project,
         "Implement CSV export",
         turn_id="turn-1",
@@ -265,7 +270,7 @@ def test_guided_onboarding_plugin_and_assurance_share_one_project(
     assert decision.confirmed_node_ids == bootstrap.core_node_ids
     assert runtime.graph_store.load().version == 1
 
-    aligned_route, aligned_hook_stdout, aligned_hook_stderr = _plugin_prompt(
+    aligned_route, aligned_hook_stdout, aligned_hook_stderr = _governed_prompt(
         project,
         "Implement CSV export",
         turn_id="turn-2",
@@ -502,7 +507,7 @@ def test_guided_onboarding_plugin_and_assurance_share_one_project(
     assert post_task.claim.verified_commit == implementation_revision
     assert runtime.graph_store.load().version == 2
 
-    ambiguous_route, ambiguous_hook_stdout, ambiguous_hook_stderr = _plugin_prompt(
+    ambiguous_route, ambiguous_hook_stdout, ambiguous_hook_stderr = _governed_prompt(
         project,
         "Add team sharing",
         turn_id="turn-3",
@@ -547,7 +552,7 @@ def test_guided_onboarding_plugin_and_assurance_share_one_project(
             if item.id not in {record.question_id for record in pending.answers}
         )
         evidence_before_answer_hook = tuple(runtime.evidence())
-        answer_route, answer_hook_stdout, answer_hook_stderr = _plugin_prompt(
+        answer_route, answer_hook_stdout, answer_hook_stderr = _governed_prompt(
             project,
             answer,
             turn_id=turn_id,
@@ -668,7 +673,7 @@ def test_guided_onboarding_plugin_and_assurance_share_one_project(
         },
     )
     assert clarification_proposed["status"] == "proposed"
-    review_route, review_hook_stdout, review_hook_stderr = _plugin_prompt(
+    review_route, review_hook_stdout, review_hook_stderr = _governed_prompt(
         project,
         f"confirm {clarification_proposed['proposal_digest']}",
         turn_id="turn-6",

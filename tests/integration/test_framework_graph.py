@@ -22,7 +22,7 @@ def test_framework_graph_is_valid_and_provenance_backed() -> None:
 
     assert graph.id == "intent-engineering-framework"
     assert graph.schema_version == "0.1.0"
-    assert graph.version == 3
+    assert graph.version == 5
     assert graph.created_at == date(2026, 8, 25)
     assert graph.source_spec == "INTENT_ENGINEERING.md"
     assert all(node.evidence_refs for node in graph.nodes if node.source_mode is not None)
@@ -35,6 +35,8 @@ def test_framework_graph_is_valid_and_provenance_backed() -> None:
         "req-contextual-clarification",
         "req-visible-intent-coverage",
         "req-readable-intent-pages",
+        "req-background-intent-maintenance",
+        "req-source-connected-background-onboarding",
     } <= {node.id for node in graph.nodes}
     graph.assert_invariants()
 
@@ -169,7 +171,10 @@ def test_framework_graph_spec_references_import_as_section_backed_versioned_evid
         resolve_foundational_reference(store, alternatives_reference).payload["content"]
         == alternatives_path.read_text()
     )
-    assert resolve_foundational_reference(store, focused_reference).payload["content"] == focused_path.read_text()
+    assert (
+        resolve_foundational_reference(store, focused_reference).payload["content"]
+        == focused_path.read_text()
+    )
 
 
 def test_foundational_evidence_retains_changed_section_versions_and_dedupes_unchanged(

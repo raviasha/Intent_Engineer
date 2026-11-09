@@ -1,5 +1,15 @@
 created_at: '2026-08-25'
 edges:
+- created_at: '2026-11-09T00:00:00Z'
+  created_by: agent:background-workflow-implementation
+  external: false
+  from: intent-preserve-fidelity
+  id: e-background-maintenance
+  last_modified_at: '2026-11-09T00:00:00Z'
+  last_modified_by: agent:background-workflow-implementation
+  relation: SPECIFIED_BY
+  status: active
+  to: req-background-intent-maintenance
 - created_at: '2026-11-08T00:00:00Z'
   created_by: approved-intent-focused-design
   external: false
@@ -40,6 +50,16 @@ edges:
   relation: SPECIFIED_BY
   status: active
   to: req-readable-intent-pages
+- created_at: '2026-11-09T00:00:00Z'
+  created_by: agent:background-workflow-implementation
+  external: false
+  from: intent-preserve-fidelity
+  id: e-source-connected-background-onboarding
+  last_modified_at: '2026-11-09T00:00:00Z'
+  last_modified_by: agent:background-workflow-implementation
+  relation: SPECIFIED_BY
+  status: active
+  to: req-source-connected-background-onboarding
 - created_at: '2026-08-25T00:00:00'
   created_by: founding-spec
   external: false
@@ -336,18 +356,20 @@ nodes:
   source_mode: explicit
   status: active
   type: CAPABILITY
-- confidence_basis: Approved intent-aware workflow design
+- confidence_basis: Derived from the November 9 requested background workflow
   created_at: '2026-08-26T00:00:00'
   created_by: approved-workflow-design
   evidence_refs:
   - spec:8
   - spec:10
+  - spec:17
   id: cap-mandatory-intent-preflight
   implementation_status: null
   intent_fidelity_confidence: 0.95
-  label: Require intent preflight before enabled agents mutate repository state
-  last_modified_at: '2026-08-26T00:00:00'
-  last_modified_by: approved-workflow-design
+  label: Check task relevance lightly and consult intent when needed; keep aligned
+    and unrelated development silent
+  last_modified_at: '2026-11-09T00:00:00Z'
+  last_modified_by: agent:background-workflow-implementation
   last_reassessed_at: null
   source_mode: derived
   status: active
@@ -594,6 +616,23 @@ nodes:
   source_mode: explicit
   status: active
   type: PRINCIPLE
+- confidence_basis: Implementation interpretation of the November 9 user request recorded
+    in section 17
+  created_at: '2026-11-09T00:00:00Z'
+  created_by: agent:background-workflow-implementation
+  evidence_refs:
+  - spec:17
+  id: req-background-intent-maintenance
+  implementation_status: null
+  intent_fidelity_confidence: 0.95
+  label: Clarify consequential intent gaps in chat, reuse answers, and maintain clear
+    intent automatically with provenance and ChangeSet history
+  last_modified_at: '2026-11-09T00:00:00Z'
+  last_modified_by: agent:background-workflow-implementation
+  last_reassessed_at: null
+  source_mode: derived
+  status: active
+  type: REQUIREMENT
 - confidence_basis: Local-first open-source boundary
   created_at: '2026-08-25T00:00:00'
   created_by: founding-spec
@@ -690,6 +729,23 @@ nodes:
   source_mode: explicit
   status: active
   type: REQUIREMENT
+- confidence_basis: Implementation interpretation of the November 9 source-connected
+    separate-chat onboarding request in section 17
+  created_at: '2026-11-09T00:00:00Z'
+  created_by: agent:background-workflow-implementation
+  evidence_refs:
+  - spec:17
+  id: req-source-connected-background-onboarding
+  implementation_status: null
+  intent_fidelity_confidence: 0.95
+  label: Offer source-connected intent graph creation in a separate chat while original
+    work continues; remind after three completed turns when deferred
+  last_modified_at: '2026-11-09T00:00:00Z'
+  last_modified_by: agent:background-workflow-implementation
+  last_reassessed_at: null
+  source_mode: derived
+  status: active
+  type: REQUIREMENT
 - confidence_basis: User approved the four recommendations on 2026-11-08
   created_at: '2026-11-08T00:00:00Z'
   created_by: approved-intent-focused-design
@@ -710,4 +766,4 @@ schema_version: 0.1.0
 source_spec: INTENT_ENGINEERING.md
 type_registry:
   extensions: []
-version: 3
+version: 5
