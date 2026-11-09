@@ -63,8 +63,33 @@ The host uses `intent background-onboarding --prepare` to obtain a setup-chat pr
 creates the chat, and records its actual ID with `--chat-id`. It captures real authorized
 source reads with `intent background-source --submission <relative-json-path>` (inspect
 `--submission-schema` first). This retains source authors, revisions, locations and content
-as local evidence. Later reads can update intent; no continuous source polling is installed.
+as local evidence. Record the user's bounded scope and authority designation using
+`intent background-sources --submission <relative-json-path>`. Inspect the live schema with
+`--submission-schema`; old captured evidence is not automatically an authoritative selection.
 Use `intent background-onboarding --defer` to postpone setup for three completed work turns.
+
+Before a new development task, the agent starts `intent_background_refresh` (CLI:
+`intent background-refresh --submission-schema`). It uses connected host tools to check
+scope-wide revision markers. Verified unchanged markers reuse captured content; changed or
+unverifiable markers require a complete bounded source read. Collection checks must include
+new/deleted objects and edits, not just a latest message timestamp. Failed or partial reads
+stay pending. Changed content is interpreted against current intent before dependent work.
+
+Provider events can mark a selected source dirty through `intent_background_source_signal`
+(CLI: `intent background-source-signal`). Installing the plugin does not configure provider
+subscriptions, a webhook listener, or continuous polling. A separate verified provider bridge
+is needed for push notifications; event silence alone never establishes freshness.
+
+Selected authoritative sources govern downstream intent. If they disagree, the agent shows
+both sources and recommends a resolution; you decide in the current chat. It preserves the
+sources and records your decision locally. Independent work can continue while affected work
+waits. The task-start hook guides the cooperating agent; it does not intercept arbitrary shell
+or editor operations. Read receipts are host-reported, not independent provider authentication.
+
+After source changes, the agent checks affected intent/requirement paths in both directions
+and compares their meaning with the source. Existing structural coverage checks do not prove
+that every source need is captured or satisfied. A refresh `ready` result verifies freshness
+and recorded interpretation, not a gap-free graph or code/test completeness.
 
 The old review UI is optional, for explicitly requested governed review or team operations:
 

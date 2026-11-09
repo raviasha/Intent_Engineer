@@ -16,6 +16,17 @@ retain provider/object/revision/author/time/locator/content as immutable local e
 authorized reads can update intent, preserving source versions and disagreements. Continuous
 remote polling is outside this change.
 
+Later November 9 clarification: refresh selected authoritative source scopes before the next
+development task, with efficient reuse of verified unchanged content. The task-start hook
+routes the cooperating agent into task-bound refresh; it makes no provider calls itself.
+Real host reads supply scope-wide validators or complete content manifests. Optional change
+signals invalidate caches, but provider subscriptions require separate verified setup.
+See [task source refresh](2026-11-09-task-source-refresh.md) for the protocol and race behavior.
+Authoritative sources govern downstream interpretation. Source conflicts raise an evidence-backed
+alert with a recommendation, and the user decides. No timestamp-based automatic winner.
+The refreshed material also informs an agent check of both directions of intent/requirement
+coverage. Neither structural links nor a successful refresh prove semantic completeness.
+
 Once meaning is clear, maintain the local graph through typed, validated ChangeSets with
 immutable evidence and history. No routine dashboard, proposal approval, WebAuthn, export,
 or report. Explicit user statements and agent inferences remain distinguishable. A chat
