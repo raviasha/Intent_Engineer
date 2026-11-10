@@ -163,6 +163,62 @@ def test_changed_code_invalidates_checkpoint_and_does_not_overwrite_user_work(en
     assert "send_to_cloud" in (env.root / "app.py").read_text()
 
 
+def test_removed_file_has_verified_absence_evidence_and_cannot_claim_coverage(env):
+    (env.root / "app.py").unlink()
+    result = call(
+        env, "start", scope="Review removed implementation",
+        files=[{"path": "app.py", "role": "code", "missing": True}],
+    )
+    assert result["code_refs"][0]["missing"] is True
+    inputs = InitialReconciliationService(env).inputs(result["run_id"])
+    assert inputs["nodes"][0]["id"] in {"intent:privacy", "req:local"}
+    assert any(e["id"] == result["code_refs"][0]["evidence_ref"] for e in inputs["evidence"])
+    with pytest.raises(ValueError, match="absent"):
+        call(env, "checkpoint", run_id=result["run_id"], comparisons=reviews(result))
+    assert not (env.root / "app.py").exists()
+
+
+def test_absence_cannot_be_asserted_for_existing_file_or_symlink(env):
+    for path in ("app.py", "alias.py"):
+        if path == "alias.py":
+            (env.root / path).symlink_to(env.root / "app.py")
+        with pytest.raises(ValueError):
+            call(env, "start", scope="Missing file", files=[
+                {"path": path, "role": "code", "missing": True}
+            ])
+
+
+def test_removed_directory_is_absent_but_reappearance_invalidates_review(env):
+    result = call(env, "start", scope="Removed directory", files=[
+        {"path": "removed/code.py", "role": "code", "missing": True}
+    ])
+    (env.root / "removed").mkdir()
+    (env.root / "removed/code.py").write_text("restored = True")
+    assert call(env, "status", run_id=result["run_id"])["status"] == "stale"
+    assert InitialReconciliationService(env).inputs(result["run_id"])["status"] == "stale"
+
+
+def test_changed_directory_membership_guard_prevents_publication(env, monkeypatch):
+    result = start(env)
+    call(env, "checkpoint", run_id=result["run_id"], comparisons=reviews(result))
+    service = InitialReconciliationService(
+        env, clock=lambda: NOW, input_guard=lambda: not (env.root / "new.py").exists()
+    )
+    original = service._publish
+
+    def publish_then_edit(*args):
+        original(*args)
+        (env.root / "new.py").write_text("unreviewed = True")
+
+    monkeypatch.setattr(service, "_publish", publish_then_edit)
+    with pytest.raises(ValueError, match="changed during publication"):
+        service.run(InitialReconciliationRequest(
+            action="finish", session_id="setup", turn_id="finish", run_id=result["run_id"]
+        ))
+    assert env.graph_store.load().version == 1
+    assert (env.root / "new.py").read_text() == "unreviewed = True"
+
+
 def test_all_five_axes_are_required_and_aligned_links_do_not_close_old_cases(env):
     started = start(env)
     call(env, "checkpoint", run_id=started["run_id"], comparisons=reviews(started))

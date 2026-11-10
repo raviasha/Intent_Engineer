@@ -20,6 +20,7 @@ Axis = Literal[
 class AssessmentFile(BackgroundModel):
     path: Annotated[str, Field(min_length=1, max_length=4096, pattern=r"^[^\x00-\x1f\x7f]+$")]
     role: Literal["requirements", "code"]
+    missing: bool = False
 
 
 class Comparison(BackgroundModel):

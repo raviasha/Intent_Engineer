@@ -6,6 +6,8 @@ Every completion is scoped to explicit file snapshots and captured source manife
 
 from __future__ import annotations
 
+import os
+import stat
 from collections.abc import Callable
 from datetime import UTC, datetime
 from fnmatch import fnmatchcase
@@ -50,10 +52,14 @@ REQUIREMENT_TYPES = {"REQUIREMENT", "CAPABILITY", "ACCEPTANCE_CRITERION"}
 
 
 class InitialReconciliationService:
-    def __init__(self, runtime: Runtime, *, clock: Callable[[], datetime] | None = None) -> None:
+    def __init__(
+        self, runtime: Runtime, *, clock: Callable[[], datetime] | None = None,
+        input_guard: Callable[[], bool] | None = None,
+    ) -> None:
         self.runtime = runtime
         self.clock = clock or (lambda: datetime.now(UTC))
         self.refresh = SourceRefreshService(runtime, clock=self.clock)
+        self.input_guard = input_guard or (lambda: True)
 
     def _events(self, actor: str) -> list[dict[str, Any]]:
         result = []
@@ -114,11 +120,39 @@ class InitialReconciliationService:
             for p in self.runtime.config.source_exclusions
         ):
             raise ValueError("excluded assessment path")
+        if item.missing:
+            if not self.file_missing(item.path):
+                raise ValueError("assessment file is not absent")
+            return b""
         return self.runtime.project_directory.read_relative(
             item.path, nonblocking=True, max_bytes=1048576
         ).content
 
+    def file_missing(self, path: str) -> bool:
+        """Prove absence under no-follow descriptors, including a removed parent."""
+        parts = PurePosixPath(path).parts
+        if not parts or PurePosixPath(path).is_absolute() or any(
+            p in {"..", ".intent", ".git"} for p in parts
+        ):
+            raise ValueError("unsafe assessment path")
+        fd = os.dup(self.runtime.project_directory.descriptor)
+        try:
+            for part in parts[:-1]:
+                child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+                os.close(fd)
+                fd = child
+            info = os.stat(parts[-1], dir_fd=fd, follow_symlinks=False)
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                raise ValueError("unsafe assessment file")
+            return False
+        except FileNotFoundError:
+            return True
+        finally:
+            os.close(fd)
+
     def _fresh(self, state: dict[str, Any], actor: str, principals: frozenset[str]) -> bool:
+        if not self.input_guard():
+            return False
         if self.runtime.graph_store.load().version != state["graph_version"]:
             return False
         if self._sources(actor) != state["sources"]:
@@ -127,7 +161,9 @@ class InitialReconciliationService:
             return False
         try:
             return all(
-                sha256(self._file(AssessmentFile(path=f["path"], role=f["role"]))).hexdigest()
+                sha256(self._file(AssessmentFile(
+                    path=f["path"], role=f["role"], missing=f.get("missing", False)
+                ))).hexdigest()
                 == f["digest"]
                 for f in state["files"]
             )
@@ -169,12 +205,15 @@ class InitialReconciliationService:
                 RawSourceObject(
                     connector_type="initial:local",
                     external_object_id=item.path,
-                    external_version="sha256:" + digest,
+                    external_version=("missing:" if item.missing else "sha256:") + digest,
                     source_locator=item.path,
                     author=None,
                     observed_at=now,
                     content_hash="sha256:" + digest,
-                    payload={"content": content, "capture_method": "local_verified_read"},
+                    payload={
+                        "content": content, "capture_method": "local_verified_read",
+                        "missing": item.missing,
+                    },
                     acl=(actor,),
                 )
             )
@@ -260,6 +299,11 @@ class InitialReconciliationService:
         left, right = allowed[c.axis]
         if c.subject_ref not in left or not set(c.related_refs) <= right:
             raise ValueError("invalid comparison endpoints")
+        absent = {f["node_id"] for f in state["files"] if f.get("missing", False)}
+        if c.status in {"aligned", "partial"} and absent.intersection(
+            (c.subject_ref, *c.related_refs)
+        ):
+            raise ValueError("absent files cannot establish coverage")
         if not set(c.evidence_refs) <= set(state["evidence_refs"]) or not refs_allowed(
             c.evidence_refs, self.runtime.evidence(), principals
         ):
@@ -338,7 +382,8 @@ class InitialReconciliationService:
                 if (
                     state
                     and state["scope"] == draft.scope
-                    and [{"path": f["path"], "role": f["role"]} for f in state["files"]]
+                    and [{"path": f["path"], "role": f["role"],
+                          "missing": f.get("missing", False)} for f in state["files"]]
                     == [f.model_dump() for f in draft.files]
                     and self._fresh(state, actor, principals)
                 ):
@@ -375,6 +420,34 @@ class InitialReconciliationService:
                 if not self._fresh(state, actor, principals):
                     raise ValueError("assessment inputs changed during publication")
                 self._record(state, draft, actor, now)
+            return self._result(state)
+
+    def inputs(self, run_id: str) -> dict[str, Any]:
+        """Read exact accessible snapshot content for a semantic reviewer."""
+        with self.refresh._transaction() as (actor, principals, _now):
+            state = next((e["state"] for e in reversed(self._events(actor))
+                          if e["state"]["run_id"] == run_id), None)
+            if state is None or not refs_allowed(
+                state["evidence_refs"], self.runtime.evidence(), principals
+            ):
+                return {"status": "unavailable"}
+            if not self._fresh(state, actor, principals):
+                return {"status": "stale"}
+            return {
+                **self._result(state), "nodes": state["nodes"],
+                "evidence": [e.model_dump(mode="json") for e in self.runtime.evidence()
+                             if e.id in state["evidence_refs"]],
+            }
+
+    def baseline(self) -> dict[str, Any] | None:
+        """Latest completed scope, even after an edit, without revoked evidence."""
+        with self.refresh._transaction() as (actor, principals, _now):
+            state = next((e["state"] for e in reversed(self._events(actor))
+                          if e["state"]["status"] in {"ready", "ready_with_findings"}), None)
+            if state is None or not refs_allowed(
+                state["evidence_refs"], self.runtime.evidence(), principals
+            ):
+                return None
             return self._result(state)
 
     def _publish(self, state: dict[str, Any], actor: str, now: datetime) -> None:
