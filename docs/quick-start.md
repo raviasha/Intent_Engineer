@@ -7,29 +7,40 @@ Requirements-to-code matching is included in initial reconciliation. Test-to-cod
 
 ## 1. Install the CLI and Codex plugin
 
-Python 3.12 or newer is required. Install from a source checkout when you want both the CLI and the
-repository-shipped Codex plugin:
+Use Codex desktop or CLI. Add the Git marketplace once, then install Intent Advisor:
 
 ```bash
-git clone https://github.com/raviasha/Intent_Engineer.git /absolute/path/to/Intent_Engineer
-python -m pip install /absolute/path/to/Intent_Engineer
-codex plugin marketplace add /absolute/path/to/Intent_Engineer
+codex plugin marketplace add raviasha/Intent_Engineer --ref marketplace
 codex plugin add intent-advisor@intent-engineering-local
 ```
 
-Restart the ChatGPT desktop app after installing the plugin. Open **Plugins Directory**, select
-**Intent Engineering Local**, enable `intent-advisor`, and review and trust its bundled hooks.
-The plugin supplies the hook definitions automatically; it cannot approve its own hooks.
-Use **Review hooks** or **Settings > Hooks** in the desktop app, or `/hooks` in the CLI.
-Changed hook scripts may require a new review. Install the local runtime and trust the hooks
-on each computer where you use this plugin; signing into the same account does not deploy
-local scripts. [Codex hook documentation](https://learn.chatgpt.com/docs/hooks).
+No source checkout, Python installation, pip command or global `intent` is required.
+The package includes Python 3.12 and pinned dependencies for macOS Apple Silicon/Intel
+and Linux x86_64 with glibc. Windows, Linux arm64 and Alpine/musl are not supported yet.
+In the desktop plugin directory, choose **Intent Engineering Local** and install/enable
+**Intent Advisor** after registering the marketplace. Start a new chat or restart the app
+if it has not loaded the new plugin. Review and trust the bundled hooks under
+**Review hooks** or **Settings > Hooks**, or use `/hooks` in the CLI.
 
-A wheel-only installation provides the CLI and MCP server, but not the Codex plugin assets:
+The reviewer uses Codex from the host's PATH, with a fallback to the ChatGPT macOS app's
+bundled executable. Use the signed-in Codex host; there is no separate Intent account.
+If the host executable cannot be found, reconciliation remains pending instead of claiming
+success. The plugin cannot approve its own hooks. Install and trust on each computer.
 
-```bash
-python -m pip install intent-engineering
-```
+For updates, run `codex plugin marketplace upgrade intent-engineering-local`, then update
+or reinstall the plugin from the directory and review changed hooks when prompted.
+Existing installations registered from a local source checkout should remove that marketplace
+registration and add the Git source above; this does not authorize deletion of project graphs.
+
+Commands below use `intent` as shorthand for `/bin/sh "<installed plugin root>/scripts/intent"`.
+The agent resolves that path from its installed skill. The plugin does not alter your shell PATH.
+
+### Source development (contributors only)
+
+Python 3.12+ remains a development prerequisite. Install the source project in your own
+virtual environment and set `INTENT_DEVELOPMENT_PYTHON` to that environment's absolute
+Python path when exercising source plugin scripts. Keep its `intent` executable on PATH
+for the source hook subprocesses. Distributed packages never use this fallback.
 
 ## 2. Develop normally
 

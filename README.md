@@ -24,19 +24,22 @@ onboarding, everyday development, graph assessment, team enrollment, and CI assu
 
 ## Guided developer journey
 
-Requires Python 3.12 or newer.
+Install through the Git marketplace (Codex desktop or CLI):
 
 ```bash
-git clone https://github.com/raviasha/Intent_Engineer.git /absolute/path/to/Intent_Engineer
-python -m pip install /absolute/path/to/Intent_Engineer
-codex plugin marketplace add /absolute/path/to/Intent_Engineer
+codex plugin marketplace add raviasha/Intent_Engineer --ref marketplace
 codex plugin add intent-advisor@intent-engineering-local
-cd /absolute/path/to/target-repository
 ```
 
-Wheel-only installs such as `python -m pip install intent-engineering` provide the CLI and MCP
-server, but not the repository-shipped plugin marketplace or advisor assets. Use the source
-checkout sequence above when installing the Codex plugin.
+Python and dependencies are bundled: no manual clone, Python or pip installation.
+Supports macOS arm64/x86_64 and Linux x86_64 with glibc. Windows and Linux arm64 are
+not yet supported. Review and trust the hooks in **Settings > Hooks** or `/hooks`.
+The reviewer uses the signed-in Codex host; macOS desktop's bundled CLI is discovered
+when `codex` is absent from PATH. Installation and hook trust remain per computer.
+See the [quick start](docs/quick-start.md) for updates and contributor installation.
+
+CLI examples below use `intent` as shorthand for
+`/bin/sh "<installed plugin root>/scripts/intent"`; no global command is installed.
 
 Restart the ChatGPT desktop app and start a new task rooted in the target repository. Codex
 launches the plugin-owned MCP server from `plugins/intent-advisor/.mcp.json`; do not start an
