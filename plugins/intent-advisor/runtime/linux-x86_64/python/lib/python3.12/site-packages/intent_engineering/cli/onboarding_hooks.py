@@ -15,7 +15,11 @@ from intent_engineering.integrations.agent_host.advisory import (
     parse_codex_prompt_event,
     repository_matches,
 )
-from intent_engineering.intent_workflow.onboarding_reminders import complete_turn, offer_on_prompt
+from intent_engineering.intent_workflow.onboarding_reminders import (
+    complete_turn,
+    offer_on_prompt,
+    onboarding_chat_state,
+)
 from intent_engineering.storage.secure import SecureDirectory
 
 
@@ -27,6 +31,31 @@ def background_onboarding_route(
     """Offer optional source-connected setup without gating the user's development task."""
     if event.agent_id is not None or event.agent_type is not None:
         return default
+    try:
+        setup = onboarding_chat_state(project)
+        if (
+            setup["status"] == "complete"
+            and setup["assessment_run_id"]
+            and setup["return_session_id"]
+            and setup["return_session_id"] == default.arguments.get("session_id")
+            and not setup["delivered_update_id"]
+        ):
+            return PromptRoute(
+                action="background_check",
+                mcp_tool=default.mcp_tool,
+                arguments=dict(default.arguments),
+                message=(
+                    "Initial intent setup has a pending result for this original chat. "
+                    "Run intent background-onboarding --project . --result-handoff yourself; "
+                    "read the current findings, recommendations, evidence and limitations, "
+                    "explain relevant results and continue the user's task. After receiving "
+                    "a current ready packet, record --handoff-delivered with its ID. "
+                    "Do not ask the user to retrieve it. If stale/unavailable, do not use cached "
+                    "findings or mark delivered. " + default.message
+                )[:2048],
+            )
+    except Exception:  # noqa: BLE001, S110 - optional metadata never blocks work
+        pass
     if os.path.lexists(project / ".intent"):
         from intent_engineering.cli.runtime import load_readiness_runtime
 
@@ -51,9 +80,11 @@ def background_onboarding_route(
         arguments={},
         message=(
             "No active intent graph is available. Offer once: create it in a separate chat and "
-            "select intent sources such as local folders, Notion, Confluence or Slack, or defer for now. "
+            "select intent sources such as local folders, Notion, Confluence or Slack, and return findings "
+            "to this chat when complete, or defer for now. "
             "Reuse the user's answer; continue the original task without waiting for setup. "
-            "If accepted, run intent background-onboarding --prepare --project .; use the host "
+            "If accepted, run intent background-onboarding --prepare --project . with --return-session-id "
+            "from this hook and --return-thread-id/--return-host-id from real host context; use the host "
             "create_thread tool with the returned prompt/project, then persist the returned chat ID "
             "using --chat-id. Ask source/folder/account/scope questions and complete connection setup in "
             "that new chat. If deferred, run intent background-onboarding --defer --project .; "

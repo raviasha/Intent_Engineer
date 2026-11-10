@@ -26,6 +26,11 @@ class _Reminder(StrictModel):
     setup_status: Literal["idle", "prepared", "running", "complete"] = "idle"
     chat_id: Annotated[str | None, Field(max_length=512)] = None
     sources: Annotated[tuple[str, ...], Field(max_length=16)] = ()
+    return_thread_id: Annotated[str | None, Field(max_length=512)] = None
+    return_host_id: Annotated[str | None, Field(max_length=512)] = None
+    return_session_id: Annotated[str | None, Field(max_length=512)] = None
+    assessment_run_id: Annotated[str | None, Field(max_length=512)] = None
+    delivered_update_id: Annotated[str | None, Field(max_length=128)] = None
 
 
 def _digest(value: object) -> str:
@@ -94,6 +99,11 @@ def onboarding_chat_state(
     sources: tuple[str, ...] = (),
     chat_id: str | None = None,
     finished: bool = False,
+    return_thread_id: str | None = None,
+    return_host_id: str | None = None,
+    return_session_id: str | None = None,
+    assessment_run_id: str | None = None,
+    delivered_update_id: str | None = None,
 ) -> dict[str, object]:
     """Persist a host-created chat handoff, never create a chat or imply source authentication."""
     allowed = {"notion", "confluence", "slack", "google-drive", "github", "local"}
@@ -103,12 +113,27 @@ def onboarding_chat_state(
         not chat_id or len(chat_id) > 512 or any(ord(c) < 32 for c in chat_id)
     ):
         raise ValueError("invalid onboarding chat ID")
+    route = {
+        "return_thread_id": return_thread_id,
+        "return_host_id": return_host_id,
+        "return_session_id": return_session_id,
+    }
+    for value in (*route.values(), assessment_run_id, delivered_update_id):
+        if value is not None and (not value or len(value) > 512 or any(ord(c) < 32 for c in value)):
+            raise ValueError("invalid onboarding return route")
+    if any(value is not None for value in route.values()) and not prepare:
+        raise ValueError("return route is captured during preparation")
     target = _state_file(project, create=prepare or chat_id is not None or finished)
     state = _Reminder(remaining_tasks=0)
     if target is not None:
         try:
             with same_path_lock(target):
                 state = _load(target) or state
+                for key, value in route.items():
+                    if value is not None:
+                        if getattr(state, key) not in (None, value):
+                            raise ValueError("return route already exists")
+                        state = state.model_copy(update={key: value})
                 if prepare and state.setup_status == "idle":
                     state = state.model_copy(
                         update={"setup_status": "prepared", "sources": sources}
@@ -120,8 +145,22 @@ def onboarding_chat_state(
                 if finished:
                     if state.chat_id is None:
                         raise ValueError("no onboarding chat is running")
-                    state = state.model_copy(update={"setup_status": "complete"})
-                if prepare or chat_id is not None or finished:
+                    updates: dict[str, object] = {"setup_status": "complete"}
+                    if assessment_run_id is not None:
+                        updates["assessment_run_id"] = assessment_run_id
+                        if state.assessment_run_id != assessment_run_id:
+                            updates["delivered_update_id"] = None
+                    state = state.model_copy(update=updates)
+                if delivered_update_id is not None:
+                    if (
+                        state.setup_status != "complete"
+                        or state.assessment_run_id != assessment_run_id
+                    ):
+                        raise ValueError(
+                            "completed assessment changed before delivery acknowledgement"
+                        )
+                    state = state.model_copy(update={"delivered_update_id": delivered_update_id})
+                if prepare or chat_id is not None or finished or delivered_update_id is not None:
                     target.atomic_write(state.model_dump_json().encode())
         finally:
             target.close()
@@ -130,6 +169,11 @@ def onboarding_chat_state(
         "chat_id": state.chat_id,
         "sources": list(state.sources),
         "remaining_tasks": state.remaining_tasks,
+        "return_thread_id": state.return_thread_id,
+        "return_host_id": state.return_host_id,
+        "return_session_id": state.return_session_id,
+        "assessment_run_id": state.assessment_run_id,
+        "delivered_update_id": state.delivered_update_id,
     }
 
 

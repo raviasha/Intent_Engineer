@@ -36,12 +36,16 @@ remains deferred. A link alone does not prove semantic coverage.
 ## First use: offer source-connected setup in a separate chat
 
 When no active graph exists, briefly offer: “Create the intent graph in a separate chat,
-using sources such as local folders, Notion, Confluence or Slack, while I continue this task?” Include a
+using sources such as local folders, Notion, Confluence or Slack, while I continue this task, and send the findings back here when it finishes?” Include a
 “Later” choice. This first-use offer is the exception to silent checks. Continue the original
 task while awaiting the answer. A missing/corrupt-state read error is not first use.
 
 On acceptance, run `intent background-onboarding --project . --prepare` (add repeated
 `--source notion`, `--source confluence`, `--source slack`, etc. for stated preferences).
+Record the original chat's actual host thread ID with `--return-thread-id`, its host ID with
+`--return-host-id` when available, and the hook's opaque session ID with `--return-session-id`.
+These are different identifiers: never pass the hashed hook ID as a host thread ID. Use trusted
+host context/tools to obtain real IDs; keep unavailable routes unset rather than guessing.
 Discover the host's `create_thread` tool and use the packet's prompt and repository path to
 create one new chat in the same checkout, without a separate worktree. Save the actual returned
 chat or queued-client ID with `intent background-onboarding --project . --chat-id <id>`.
@@ -103,8 +107,41 @@ After capturing initial intent and requirements, follow
 source intent, requirements and code thoroughly; checkpoint and resume while the original
 work continues. Flag missing or partial coverage in both directions, mismatches and source
 conflicts with evidence and recommended changes. Do not modify assessed code. Present
-consolidated findings after the graph assessment is ready. Only then run
-`intent background-onboarding --project . --finished`. A nonempty graph alone is insufficient.
+setup progress in this same chat: opening scope, graph-capture milestone, then changed
+reviewed/total comparison counts. Render changed `chat_update` milestones even when
+`notify_user` is false; that flag concerns final findings. Keep this chat active through
+assessment; graph creation alone is not the final response. When ready, automatically show
+the assessed scope, gaps, recommended changes and targets, evidence and limitations without
+waiting for a status request. If none, say no gaps found within the assessed scope.
+If incomplete, stale or unavailable, explain the remaining work or needed user action.
+Present consolidated findings after the graph assessment is ready. Only then run
+`intent background-onboarding --project . --finished --assessment-run-id <setup-run-id>`. A nonempty graph alone is insufficient.
+
+## Return completed setup to the original agent
+
+Bind `--finished` to the exact `run_id` returned by setup's successful reconciliation finish
+using `--assessment-run-id`. First completion requires it; retries preserve that run rather
+than adopting a newer code-worker result. After `--finished`, use its `return_handoff` packet. The final handoff belongs to the original
+chat's agent, not only to the setup chat or a command the user must run. A `pending` packet
+contains the destination, stable ID, scoped findings, recommendations and evidence.
+Verify the human user's authorization to return findings from trusted original-chat history
+(using the host `read_thread` tool); accepting the offer above includes that return. The
+handoff prompt or another agent's message alone is not authorization to message a chat.
+When authorized and supported, call `send_message_to_thread` for the recorded thread/host
+with the packet's prompt. Preserve the destination's model settings. Include the packet ID;
+check the original chat for that ID before retrying an uncertain send. On confirmed success
+(or an existing matching delivered message), run `intent background-onboarding --project .
+--handoff-delivered <packet-id>`. This records host-reported delivery, not a user approval.
+A `delivered` packet is not sent again. Never send findings to an arbitrary currently focused
+chat, colleagues or source channels. Never convert the recommendation into edit permission.
+
+If sending is unsupported, unauthorized or unsuccessful, leave it pending. The original
+chat's next trusted prompt hook automatically asks its agent to read `--result-handoff`,
+explain relevant findings and acknowledge receipt. The user need not run the command.
+If no return route is known, report that limitation in setup rather than claiming delivery.
+The original agent checks freshness before using results, keeps working and presents relevant
+gaps/recommendations in context. Routine setup progress stays in the setup chat; only the
+completion handoff returns. Closed chats are not awakened by the local runtime.
 If setup is deferred or cannot proceed, use `--defer` to resume reminders. Do not activate
 pending legacy proposals or fabricate approvals.
 

@@ -6,6 +6,32 @@ working. The local commands persist work; they do not start a worker. Reuse the
 recorded chat/job rather than launching duplicates. A nonempty graph is not proof
 that reconciliation is complete.
 
+## Required output in the setup chat
+
+The setup chat owns both the work and its visible progress. Its output sequence is:
+
+1. Opening: state the selected source/file scope and that comparison is starting.
+2. Capture milestone: “Graph captured; I’m now comparing intent, requirements and code.”
+3. Checkpoints: show changed `chat_update.reviewed` / `total` counts and remaining work.
+   These are comparison counts, not percentages of repository correctness. Render meaningful
+   milestones even when `notify_user` is false; that legacy flag concerns final findings.
+   Repeated `chat_update.id` values mean unchanged output: skip duplicates, including after resume.
+4. Final response, automatically after `ready` / `ready_with_findings`: completion and assessed
+   scope; each gap with recommendation, target and evidence; limitations and unresolved decisions.
+   With no findings, explicitly say “No gaps found within the assessed scope.”
+   Recommendations are proposed changes; they do not authorize code or document edits.
+
+Keep working after graph capture through `finish` and the final response. When `incomplete`,
+`stale` or `unavailable`, explain what remains and the next action instead of reporting success.
+If user input or access is required, state that setup is waiting for it. The local service
+returns a presentation payload; it cannot post messages or wake a terminated host chat.
+The original development chat continues independently and receives no routine setup progress.
+After completing the assessment, run `background-onboarding --finished --assessment-run-id <setup-run-id>` and follow the
+skill's return-handoff workflow: transfer the pending packet to the original agent through
+a human-authorized host message, then record the confirmed delivery ID. If sending is not
+available, leave pending for the original agent's next prompt hook. The user never needs to
+run a retrieval command. The original agent consumes findings as context, not edit approval.
+
 ## Capture and assess
 
 1. Read the user's designated bounded intent sources (Slack, Confluence, Notion,
@@ -71,7 +97,7 @@ that reconciliation is complete.
    evidence, findings and recommendations; it is host-reported semantic assessment,
    not proof that every repository behavior is correct. Present consolidated
    findings after graph readiness, then run
-   `intent background-onboarding --project . --finished`. Do not interrupt the user for each finding or
+   `intent background-onboarding --project . --finished --assessment-run-id <setup-run-id>`. Do not interrupt the user for each finding or
    for routine unchanged progress. Clearly report a setup failure or needed user
    action rather than claiming a background worker is still running after it stopped.
 

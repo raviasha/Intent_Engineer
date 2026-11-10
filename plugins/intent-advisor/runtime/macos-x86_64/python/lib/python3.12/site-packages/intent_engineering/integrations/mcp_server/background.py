@@ -14,6 +14,7 @@ from intent_engineering.intent_workflow.initial_reconciliation import InitialRec
 from intent_engineering.intent_workflow.initial_reconciliation_models import (
     InitialReconciliationRequest,
 )
+from intent_engineering.intent_workflow.setup_presentation import with_setup_chat_update
 from intent_engineering.intent_workflow.source_refresh import (
     RefreshRequest,
     SourceRefreshService,
@@ -40,9 +41,13 @@ def register_background_tools(server: MCPServer[Any], runtime: Runtime) -> None:
         traces and issues only after complete current comparisons. No assessed code is written.
         Source intent has priority; test-to-code tracing remains deferred. This tool never
         launches a worker or claims that graph links prove semantic satisfaction.
+        In the setup chat, render each changed chat_update milestone even when notify_user is
+        false (that flag concerns final findings). On complete, automatically show findings,
+        recommendations, evidence, scope and limitations; do not wait for a user status request.
+        Deduplicate repeated update IDs. Keep working until ready or explain what blocks setup.
         """
         try:
-            return InitialReconciliationService(runtime).run(draft)
+            return with_setup_chat_update(InitialReconciliationService(runtime).run(draft))
         except Exception:  # noqa: BLE001 - fixed public boundary
             raise ToolError("initial reconciliation unavailable") from None
 
