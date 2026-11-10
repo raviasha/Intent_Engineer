@@ -1,6 +1,7 @@
 import json
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -23,6 +24,7 @@ def _stop(project: Path, **updates: object) -> None:
         **updates,
     }
     environment = os.environ.copy()
+    environment["INTENT_DEVELOPMENT_PYTHON"] = sys.executable
     environment["PATH"] = f"{REPO_ROOT / '.venv/bin'}:/usr/bin:/bin"
     result = subprocess.run(
         [str(REPO_ROOT / "plugins/intent-advisor/scripts/stop-hook")],

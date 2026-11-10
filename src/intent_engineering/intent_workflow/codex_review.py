@@ -22,6 +22,25 @@ class _ReviewBatch(StrictModel):
     comparisons: tuple[Comparison, ...] = Field(max_length=256)
 
 
+def resolve_codex_executable(*, application_roots: tuple[Path, ...] | None = None) -> str | None:
+    """Use the host's PATH first, then the observed macOS desktop app bundle."""
+    executable = shutil.which("codex")
+    if executable:
+        return executable
+    roots = (
+        application_roots
+        if application_roots is not None
+        else (Path("/Applications"), Path.home() / "Applications")
+    )
+    for root in roots:
+        candidate = (
+            root / "ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex"
+        )
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return str(candidate)
+    return None
+
+
 PROMPT = """Perform a thorough, evidence-backed Intent Engineering review.
 Read assessment.json in this isolated snapshot directory. It contains the exact
 captured nodes, evidence, file snapshots, previous comparisons and requested slots.
@@ -77,7 +96,7 @@ class CodexReviewRunner:
     def review(self, inputs: dict[str, Any], slots: list[dict[str, str]]) -> tuple[Comparison, ...]:
         process: subprocess.Popen[bytes] | None = None
         try:
-            executable = self.executable or shutil.which("codex")
+            executable = self.executable or resolve_codex_executable()
             if executable is None:
                 raise ValueError("Codex CLI unavailable")
             with tempfile.TemporaryDirectory(prefix="intent-review-") as tmp:

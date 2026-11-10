@@ -1,8 +1,12 @@
 {
   "mcpServers": {
     "intent_advisor": {
-      "command": "intent",
-      "args": ["mcp", "--project", "."]
+      "command": "${PLUGIN_ROOT}/scripts/intent",
+      "args": [
+        "mcp",
+        "--project",
+        "."
+      ]
     }
   }
 }

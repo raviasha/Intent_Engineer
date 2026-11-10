@@ -92,6 +92,7 @@ def _run_hook(
     timeout: float = 15,
 ) -> subprocess.CompletedProcess[bytes]:
     environment = os.environ.copy()
+    environment["INTENT_DEVELOPMENT_PYTHON"] = sys.executable
     environment["PATH"] = path or f"{REPO_ROOT / '.venv' / 'bin'}:/usr/bin:/bin"
     return subprocess.run(
         [str(HOOK)],
@@ -215,7 +216,7 @@ def test_advisory_plugin_declares_official_prompt_hook_and_repository_mcp() -> N
 
     assert manifest == {
         "name": "intent-advisor",
-        "version": "0.1.7",
+        "version": "0.1.8",
         "description": "Refresh selected sources and maintain relevant intent during development.",
         "author": {"name": "Intent Engineering"},
         "skills": "./skills/",
@@ -274,7 +275,7 @@ def test_advisory_plugin_declares_official_prompt_hook_and_repository_mcp() -> N
     assert mcp == {
         "mcpServers": {
             "intent_advisor": {
-                "command": "intent",
+                "command": "${PLUGIN_ROOT}/scripts/intent",
                 "args": ["mcp", "--project", "."],
             }
         }
@@ -652,9 +653,10 @@ def test_hook_cancellation_terminates_owned_cli_and_emits_no_child_output(tmp_pa
         "time.sleep(30)",
     )
     environment = os.environ.copy()
+    environment["INTENT_DEVELOPMENT_PYTHON"] = sys.executable
     environment["PATH"] = f"{fake_bin}:/usr/bin:/bin"
     process = subprocess.Popen(
-        [sys.executable, str(HOOK)],
+        [sys.executable, str(HOOK.with_suffix(".py"))],
         cwd=project,
         env=environment,
         stdin=subprocess.PIPE,
@@ -721,12 +723,13 @@ def test_plugin_configured_mcp_missing_project_is_protocol_clean(tmp_path: Path)
     project = tmp_path / "project"
     project.mkdir()
     mcp = json.loads((PLUGIN_ROOT / ".mcp.json").read_bytes())["mcpServers"]["intent_advisor"]
-    executable = REPO_ROOT / ".venv" / "bin" / mcp["command"]
+    executable = mcp["command"].replace("${PLUGIN_ROOT}", str(PLUGIN_ROOT))
 
     completed = subprocess.run(
         [str(executable), *mcp["args"]],
         cwd=project,
-        env={"LANG": "C.UTF-8", "LC_ALL": "C.UTF-8", "PATH": "/usr/bin:/bin"},
+        env={"LANG": "C.UTF-8", "LC_ALL": "C.UTF-8", "PATH": "/usr/bin:/bin",
+             "INTENT_DEVELOPMENT_PYTHON": sys.executable},
         capture_output=True,
         check=False,
         timeout=5,

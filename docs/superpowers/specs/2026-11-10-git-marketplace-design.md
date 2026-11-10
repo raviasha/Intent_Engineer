@@ -1,14 +1,13 @@
 # Git marketplace distribution
 
-Status: proposed design; distribution selected by user, runtime packaging proposed by agent.
+Status: approved by the user November 10, 2026, including bundled runtime and publication to main.
 
 ## Intent
 
 Users install Intent Advisor and trust its hooks without manually cloning the source
 repository or installing Python. Keep the local-first graph and existing read-only,
 background reconciliation behavior. Git marketplace distribution was explicitly selected
-in the November 10 conversation. Bundling the runtime is the recommended implementation,
-not a separately recorded user decision.
+in the November 10 conversation. The user subsequently approved bundling the runtime and requested implementation and publication.
 
 ## Approaches
 

@@ -1,0 +1,24 @@
+#!/bin/sh
+# Runtime files are immutable parts of the installed plugin, never downloaded here.
+set -eu
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+plugin_root=$(dirname -- "$script_dir")
+case "$(uname -s)-$(uname -m)" in
+  Darwin-arm64) target=macos-arm64 ;;
+  Darwin-x86_64) target=macos-x86_64 ;;
+  Linux-x86_64) target=linux-x86_64 ;;
+  *) echo "Intent Advisor: unsupported platform; bundled runtimes support macOS arm64/x86_64 and Linux x86_64." >&2; exit 78 ;;
+esac
+runtime="$plugin_root/runtime/$target/python/bin/python3"
+if [ -x "$runtime" ]; then
+  PATH="$script_dir:$PATH"
+  PYTHONDONTWRITEBYTECODE=1
+  export PATH PYTHONDONTWRITEBYTECODE
+  exec "$runtime" -B -I "$script_dir/entry.py" "$@"
+fi
+# Explicit contributor-only escape hatch, never enabled by installed manifests.
+if [ ! -f "$plugin_root/distribution.json" ] && [ -n "${INTENT_DEVELOPMENT_PYTHON:-}" ]; then
+  exec "$INTENT_DEVELOPMENT_PYTHON" -I "$script_dir/entry.py" "$@"
+fi
+echo "Intent Advisor: bundled runtime missing for $target. Install from the marketplace distribution branch, or reinstall this plugin." >&2
+exit 78

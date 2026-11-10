@@ -5,6 +5,24 @@ description: Use when repository development tasks may depend on captured intent
 
 # Intent Advisor
 
+## Bundled CLI
+
+Prefer the connected MCP tools. Every `intent ...` command in this skill and its
+references means the installed plugin launcher, not a global executable. Resolve the
+plugin root by going two directories up from this SKILL.md file's containing directory,
+then invoke `/bin/sh "<plugin root>/scripts/intent" ...` with the shown arguments.
+Preserve the target repository as the working directory. For example, when installed at
+`/example/Plugin Cache/intent-advisor`, accepted setup starts with:
+
+```sh
+/bin/sh "/example/Plugin Cache/intent-advisor/scripts/intent" background-onboarding --project . --prepare
+```
+
+The Git marketplace package includes Python and dependencies. Do not ask users to install
+Python, pip, or a global `intent`. A missing bundled runtime is an installation failure:
+report it and recommend reinstalling the marketplace package; do not claim readiness or
+write canonical state directly. Hook trust remains the user's decision.
+
 Intent Engineering runs in the background of normal development. Make a lightweight
 relevance check for each new task. For development, check selected source freshness using
 [source refresh](references/source-refresh.md) before dependent work. Routine checks and
