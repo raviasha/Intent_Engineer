@@ -166,5 +166,13 @@ class CodexReviewRunner:
                 try:
                     process.wait(timeout=2)
                 except subprocess.TimeoutExpired:
+                    pass
+                # The leader can exit before descendants (including children that
+                # ignore SIGTERM). Escalate for the group regardless of leader state.
+                try:
                     os.killpg(process.pid, signal.SIGKILL)
-                    process.wait()
+                except ProcessLookupError:
+                    pass
+                process.wait()
+                if process.stdin is not None:
+                    process.stdin.close()

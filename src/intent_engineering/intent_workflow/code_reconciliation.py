@@ -314,7 +314,9 @@ class CodeReconciliationService:
 
     def _review(self, target: SecureFile, snapshot: _Snapshot) -> str:
         state = self._load(target)
-        if state.completed_signature == snapshot.signature or snapshot.unchanged_baseline:
+        # File/semantic signatures deliberately omit graph version. Reuse only a
+        # fresh completed assessment, including unrelated canonical graph changes.
+        if snapshot.unchanged_baseline:
             self._update(
                 target,
                 completed_signature=snapshot.signature,

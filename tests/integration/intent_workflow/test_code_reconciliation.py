@@ -292,3 +292,36 @@ def test_automatic_failed_reviews_have_cooldown_but_manual_retry_can_resume(read
     assert service.run(automatic=True)["status"] == "retry_pending"
     assert len(reviewer.calls) == attempts
     assert worker(ready).run()["status"] == "ready_with_findings"
+
+
+def test_unrelated_graph_mutation_cannot_leave_completed_signature_stuck_pending(ready):
+    from intent_engineering.core.models import ChangeSet
+    from intent_engineering.storage.executor import LocalChangeSetExecutor
+
+    reviewer = Reviewer()
+    service = worker(ready, reviewer)
+    assert service.run()["status"] == "ready"
+    graph = ready.graph_store.load()
+    original = next(n for n in graph.nodes if n.type == "FILE")
+    change = ChangeSet(
+        id="changeset:unrelated-file",
+        actor="local",
+        timestamp=NOW,
+        baseline_graph_version=graph.version,
+        evidence_refs=original.evidence_refs,
+        nodes_added=(original.model_copy(update={"id": "file:outside", "label": "outside.py"}),),
+        nodes_updated=(),
+        nodes_superseded=(),
+        edges_added=(),
+        edges_updated=(),
+        edges_superseded=(),
+        confidence_changes=(),
+        implementation_status_changes=(),
+        reconciliation_cases_created=(),
+        reconciliation_cases_resolved=(),
+        validation_status="validated",
+    )
+    LocalChangeSetExecutor(ready.graph_store, ready.case_store, ready.transactions).apply(change)
+    assert service.status()["status"] == "pending"
+    assert service.run()["status"] == "ready_with_findings"
+    assert reviewer.calls
