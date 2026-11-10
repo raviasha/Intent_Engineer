@@ -1,0 +1,9 @@
+{
+  "python_version": "3.12.16",
+  "release": "20261026",
+  "targets": {
+    "macos-arm64": {"triple": "aarch64-apple-darwin", "sha256": "353d5f1b4fd2715e7053f12f068435d5bbad16b91e057006b5d01e0925709a7e"},
+    "macos-x86_64": {"triple": "x86_64-apple-darwin", "sha256": "37c38fda76fec1fbf310adcbafb7f0d96af13b5511bf8ea954c3aa8eec185734"},
+    "linux-x86_64": {"triple": "x86_64-unknown-linux-gnu", "sha256": "ce4f6d0a6cfdb3bed6e44c2f9affd85943c76a42e25ad3a259002f31d6fb8a20"}
+  }
+}

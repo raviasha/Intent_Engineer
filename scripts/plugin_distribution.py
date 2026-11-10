@@ -1,0 +1,228 @@
+"""Build and verify self-contained Git marketplace packages."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import platform
+import shutil
+import subprocess
+import sys
+import tarfile
+import tempfile
+import urllib.request
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+TARGETS = ("macos-arm64", "macos-x86_64", "linux-x86_64")
+
+
+def sha256(path: Path) -> str:
+    with path.open("rb") as stream:
+        return hashlib.file_digest(stream, "sha256").hexdigest()
+
+
+def extract_verified(archive: Path, expected: str, destination: Path) -> None:
+    if sha256(archive) != expected:
+        raise ValueError("runtime checksum mismatch")
+    if destination.exists():
+        raise ValueError("runtime destination already exists")
+    destination.mkdir(parents=True)
+    with tarfile.open(archive, "r:gz") as source:
+        source.extractall(destination, filter="data")
+
+
+def file_manifest(root: Path) -> dict:
+    result = {}
+    for path in sorted(root.rglob("*")):
+        relative = path.relative_to(root).as_posix()
+        if path.is_symlink():
+            target = os.readlink(path)
+            if Path(target).is_absolute() or not path.resolve().is_relative_to(root.resolve()):
+                raise ValueError(f"unsafe symlink: {relative}")
+            result[relative] = {"symlink": target}
+        elif path.is_file():
+            if path.stat().st_size >= 100 * 1024 * 1024:
+                raise ValueError(f"file exceeds GitHub size limit: {relative}")
+            result[relative] = {
+                "sha256": sha256(path),
+                "executable": int(bool(path.stat().st_mode & 0o111)),
+            }
+    return result
+
+
+def verify_files(root: Path, expected: dict) -> None:
+    if file_manifest(root) != expected:
+        raise ValueError("package integrity mismatch")
+
+
+def native_target() -> str:
+    system = {"Darwin": "macos", "Linux": "linux"}.get(platform.system(), "unsupported")
+    arch = {"aarch64": "arm64", "arm64": "arm64", "x86_64": "x86_64"}.get(
+        platform.machine(), "unsupported"
+    )
+    return f"{system}-{arch}"
+
+
+def build(target: str, output: Path, revision: str) -> None:
+    if target != native_target() or target not in TARGETS:
+        raise ValueError("build must run on its native supported platform")
+    sources = json.loads((ROOT / "packaging/runtime-sources.json").read_text())
+    source = sources["targets"][target]
+    filename = f"cpython-{sources['python_version']}+{sources['release']}-{source['triple']}-install_only_stripped.tar.gz"
+    url = f"https://github.com/astral-sh/python-build-standalone/releases/download/{sources['release']}/{filename}"
+    if output.exists():
+        raise ValueError("output already exists")
+    output.mkdir(parents=True)
+    package = output / "plugin"
+    shutil.copytree(
+        ROOT / "plugins/intent-advisor",
+        package,
+        ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "runtime"),
+    )
+    runtime = package / "runtime" / target
+    with tempfile.TemporaryDirectory(prefix="intent-package-") as temp:
+        temp_root = Path(temp)
+        archive = temp_root / "python.tar.gz"
+        with urllib.request.urlopen(url, timeout=120) as response, archive.open("wb") as stream:
+            shutil.copyfileobj(response, stream)
+        extract_verified(archive, source["sha256"], runtime)
+        python = runtime / "python/bin/python3"
+        subprocess.run(
+            [
+                str(python),
+                "-I",
+                "-m",
+                "pip",
+                "install",
+                "--disable-pip-version-check",
+                "--require-hashes",
+                "--only-binary=:all:",
+                "-r",
+                str(ROOT / "packaging/runtime.lock"),
+            ],
+            check=True,
+        )
+        subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "pip",
+                "wheel",
+                "--no-deps",
+                "--no-build-isolation",
+                "--wheel-dir",
+                str(temp_root / "wheels"),
+                str(ROOT),
+            ],
+            check=True,
+        )
+        wheel = next((temp_root / "wheels").glob("intent_engineering-*.whl"))
+        subprocess.run(
+            [str(python), "-I", "-m", "pip", "install", "--no-deps", str(wheel)], check=True
+        )
+        subprocess.run([str(python), "-I", "-m", "pip", "check"], check=True)
+        installed = subprocess.check_output(
+            [str(python), "-I", "-m", "pip", "list", "--format=json"]
+        )
+    # Remove console scripts with build-host shebangs; the plugin launcher owns dispatch.
+    for path in (runtime / "python/bin").iterdir():
+        if not path.name.startswith("python"):
+            if path.is_dir():
+                shutil.rmtree(path)
+            else:
+                path.unlink()
+    for path in list(runtime.rglob("__pycache__")):
+        shutil.rmtree(path)
+    for path in runtime.rglob("direct_url.json"):
+        path.unlink()
+    shutil.copy2(ROOT / "LICENSE", package / "LICENSE")
+    shutil.copy2(ROOT / "packaging/runtime.lock", package / "runtime.lock")
+    info = {
+        "source_revision": revision,
+        "target": target,
+        "python_version": sources["python_version"],
+        "runtime_url": url,
+        "runtime_sha256": source["sha256"],
+        "dependencies": json.loads(installed),
+        "plugin_version": json.loads((package / ".codex-plugin/plugin.json").read_text())[
+            "version"
+        ],
+    }
+    (package / "distribution.json").write_text(json.dumps(info, indent=2) + "\n")
+    (output / "manifest.json").write_text(json.dumps(file_manifest(package), indent=2) + "\n")
+    print(json.dumps(info, indent=2))
+
+
+def assemble(inputs: Path, output: Path, revision: str) -> None:
+    for target in TARGETS:
+        artifact = inputs / target
+        if not (artifact / "plugin/distribution.json").is_file():
+            raise ValueError(f"missing platform: {target}")
+        verify_files(artifact / "plugin", json.loads((artifact / "manifest.json").read_text()))
+        info = json.loads((artifact / "plugin/distribution.json").read_text())
+        if info["target"] != target or info["source_revision"] != revision:
+            raise ValueError("platform source revision mismatch")
+    if output.exists():
+        raise ValueError("assembly output already exists")
+    package = output / "plugins/intent-advisor"
+    first = inputs / TARGETS[0] / "plugin"
+    shutil.copytree(first, package, symlinks=True)
+    common = {
+        k: v
+        for k, v in file_manifest(first).items()
+        if not k.startswith("runtime/") and k != "distribution.json"
+    }
+    platforms = {}
+    for target in TARGETS:
+        source = inputs / target / "plugin"
+        other = {
+            k: v
+            for k, v in file_manifest(source).items()
+            if not k.startswith("runtime/") and k != "distribution.json"
+        }
+        if common != other:
+            raise ValueError("platform plugin content differs")
+        if target != TARGETS[0]:
+            shutil.copytree(
+                source / "runtime" / target, package / "runtime" / target, symlinks=True
+            )
+        platforms[target] = json.loads((source / "distribution.json").read_text())
+    (package / "distribution.json").write_text(
+        json.dumps({"source_revision": revision, "platforms": platforms}, indent=2) + "\n"
+    )
+    marketplace = output / ".agents/plugins/marketplace.json"
+    marketplace.parent.mkdir(parents=True)
+    shutil.copy2(ROOT / ".agents/plugins/marketplace.json", marketplace)
+    (output / "README.md").write_text(
+        "# Intent Advisor marketplace\n\nGenerated release; source: "
+        f"https://github.com/raviasha/Intent_Engineer/commit/{revision}\n\n"
+        "Install: `codex plugin marketplace add raviasha/Intent_Engineer --ref marketplace`, "
+        "then `codex plugin add intent-advisor@intent-engineering-local`. Review and trust hooks.\n"
+        "Includes Python; macOS arm64/x86_64 and Linux x86_64 (glibc).\n"
+    )
+    (output / "manifest.json").write_text(json.dumps(file_manifest(package), indent=2) + "\n")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("action", choices=["build", "assemble", "verify"])
+    parser.add_argument("--target", choices=TARGETS)
+    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--inputs", type=Path)
+    parser.add_argument("--revision", default="")
+    args = parser.parse_args()
+    if args.action == "build":
+        build(args.target, args.output.resolve(), args.revision)
+    elif args.action == "assemble":
+        assemble(args.inputs.resolve(), args.output.resolve(), args.revision)
+    else:
+        root = args.output
+        package = root / "plugin" if (root / "plugin").exists() else root / "plugins/intent-advisor"
+        verify_files(package, json.loads((root / "manifest.json").read_text()))
+
+
+if __name__ == "__main__":
+    main()
