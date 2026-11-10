@@ -205,10 +205,9 @@ def test_explicit_governed_onboarding_and_assurance_share_one_project(
     assert workflow.runtime is runtime
     assert workflow.runtime.transactions is runtime.transactions
     plugin_mcp = json.loads((ROOT / "plugins/intent-advisor/.mcp.json").read_bytes())
-    assert plugin_mcp["mcpServers"]["intent_advisor"] == {
-        "command": "intent",
-        "args": ["mcp", "--project", "."],
-    }
+    mcp_config = plugin_mcp["mcpServers"]["intent_advisor"]
+    assert mcp_config["args"][-3:] == ["mcp", "--project", "."]
+    assert "cwd" not in mcp_config  # Preserve the assessed repository, not the plugin cache.
 
     class AdvisoryIssuerSpy:
         def __init__(self) -> None:

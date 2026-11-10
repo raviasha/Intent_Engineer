@@ -130,16 +130,13 @@ def test_public_alpha_docs_and_bindings_match_the_shipped_operating_model(
         "intent_bootstrap_propose"
     )
     for text in (readme, guide, adoption):
-        assert (
-            "git clone https://github.com/raviasha/Intent_Engineer.git "
-            "/absolute/path/to/Intent_Engineer"
-        ) in text
-        assert "python -m pip install /absolute/path/to/Intent_Engineer" in text
-        assert "codex plugin marketplace add /absolute/path/to/Intent_Engineer" in text
+        assert "codex plugin marketplace add raviasha/Intent_Engineer --ref marketplace" in text
+        assert "no manual clone, Python or pip installation" in text
+        assert '<installed plugin root>/scripts/intent' in text
         assert "codex plugin add intent-advisor@intent-engineering-local" in text
         assert "cd /absolute/path/to/target-repository" in text
         assert "new task" in text.casefold() or "restart" in text.casefold()
-        assert "wheel-only" in text.casefold()
+        assert "bundled" in text.casefold()
         assert "CLI and MCP" in text
         assert "plugin marketplace" in text.casefold()
         assert "codex plugin marketplace add ." not in text
@@ -451,9 +448,7 @@ def test_scheduled_workflow_is_read_only_and_orders_capture_before_assurance() -
 
 def test_guided_adoption_docs_and_plugin_independent_assurance_are_ordered() -> None:
     journey_markers = (
-        "git clone https://github.com/raviasha/Intent_Engineer.git",
-        "python -m pip install /absolute/path/to/Intent_Engineer",
-        "codex plugin marketplace add /absolute/path/to/Intent_Engineer",
+        "codex plugin marketplace add raviasha/Intent_Engineer --ref marketplace",
         "cd /absolute/path/to/target-repository",
         "intent onboard --project . --prd docs/PRD.md --yes",
         "Approve the baseline",
@@ -472,10 +467,10 @@ def test_guided_adoption_docs_and_plugin_independent_assurance_are_ordered() -> 
         else:
             assert "intent_advisory_preflight" in text
         assert "MandatoryHookUnavailable" in text
-        assert "codex plugin marketplace add /absolute/path/to/Intent_Engineer" in text
+        assert "codex plugin marketplace add raviasha/Intent_Engineer --ref marketplace" in text
         assert "codex plugin add intent-advisor@intent-engineering-local" in text
         assert "codex plugin marketplace add ." not in text
-        assert "wheel-only" in text.casefold()
+        assert "bundled" in text.casefold()
 
     marketplace = json.loads(
         (ROOT / ".agents/plugins/marketplace.json").read_text(encoding="utf-8")

@@ -204,6 +204,8 @@ _REVIEWED_ACTION_REFS = {
     "actions/checkout@11d5960a326750d5838078e36cf38b85af677262",  # v4.4.0
     "actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065",  # v5.6.0
     "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02",  # v4.6.2
+    # Official v4.3.0 action manifest/source reviewed 2026-11-10; current-run artifacts only.
+    "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093",
 }
 
 

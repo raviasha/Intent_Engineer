@@ -29,6 +29,7 @@ Install through the Git marketplace (Codex desktop or CLI):
 ```bash
 codex plugin marketplace add raviasha/Intent_Engineer --ref marketplace
 codex plugin add intent-advisor@intent-engineering-local
+cd /absolute/path/to/target-repository
 ```
 
 Python and dependencies are bundled: no manual clone, Python or pip installation.
