@@ -259,6 +259,7 @@ def smoke(plugin: Path) -> None:
                         "user_statement": "Store project data locally.",
                         "classification": "aligned",
                         "understanding": "PRD remains aligned.",
+                        "relevant_node_ids": ["intent:privacy", "req:local"],
                         "evidence_refs": cycle["required_evidence_refs"],
                     }
                 )
