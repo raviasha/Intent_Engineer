@@ -1,0 +1,667 @@
+{
+  "source_revision": "ac9da36337fd71dea29dbc2f4b037df29ff17209",
+  "platforms": {
+    "macos-arm64": {
+      "source_revision": "ac9da36337fd71dea29dbc2f4b037df29ff17209",
+      "target": "macos-arm64",
+      "python_version": "3.12.16",
+      "runtime_url": "https://github.com/astral-sh/python-build-standalone/releases/download/20261026/cpython-3.12.16+20261026-aarch64-apple-darwin-install_only_stripped.tar.gz",
+      "runtime_sha256": "353d5f1b4fd2715e7053f12f068435d5bbad16b91e057006b5d01e0925709a7e",
+      "dependencies": [
+        {
+          "name": "annotated-doc",
+          "version": "0.0.5"
+        },
+        {
+          "name": "annotated-types",
+          "version": "0.8.0"
+        },
+        {
+          "name": "anyio",
+          "version": "4.14.2"
+        },
+        {
+          "name": "attrs",
+          "version": "26.1.0"
+        },
+        {
+          "name": "cbor2",
+          "version": "6.1.4"
+        },
+        {
+          "name": "certifi",
+          "version": "2026.7.22"
+        },
+        {
+          "name": "cffi",
+          "version": "2.1.1"
+        },
+        {
+          "name": "click",
+          "version": "8.5.0"
+        },
+        {
+          "name": "cryptography",
+          "version": "50.0.1"
+        },
+        {
+          "name": "h11",
+          "version": "0.16.0"
+        },
+        {
+          "name": "httpcore",
+          "version": "1.0.9"
+        },
+        {
+          "name": "httpcore2",
+          "version": "2.12.0"
+        },
+        {
+          "name": "httpx",
+          "version": "0.28.1"
+        },
+        {
+          "name": "httpx2",
+          "version": "2.12.0"
+        },
+        {
+          "name": "idna",
+          "version": "3.19"
+        },
+        {
+          "name": "intent-engineering",
+          "version": "0.1.0"
+        },
+        {
+          "name": "jaraco.classes",
+          "version": "3.4.0"
+        },
+        {
+          "name": "jaraco.context",
+          "version": "6.1.2"
+        },
+        {
+          "name": "jaraco.functools",
+          "version": "4.6.0"
+        },
+        {
+          "name": "jsonschema",
+          "version": "4.26.0"
+        },
+        {
+          "name": "jsonschema-specifications",
+          "version": "2025.9.1"
+        },
+        {
+          "name": "keyring",
+          "version": "25.7.0"
+        },
+        {
+          "name": "markdown-it-py",
+          "version": "4.2.0"
+        },
+        {
+          "name": "mcp",
+          "version": "2.1.1"
+        },
+        {
+          "name": "mcp-types",
+          "version": "2.1.1"
+        },
+        {
+          "name": "mdurl",
+          "version": "0.1.2"
+        },
+        {
+          "name": "more-itertools",
+          "version": "11.1.0"
+        },
+        {
+          "name": "opentelemetry-api",
+          "version": "1.44.0"
+        },
+        {
+          "name": "pip",
+          "version": "26.2.2"
+        },
+        {
+          "name": "pyasn1",
+          "version": "0.6.4"
+        },
+        {
+          "name": "pyasn1_modules",
+          "version": "0.4.2"
+        },
+        {
+          "name": "pycparser",
+          "version": "3.0"
+        },
+        {
+          "name": "pydantic",
+          "version": "2.13.5"
+        },
+        {
+          "name": "pydantic_core",
+          "version": "2.46.5"
+        },
+        {
+          "name": "Pygments",
+          "version": "2.21.0"
+        },
+        {
+          "name": "PyJWT",
+          "version": "2.13.0"
+        },
+        {
+          "name": "pyOpenSSL",
+          "version": "26.4.0"
+        },
+        {
+          "name": "python-multipart",
+          "version": "0.0.32"
+        },
+        {
+          "name": "PyYAML",
+          "version": "6.0.3"
+        },
+        {
+          "name": "referencing",
+          "version": "0.37.0"
+        },
+        {
+          "name": "rich",
+          "version": "15.0.0"
+        },
+        {
+          "name": "rpds-py",
+          "version": "2026.6.3"
+        },
+        {
+          "name": "shellingham",
+          "version": "1.5.4"
+        },
+        {
+          "name": "sse-starlette",
+          "version": "3.4.8"
+        },
+        {
+          "name": "starlette",
+          "version": "1.6.0"
+        },
+        {
+          "name": "structlog",
+          "version": "26.1.0"
+        },
+        {
+          "name": "truststore",
+          "version": "0.10.4"
+        },
+        {
+          "name": "typer",
+          "version": "0.27.2"
+        },
+        {
+          "name": "typing_extensions",
+          "version": "4.16.0"
+        },
+        {
+          "name": "typing-inspection",
+          "version": "0.4.4"
+        },
+        {
+          "name": "uvicorn",
+          "version": "0.52.4"
+        },
+        {
+          "name": "webauthn",
+          "version": "3.0.0"
+        }
+      ],
+      "plugin_version": "0.1.8"
+    },
+    "macos-x86_64": {
+      "source_revision": "ac9da36337fd71dea29dbc2f4b037df29ff17209",
+      "target": "macos-x86_64",
+      "python_version": "3.12.16",
+      "runtime_url": "https://github.com/astral-sh/python-build-standalone/releases/download/20261026/cpython-3.12.16+20261026-x86_64-apple-darwin-install_only_stripped.tar.gz",
+      "runtime_sha256": "37c38fda76fec1fbf310adcbafb7f0d96af13b5511bf8ea954c3aa8eec185734",
+      "dependencies": [
+        {
+          "name": "annotated-doc",
+          "version": "0.0.5"
+        },
+        {
+          "name": "annotated-types",
+          "version": "0.8.0"
+        },
+        {
+          "name": "anyio",
+          "version": "4.14.2"
+        },
+        {
+          "name": "attrs",
+          "version": "26.1.0"
+        },
+        {
+          "name": "cbor2",
+          "version": "6.1.4"
+        },
+        {
+          "name": "certifi",
+          "version": "2026.7.22"
+        },
+        {
+          "name": "cffi",
+          "version": "2.1.1"
+        },
+        {
+          "name": "click",
+          "version": "8.5.0"
+        },
+        {
+          "name": "cryptography",
+          "version": "50.0.1"
+        },
+        {
+          "name": "h11",
+          "version": "0.16.0"
+        },
+        {
+          "name": "httpcore",
+          "version": "1.0.9"
+        },
+        {
+          "name": "httpcore2",
+          "version": "2.12.0"
+        },
+        {
+          "name": "httpx",
+          "version": "0.28.1"
+        },
+        {
+          "name": "httpx2",
+          "version": "2.12.0"
+        },
+        {
+          "name": "idna",
+          "version": "3.19"
+        },
+        {
+          "name": "intent-engineering",
+          "version": "0.1.0"
+        },
+        {
+          "name": "jaraco.classes",
+          "version": "3.4.0"
+        },
+        {
+          "name": "jaraco.context",
+          "version": "6.1.2"
+        },
+        {
+          "name": "jaraco.functools",
+          "version": "4.6.0"
+        },
+        {
+          "name": "jsonschema",
+          "version": "4.26.0"
+        },
+        {
+          "name": "jsonschema-specifications",
+          "version": "2025.9.1"
+        },
+        {
+          "name": "keyring",
+          "version": "25.7.0"
+        },
+        {
+          "name": "markdown-it-py",
+          "version": "4.2.0"
+        },
+        {
+          "name": "mcp",
+          "version": "2.1.1"
+        },
+        {
+          "name": "mcp-types",
+          "version": "2.1.1"
+        },
+        {
+          "name": "mdurl",
+          "version": "0.1.2"
+        },
+        {
+          "name": "more-itertools",
+          "version": "11.1.0"
+        },
+        {
+          "name": "opentelemetry-api",
+          "version": "1.44.0"
+        },
+        {
+          "name": "pip",
+          "version": "26.2.2"
+        },
+        {
+          "name": "pyasn1",
+          "version": "0.6.4"
+        },
+        {
+          "name": "pyasn1_modules",
+          "version": "0.4.2"
+        },
+        {
+          "name": "pycparser",
+          "version": "3.0"
+        },
+        {
+          "name": "pydantic",
+          "version": "2.13.5"
+        },
+        {
+          "name": "pydantic_core",
+          "version": "2.46.5"
+        },
+        {
+          "name": "Pygments",
+          "version": "2.21.0"
+        },
+        {
+          "name": "PyJWT",
+          "version": "2.13.0"
+        },
+        {
+          "name": "pyOpenSSL",
+          "version": "26.4.0"
+        },
+        {
+          "name": "python-multipart",
+          "version": "0.0.32"
+        },
+        {
+          "name": "PyYAML",
+          "version": "6.0.3"
+        },
+        {
+          "name": "referencing",
+          "version": "0.37.0"
+        },
+        {
+          "name": "rich",
+          "version": "15.0.0"
+        },
+        {
+          "name": "rpds-py",
+          "version": "2026.6.3"
+        },
+        {
+          "name": "shellingham",
+          "version": "1.5.4"
+        },
+        {
+          "name": "sse-starlette",
+          "version": "3.4.8"
+        },
+        {
+          "name": "starlette",
+          "version": "1.6.0"
+        },
+        {
+          "name": "structlog",
+          "version": "26.1.0"
+        },
+        {
+          "name": "truststore",
+          "version": "0.10.4"
+        },
+        {
+          "name": "typer",
+          "version": "0.27.2"
+        },
+        {
+          "name": "typing_extensions",
+          "version": "4.16.0"
+        },
+        {
+          "name": "typing-inspection",
+          "version": "0.4.4"
+        },
+        {
+          "name": "uvicorn",
+          "version": "0.52.4"
+        },
+        {
+          "name": "webauthn",
+          "version": "3.0.0"
+        }
+      ],
+      "plugin_version": "0.1.8"
+    },
+    "linux-x86_64": {
+      "source_revision": "ac9da36337fd71dea29dbc2f4b037df29ff17209",
+      "target": "linux-x86_64",
+      "python_version": "3.12.16",
+      "runtime_url": "https://github.com/astral-sh/python-build-standalone/releases/download/20261026/cpython-3.12.16+20261026-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz",
+      "runtime_sha256": "ce4f6d0a6cfdb3bed6e44c2f9affd85943c76a42e25ad3a259002f31d6fb8a20",
+      "dependencies": [
+        {
+          "name": "annotated-doc",
+          "version": "0.0.5"
+        },
+        {
+          "name": "annotated-types",
+          "version": "0.8.0"
+        },
+        {
+          "name": "anyio",
+          "version": "4.14.2"
+        },
+        {
+          "name": "attrs",
+          "version": "26.1.0"
+        },
+        {
+          "name": "cbor2",
+          "version": "6.1.4"
+        },
+        {
+          "name": "certifi",
+          "version": "2026.7.22"
+        },
+        {
+          "name": "cffi",
+          "version": "2.1.1"
+        },
+        {
+          "name": "click",
+          "version": "8.5.0"
+        },
+        {
+          "name": "cryptography",
+          "version": "50.0.1"
+        },
+        {
+          "name": "h11",
+          "version": "0.16.0"
+        },
+        {
+          "name": "httpcore",
+          "version": "1.0.9"
+        },
+        {
+          "name": "httpcore2",
+          "version": "2.12.0"
+        },
+        {
+          "name": "httpx",
+          "version": "0.28.1"
+        },
+        {
+          "name": "httpx2",
+          "version": "2.12.0"
+        },
+        {
+          "name": "idna",
+          "version": "3.19"
+        },
+        {
+          "name": "intent-engineering",
+          "version": "0.1.0"
+        },
+        {
+          "name": "jaraco.classes",
+          "version": "3.4.0"
+        },
+        {
+          "name": "jaraco.context",
+          "version": "6.1.2"
+        },
+        {
+          "name": "jaraco.functools",
+          "version": "4.6.0"
+        },
+        {
+          "name": "jeepney",
+          "version": "0.9.0"
+        },
+        {
+          "name": "jsonschema",
+          "version": "4.26.0"
+        },
+        {
+          "name": "jsonschema-specifications",
+          "version": "2025.9.1"
+        },
+        {
+          "name": "keyring",
+          "version": "25.7.0"
+        },
+        {
+          "name": "markdown-it-py",
+          "version": "4.2.0"
+        },
+        {
+          "name": "mcp",
+          "version": "2.1.1"
+        },
+        {
+          "name": "mcp-types",
+          "version": "2.1.1"
+        },
+        {
+          "name": "mdurl",
+          "version": "0.1.2"
+        },
+        {
+          "name": "more-itertools",
+          "version": "11.1.0"
+        },
+        {
+          "name": "opentelemetry-api",
+          "version": "1.44.0"
+        },
+        {
+          "name": "pip",
+          "version": "26.2.2"
+        },
+        {
+          "name": "pyasn1",
+          "version": "0.6.4"
+        },
+        {
+          "name": "pyasn1_modules",
+          "version": "0.4.2"
+        },
+        {
+          "name": "pycparser",
+          "version": "3.0"
+        },
+        {
+          "name": "pydantic",
+          "version": "2.13.5"
+        },
+        {
+          "name": "pydantic_core",
+          "version": "2.46.5"
+        },
+        {
+          "name": "Pygments",
+          "version": "2.21.0"
+        },
+        {
+          "name": "PyJWT",
+          "version": "2.13.0"
+        },
+        {
+          "name": "pyOpenSSL",
+          "version": "26.4.0"
+        },
+        {
+          "name": "python-multipart",
+          "version": "0.0.32"
+        },
+        {
+          "name": "PyYAML",
+          "version": "6.0.3"
+        },
+        {
+          "name": "referencing",
+          "version": "0.37.0"
+        },
+        {
+          "name": "rich",
+          "version": "15.0.0"
+        },
+        {
+          "name": "rpds-py",
+          "version": "2026.6.3"
+        },
+        {
+          "name": "SecretStorage",
+          "version": "3.5.0"
+        },
+        {
+          "name": "shellingham",
+          "version": "1.5.4"
+        },
+        {
+          "name": "sse-starlette",
+          "version": "3.4.8"
+        },
+        {
+          "name": "starlette",
+          "version": "1.6.0"
+        },
+        {
+          "name": "structlog",
+          "version": "26.1.0"
+        },
+        {
+          "name": "truststore",
+          "version": "0.10.4"
+        },
+        {
+          "name": "typer",
+          "version": "0.27.2"
+        },
+        {
+          "name": "typing_extensions",
+          "version": "4.16.0"
+        },
+        {
+          "name": "typing-inspection",
+          "version": "0.4.4"
+        },
+        {
+          "name": "uvicorn",
+          "version": "0.52.4"
+        },
+        {
+          "name": "webauthn",
+          "version": "3.0.0"
+        }
+      ],
+      "plugin_version": "0.1.8"
+    }
+  }
+}

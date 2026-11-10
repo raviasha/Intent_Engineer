@@ -1,0 +1,11 @@
+# Build-only tools for the hash-pinned Intel macOS native sources.
+setuptools==80.9.0
+setuptools-rust==1.12.0
+setuptools_scm==9.2.2
+wheel==0.45.1
+packaging==25.0
+semantic_version==2.10.0
+typing_extensions==4.15.0
+maturin==1.14.1
+cffi==2.1.1
+pycparser==3.0

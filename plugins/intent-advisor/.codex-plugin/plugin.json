@@ -1,0 +1,19 @@
+{
+  "name": "intent-advisor",
+  "version": "0.1.8",
+  "description": "Refresh selected sources and maintain relevant intent during development.",
+  "author": {
+    "name": "Intent Engineering"
+  },
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Intent Advisor",
+    "shortDescription": "Route work through repository intent.",
+    "longDescription": "Check source freshness before development, reuse unchanged content, surface source conflicts for your decision, and maintain a provenance-backed local intent graph.",
+    "developerName": "Intent Engineering",
+    "category": "Developer Tools",
+    "capabilities": [],
+    "defaultPrompt": "Check this task against the repository intent workflow."
+  },
+  "mcpServers": "./.mcp.json"
+}

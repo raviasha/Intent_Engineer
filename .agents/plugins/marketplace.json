@@ -1,0 +1,17 @@
+{
+  "name": "intent-engineering-local",
+  "plugins": [
+    {
+      "name": "intent-advisor",
+      "source": {
+        "source": "local",
+        "path": "./plugins/intent-advisor"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Developer Tools"
+    }
+  ]
+}
