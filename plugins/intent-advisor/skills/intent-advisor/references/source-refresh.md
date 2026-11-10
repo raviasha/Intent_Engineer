@@ -53,6 +53,17 @@ intent background-source-signal --submission-schema
 
 ## Source notifications
 
+For a selected local folder, the host inventories and reads the complete selected file scope,
+including agreed subfolders, while respecting exclusions and access permissions. Keep each
+file's stable object ID and locator tied to the selected root and relative path. Use an actual
+content hash as the revision when the filesystem has no immutable revision. Preserve a known
+document author; otherwise use null rather than the filesystem owner as an invented author.
+A reusable folder validator must cover the sorted file membership and content revisions,
+including edits, additions and deletions. Directory mtime alone is insufficient. If a complete
+current manifest cannot be established, fetch the selected contents or record a partial/failed
+read; unreadable or unsupported files cannot silently count as checked. Do not follow a symlink
+outside the selected scope. Local folder selection does not install a filesystem watcher.
+
 A separately configured provider event bridge may call `intent_background_source_signal`
 with `source_id`, stable `event_id` and `observed_at`. This only marks a source dirty; the
 next development task fetches it. It never changes intent or declares content fresh.

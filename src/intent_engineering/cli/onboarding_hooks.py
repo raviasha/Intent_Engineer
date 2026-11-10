@@ -51,11 +51,11 @@ def background_onboarding_route(
         arguments={},
         message=(
             "No active intent graph is available. Offer once: create it in a separate chat and "
-            "connect existing sources such as Notion, Confluence or Slack, or defer for now. "
+            "select intent sources such as local folders, Notion, Confluence or Slack, or defer for now. "
             "Reuse the user's answer; continue the original task without waiting for setup. "
             "If accepted, run intent background-onboarding --prepare --project .; use the host "
             "create_thread tool with the returned prompt/project, then persist the returned chat ID "
-            "using --chat-id. Ask source/account/scope questions and complete connection setup in "
+            "using --chat-id. Ask source/folder/account/scope questions and complete connection setup in "
             "that new chat. If deferred, run intent background-onboarding --defer --project .; "
             "remind after three completed turns. Never fabricate a chat ID or connection. "
             + default.message

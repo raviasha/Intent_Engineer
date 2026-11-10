@@ -31,9 +31,15 @@ python -m pip install intent-engineering
 Open a chat rooted in your repository and give the agent a task. The advisor makes a lightweight
 relevance check, consults relevant intent when needed, and proceeds silently for unrelated or
 aligned work. If no graph exists, it offers to create one in a separate chat using sources
-such as Notion, Confluence or Slack. Your original task keeps moving. The setup chat asks
-which sources and spaces, pages or channels to read and helps you connect them there.
+such as local folders, Notion, Confluence or Slack. Your original task keeps moving. The setup chat asks
+which folders, spaces, pages or channels to read and helps you connect them there.
 If you choose “Later,” it offers again after three completed work turns.
+
+For a local folder, give its path and choose which files/subfolders are in scope. This can be
+inside the codebase or another folder the host can read. Designate whether those documents
+represent authoritative intent or supporting context. Local folders need filesystem access,
+not a remote-service login. Current file contents and folder membership are checked during
+source refresh, including additions and deletions; no continuous filesystem watcher is installed.
 
 When your task needs intent that is missing or unclear, the agent shows its captured understanding
 and asks one consequential question. For a conflict it shows the existing intent and the specific

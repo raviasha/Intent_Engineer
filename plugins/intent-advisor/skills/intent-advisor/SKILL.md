@@ -18,7 +18,7 @@ remains deferred. A link alone does not prove semantic coverage.
 ## First use: offer source-connected setup in a separate chat
 
 When no active graph exists, briefly offer: “Create the intent graph in a separate chat,
-using sources such as Notion, Confluence or Slack, while I continue this task?” Include a
+using sources such as local folders, Notion, Confluence or Slack, while I continue this task?” Include a
 “Later” choice. This first-use offer is the exception to silent checks. Continue the original
 task while awaiting the answer. A missing/corrupt-state read error is not first use.
 
@@ -38,7 +38,13 @@ do not build the initial graph in the original chat. An explicit later request c
 setup immediately. If no answer arrives, continue working without repeatedly offering in
 the same turn. Ordinary task clarification can still happen when necessary.
 
-In the setup chat, first ask which sources and specific spaces, pages or channels to use.
+In the setup chat, first ask which local folders, spaces, pages or channels to use.
+Local folders are a first-class source option, including a user-selected folder outside the
+repository when host access allows it. Record the exact path, file/subfolder scope, exclusions
+and authority designation as `provider=local`, `collection=true`. Use host filesystem reads;
+no remote provider login is needed. Follow the local-folder checks in
+[source refresh](references/source-refresh.md). Selection permits reading that scope, not
+editing it or treating every local document as authoritative.
 Reuse available connections and discover the corresponding host plugin tools. For a source
 the user selected that is unavailable, use supported connection/install tools and let the
 user complete provider authentication in this setup chat. A source is connected only after

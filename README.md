@@ -41,7 +41,7 @@ checkout sequence above when installing the Codex plugin.
 Restart the ChatGPT desktop app and start a new task rooted in the target repository. Codex
 launches the plugin-owned MCP server from `plugins/intent-advisor/.mcp.json`; do not start an
 additional server process for the plugin. On first use, the agent offers to create the intent
-graph in a separate chat and connect sources such as Notion, Confluence and Slack. Accepting
+graph in a separate chat and select sources such as local folders, Notion, Confluence and Slack. Accepting
 opens a setup chat for source selection, connection and graph creation while the original
 task continues. Deferring schedules another offer after three completed work turns.
 Normal work with an existing graph gets a lightweight relevance check.
