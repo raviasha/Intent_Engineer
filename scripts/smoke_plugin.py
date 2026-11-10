@@ -71,6 +71,13 @@ async def check_mcp(launcher, project, environment):
         result = await session.initialize()
         assert result.server_info.name
         assert (await session.list_tools()).tools
+        assessment = await session.call_tool(
+            "intent_initial_reconciliation",
+            {"draft": {"action": "status", "session_id": "smoke", "turn_id": "status"}},
+        )
+        update = assessment.structured_content["chat_update"]
+        assert update["kind"] == "complete"
+        assert update["findings"][0]["recommendation"] == "Restore local storage."
 
 
 def smoke(plugin: Path) -> None:
@@ -181,6 +188,54 @@ def smoke(plugin: Path) -> None:
             ).run()
             assert result["status"] == "ready_with_findings", result
             assert result["notify_user"] is False
+            assert "chat_update" not in result
+            public = subprocess.run(
+                [str(launcher), "initial-reconciliation", "--project", str(project)],
+                env=environment,
+                capture_output=True,
+                check=True,
+                timeout=20,
+            )
+            update = json.loads(public.stdout)["chat_update"]
+            assert update["kind"] == "complete"
+            assert update["findings"][0]["recommendation"] == "Restore local storage."
+            onboarding = [str(launcher), "background-onboarding", "--project", str(project)]
+            for options in (
+                [
+                    "--prepare",
+                    "--return-thread-id",
+                    "smoke-parent",
+                    "--return-session-id",
+                    "smoke-session",
+                ],
+                ["--chat-id", "smoke-setup"],
+                ["--finished", "--assessment-run-id", result["run_id"]],
+            ):
+                packet = json.loads(
+                    subprocess.run(
+                        [*onboarding, *options],
+                        env=environment,
+                        capture_output=True,
+                        check=True,
+                        timeout=20,
+                    ).stdout
+                )
+            handoff = packet["return_handoff"]
+            assert handoff["status"] == "pending" and handoff["thread_id"] == "smoke-parent"
+            assert (
+                handoff["assessment"]["findings"][0]["recommendation"] == "Restore local storage."
+            )
+            acknowledged = json.loads(
+                subprocess.run(
+                    [*onboarding, "--handoff-delivered", handoff["id"]],
+                    env=environment,
+                    capture_output=True,
+                    check=True,
+                    timeout=20,
+                ).stdout
+            )
+            assert acknowledged["return_handoff"]["status"] == "delivered"
+            assert acknowledged["return_handoff"]["message_sent_by_runtime"] is False
             assert (project / "app.py").read_text() == changed
             from intent_engineering.cli.dev import _start_or_reuse_background_service
             from intent_engineering.intent_workflow.check import SharedStateRestoreStatus

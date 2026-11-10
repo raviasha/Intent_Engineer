@@ -12,6 +12,7 @@ from intent_engineering.intent_workflow.initial_reconciliation import InitialRec
 from intent_engineering.intent_workflow.initial_reconciliation_models import (
     InitialReconciliationRequest,
 )
+from intent_engineering.intent_workflow.setup_presentation import with_setup_chat_update
 from intent_engineering.storage.secure import SecureDirectory
 
 
@@ -41,7 +42,7 @@ def initial_reconciliation_command(
                 finally:
                     directory.close()
             runtime = load_runtime(project)
-            result = InitialReconciliationService(runtime).run(draft)
+            result = with_setup_chat_update(InitialReconciliationService(runtime).run(draft))
         typer.echo(json.dumps(result, ensure_ascii=False))
     except Exception as error:
         raise typer.BadParameter(

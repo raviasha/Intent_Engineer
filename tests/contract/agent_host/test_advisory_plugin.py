@@ -216,7 +216,7 @@ def test_advisory_plugin_declares_official_prompt_hook_and_repository_mcp() -> N
 
     assert manifest == {
         "name": "intent-advisor",
-        "version": "0.1.9",
+        "version": "0.1.10",
         "description": "Refresh selected sources and maintain relevant intent during development.",
         "author": {"name": "Intent Engineering"},
         "skills": "./skills/",
@@ -278,7 +278,7 @@ def test_advisory_plugin_declares_official_prompt_hook_and_repository_mcp() -> N
                 "command": "/bin/sh",
                 "args": [
                     "-c",
-                    'exec "${CODEX_HOME:-$HOME/.codex}/plugins/cache/intent-engineering-local/intent-advisor/0.1.9/scripts/intent" "$@"',
+                    'exec "${CODEX_HOME:-$HOME/.codex}/plugins/cache/intent-engineering-local/intent-advisor/0.1.10/scripts/intent" "$@"',
                     "intent-advisor",
                     "mcp",
                     "--project",
@@ -733,7 +733,7 @@ def test_plugin_configured_mcp_missing_project_is_protocol_clean(tmp_path: Path)
     mcp = json.loads((PLUGIN_ROOT / ".mcp.json").read_bytes())["mcpServers"]["intent_advisor"]
     executable = mcp["command"]
     profile = tmp_path / "codex-profile"
-    cache = profile / "plugins/cache/intent-engineering-local/intent-advisor/0.1.9"
+    cache = profile / "plugins/cache/intent-engineering-local/intent-advisor/0.1.10"
     cache.parent.mkdir(parents=True)
     cache.symlink_to(PLUGIN_ROOT, target_is_directory=True)
 

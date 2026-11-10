@@ -57,7 +57,11 @@ graph approval, WebAuthn, PRD file or export is required. During initial setup, 
 compares source intent, requirements and production code in the setup chat, checkpointing
 until the scoped assessment is complete. Source intent has highest priority. Missing or
 conflicting coverage becomes an evidence-backed issue with a recommended change; assessed
-code and documents remain unchanged. Findings are presented together after readiness.
+code and documents remain unchanged. The setup chat shows capture and comparison progress,
+then automatically presents findings, recommended changes, evidence and scope limitations
+after readiness. It hands completed results back to the original chat's agent through an
+authorized host message, with automatic next-prompt retrieval as a fallback. There is no need
+to run a command or ask the agent to check for results.
 Requirements-to-code tracing is included; test-to-code tracing remains deferred.
 
 Existing pending proposals remain pending; upgrading never fabricates their approval.

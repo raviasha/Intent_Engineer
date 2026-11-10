@@ -123,6 +123,18 @@ finished. It takes the time needed, persists checkpoints and resumes in the same
 Your original work continues. The CLI and MCP tools store the assessment; they do not launch
 a worker on their own.
 
+In that same setup chat, you see the opening scope, graph-capture milestone and changed
+comparison counts. Graph creation is followed by reconciliation. The agent automatically
+shows the final gaps, recommended changes, evidence and limitations; you do not need to ask
+for a status check. With no findings it reports no gaps within the assessed scope. If evidence
+is missing or inputs change, it explains the remaining work rather than claiming completion.
+When complete, setup returns the findings and recommendations to your original chat's agent,
+which explains relevant gaps in context while continuing your work. The setup offer includes
+permission for this return message. Delivery is tracked so unchanged results are not sent twice.
+If host messaging is unavailable or not authorized, the original agent retrieves the result
+automatically at its next trusted prompt hook; you do not run a command. The host must keep
+the setup task active; the local runtime cannot wake a terminated chat.
+
 Once that assessment is complete, the separate automatic worker described below handles
 subsequent code-change reviews when trusted hooks fire.
 
@@ -159,7 +171,7 @@ means a graph, source or file snapshot changed. Continue the work or report an u
 scope, and reassess changed inputs. Neither state can mark setup complete. `ready` or
 `ready_with_findings` publishes verified artifact nodes, trace relationships and open issues
 through a validated ChangeSet. Present the consolidated findings and recommended changes,
-then mark the setup chat finished with `intent background-onboarding --finished`.
+then mark the setup chat finished with `intent background-onboarding --finished --assessment-run-id <setup-run-id>`.
 
 Readiness means a host-reported semantic assessment with validated evidence within the
 declared scope, not universal proof of correctness. Missing PRDs or external sources remain
