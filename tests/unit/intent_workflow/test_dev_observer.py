@@ -686,12 +686,19 @@ async def test_cancellation_kills_a_real_grandchild_process_tree(tmp_path: Path)
     )
     observer = _observer(repo)
 
-    with anyio.move_on_after(0.4) as scope:
+    async def run() -> None:
         await observer.run_reviewed_tests(observer.command_ids[0], at=NOW)
 
-    assert scope.cancel_called
-    assert (repo / "parent-started").exists()
-    assert (repo / "grandchild-started").exists()
+    async with anyio.create_task_group() as tasks:
+        tasks.start_soon(run)
+        with anyio.fail_after(5):
+            while not all(
+                (repo / marker).exists()
+                for marker in ("parent-started", "grandchild-started")
+            ):
+                await anyio.sleep(0.01)
+        tasks.cancel_scope.cancel()
+
     await anyio.sleep(1)
     assert not (repo / "grandchild-finished").exists()
 
