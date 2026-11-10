@@ -166,7 +166,9 @@ def test_changed_code_invalidates_checkpoint_and_does_not_overwrite_user_work(en
 def test_removed_file_has_verified_absence_evidence_and_cannot_claim_coverage(env):
     (env.root / "app.py").unlink()
     result = call(
-        env, "start", scope="Review removed implementation",
+        env,
+        "start",
+        scope="Review removed implementation",
         files=[{"path": "app.py", "role": "code", "missing": True}],
     )
     assert result["code_refs"][0]["missing"] is True
@@ -183,15 +185,21 @@ def test_absence_cannot_be_asserted_for_existing_file_or_symlink(env):
         if path == "alias.py":
             (env.root / path).symlink_to(env.root / "app.py")
         with pytest.raises(ValueError):
-            call(env, "start", scope="Missing file", files=[
-                {"path": path, "role": "code", "missing": True}
-            ])
+            call(
+                env,
+                "start",
+                scope="Missing file",
+                files=[{"path": path, "role": "code", "missing": True}],
+            )
 
 
 def test_removed_directory_is_absent_but_reappearance_invalidates_review(env):
-    result = call(env, "start", scope="Removed directory", files=[
-        {"path": "removed/code.py", "role": "code", "missing": True}
-    ])
+    result = call(
+        env,
+        "start",
+        scope="Removed directory",
+        files=[{"path": "removed/code.py", "role": "code", "missing": True}],
+    )
     (env.root / "removed").mkdir()
     (env.root / "removed/code.py").write_text("restored = True")
     assert call(env, "status", run_id=result["run_id"])["status"] == "stale"
@@ -212,9 +220,11 @@ def test_changed_directory_membership_guard_prevents_publication(env, monkeypatc
 
     monkeypatch.setattr(service, "_publish", publish_then_edit)
     with pytest.raises(ValueError, match="changed during publication"):
-        service.run(InitialReconciliationRequest(
-            action="finish", session_id="setup", turn_id="finish", run_id=result["run_id"]
-        ))
+        service.run(
+            InitialReconciliationRequest(
+                action="finish", session_id="setup", turn_id="finish", run_id=result["run_id"]
+            )
+        )
     assert env.graph_store.load().version == 1
     assert (env.root / "new.py").read_text() == "unreviewed = True"
 
@@ -686,6 +696,9 @@ def test_revoked_evidence_cannot_leak_through_status_or_exact_retry(env, action,
     else:
         response = call(env, action, run_id=result["run_id"])
     assert response == {"status": "unavailable", "notify_user": False, "findings": []}
+    service = InitialReconciliationService(env)
+    assert service.inputs(result["run_id"]) == {"status": "unavailable"}
+    assert service.baseline() is None
 
 
 def test_reassessment_preserves_user_owned_and_out_of_scope_edges(env):

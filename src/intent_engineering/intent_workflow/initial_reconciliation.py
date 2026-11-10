@@ -53,7 +53,10 @@ REQUIREMENT_TYPES = {"REQUIREMENT", "CAPABILITY", "ACCEPTANCE_CRITERION"}
 
 class InitialReconciliationService:
     def __init__(
-        self, runtime: Runtime, *, clock: Callable[[], datetime] | None = None,
+        self,
+        runtime: Runtime,
+        *,
+        clock: Callable[[], datetime] | None = None,
         input_guard: Callable[[], bool] | None = None,
     ) -> None:
         self.runtime = runtime
@@ -131,8 +134,10 @@ class InitialReconciliationService:
     def file_missing(self, path: str) -> bool:
         """Prove absence under no-follow descriptors, including a removed parent."""
         parts = PurePosixPath(path).parts
-        if not parts or PurePosixPath(path).is_absolute() or any(
-            p in {"..", ".intent", ".git"} for p in parts
+        if (
+            not parts
+            or PurePosixPath(path).is_absolute()
+            or any(p in {"..", ".intent", ".git"} for p in parts)
         ):
             raise ValueError("unsafe assessment path")
         fd = os.dup(self.runtime.project_directory.descriptor)
@@ -161,9 +166,13 @@ class InitialReconciliationService:
             return False
         try:
             return all(
-                sha256(self._file(AssessmentFile(
-                    path=f["path"], role=f["role"], missing=f.get("missing", False)
-                ))).hexdigest()
+                sha256(
+                    self._file(
+                        AssessmentFile(
+                            path=f["path"], role=f["role"], missing=f.get("missing", False)
+                        )
+                    )
+                ).hexdigest()
                 == f["digest"]
                 for f in state["files"]
             )
@@ -211,7 +220,8 @@ class InitialReconciliationService:
                     observed_at=now,
                     content_hash="sha256:" + digest,
                     payload={
-                        "content": content, "capture_method": "local_verified_read",
+                        "content": content,
+                        "capture_method": "local_verified_read",
                         "missing": item.missing,
                     },
                     acl=(actor,),
@@ -382,8 +392,10 @@ class InitialReconciliationService:
                 if (
                     state
                     and state["scope"] == draft.scope
-                    and [{"path": f["path"], "role": f["role"],
-                          "missing": f.get("missing", False)} for f in state["files"]]
+                    and [
+                        {"path": f["path"], "role": f["role"], "missing": f.get("missing", False)}
+                        for f in state["files"]
+                    ]
                     == [f.model_dump() for f in draft.files]
                     and self._fresh(state, actor, principals)
                 ):
@@ -425,8 +437,14 @@ class InitialReconciliationService:
     def inputs(self, run_id: str) -> dict[str, Any]:
         """Read exact accessible snapshot content for a semantic reviewer."""
         with self.refresh._transaction() as (actor, principals, _now):
-            state = next((e["state"] for e in reversed(self._events(actor))
-                          if e["state"]["run_id"] == run_id), None)
+            state = next(
+                (
+                    e["state"]
+                    for e in reversed(self._events(actor))
+                    if e["state"]["run_id"] == run_id
+                ),
+                None,
+            )
             if state is None or not refs_allowed(
                 state["evidence_refs"], self.runtime.evidence(), principals
             ):
@@ -434,16 +452,26 @@ class InitialReconciliationService:
             if not self._fresh(state, actor, principals):
                 return {"status": "stale"}
             return {
-                **self._result(state), "nodes": state["nodes"],
-                "evidence": [e.model_dump(mode="json") for e in self.runtime.evidence()
-                             if e.id in state["evidence_refs"]],
+                **self._result(state),
+                "nodes": state["nodes"],
+                "evidence": [
+                    e.model_dump(mode="json")
+                    for e in self.runtime.evidence()
+                    if e.id in state["evidence_refs"]
+                ],
             }
 
     def baseline(self) -> dict[str, Any] | None:
         """Latest completed scope, even after an edit, without revoked evidence."""
         with self.refresh._transaction() as (actor, principals, _now):
-            state = next((e["state"] for e in reversed(self._events(actor))
-                          if e["state"]["status"] in {"ready", "ready_with_findings"}), None)
+            state = next(
+                (
+                    e["state"]
+                    for e in reversed(self._events(actor))
+                    if e["state"]["status"] in {"ready", "ready_with_findings"}
+                ),
+                None,
+            )
             if state is None or not refs_allowed(
                 state["evidence_refs"], self.runtime.evidence(), principals
             ):

@@ -23,6 +23,10 @@ from intent_engineering.cli.assessment import assess_command, assessment_gate_co
 from intent_engineering.cli.background import background_command
 from intent_engineering.cli.background_onboarding import background_onboarding_command
 from intent_engineering.cli.background_sources import background_source_command
+from intent_engineering.cli.code_reconciliation import (
+    agent_reconcile_hook_command,
+    reconcile_code_command,
+)
 from intent_engineering.cli.connectors import (
     configured_actor_principals,
     connector_catalog,
@@ -147,6 +151,8 @@ app.add_typer(sources_app, name="sources")
 app.add_typer(proposals_app, name="proposals")
 app.add_typer(team_app, name="team")
 app.command("initial-reconciliation")(initial_reconciliation_command)
+app.command("reconcile-code")(reconcile_code_command)
+app.command("agent-reconcile-hook", hidden=True)(agent_reconcile_hook_command)
 app.command("background")(background_command)
 app.command("background-onboarding")(background_onboarding_command)
 app.command("background-source")(background_source_command)
