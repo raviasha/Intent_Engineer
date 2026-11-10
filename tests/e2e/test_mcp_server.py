@@ -306,6 +306,7 @@ async def test_intent_mcp_stdio_is_protocol_clean_and_read_only(tmp_path: Path) 
         "intent_background_source_signal",
         "intent_background_refresh",
         "intent_initial_reconciliation",
+        "intent_monitor",
         "intent_context",
         "intent_explain",
         "intent_impact",

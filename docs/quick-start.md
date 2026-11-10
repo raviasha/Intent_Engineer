@@ -181,52 +181,53 @@ obsolete service-owned mappings within the assessed scope; unrelated mappings ar
 Existing issues are not automatically closed. Governed bootstrap activation likewise exposes
 the pending reconciliation step; activating a graph alone does not compare it with code.
 
-### Background reconciliation after code changes
+### Automatic intent and PRD checks
 
-After the first completed assessment, trusted async hooks automatically compare changes
-against captured intent and requirements. The user continues working; hooks do not display
-warnings, ask questions, block tools or continue a stopped chat. Findings and recommended
-changes are stored as evidence-backed issues. Code, PRDs and source documents are not edited.
+Accept source-connected setup and background monitoring. Select bounded intent sources (including
+local folders), PRD files and source authority. The setup agent assesses the existing codebase,
+returns initial findings to the original agent, then creates one five-minute heartbeat in the same
+setup chat. It confirms the actual host schedule ID before claiming monitoring is active.
 
-Install a current Codex CLI on each machine and sign in normally. `codex` and `intent` must
-both be on the hook environment's `PATH`. Background reviews use Codex model usage, with
-no separate API key required for an existing ChatGPT CLI sign-in. The reviewer runs in a
-temporary snapshot directory under the read-only sandbox, with approval prompts, plugins,
-apps and hooks disabled. It uses the default Codex model configuration; custom user profiles
-and custom providers are not loaded into this isolated reviewer.
+The heartbeat checks intent sources and PRDs while Codex is open. After reopening, its first
+scheduled run catches up with current state. It does not need a new user prompt. SessionStart
+hook context assists resume/repair; the host schedule, rather than the hook, starts background work.
+No standalone daemon, provider webhook configuration or copied credentials is needed. Keep the
+project available and provider connections authorized. An unavailable scheduler or source is
+reported honestly; task-time refresh remains available.
+
+Only new actionable gaps, proposed document changes or consequential clarifications return to the
+recorded working agent. Unchanged/aligned checks and already-delivered packets stay quiet. Clear
+intent and requirements are maintained in the graph; PRD/source documents and code are not edited.
+Source intent has highest priority, while conflicting sources remain explicit for a user decision.
+The scope includes missing intent for requirements, missing requirements for intent, partial coverage
+and contradictory or outdated PRD statements. Missing access is unknown, not alignment.
+
+For an existing graph, ask: “Monitor my selected intent sources and PRD in the background and return
+recommendations here.” Existing source selections are reused. On plugin updates, review any changed
+hook trust request in Codex; the plugin does not enable trust on your behalf.
+
+### On-demand code reconciliation
+
+Code review runs only when deliberately requested, for example: “Check code against intent and the
+PRD.” Initial graph setup still assesses the existing codebase. Later code coverage remains
+last-reviewed or unknown until another explicit review; an aligned task does not prove implementation.
 
 ```bash
-codex login status
-intent reconcile-code --project .           # status and current findings
-intent reconcile-code --project . --run     # run/resume a review manually
-intent reconcile-code --project . --disable # stop automatic reviews for this checkout
-intent reconcile-code --project . --enable  # allow reviews on subsequent hook events
+intent reconcile-code --project .       # status and last findings
+intent reconcile-code --project . --run # explicitly run/resume code review
+intent monitor-intent --project .       # monitor status; normally the agent handles this
 ```
 
-Session start, prompt submission, tool completion and turn completion trigger checks.
-Changes made in another editor are picked up at the next hook event. No always-on filesystem
-watcher is installed. Repeated events share one worker, edits coalesce, and completed batches
-survive cancellation/restart. When files change during review, old results cannot publish;
-the worker reassesses the latest snapshot.
+These commands use the bundled plugin launcher described above. Only the explicit code reviewer
+needs a signed-in current Codex CLI. It uses the normal default model configuration in an isolated
+read-only snapshot; it never edits assessed code. Legacy `--enable` does not restore automatic
+reviews; `--disable` can cancel a running review. Edits, prompt submission, tool completion and
+SessionStart do not start code review.
 
-Coverage starts with the initial assessment's declared files. In Git repositories, it also
-includes recognized nonignored source/config files under the declared code directories,
-including untracked additions, renames and removals. Other file formats need explicit
-inclusion in the initial assessment. Non-Git projects retain the exact declared files.
-Configured source exclusions apply; unsafe, unreadable, binary or oversized inputs leave
-the review pending. Bounds are 4,096 files, 1 MiB per file and 64 MiB of file content.
-
-The worker uses the latest captured intent evidence. It does not connect to Slack, Notion,
-Confluence or local source folders itself. Dirty, uninitialized or uninterpreted selections
-produce `awaiting_source_refresh`; the existing foreground source-refresh workflow supplies
-new evidence. A completed code review is not a claim that a remote provider has not changed.
-
-`ready_with_findings` contains the flagged gaps and recommendations. `retry_pending` means
-the runtime, authentication, input read or model response was unavailable; `incomplete`
-means semantic comparisons remain unknown. Check CLI installation/login and source access,
-then run/resume or allow a hook event after the one-minute failure cooldown to retry.
-Manual `--run` retries immediately. Hook cancellation retains checkpoints.
-Test-to-code tracing remains deferred; existing cases require explicit resolution.
+Coverage starts with initial assessment files; Git projects also include recognized nonignored
+source/config files under declared code directories, including additions and removals. Non-Git
+projects keep their declared scope. Unsafe, unreadable or oversized inputs remain pending. Dirty
+intent sources must first be refreshed by the host. Test-to-code tracing remains deferred.
 
 ### Optional governed review
 

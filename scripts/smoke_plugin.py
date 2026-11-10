@@ -25,6 +25,7 @@ from intent_engineering.intent_workflow.initial_reconciliation_models import (
     Comparison,
     InitialReconciliationRequest,
 )
+from intent_engineering.intent_workflow.intent_monitor import IntentMonitorService, MonitorRequest
 
 NOW = datetime(2026, 11, 10, tzinfo=UTC)
 
@@ -101,7 +102,7 @@ def smoke(plugin: Path) -> None:
             timeout=20,
         )
         assert b"reconcile-code" in help_result.stdout
-        for name in ("prompt-hook", "stop-hook", "reconcile-hook"):
+        for name in ("prompt-hook", "stop-hook", "reconcile-hook", "monitor-hook"):
             result = subprocess.run(
                 [str(plugin / "scripts" / name)],
                 input=b"{}",
@@ -236,6 +237,43 @@ def smoke(plugin: Path) -> None:
             )
             assert acknowledged["return_handoff"]["status"] == "delivered"
             assert acknowledged["return_handoff"]["message_sent_by_runtime"] is False
+            monitor = IntentMonitorService(runtime, clock=lambda: NOW)
+            monitor.run(
+                MonitorRequest(
+                    action="configure",
+                    prd_paths=("prd.md",),
+                    session_id="smoke-monitor",
+                    monitor_thread_id="smoke-setup",
+                    monitor_host_id="smoke-host",
+                    return_thread_id="smoke-parent",
+                    return_host_id="smoke-host",
+                )
+            )
+            cycle = monitor.run(MonitorRequest(action="begin"))
+            review = BackgroundIntentService(runtime, clock=lambda: NOW).submit(
+                BackgroundSubmission.model_validate(
+                    {
+                        "session_id": "smoke-monitor",
+                        "turn_id": cycle["cycle_id"],
+                        "graph_version": runtime.graph_store.load().version,
+                        "user_statement": "Store project data locally.",
+                        "classification": "aligned",
+                        "understanding": "PRD remains aligned.",
+                        "evidence_refs": cycle["required_evidence_refs"],
+                    }
+                )
+            )
+            done = monitor.run(
+                MonitorRequest(
+                    action="finish",
+                    cycle_id=cycle["cycle_id"],
+                    interpretation_ref=review["evidence_ref"],
+                )
+            )
+            assert done["status"] == "quiet" and not done["schedule_confirmed"]
+            assert monitor.run(MonitorRequest(action="begin"))["status"] == "quiet"
+            automatic = CodeReconciliationService(runtime).run(automatic=True)
+            assert automatic["status"] == "on_demand_only"
             assert (project / "app.py").read_text() == changed
             from intent_engineering.cli.dev import _start_or_reuse_background_service
             from intent_engineering.intent_workflow.check import SharedStateRestoreStatus

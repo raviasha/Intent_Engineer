@@ -73,7 +73,7 @@ def test_desktop_codex_is_resolved_without_global_cli(tmp_path, monkeypatch):
     assert resolver(application_roots=(tmp_path,)) is None
 
 
-@pytest.mark.parametrize("hook", ["prompt-hook", "stop-hook", "reconcile-hook"])
+@pytest.mark.parametrize("hook", ["prompt-hook", "stop-hook", "reconcile-hook", "monitor-hook"])
 def test_development_hook_uses_explicit_interpreter(tmp_path, hook):
     import sys
 

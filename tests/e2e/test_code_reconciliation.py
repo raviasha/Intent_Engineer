@@ -35,7 +35,7 @@ def test_invalid_unrelated_or_subagent_hooks_are_silent(tmp_path, monkeypatch, e
     assert list(tmp_path.iterdir()) == []
 
 
-def test_valid_hook_dispatches_for_the_enclosing_project_silently(tmp_path, monkeypatch):
+def test_valid_legacy_hook_does_not_dispatch_review(tmp_path, monkeypatch):
     from intent_engineering.core.policy.project import initialize_project
     from intent_engineering.intent_workflow.code_reconciliation import CodeReconciliationService
 
@@ -66,7 +66,7 @@ def test_valid_hook_dispatches_for_the_enclosing_project_silently(tmp_path, monk
     )
     assert result.exit_code == 0
     assert result.output == "{}\n"
-    assert roots == [tmp_path]
+    assert roots == []
 
 
 def test_hook_worker_failure_has_no_warning_question_or_continuation(tmp_path, monkeypatch):
@@ -93,3 +93,15 @@ def test_hook_worker_failure_has_no_warning_question_or_continuation(tmp_path, m
     )
     assert result.exit_code == 0
     assert result.output == "{}\n"
+
+
+def test_cli_enable_cannot_restore_automatic_review(tmp_path, monkeypatch):
+    from intent_engineering.core.policy.project import initialize_project
+
+    initialize_project(tmp_path)
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    result = CliRunner().invoke(app, ["reconcile-code", "--project", str(tmp_path), "--enable"])
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["enabled"] is False
+    assert payload["execution_mode"] == "on_demand"

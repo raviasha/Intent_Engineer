@@ -11,16 +11,6 @@
             "additionalContextLimit": 2048
           }
         ]
-      },
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "/bin/sh \"${PLUGIN_ROOT}/scripts/reconcile-hook\"",
-            "async": true,
-            "timeout": 86400
-          }
-        ]
       }
     ],
     "Stop": [
@@ -32,38 +22,17 @@
             "timeout": 5
           }
         ]
-      },
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "/bin/sh \"${PLUGIN_ROOT}/scripts/reconcile-hook\"",
-            "async": true,
-            "timeout": 86400
-          }
-        ]
       }
     ],
     "SessionStart": [
       {
+        "matcher": "startup|resume",
         "hooks": [
           {
             "type": "command",
-            "command": "/bin/sh \"${PLUGIN_ROOT}/scripts/reconcile-hook\"",
-            "async": true,
-            "timeout": 86400
-          }
-        ]
-      }
-    ],
-    "PostToolUse": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "/bin/sh \"${PLUGIN_ROOT}/scripts/reconcile-hook\"",
-            "async": true,
-            "timeout": 86400
+            "command": "/bin/sh \"${PLUGIN_ROOT}/scripts/monitor-hook\"",
+            "timeout": 5,
+            "additionalContextLimit": 2048
           }
         ]
       }

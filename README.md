@@ -301,22 +301,19 @@ proposal, reconciliation, or release controls.
 
 Initial reconciliation is available through `intent_initial_reconciliation` and
 `intent initial-reconciliation`. The host performs semantic review; the local service validates
-snapshot evidence, coverage, freshness and atomic publication. After a completed assessment,
-trusted asynchronous hooks automatically run a separate read-only Codex review when code
-changes. Reviews coalesce overlapping events, checkpoint progress and flag evidence-backed
-gaps and recommended changes without editing assessed code or interrupting the user's task.
-Inspect findings with `intent reconcile-code --project .`; use `--disable` or `--enable` to
-control automatic reviews locally. A signed-in current `codex` CLI must be on `PATH`; reviews
-use its normal model usage. Missing runtime/authentication leaves work pending.
+snapshot evidence, coverage, freshness and atomic publication. Initial setup assesses the existing
+codebase. Ongoing code review is on demand: `intent reconcile-code --project . --run`.
+Ordinary code edits and hooks never trigger semantic code review, including legacy enabled settings.
+An explicit review uses a signed-in current `codex` CLI and its normal model usage.
 
-Triggers are session start, prompt submission, tool completion and turn completion. Changes
-from other editors are detected at the next event; this is not an always-on filesystem watcher.
-Coverage includes the declared initial files and recognized nonignored source/config files
-under declared code directories, including additions and removals. Non-Git projects retain
-their exact declared file scope. Remote intent uses the latest captured source evidence;
-dirty or unreconciled sources wait for the existing host source-refresh workflow. Neither an
-idle hook nor a successful code review proves live provider freshness. See the
-[quick start](docs/quick-start.md#background-reconciliation-after-code-changes).
+After accepted setup, the host creates one five-minute heartbeat in the setup chat. It checks
+selected local folders and connected sources against selected PRDs and captured requirements,
+maintains clear graph intent, and sends only actionable recommendations or clarifications to the
+original working agent. No code or source/PRD documents are edited. Unchanged checks stay quiet.
+The scheduler must confirm an actual automation ID; hooks alone do not poll providers or wake an
+agent. Local monitoring runs while Codex is open and catches up on the first scheduled check after
+reopening. Missing source access remains unknown and actionable, never a successful sync claim.
+See the [quick start](docs/quick-start.md#automatic-intent-and-prd-checks).
 
 Deferred follow-up work is explicitly not shipped or reachable: test-to-code matching,
 automatic activation beyond the existing reviewed governance boundaries, and the broader

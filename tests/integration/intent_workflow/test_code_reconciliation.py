@@ -192,14 +192,45 @@ def test_overlapping_events_queue_without_duplicate_semantic_worker(ready):
     assert len(ready.cases()) == 1
 
 
-def test_disabled_worker_and_unfinished_onboarding_never_start_model(env, ready):
+def test_explicit_run_works_after_legacy_disable(ready):
     reviewer = Reviewer()
     service = worker(ready, reviewer)
     service.configure(enabled=False)
     (ready.root / "app.py").write_text("changed = True")
-    assert service.run()["status"] == "disabled"
+    assert service.run()["status"] == "ready_with_findings"
+    assert reviewer.calls
+
+
+@pytest.mark.parametrize("legacy_enabled", [False, True])
+def test_automatic_calls_never_review_or_mutate_even_with_legacy_state(ready, legacy_enabled):
+    from contextlib import closing
+
+    reviewer = Reviewer()
+    service = worker(ready, reviewer)
+    with closing(service._target()) as target:
+        state = service._load(target)
+        state.enabled = legacy_enabled
+        service._save(target, state)
+        before = target.read_optional_nonblocking(max_bytes=65536)
+    graph_version = ready.graph_store.load().version
+    (ready.root / "app.py").write_text("changed = True")
+    result = service.run(automatic=True)
+    assert result["status"] == "on_demand_only"
+    assert result["enabled"] is False
+    assert result["findings"] == []
     assert reviewer.calls == []
-    service.configure(enabled=True)
+    assert ready.graph_store.load().version == graph_version
+    with closing(service._target()) as target:
+        assert target.read_optional_nonblocking(max_bytes=65536) == before
+
+
+def test_enable_cannot_restore_automatic_review(ready):
+    reviewer = Reviewer()
+    service = worker(ready, reviewer)
+    assert service.configure(enabled=True)["enabled"] is False
+    (ready.root / "app.py").write_text("changed = True")
+    assert service.run(automatic=True)["status"] == "on_demand_only"
+    assert reviewer.calls == []
     assert service.run()["status"] == "ready_with_findings"
 
 
@@ -275,23 +306,6 @@ def test_before_initial_assessment_no_worker_starts(env, tmp_path, monkeypatch):
     reviewer = Reviewer()
     assert worker(env, reviewer).run()["status"] == "awaiting_initial_assessment"
     assert reviewer.calls == []
-
-
-def test_automatic_failed_reviews_have_cooldown_but_manual_retry_can_resume(ready):
-    (ready.root / "app.py").write_text("changed = True")
-    reviewer = Reviewer()
-
-    def unavailable(inputs, slots):
-        reviewer.calls.append(slots)
-        raise ValueError("runtime unavailable")
-
-    reviewer.review = unavailable
-    service = worker(ready, reviewer)
-    assert service.run(automatic=True)["status"] == "retry_pending"
-    attempts = len(reviewer.calls)
-    assert service.run(automatic=True)["status"] == "retry_pending"
-    assert len(reviewer.calls) == attempts
-    assert worker(ready).run()["status"] == "ready_with_findings"
 
 
 def test_unrelated_graph_mutation_cannot_leave_completed_signature_stuck_pending(ready):

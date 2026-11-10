@@ -36,7 +36,7 @@ remains deferred. A link alone does not prove semantic coverage.
 ## First use: offer source-connected setup in a separate chat
 
 When no active graph exists, briefly offer: “Create the intent graph in a separate chat,
-using sources such as local folders, Notion, Confluence or Slack, while I continue this task, and send the findings back here when it finishes?” Include a
+using sources such as local folders, Notion, Confluence or Slack, while I continue this task, then monitor intent/PRD updates in the background while Codex is open and send actionable findings back here?” Include a
 “Later” choice. This first-use offer is the exception to silent checks. Continue the original
 task while awaiting the answer. A missing/corrupt-state read error is not first use.
 
@@ -94,8 +94,7 @@ bridge records host-reported reads, not provider authentication. Preserve suppli
 local evidence remains scoped to the local actor. Use the returned evidence IDs in graph
 submissions. Configured native connectors can instead use their existing sync workflow.
 On later authorized reads, capture new revisions and update clear intent using the same path;
-ask about conflicts instead of silently replacing another contributor's position. These hooks
-do not create a continuous remote polling subscription.
+ask about conflicts instead of silently replacing another contributor's position. Automatic monitoring uses the host-owned schedule described below, not a provider webhook subscription.
 
 Selected authoritative material governs downstream intent and requirements. When those
 sources disagree, show both positions with evidence and a recommended resolution; the user
@@ -144,6 +143,20 @@ gaps/recommendations in context. Routine setup progress stays in the setup chat;
 completion handoff returns. Closed chats are not awakened by the local runtime.
 If setup is deferred or cannot proceed, use `--defer` to resume reminders. Do not activate
 pending legacy proposals or fabricate approvals.
+
+## Monitor intent and PRD updates automatically
+
+After accepted setup, follow [intent monitoring](references/intent-monitor.md) to configure one
+five-minute host heartbeat in this setup chat, record its actual automation ID, and run a cycle.
+Reuse selected sources, PRDs and original-agent routing. Verify authorization from trusted user
+history; the setup offer above includes monitoring. The host schedule checks while Codex is open
+and catches up on its first run after reopening. A hook alone cannot wake the agent. Return only
+new actionable recommendations or clarifications; stay quiet on unchanged/aligned results.
+Maintain clear graph intent/requirements, propose PRD edits, and never automatically edit documents
+or code. For existing graphs, an explicit monitoring request authorizes this same workflow.
+Ongoing code reconciliation is deliberate/on-demand (`intent reconcile-code --project . --run`);
+ordinary code edits and source changes never trigger it. Initial setup still assesses existing code.
+Do not label later code as verified merely because its task was aligned with intent and requirements.
 
 ## Consult only relevant intent
 

@@ -66,7 +66,7 @@ outside the selected scope. Local folder selection does not install a filesystem
 
 A separately configured provider event bridge may call `intent_background_source_signal`
 with `source_id`, stable `event_id` and `observed_at`. This only marks a source dirty; the
-next development task fetches it. It never changes intent or declares content fresh.
+next scheduled monitor cycle or development task fetches it. It never changes intent or declares content fresh.
 Installing this plugin does not subscribe to Notion, Confluence, Slack or Drive events.
 Only claim a subscription when actual provider setup and delivery are verified. No events
 seen, a disconnected bridge, or best-effort event delivery cannot prove no changes occurred;
@@ -113,3 +113,8 @@ is captured or semantically satisfied. `ready` means refresh and interpretation 
 not a guarantee of a gap-free graph. Test-to-code coverage remains deferred. Requirement/code tracing uses the initial
 reconciliation service and its verified snapshots; source refresh alone does not refresh
 implementation evidence.
+
+For automatic checks without a new user task, follow [intent monitoring](intent-monitor.md).
+The host heartbeat checks selected sources and PRDs every five minutes while Codex is open,
+resumes on its first run after reopening, and returns only actionable findings to the original agent.
+Source refresh never triggers ongoing code reconciliation; code review is on demand.
