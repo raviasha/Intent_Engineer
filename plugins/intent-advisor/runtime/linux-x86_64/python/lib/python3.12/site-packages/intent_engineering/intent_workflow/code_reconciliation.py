@@ -1,4 +1,4 @@
-"""Silent, checkout-local scheduling for read-only semantic reconciliation."""
+"""Explicit, checkout-local jobs for read-only semantic reconciliation."""
 
 from __future__ import annotations
 
@@ -104,7 +104,8 @@ class ReviewRunner(Protocol):
 
 
 class _Job(StrictModel):
-    enabled: bool = True
+    # Legacy field retained as an in-flight manual cancellation gate.
+    enabled: bool = False
     generation: int = Field(default=0, ge=0)
     status: str = "pending"
     completed_signature: str | None = None
@@ -166,11 +167,12 @@ class CodeReconciliationService:
         target.atomic_write(state.model_dump_json().encode(), mode=0o600)
 
     def configure(self, *, enabled: bool) -> dict[str, Any]:
+        """Retire legacy automatic enablement; disable also cancels a running review."""
         with closing(self._target()) as target, same_path_lock(target):
             state = self._load(target)
-            state.enabled = enabled
+            state.enabled = False
             state.generation += 1
-            state.status = "pending" if enabled else "disabled"
+            state.status = "on_demand_only" if enabled else "disabled"
             self._save(target, state)
         return self.status()
 
@@ -185,7 +187,7 @@ class CodeReconciliationService:
                     run_id=state.run_id,
                 )
             )
-        actual = status or (state.status if state.enabled else "disabled")
+        actual = status or state.status
         if actual in {"ready", "ready_with_findings"} and result.get("status") not in {
             "ready",
             "ready_with_findings",
@@ -194,12 +196,13 @@ class CodeReconciliationService:
         return {
             **result,
             "status": actual,
-            "enabled": state.enabled,
+            "enabled": False,
+            "execution_mode": "on_demand",
             "notify_user": False,
             "findings": result.get("findings", [])
             if actual in {"ready", "ready_with_findings"}
             else [],
-            "trigger_coverage": "trusted hook events; external edits at the next event",
+            "trigger_coverage": "explicit reconcile-code --run only",
             "source_freshness": "latest captured evidence; provider refresh is host-operated",
         }
 
@@ -429,7 +432,17 @@ class CodeReconciliationService:
         return str(result["status"])
 
     def run(self, *, automatic: bool = False) -> dict[str, Any]:
-        """Signal work and acquire one nonblocking worker lease; overlap only queues."""
+        """Run an explicitly requested review; legacy automatic requests are inert."""
+        if automatic:
+            # Do not read inputs, create state, queue work, or instantiate a reviewer.
+            # Persisted enablement from older releases cannot override this policy.
+            return {
+                "status": "on_demand_only",
+                "enabled": False,
+                "execution_mode": "on_demand",
+                "notify_user": False,
+                "findings": [],
+            }
         with (
             closing(self._target()) as target,
             closing(target.sibling("worker-" + target.path.name)) as lease,
@@ -439,14 +452,6 @@ class CodeReconciliationService:
             try:
                 with same_path_lock(target):
                     state = self._load(target)
-                    if not state.enabled:
-                        return self._view(state, status="disabled")
-                    if (
-                        automatic
-                        and state.retry_after is not None
-                        and self.clock() < state.retry_after
-                    ):
-                        return self._view(state)
                     state.generation += 1
                     self._save(target, state)
                     try:
@@ -454,6 +459,10 @@ class CodeReconciliationService:
                     except BlockingIOError:
                         return {"status": "queued", "notify_user": False, "findings": []}
                     owned = True
+                    # Explicit demand supersedes an old disabled configuration.
+                    # A subsequent --disable still cancels this worker safely.
+                    state.enabled = True
+                    self._save(target, state)
                 while True:
                     with same_path_lock(target):
                         state = self._load(target)

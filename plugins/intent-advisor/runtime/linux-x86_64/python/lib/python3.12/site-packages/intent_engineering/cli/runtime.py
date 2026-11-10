@@ -579,7 +579,9 @@ def load_runtime(root: Path, *, assurance_workspace: Path | None = None) -> Runt
             else SecureDirectory.open(assurance_workspace)
         )
         config_file = workspace_directory.file("config.yaml")
-        loaded = yaml.safe_load(config_file.read_bytes().decode("utf-8"))
+        loaded = yaml.safe_load(
+            config_file.read_bytes_nonblocking(max_bytes=MAX_CANONICAL_FILE_BYTES).decode("utf-8")
+        )
     except UnsafePathError as error:
         raise ProjectNotInitialized("local project is not initialized") from error
     workspace = workspace_path(root) if assurance_workspace is None else assurance_workspace

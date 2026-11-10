@@ -14,6 +14,7 @@ from intent_engineering.intent_workflow.initial_reconciliation import InitialRec
 from intent_engineering.intent_workflow.initial_reconciliation_models import (
     InitialReconciliationRequest,
 )
+from intent_engineering.intent_workflow.intent_monitor import IntentMonitorService, MonitorRequest
 from intent_engineering.intent_workflow.setup_presentation import with_setup_chat_update
 from intent_engineering.intent_workflow.source_refresh import (
     RefreshRequest,
@@ -50,6 +51,27 @@ def register_background_tools(server: MCPServer[Any], runtime: Runtime) -> None:
             return with_setup_chat_update(InitialReconciliationService(runtime).run(draft))
         except Exception:  # noqa: BLE001 - fixed public boundary
             raise ToolError("initial reconciliation unavailable") from None
+
+    @server.tool(
+        annotations=ToolAnnotations(
+            read_only_hint=False, destructive_hint=False, idempotent_hint=True, open_world_hint=False,
+        )
+    )
+    def intent_monitor(draft: MonitorRequest) -> dict[str, Any]:
+        """Configure and drive periodic intent/PRD checks in the existing host setup chat.
+
+        The host owns scheduling and reads selected sources with its authorized tools. Record
+        automation_id only after actual host scheduler success. Begin resumes a cycle and returns
+        source-refresh work plus verified PRD evidence; use the returned session_id and cycle_id
+        for the evidence-backed background interpretation. Finish validates current evidence.
+        Stay silent for unchanged/aligned cycles. Deliver only a returned actionable handoff
+        to its recorded original agent with trusted human authorization, then acknowledge
+        confirmed receipt. Preserve the default model. No code review or document/code edits.
+        """
+        try:
+            return IntentMonitorService(runtime).run(draft)
+        except Exception:  # noqa: BLE001 - redacted public boundary
+            raise ToolError("intent monitoring unavailable") from None
 
     service = BackgroundIntentService(runtime)
     refresh = SourceRefreshService(runtime)

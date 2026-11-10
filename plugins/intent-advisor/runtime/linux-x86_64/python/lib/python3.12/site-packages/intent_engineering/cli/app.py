@@ -40,6 +40,7 @@ from intent_engineering.cli.dev import (
 )
 from intent_engineering.cli.github import GitHubDoctorResult, check_github
 from intent_engineering.cli.initial_reconciliation import initial_reconciliation_command
+from intent_engineering.cli.intent_monitor import monitor_intent_command
 from intent_engineering.cli.intent_workflow import (
     bootstrap_command,
     onboard_command,
@@ -151,6 +152,7 @@ app.add_typer(sources_app, name="sources")
 app.add_typer(proposals_app, name="proposals")
 app.add_typer(team_app, name="team")
 app.command("initial-reconciliation")(initial_reconciliation_command)
+app.command("monitor-intent")(monitor_intent_command)
 app.command("reconcile-code")(reconcile_code_command)
 app.command("agent-reconcile-hook", hidden=True)(agent_reconcile_hook_command)
 app.command("background")(background_command)
