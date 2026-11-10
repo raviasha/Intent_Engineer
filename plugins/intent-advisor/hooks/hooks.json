@@ -5,7 +5,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "${PLUGIN_ROOT}/scripts/prompt-hook",
+            "command": "/bin/sh \"${PLUGIN_ROOT}/scripts/prompt-hook\"",
             "timeout": 15,
             "statusMessage": "Checking repository intent",
             "additionalContextLimit": 2048
@@ -16,7 +16,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "${PLUGIN_ROOT}/scripts/reconcile-hook",
+            "command": "/bin/sh \"${PLUGIN_ROOT}/scripts/reconcile-hook\"",
             "async": true,
             "timeout": 86400
           }
@@ -28,7 +28,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "${PLUGIN_ROOT}/scripts/stop-hook",
+            "command": "/bin/sh \"${PLUGIN_ROOT}/scripts/stop-hook\"",
             "timeout": 5
           }
         ]
@@ -37,7 +37,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "${PLUGIN_ROOT}/scripts/reconcile-hook",
+            "command": "/bin/sh \"${PLUGIN_ROOT}/scripts/reconcile-hook\"",
             "async": true,
             "timeout": 86400
           }
@@ -49,7 +49,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "${PLUGIN_ROOT}/scripts/reconcile-hook",
+            "command": "/bin/sh \"${PLUGIN_ROOT}/scripts/reconcile-hook\"",
             "async": true,
             "timeout": 86400
           }
@@ -61,7 +61,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "${PLUGIN_ROOT}/scripts/reconcile-hook",
+            "command": "/bin/sh \"${PLUGIN_ROOT}/scripts/reconcile-hook\"",
             "async": true,
             "timeout": 86400
           }

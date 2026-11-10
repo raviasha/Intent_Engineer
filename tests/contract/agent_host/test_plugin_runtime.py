@@ -119,3 +119,26 @@ def test_release_cannot_use_developer_interpreter_when_runtime_missing(tmp_path)
     assert result.returncode == 78
     assert "runtime missing" in result.stderr
     assert not result.stdout
+
+
+def test_host_hook_command_handles_plugin_path_with_spaces(tmp_path):
+    import json
+    import sys
+
+    package = tmp_path / "plugin with spaces"
+    shutil.copytree(PLUGIN, package)
+    hooks = json.loads((package / "hooks/hooks.json").read_text())
+    command = hooks["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"]
+    result = subprocess.run(
+        ["/bin/sh", "-c", command],
+        input=b"{}",
+        env={
+            "PATH": "/usr/bin:/bin",
+            "PLUGIN_ROOT": str(package),
+            "INTENT_DEVELOPMENT_PYTHON": sys.executable,
+        },
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "hookSpecificOutput" in json.loads(result.stdout)

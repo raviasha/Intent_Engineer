@@ -236,7 +236,7 @@ def test_advisory_plugin_declares_official_prompt_hook_and_repository_mcp() -> N
     }
     background_hook = {
         "type": "command",
-        "command": "${PLUGIN_ROOT}/scripts/reconcile-hook",
+        "command": '/bin/sh "${PLUGIN_ROOT}/scripts/reconcile-hook"',
         "async": True,
         "timeout": 86400,
     }
@@ -247,7 +247,7 @@ def test_advisory_plugin_declares_official_prompt_hook_and_repository_mcp() -> N
                     "hooks": [
                         {
                             "type": "command",
-                            "command": "${PLUGIN_ROOT}/scripts/prompt-hook",
+                            "command": '/bin/sh "${PLUGIN_ROOT}/scripts/prompt-hook"',
                             "timeout": 15,
                             "statusMessage": "Checking repository intent",
                             "additionalContextLimit": 2048,
@@ -260,7 +260,7 @@ def test_advisory_plugin_declares_official_prompt_hook_and_repository_mcp() -> N
                     "hooks": [
                         {
                             "type": "command",
-                            "command": "${PLUGIN_ROOT}/scripts/stop-hook",
+                            "command": '/bin/sh "${PLUGIN_ROOT}/scripts/stop-hook"',
                             "timeout": 5,
                         }
                     ]
@@ -728,8 +728,12 @@ def test_plugin_configured_mcp_missing_project_is_protocol_clean(tmp_path: Path)
     completed = subprocess.run(
         [str(executable), *mcp["args"]],
         cwd=project,
-        env={"LANG": "C.UTF-8", "LC_ALL": "C.UTF-8", "PATH": "/usr/bin:/bin",
-             "INTENT_DEVELOPMENT_PYTHON": sys.executable},
+        env={
+            "LANG": "C.UTF-8",
+            "LC_ALL": "C.UTF-8",
+            "PATH": "/usr/bin:/bin",
+            "INTENT_DEVELOPMENT_PYTHON": sys.executable,
+        },
         capture_output=True,
         check=False,
         timeout=5,
