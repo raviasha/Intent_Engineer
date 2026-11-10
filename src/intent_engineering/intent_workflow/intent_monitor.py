@@ -214,6 +214,8 @@ class IntentMonitorService:
                         "return_host_id": state["return_host_id"],
                         "understanding": content["understanding"],
                         "question": content.get("question"),
+                        "question_ref": event.id if content.get("question") else None,
+                        "clarification_session_id": state["session_id"],
                         "conflict": content.get("conflict"),
                         "evidence_refs": [
                             *cycle["required_refs"],

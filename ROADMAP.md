@@ -124,16 +124,21 @@ Source intent has highest priority; findings recommend changes without editing i
 artifacts. Test-to-code tracing remains deferred. See the background-workflow and
 initial-reconciliation specs in `docs/superpowers/specs`.
 
-After initial assessment, trusted async hooks run a separate read-only Codex worker for
-code-change reconciliation. It queues overlapping events, resumes checkpoints, detects
-scoped additions/removals and rejects stale results. Findings remain available for review;
-no code changes or user interruptions occur. Requires a signed-in current local Codex CLI.
-External-editor changes are checked at the next hook event; continuous watchers and live
-provider polling remain separate. See the code-change reconciliation spec.
+After accepted setup, a host-owned five-minute heartbeat in the existing monitor chat checks
+selected intent sources and PRDs while Codex is open. Durable checkpoints support catch-up
+against current state after reopening, including edits, additions and removals. Only actionable
+recommendations or clarifications return to the recorded original agent; unchanged and delivered
+findings stay quiet. Source access and current evidence are revalidated before handoff. Hooks
+provide resume context only. See the intent-source monitor spec.
 
-First use offers source-connected graph creation in a separate chat while the original task
-continues. Deferral reminds after three completed turns. Host connections supply versioned
-Notion, Confluence, Slack and other authorized source reads; continuous polling remains separate.
+Initial existing-codebase assessment remains available. Ongoing code reconciliation is on demand
+through `intent reconcile-code --run`; code edits, source updates and hooks do not trigger it.
+Neither monitoring nor assessment edits code or source documents automatically.
+
+First use offers source-connected graph creation and ongoing intent/PRD monitoring in a separate
+setup chat while the original task continues. Deferral reminds after three completed turns.
+Host connections supply versioned Notion, Confluence, Slack and other authorized source reads;
+no provider credentials or personal daemon are copied into the project.
 
 ## Phase 3 — Collaboration connectors
 

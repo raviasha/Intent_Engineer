@@ -423,3 +423,74 @@ def test_acknowledged_missing_prd_does_not_advance_success_checkpoint(runtime):
     assert repeated["handoff"] is None
     assert not repeated["scope_complete"]
     assert call(service, "begin")["status"] == "needs_interpretation"
+
+
+@pytest.mark.parametrize("unavailable_only", [False, True])
+def test_handoff_advertises_clarification_session_for_original_agent(runtime, unavailable_only):
+    from tests.integration.intent_workflow.test_source_refresh import observe, selection
+
+    service = IntentMonitorService(runtime, clock=lambda: NOW)
+    call(
+        service,
+        "configure",
+        prd_paths=() if unavailable_only else ("PRD.md",),
+        session_id="monitor:one",
+        monitor_thread_id="chat:monitor",
+        monitor_host_id="host:one",
+        return_thread_id="chat:original",
+        return_host_id="host:one",
+    )
+    if unavailable_only:
+        service.refresh.sources(selection())
+        call(service, "begin")
+        cycle = call(
+            service,
+            "begin",
+            observations=(
+                observe(
+                    kind="unavailable", complete=False, generation=1, reason="Access unavailable"
+                ),
+            ),
+        )
+    else:
+        cycle = call(service, "begin")
+    background = BackgroundIntentService(runtime, clock=lambda: NOW)
+    review = background.submit(
+        submission(
+            session_id="monitor:one",
+            turn_id=cycle["cycle_id"],
+            nodes=[],
+            classification="needs_clarification",
+            question="Which intent source should guide this requirement?",
+            evidence_refs=cycle["required_evidence_refs"],
+        )
+    )
+    packet = call(
+        service, "finish", cycle_id=cycle["cycle_id"], interpretation_ref=review["evidence_ref"]
+    )["handoff"]
+    assert packet["question_ref"] == review["evidence_ref"]
+    assert packet["clarification_session_id"] == "monitor:one"
+    assert (
+        background.context(task="Review requirements", session_id="original:one")["questions"] == []
+    )
+    answer = {
+        "user_statement": "Use the existing local requirement.",
+        "nodes": [],
+        "turn_id": "human-answer:fresh-turn",
+        "graph_version": runtime.graph_store.load().version,
+        "answers": [
+            {
+                "question_ref": packet["question_ref"],
+                "quote": "Use the existing local requirement.",
+                "resolution": "clarify",
+            }
+        ],
+    }
+    with pytest.raises(ValueError, match="unanswered question"):
+        background.submit(submission(session_id="original:one", **answer))
+    background.submit(submission(session_id=packet["clarification_session_id"], **answer))
+    context = background.context(
+        task="Review requirements", session_id=packet["clarification_session_id"]
+    )
+    assert context["questions"] == []
+    assert context["answers"][0]["question_ref"] == packet["question_ref"]

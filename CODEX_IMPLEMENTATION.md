@@ -55,12 +55,16 @@ If an implementation simplification conflicts with these invariants, preserve th
 
 ## Current background workflow
 
-The November 10 code-change reconciliation spec adds trusted asynchronous hooks and a
-separate read-only Codex reviewer after the first completed assessment. Preserve durable
-checkpoint/resume, checkout-local exclusive workers, explicit file scope, source priority,
-ACL checks, and final file/membership revalidation. Publish only validated graph/case changes;
-never alter assessed code, source documents or hook trust. Hook output stays silent. Runtime
-failure and unknown evidence remain incomplete; no idle event establishes provider freshness.
+The November 10 intent-source monitor spec supersedes automatic ongoing code review.
+After accepted setup, use the host-owned five-minute heartbeat in the existing monitor chat
+for selected intent sources and PRDs while Codex is open. Preserve durable checkpoints and
+catch up against current source membership/content after reopening. Source and PRD changes
+require evidence-backed interpretation; only actionable findings or clarifications return to
+the recorded original agent, with confirmed delivery and stable deduplication. Missing access
+and unreadable inputs stay incomplete. Hooks provide resume context, never provider freshness.
+Do not change code or source documents automatically. Initial existing-codebase assessment
+remains available; ongoing code reconciliation runs only on explicit user demand through
+`intent reconcile-code --run`. Preserve source priority, ACL checks, and input revalidation.
 
 The November 9 background-workflow spec supersedes routine approval-centric onboarding and
 advisory routing. Use the conversational service for clear local intent maintenance, preserving

@@ -693,16 +693,21 @@ service validates evidence and completeness, checkpoints progress and publishes 
 ChangeSet. The original user continues working. See
 `docs/superpowers/specs/2026-11-09-prd-consistency-check-design.md`.
 
-After a completed initial assessment, code changes trigger a separate read-only background
-review through trusted asynchronous Codex hooks. The foreground task continues. Coalesce
-overlapping events, retain checkpoints, include additions/removals within the declared code
-scope, and revalidate current files, graph, source state and access before publication. Flag
-gaps and recommended changes; never modify assessed code or interrupt the user. A missing
-review runtime, unreadable input or unfinished comparison stays pending/incomplete. Reviews
-use the latest captured intent; marked-dirty or unreconciled sources await host refresh.
-Hooks do not establish provider freshness. External-editor changes are detected at the next
-hook event; no always-on watcher is implied. See
-`docs/superpowers/specs/2026-11-10-code-change-reconciliation.md`.
+After accepted setup, a host-owned five-minute heartbeat in the existing setup/monitor chat
+checks selected intent sources and PRDs while Codex is open. Preserve durable checkpoints and
+compare current source membership/content after reopening, including additions and deletions.
+Source or PRD changes require evidence-backed interpretation; unchanged cycles remain quiet.
+Return only actionable recommendations or consequential clarifications to the recorded original
+agent, with stable handoff identity and confirmed delivery. Revalidate source access, current
+PRDs, graph and interpretation evidence before exposing findings. Unknown or unreadable inputs
+remain incomplete. Hooks provide resume context and do not themselves establish provider
+freshness or start a review. Never automatically edit code, PRDs or source documents.
+
+Initial existing-codebase assessment remains available. Ongoing code reconciliation runs only
+on explicit user demand through `intent reconcile-code --run`; code changes, source updates
+and session hooks do not trigger it. The intent-source monitor policy supersedes the earlier
+automatic code-change hook policy. See
+`docs/superpowers/specs/2026-11-10-intent-source-monitor.md`.
 
 ### 17.1 Core agent queries
 
