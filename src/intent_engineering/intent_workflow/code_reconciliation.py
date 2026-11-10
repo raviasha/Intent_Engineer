@@ -8,7 +8,7 @@ import time
 from collections.abc import Callable
 from contextlib import closing
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from fnmatch import fnmatchcase
 from hashlib import sha256
 from pathlib import Path, PurePosixPath
@@ -111,6 +111,7 @@ class _Job(StrictModel):
     run_id: str | None = None
     review_signature: str | None = None
     review_scope: str | None = None
+    retry_after: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -416,7 +417,7 @@ class CodeReconciliationService:
             self._update(target, completed_signature=snapshot.signature)
         return str(result["status"])
 
-    def run(self) -> dict[str, Any]:
+    def run(self, *, automatic: bool = False) -> dict[str, Any]:
         """Signal work and acquire one nonblocking worker lease; overlap only queues."""
         with (
             closing(self._target()) as target,
@@ -429,6 +430,12 @@ class CodeReconciliationService:
                     state = self._load(target)
                     if not state.enabled:
                         return self._view(state, status="disabled")
+                    if (
+                        automatic
+                        and state.retry_after is not None
+                        and self.clock() < state.retry_after
+                    ):
+                        return self._view(state)
                     state.generation += 1
                     self._save(target, state)
                     try:
@@ -458,6 +465,11 @@ class CodeReconciliationService:
                     with same_path_lock(target):
                         state = self._load(target)
                         state.status = outcome if state.enabled else "disabled"
+                        state.retry_after = (
+                            self.clock() + timedelta(seconds=60)
+                            if outcome in {"retry_pending", "incomplete", "unavailable"}
+                            else None
+                        )
                         self._save(target, state)
                         if (
                             state.enabled

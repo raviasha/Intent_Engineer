@@ -113,7 +113,7 @@ A developer asks a coding agent to implement a task. The agent retrieves:
 
 ---
 
-### Current development experience (2026-11-09)
+### Current development experience (2026-11-10)
 
 Background conversational capture/maintenance is the default. Relevant gaps and conflicts are
 clarified in chat; aligned and unrelated tasks stay silent. Graph changes retain provenance,
@@ -123,6 +123,13 @@ production code, including requirements-to-code traces and missing links in both
 Source intent has highest priority; findings recommend changes without editing inspected
 artifacts. Test-to-code tracing remains deferred. See the background-workflow and
 initial-reconciliation specs in `docs/superpowers/specs`.
+
+After initial assessment, trusted async hooks run a separate read-only Codex worker for
+code-change reconciliation. It queues overlapping events, resumes checkpoints, detects
+scoped additions/removals and rejects stale results. Findings remain available for review;
+no code changes or user interruptions occur. Requires a signed-in current local Codex CLI.
+External-editor changes are checked at the next hook event; continuous watchers and live
+provider polling remain separate. See the code-change reconciliation spec.
 
 First use offers source-connected graph creation in a separate chat while the original task
 continues. Deferral reminds after three completed turns. Host connections supply versioned

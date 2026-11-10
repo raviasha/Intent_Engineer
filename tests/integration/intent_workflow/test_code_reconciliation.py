@@ -237,10 +237,16 @@ def test_unknown_review_remains_incomplete_and_can_be_reassessed(ready):
     original = reviewer.review
 
     def uncertain(inputs, slots):
-        return tuple(row.model_copy(update={
-            "status": "unknown", "recommendation": "Inspect the unresolved storage path.",
-            "recommendation_target": "code",
-        }) for row in original(inputs, slots))
+        return tuple(
+            row.model_copy(
+                update={
+                    "status": "unknown",
+                    "recommendation": "Inspect the unresolved storage path.",
+                    "recommendation_target": "code",
+                }
+            )
+            for row in original(inputs, slots)
+        )
 
     reviewer.review = uncertain
     assert worker(ready, reviewer).run()["status"] == "incomplete"
@@ -269,3 +275,20 @@ def test_before_initial_assessment_no_worker_starts(env, tmp_path, monkeypatch):
     reviewer = Reviewer()
     assert worker(env, reviewer).run()["status"] == "awaiting_initial_assessment"
     assert reviewer.calls == []
+
+
+def test_automatic_failed_reviews_have_cooldown_but_manual_retry_can_resume(ready):
+    (ready.root / "app.py").write_text("changed = True")
+    reviewer = Reviewer()
+
+    def unavailable(inputs, slots):
+        reviewer.calls.append(slots)
+        raise ValueError("runtime unavailable")
+
+    reviewer.review = unavailable
+    service = worker(ready, reviewer)
+    assert service.run(automatic=True)["status"] == "retry_pending"
+    attempts = len(reviewer.calls)
+    assert service.run(automatic=True)["status"] == "retry_pending"
+    assert len(reviewer.calls) == attempts
+    assert worker(ready).run()["status"] == "ready_with_findings"

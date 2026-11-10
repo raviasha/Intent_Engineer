@@ -55,6 +55,13 @@ If an implementation simplification conflicts with these invariants, preserve th
 
 ## Current background workflow
 
+The November 10 code-change reconciliation spec adds trusted asynchronous hooks and a
+separate read-only Codex reviewer after the first completed assessment. Preserve durable
+checkpoint/resume, checkout-local exclusive workers, explicit file scope, source priority,
+ACL checks, and final file/membership revalidation. Publish only validated graph/case changes;
+never alter assessed code, source documents or hook trust. Hook output stays silent. Runtime
+failure and unknown evidence remain incomplete; no idle event establishes provider freshness.
+
 The November 9 background-workflow spec supersedes routine approval-centric onboarding and
 advisory routing. Use the conversational service for clear local intent maintenance, preserving
 provenance, typed validation, history and unresolved disagreement. Never synthesize human

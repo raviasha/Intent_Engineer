@@ -29,8 +29,10 @@ def reconcile_code_command(
             raise ValueError("choose one operation")
         runtime = load_runtime(project.resolve(strict=True))
         service = CodeReconciliationService(runtime)
-        result = service.configure(enabled=enable) if enable or disable else (
-            service.run() if run else service.status()
+        result = (
+            service.configure(enabled=enable)
+            if enable or disable
+            else (service.run() if run else service.status())
         )
         typer.echo(json.dumps(result, ensure_ascii=False))
     except Exception as error:
@@ -55,9 +57,12 @@ def agent_reconcile_hook_command() -> None:
         event = json.loads(raw)
         if (
             type(event) is not dict
-            or event.get("hook_event_name") not in {"SessionStart", "UserPromptSubmit", "PostToolUse", "Stop"}
-            or event.get("agent_id") is not None or event.get("agent_type") is not None
-            or type(event.get("session_id")) is not str or not event["session_id"]
+            or event.get("hook_event_name")
+            not in {"SessionStart", "UserPromptSubmit", "PostToolUse", "Stop"}
+            or event.get("agent_id") is not None
+            or event.get("agent_type") is not None
+            or type(event.get("session_id")) is not str
+            or not event["session_id"]
             or type(event.get("cwd")) is not str
         ):
             return
@@ -67,7 +72,7 @@ def agent_reconcile_hook_command() -> None:
         for candidate in (cwd, *cwd.parents):
             if (candidate / ".intent" / "config.yaml").is_file():
                 runtime = load_runtime(candidate)
-                CodeReconciliationService(runtime).run()
+                CodeReconciliationService(runtime).run(automatic=True)
                 break
             if (candidate / ".git").exists():
                 break

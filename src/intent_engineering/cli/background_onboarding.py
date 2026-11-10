@@ -93,7 +93,12 @@ def background_onboarding_command(
                         "checkpoint/resume without blocking the original work, and revalidate changed "
                         "inputs. Present consolidated issues only after graph assessment is ready. "
                         "Only after a current ready assessment, record intent background-onboarding "
-                        "--project . --finished and briefly summarize completion in this chat. If setup "
+                        "--project . --finished and briefly summarize completion in this chat. "
+                        "Explain that trusted async hooks now run separate read-only code-change "
+                        "reviews, using a signed-in current codex CLI on PATH. The user keeps working; "
+                        "findings are available with intent reconcile-code --project . and automatic "
+                        "reviews can be disabled with --disable. External-editor changes are detected "
+                        "at the next hook event. Never enable or trust hooks on the user's behalf. If setup "
                         "is deferred or cannot proceed, use --defer so the parent can remind after three "
                         "completed turns. Do not send messages to colleagues or alter source documents."
                     ),

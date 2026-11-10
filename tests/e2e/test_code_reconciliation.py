@@ -15,11 +15,16 @@ def test_cli_exposes_background_reconciliation_status_and_control(tmp_path):
         assert flag in result.output
 
 
-@pytest.mark.parametrize("event", [
-    None, {}, {"hook_event_name": "PermissionRequest"},
-    {"hook_event_name": "PostToolUse", "cwd": "/unrelated", "session_id": "chat"},
-    {"hook_event_name": "PostToolUse", "agent_id": "child"},
-])
+@pytest.mark.parametrize(
+    "event",
+    [
+        None,
+        {},
+        {"hook_event_name": "PermissionRequest"},
+        {"hook_event_name": "PostToolUse", "cwd": "/unrelated", "session_id": "chat"},
+        {"hook_event_name": "PostToolUse", "agent_id": "child"},
+    ],
+)
 def test_invalid_unrelated_or_subagent_hooks_are_silent(tmp_path, monkeypatch, event):
     monkeypatch.chdir(tmp_path)
     result = CliRunner().invoke(app, ["agent-reconcile-hook"], input=json.dumps(event))
@@ -38,15 +43,25 @@ def test_valid_hook_dispatches_for_the_enclosing_project_silently(tmp_path, monk
     monkeypatch.chdir(child)
     roots = []
 
-    def run(service):
+    def run(service, *, automatic=False):
+        assert automatic is True
         roots.append(service.runtime.root)
         return {"status": "running", "notify_user": False}
 
     monkeypatch.setattr(CodeReconciliationService, "run", run)
-    result = CliRunner().invoke(app, ["agent-reconcile-hook"], input=json.dumps({
-        "hook_event_name": "PostToolUse", "session_id": "chat",
-        "cwd": str(child), "tool_name": "apply_patch", "tool_input": {},
-    }))
+    result = CliRunner().invoke(
+        app,
+        ["agent-reconcile-hook"],
+        input=json.dumps(
+            {
+                "hook_event_name": "PostToolUse",
+                "session_id": "chat",
+                "cwd": str(child),
+                "tool_name": "apply_patch",
+                "tool_input": {},
+            }
+        ),
+    )
     assert result.exit_code == 0
     assert result.output == "{}\n"
     assert roots == [tmp_path]
@@ -59,12 +74,20 @@ def test_hook_worker_failure_has_no_warning_question_or_continuation(tmp_path, m
     initialize_project(tmp_path)
     monkeypatch.chdir(tmp_path)
 
-    def fail(service):
+    def fail(service, *, automatic=False):
         raise RuntimeError("PRIVATE runner error")
 
     monkeypatch.setattr(CodeReconciliationService, "run", fail)
-    result = CliRunner().invoke(app, ["agent-reconcile-hook"], input=json.dumps({
-        "hook_event_name": "Stop", "session_id": "chat", "cwd": str(tmp_path),
-    }))
+    result = CliRunner().invoke(
+        app,
+        ["agent-reconcile-hook"],
+        input=json.dumps(
+            {
+                "hook_event_name": "Stop",
+                "session_id": "chat",
+                "cwd": str(tmp_path),
+            }
+        ),
+    )
     assert result.exit_code == 0
     assert result.output == "{}\n"

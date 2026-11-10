@@ -122,7 +122,7 @@ manufacture it. Existing automation may still use `intent init --project .`,
 
 The validated advisory bundle installed above is `plugins/intent-advisor`. Open **Plugins
 Directory**, select **Intent Engineering Local**,
-enable `intent-advisor`, and review/trust its `UserPromptSubmit` and `Stop` hooks. The marketplace keeps the
+enable `intent-advisor`, and review/trust its bundled hooks. The marketplace keeps the
 bundle path explicit as `source.path: "./plugins/intent-advisor"`. The plugin MCP configuration
 intentionally omits `cwd`: on a local Codex host, `--project .` binds to the active repository's
 working directory. A remote executor must explicitly reproduce or configure that repository
@@ -293,8 +293,22 @@ proposal, reconciliation, or release controls.
 
 Initial reconciliation is available through `intent_initial_reconciliation` and
 `intent initial-reconciliation`. The host performs semantic review; the local service validates
-snapshot evidence, coverage, freshness and atomic publication. It does not launch a worker or
-claim coverage beyond the declared file scope. See the [quick start](docs/quick-start.md).
+snapshot evidence, coverage, freshness and atomic publication. After a completed assessment,
+trusted asynchronous hooks automatically run a separate read-only Codex review when code
+changes. Reviews coalesce overlapping events, checkpoint progress and flag evidence-backed
+gaps and recommended changes without editing assessed code or interrupting the user's task.
+Inspect findings with `intent reconcile-code --project .`; use `--disable` or `--enable` to
+control automatic reviews locally. A signed-in current `codex` CLI must be on `PATH`; reviews
+use its normal model usage. Missing runtime/authentication leaves work pending.
+
+Triggers are session start, prompt submission, tool completion and turn completion. Changes
+from other editors are detected at the next event; this is not an always-on filesystem watcher.
+Coverage includes the declared initial files and recognized nonignored source/config files
+under declared code directories, including additions and removals. Non-Git projects retain
+their exact declared file scope. Remote intent uses the latest captured source evidence;
+dirty or unreconciled sources wait for the existing host source-refresh workflow. Neither an
+idle hook nor a successful code review proves live provider freshness. See the
+[quick start](docs/quick-start.md#background-reconciliation-after-code-changes).
 
 Deferred follow-up work is explicitly not shipped or reachable: test-to-code matching,
 automatic activation beyond the existing reviewed governance boundaries, and the broader

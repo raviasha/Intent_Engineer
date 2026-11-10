@@ -693,6 +693,17 @@ service validates evidence and completeness, checkpoints progress and publishes 
 ChangeSet. The original user continues working. See
 `docs/superpowers/specs/2026-11-09-prd-consistency-check-design.md`.
 
+After a completed initial assessment, code changes trigger a separate read-only background
+review through trusted asynchronous Codex hooks. The foreground task continues. Coalesce
+overlapping events, retain checkpoints, include additions/removals within the declared code
+scope, and revalidate current files, graph, source state and access before publication. Flag
+gaps and recommended changes; never modify assessed code or interrupt the user. A missing
+review runtime, unreadable input or unfinished comparison stays pending/incomplete. Reviews
+use the latest captured intent; marked-dirty or unreconciled sources await host refresh.
+Hooks do not establish provider freshness. External-editor changes are detected at the next
+hook event; no always-on watcher is implied. See
+`docs/superpowers/specs/2026-11-10-code-change-reconciliation.md`.
+
 ### 17.1 Core agent queries
 
 Expose queries such as:

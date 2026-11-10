@@ -18,7 +18,12 @@ codex plugin add intent-advisor@intent-engineering-local
 ```
 
 Restart the ChatGPT desktop app after installing the plugin. Open **Plugins Directory**, select
-**Intent Engineering Local**, enable `intent-advisor`, and review and trust its prompt and completion hooks.
+**Intent Engineering Local**, enable `intent-advisor`, and review and trust its bundled hooks.
+The plugin supplies the hook definitions automatically; it cannot approve its own hooks.
+Use **Review hooks** or **Settings > Hooks** in the desktop app, or `/hooks` in the CLI.
+Changed hook scripts may require a new review. Install the local runtime and trust the hooks
+on each computer where you use this plugin; signing into the same account does not deploy
+local scripts. [Codex hook documentation](https://learn.chatgpt.com/docs/hooks).
 
 A wheel-only installation provides the CLI and MCP server, but not the Codex plugin assets:
 
@@ -104,6 +109,9 @@ finished. It takes the time needed, persists checkpoints and resumes in the same
 Your original work continues. The CLI and MCP tools store the assessment; they do not launch
 a worker on their own.
 
+Once that assessment is complete, the separate automatic worker described below handles
+subsequent code-change reviews when trusted hooks fire.
+
 The host inventories relevant files, reads actual behavior and checks source freshness. It
 then uses `intent_initial_reconciliation` with `action=start` to snapshot an explicit file
 scope and obtains evidence references and required comparisons. The CLI exposes the same service:
@@ -147,7 +155,56 @@ obsolete service-owned mappings within the assessed scope; unrelated mappings ar
 Existing issues are not automatically closed. Governed bootstrap activation likewise exposes
 the pending reconciliation step; activating a graph alone does not compare it with code.
 
-The old review UI is optional, for explicitly requested governed review or team operations:
+### Background reconciliation after code changes
+
+After the first completed assessment, trusted async hooks automatically compare changes
+against captured intent and requirements. The user continues working; hooks do not display
+warnings, ask questions, block tools or continue a stopped chat. Findings and recommended
+changes are stored as evidence-backed issues. Code, PRDs and source documents are not edited.
+
+Install a current Codex CLI on each machine and sign in normally. `codex` and `intent` must
+both be on the hook environment's `PATH`. Background reviews use Codex model usage, with
+no separate API key required for an existing ChatGPT CLI sign-in. The reviewer runs in a
+temporary snapshot directory under the read-only sandbox, with approval prompts, plugins,
+apps and hooks disabled. It uses the default Codex model configuration; custom user profiles
+and custom providers are not loaded into this isolated reviewer.
+
+```bash
+codex login status
+intent reconcile-code --project .           # status and current findings
+intent reconcile-code --project . --run     # run/resume a review manually
+intent reconcile-code --project . --disable # stop automatic reviews for this checkout
+intent reconcile-code --project . --enable  # allow reviews on subsequent hook events
+```
+
+Session start, prompt submission, tool completion and turn completion trigger checks.
+Changes made in another editor are picked up at the next hook event. No always-on filesystem
+watcher is installed. Repeated events share one worker, edits coalesce, and completed batches
+survive cancellation/restart. When files change during review, old results cannot publish;
+the worker reassesses the latest snapshot.
+
+Coverage starts with the initial assessment's declared files. In Git repositories, it also
+includes recognized nonignored source/config files under the declared code directories,
+including untracked additions, renames and removals. Other file formats need explicit
+inclusion in the initial assessment. Non-Git projects retain the exact declared files.
+Configured source exclusions apply; unsafe, unreadable, binary or oversized inputs leave
+the review pending. Bounds are 4,096 files, 1 MiB per file and 64 MiB of file content.
+
+The worker uses the latest captured intent evidence. It does not connect to Slack, Notion,
+Confluence or local source folders itself. Dirty, uninitialized or uninterpreted selections
+produce `awaiting_source_refresh`; the existing foreground source-refresh workflow supplies
+new evidence. A completed code review is not a claim that a remote provider has not changed.
+
+`ready_with_findings` contains the flagged gaps and recommendations. `retry_pending` means
+the runtime, authentication, input read or model response was unavailable; `incomplete`
+means semantic comparisons remain unknown. Check CLI installation/login and source access,
+then run/resume or allow a hook event after the one-minute failure cooldown to retry.
+Manual `--run` retries immediately. Hook cancellation retains checkpoints.
+Test-to-code tracing remains deferred; existing cases require explicit resolution.
+
+### Optional governed review
+
+The old review UI is available for explicitly requested governed review or team operations:
 
 ```bash
 intent dev --project . --offline

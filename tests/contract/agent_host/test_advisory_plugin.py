@@ -215,7 +215,7 @@ def test_advisory_plugin_declares_official_prompt_hook_and_repository_mcp() -> N
 
     assert manifest == {
         "name": "intent-advisor",
-        "version": "0.1.6",
+        "version": "0.1.7",
         "description": "Refresh selected sources and maintain relevant intent during development.",
         "author": {"name": "Intent Engineering"},
         "skills": "./skills/",
@@ -233,7 +233,13 @@ def test_advisory_plugin_declares_official_prompt_hook_and_repository_mcp() -> N
         },
         "mcpServers": "./.mcp.json",
     }
-    assert hooks == {
+    background_hook = {
+        "type": "command",
+        "command": "${PLUGIN_ROOT}/scripts/reconcile-hook",
+        "async": True,
+        "timeout": 86400,
+    }
+    foreground_hooks = {
         "hooks": {
             "UserPromptSubmit": [
                 {
@@ -261,6 +267,10 @@ def test_advisory_plugin_declares_official_prompt_hook_and_repository_mcp() -> N
             ],
         }
     }
+    for event in ("SessionStart", "UserPromptSubmit", "PostToolUse", "Stop"):
+        foreground_hooks["hooks"].setdefault(event, []).append({"hooks": [background_hook]})
+    assert hooks == foreground_hooks
+    assert os.access(PLUGIN_ROOT / "scripts" / "reconcile-hook", os.X_OK)
     assert mcp == {
         "mcpServers": {
             "intent_advisor": {
