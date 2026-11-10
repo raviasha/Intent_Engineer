@@ -275,8 +275,16 @@ def test_advisory_plugin_declares_official_prompt_hook_and_repository_mcp() -> N
     assert mcp == {
         "mcpServers": {
             "intent_advisor": {
-                "command": "${PLUGIN_ROOT}/scripts/intent",
-                "args": ["mcp", "--project", "."],
+                "command": "/bin/sh",
+                "args": [
+                    "-c",
+                    'exec "${CODEX_HOME:-$HOME/.codex}/plugins/cache/intent-engineering-local/intent-advisor/0.1.8/scripts/intent" "$@"',
+                    "intent-advisor",
+                    "mcp",
+                    "--project",
+                    ".",
+                ],
+                "env_vars": ["CODEX_HOME"],
             }
         }
     }
@@ -723,7 +731,11 @@ def test_plugin_configured_mcp_missing_project_is_protocol_clean(tmp_path: Path)
     project = tmp_path / "project"
     project.mkdir()
     mcp = json.loads((PLUGIN_ROOT / ".mcp.json").read_bytes())["mcpServers"]["intent_advisor"]
-    executable = mcp["command"].replace("${PLUGIN_ROOT}", str(PLUGIN_ROOT))
+    executable = mcp["command"]
+    profile = tmp_path / "codex-profile"
+    cache = profile / "plugins/cache/intent-engineering-local/intent-advisor/0.1.8"
+    cache.parent.mkdir(parents=True)
+    cache.symlink_to(PLUGIN_ROOT, target_is_directory=True)
 
     completed = subprocess.run(
         [str(executable), *mcp["args"]],
@@ -733,6 +745,7 @@ def test_plugin_configured_mcp_missing_project_is_protocol_clean(tmp_path: Path)
             "LC_ALL": "C.UTF-8",
             "PATH": "/usr/bin:/bin",
             "INTENT_DEVELOPMENT_PYTHON": sys.executable,
+            "CODEX_HOME": str(profile),
         },
         capture_output=True,
         check=False,

@@ -98,6 +98,7 @@ jobs:
             git worktree add --detach publish-tree HEAD
             git -C publish-tree switch --orphan marketplace-initial
           fi
+          python scripts/plugin_distribution.py check-upgrade --inputs publish-tree --output distribution
           rsync -a --delete --exclude=.git distribution/ publish-tree/
           git -C publish-tree config user.name 'github-actions[bot]'
           git -C publish-tree config user.email '41898282+github-actions[bot]@users.noreply.github.com'

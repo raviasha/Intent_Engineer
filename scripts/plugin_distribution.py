@@ -58,12 +58,40 @@ def verify_files(root: Path, expected: dict) -> None:
         raise ValueError("package integrity mismatch")
 
 
+def materialize_symlinks(root: Path) -> None:
+    """Codex's plugin cache copier omits symlinks; distribute actual runtime files."""
+    file_manifest(root)  # Reject escaping links before dereferencing anything.
+    for path in list(root.rglob("*")):
+        if path.is_symlink():
+            target = path.resolve(strict=True)
+            path.unlink()
+            if target.is_dir():
+                shutil.copytree(target, path)
+            else:
+                shutil.copy2(target, path)
+
+
 def native_target() -> str:
     system = {"Darwin": "macos", "Linux": "linux"}.get(platform.system(), "unsupported")
     arch = {"aarch64": "arm64", "arm64": "arm64", "x86_64": "x86_64"}.get(
         platform.machine(), "unsupported"
     )
     return f"{system}-{arch}"
+
+
+def check_upgrade(current: Path, incoming: Path) -> None:
+    old = current / "plugins/intent-advisor"
+    new = incoming / "plugins/intent-advisor"
+    if not (old / "distribution.json").exists():
+        return
+    old_version = json.loads((old / ".codex-plugin/plugin.json").read_text())["version"]
+    new_version = json.loads((new / ".codex-plugin/plugin.json").read_text())["version"]
+    old_source = json.loads((old / "distribution.json").read_text())["source_revision"]
+    new_source = json.loads((new / "distribution.json").read_text())["source_revision"]
+    if old_version == new_version and old_source == new_source:
+        return
+    if tuple(map(int, new_version.split("."))) <= tuple(map(int, old_version.split("."))):
+        raise ValueError("changed release requires a newer plugin version")
 
 
 def build(target: str, output: Path, revision: str) -> None:
@@ -139,6 +167,8 @@ def build(target: str, output: Path, revision: str) -> None:
     for path in runtime.rglob("direct_url.json"):
         path.unlink()
     shutil.copy2(ROOT / "LICENSE", package / "LICENSE")
+    shutil.copytree(ROOT / "packaging/python-licenses", package / "python-licenses")
+    materialize_symlinks(runtime)
     shutil.copy2(ROOT / "packaging/runtime.lock", package / "runtime.lock")
     info = {
         "source_revision": revision,
@@ -208,7 +238,7 @@ def assemble(inputs: Path, output: Path, revision: str) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=["build", "assemble", "verify"])
+    parser.add_argument("action", choices=["build", "assemble", "verify", "check-upgrade"])
     parser.add_argument("--target", choices=TARGETS)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--inputs", type=Path)
@@ -218,6 +248,8 @@ def main() -> None:
         build(args.target, args.output.resolve(), args.revision)
     elif args.action == "assemble":
         assemble(args.inputs.resolve(), args.output.resolve(), args.revision)
+    elif args.action == "check-upgrade":
+        check_upgrade(args.inputs.resolve(), args.output.resolve())
     else:
         root = args.output
         package = root / "plugin" if (root / "plugin").exists() else root / "plugins/intent-advisor"

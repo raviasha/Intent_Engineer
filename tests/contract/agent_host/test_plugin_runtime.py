@@ -142,3 +142,51 @@ def test_host_hook_command_handles_plugin_path_with_spaces(tmp_path):
     )
     assert result.returncode == 0, result.stderr
     assert "hookSpecificOutput" in json.loads(result.stdout)
+
+
+def test_background_python_child_does_not_mutate_imported_package(tmp_path, monkeypatch):
+    from intent_engineering.cli import dev
+
+    module = tmp_path / "packaged_module.py"
+    module.write_text("value = 42\n")
+    monkeypatch.setattr(
+        dev,
+        "_BACKGROUND_ENTRYPOINT",
+        "import sys; sys.path.insert(0, sys.argv[2]); import packaged_module",
+    )
+    subprocess.run(
+        dev._background_argv(tmp_path),
+        env=dev._background_environment(),
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+    )
+    assert not list(tmp_path.rglob("*.pyc"))
+
+
+def test_mcp_configuration_runs_from_codex_cache_without_host_placeholder_expansion(tmp_path):
+    import json
+
+    server = json.loads((PLUGIN / ".mcp.json").read_text())["mcpServers"]["intent_advisor"]
+    version = json.loads((PLUGIN / ".codex-plugin/plugin.json").read_text())["version"]
+    profile = tmp_path / "Codex profile"
+    launcher = (
+        profile
+        / "plugins/cache/intent-engineering-local/intent-advisor"
+        / version
+        / "scripts/intent"
+    )
+    launcher.parent.mkdir(parents=True)
+    launcher.write_text('#!/bin/sh\nprintf "%s\\n" "$PWD" "$@"\n')
+    launcher.chmod(0o755)
+    assert Path(server["command"]).is_absolute(), "legacy MCP does not expand PLUGIN_ROOT"
+    result = subprocess.run(
+        [server["command"], *server["args"]],
+        cwd=tmp_path,
+        env={"PATH": "/usr/bin:/bin", "CODEX_HOME": str(profile)},
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+    assert result.stdout.splitlines() == [str(tmp_path), "mcp", "--project", "."]
+    assert "CODEX_HOME" in server["env_vars"]

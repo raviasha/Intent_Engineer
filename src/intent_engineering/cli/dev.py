@@ -1508,6 +1508,7 @@ def _background_argv(root: Path) -> tuple[str, ...]:
     source_root = Path(__file__).resolve().parents[2]
     return (
         sys.executable,
+        "-B",
         "-I",
         "-c",
         _BACKGROUND_ENTRYPOINT,

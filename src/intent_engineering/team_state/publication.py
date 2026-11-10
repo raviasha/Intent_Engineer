@@ -745,6 +745,7 @@ class TemporaryWorktreePublisher:
             os.set_inheritable(status_write, True)
             argv = (
                 sys.executable,
+                "-B",
                 "-I",
                 "-S",
                 "-c",

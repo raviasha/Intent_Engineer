@@ -1279,6 +1279,7 @@ def _run_bounded_fetch_git(arguments: tuple[str, ...]) -> None:
         os.set_inheritable(status_write, True)
         argv = (
             sys.executable,
+            "-B",
             "-I",
             "-S",
             "-c",

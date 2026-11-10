@@ -126,6 +126,7 @@ def fetch_proposed_revision(root: Path, request: ProtectedRequest, token: str) -
     process = subprocess.Popen(
         [
             sys.executable,
+            "-B",
             "-I",
             "-S",
             "-c",

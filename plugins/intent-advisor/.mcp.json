@@ -1,11 +1,17 @@
 {
   "mcpServers": {
     "intent_advisor": {
-      "command": "${PLUGIN_ROOT}/scripts/intent",
+      "command": "/bin/sh",
       "args": [
+        "-c",
+        "exec \"${CODEX_HOME:-$HOME/.codex}/plugins/cache/intent-engineering-local/intent-advisor/0.1.8/scripts/intent\" \"$@\"",
+        "intent-advisor",
         "mcp",
         "--project",
         "."
+      ],
+      "env_vars": [
+        "CODEX_HOME"
       ]
     }
   }

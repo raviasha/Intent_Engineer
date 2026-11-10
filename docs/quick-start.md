@@ -22,6 +22,9 @@ In the desktop plugin directory, choose **Intent Engineering Local** and install
 if it has not loaded the new plugin. Review and trust the bundled hooks under
 **Review hooks** or **Settings > Hooks**, or use `/hooks` in the CLI.
 
+The marketplace name and versioned cache layout are part of the launcher contract; use the
+registration command above rather than renaming the marketplace.
+
 The reviewer uses Codex from the host's PATH, with a fallback to the ChatGPT macOS app's
 bundled executable. Use the signed-in Codex host; there is no separate Intent account.
 If the host executable cannot be found, reconciliation remains pending instead of claiming

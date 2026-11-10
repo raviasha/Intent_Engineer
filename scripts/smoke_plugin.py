@@ -182,6 +182,12 @@ def smoke(plugin: Path) -> None:
             assert result["status"] == "ready_with_findings", result
             assert result["notify_user"] is False
             assert (project / "app.py").read_text() == changed
+            from intent_engineering.cli.dev import _start_or_reuse_background_service
+            from intent_engineering.intent_workflow.check import SharedStateRestoreStatus
+
+            assert _start_or_reuse_background_service(
+                project, SharedStateRestoreStatus.NOT_REQUIRED
+            )
             anyio.run(check_mcp, launcher, project, environment)
             event = {
                 "hook_event_name": "UserPromptSubmit",
@@ -189,17 +195,22 @@ def smoke(plugin: Path) -> None:
                 "turn_id": "smoke-turn",
                 "cwd": str(project),
                 "prompt": "Format README",
+                "transcript_path": None,
+                "model": "test",
+                "permission_mode": "default",
             }
             result = subprocess.run(
                 [str(plugin / "scripts/prompt-hook")],
                 input=json.dumps(event).encode(),
-                cwd=root,
+                cwd=project,
                 env=environment,
                 capture_output=True,
                 check=True,
                 timeout=20,
             )
-            assert "hookSpecificOutput" in json.loads(result.stdout)
+            context = json.loads(result.stdout)["hookSpecificOutput"]["additionalContext"]
+            assert "unavailable" not in context.lower(), context
+            assert "intent_background_refresh" in context, context
         finally:
             runtime.close()
             for metadata in project.rglob("control-plane.json"):

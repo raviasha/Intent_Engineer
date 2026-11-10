@@ -95,3 +95,42 @@ def test_assembly_combines_only_matching_verified_platforms(tmp_path):
     mod.verify_files(package, json.loads((tmp_path / "release/manifest.json").read_text()))
     with pytest.raises(ValueError, match="revision"):
         mod.assemble(inputs, tmp_path / "wrong-source", "b" * 40)
+
+
+def test_runtime_symlinks_become_regular_files_for_codex_installation(tmp_path):
+    mod = distribution()
+    real = tmp_path / "python3.12"
+    real.write_text("executable content")
+    real.chmod(0o755)
+    alias = tmp_path / "python3"
+    alias.symlink_to("python3.12")
+    convert = getattr(mod, "materialize_symlinks", None)
+    assert convert is not None, "Codex installer drops symlinks; release must materialize them"
+    convert(tmp_path)
+    assert alias.is_file() and not alias.is_symlink()
+    assert alias.read_text() == "executable content"
+    assert alias.stat().st_mode & 0o111
+
+
+def test_publication_requires_version_bump_for_changed_source(tmp_path):
+    import json
+
+    mod = distribution()
+    old = tmp_path / "old"
+    new = tmp_path / "new"
+    for root, revision in ((old, "a" * 40), (new, "b" * 40)):
+        plugin = root / "plugins/intent-advisor"
+        (plugin / ".codex-plugin").mkdir(parents=True)
+        (plugin / ".codex-plugin/plugin.json").write_text(json.dumps({"version": "0.1.8"}))
+        (plugin / "distribution.json").write_text(json.dumps({"source_revision": revision}))
+    check = getattr(mod, "check_upgrade", None)
+    assert check is not None, "changed source must not reuse an installed plugin version"
+    with pytest.raises(ValueError, match="version"):
+        check(old, new)
+    (new / "plugins/intent-advisor/.codex-plugin/plugin.json").write_text(
+        json.dumps({"version": "0.1.9"})
+    )
+    check(old, new)
+    check(new, new)
+    with pytest.raises(ValueError, match="version"):
+        check(new, old)
