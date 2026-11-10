@@ -134,3 +134,17 @@ def test_publication_requires_version_bump_for_changed_source(tmp_path):
     check(new, new)
     with pytest.raises(ValueError, match="version"):
         check(new, old)
+
+
+@pytest.mark.parametrize("target", ("macos-arm64", "macos-x86_64", "linux-x86_64"))
+def test_only_intel_cbor_may_build_from_hash_locked_source(target):
+    mod = distribution()
+    argv = mod.dependency_install_argv(Path("/bundled/python"), target)
+    assert "--require-hashes" in argv
+    assert "--only-binary=:all:" in argv
+    assert ("--no-binary=cbor2" in argv) == (target == "macos-x86_64")
+    if target == "macos-x86_64":
+        assert "--build-constraint" in argv
+        constraints = Path(argv[argv.index("--build-constraint") + 1]).read_text()
+        assert "setuptools-rust==" in constraints
+        assert "setuptools_scm==" in constraints

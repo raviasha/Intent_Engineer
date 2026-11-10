@@ -44,9 +44,13 @@ jobs:
         with:
           python-version: '3.12'
       - run: python -m pip install 'hatchling==1.27.0'
+      - name: Prepare pinned Intel-only source build toolchain
+        if: matrix.target == 'macos-x86_64'
+        run: rustup toolchain install 1.93.0 --profile minimal
       - name: Build pinned native runtime
         env:
           TARGET: ${{ matrix.target }}
+          RUSTUP_TOOLCHAIN: 1.93.0
           REVISION: ${{ github.sha }}
         run: python scripts/plugin_distribution.py build --target "$TARGET" --revision "$REVISION" --output native
       - name: Relocate and test without external Python or intent

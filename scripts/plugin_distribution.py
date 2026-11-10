@@ -94,6 +94,28 @@ def check_upgrade(current: Path, incoming: Path) -> None:
         raise ValueError("changed release requires a newer plugin version")
 
 
+def dependency_install_argv(python: Path, target: str) -> list[str]:
+    argv = [
+        str(python),
+        "-I",
+        "-m",
+        "pip",
+        "install",
+        "--disable-pip-version-check",
+        "--require-hashes",
+        "--only-binary=:all:",
+    ]
+    if target == "macos-x86_64":
+        # Upstream publishes no Intel macOS wheel for the pinned cbor2 release.
+        # Compile only this hash-verified source on the release runner.
+        argv += [
+            "--no-binary=cbor2",
+            "--build-constraint",
+            str(ROOT / "packaging/build-constraints.txt"),
+        ]
+    return argv + ["-r", str(ROOT / "packaging/runtime.lock")]
+
+
 def build(target: str, output: Path, revision: str) -> None:
     if target != native_target() or target not in TARGETS:
         raise ValueError("build must run on its native supported platform")
@@ -118,21 +140,7 @@ def build(target: str, output: Path, revision: str) -> None:
             shutil.copyfileobj(response, stream)
         extract_verified(archive, source["sha256"], runtime)
         python = runtime / "python/bin/python3"
-        subprocess.run(
-            [
-                str(python),
-                "-I",
-                "-m",
-                "pip",
-                "install",
-                "--disable-pip-version-check",
-                "--require-hashes",
-                "--only-binary=:all:",
-                "-r",
-                str(ROOT / "packaging/runtime.lock"),
-            ],
-            check=True,
-        )
+        subprocess.run(dependency_install_argv(python, target), check=True)
         subprocess.run(
             [
                 sys.executable,
@@ -170,6 +178,7 @@ def build(target: str, output: Path, revision: str) -> None:
     shutil.copytree(ROOT / "packaging/python-licenses", package / "python-licenses")
     materialize_symlinks(runtime)
     shutil.copy2(ROOT / "packaging/runtime.lock", package / "runtime.lock")
+    shutil.copy2(ROOT / "packaging/build-constraints.txt", package / "build-constraints.txt")
     info = {
         "source_revision": revision,
         "target": target,
