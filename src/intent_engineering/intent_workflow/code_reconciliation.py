@@ -146,13 +146,15 @@ class CodeReconciliationService:
     def _target(self) -> SecureFile:
         project = self.runtime.project_directory
         key = _digest([str(project.path), project.identity])
+        with closing(SecureDirectory.open(self._state_root(), create=True)) as directory:
+            return directory.file(key + ".json")
+
+    @staticmethod
+    def _state_root() -> Path:
         root = Path(os.environ.get("XDG_STATE_HOME", str(Path.home() / ".local/state")))
         if not root.is_absolute():
             raise ValueError("background state unavailable")
-        with closing(
-            SecureDirectory.open(root / "intent-engineering" / "code-reconciliation", create=True)
-        ) as directory:
-            return directory.file(key + ".json")
+        return root / "intent-engineering" / "code-reconciliation"
 
     @staticmethod
     def _load(target: SecureFile) -> _Job:
@@ -215,6 +217,13 @@ class CodeReconciliationService:
 
     def _excluded(self, path: str) -> bool:
         p = PurePosixPath(path)
+        # XDG_STATE_HOME may intentionally live inside a checkout. Our own job
+        # updates must never become code candidates or recursively trigger review.
+        cache = self._state_root()
+        if cache.is_relative_to(self.runtime.root):
+            relative_cache = PurePosixPath(cache.relative_to(self.runtime.root).as_posix())
+            if p == relative_cache or relative_cache in p.parents:
+                return True
         return bool(set(p.parts) & _PRIVATE_PARTS) or any(
             p.match(pattern) or fnmatchcase(path, pattern)
             for pattern in self.runtime.config.source_exclusions

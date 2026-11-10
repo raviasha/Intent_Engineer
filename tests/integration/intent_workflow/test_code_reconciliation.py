@@ -325,3 +325,13 @@ def test_unrelated_graph_mutation_cannot_leave_completed_signature_stuck_pending
     assert service.status()["status"] == "pending"
     assert service.run()["status"] == "ready_with_findings"
     assert reviewer.calls
+
+
+def test_checkout_local_state_directory_cannot_trigger_its_own_reviews(ready):
+    git_project(ready)
+    (ready.root / ".gitignore").write_text(".intent/\n")
+    service = worker(ready)
+    service.configure(enabled=True)
+    snapshot = service._snapshot()
+    assert {f.path for f in snapshot.files} == {"app.py", "prd.md"}
+    assert service.run()["status"] == "ready"
