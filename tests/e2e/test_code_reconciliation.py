@@ -3,16 +3,18 @@
 import json
 
 import pytest
+from click import unstyle
 from typer.testing import CliRunner
 
 from intent_engineering.cli.app import app
 
 
-def test_cli_exposes_background_reconciliation_status_and_control(tmp_path):
-    result = CliRunner().invoke(app, ["reconcile-code", "--help"])
+@pytest.mark.parametrize("color", [False, True])
+def test_cli_exposes_background_reconciliation_status_and_control(color):
+    result = CliRunner().invoke(app, ["reconcile-code", "--help"], color=color)
     assert result.exit_code == 0
     for flag in ("--run", "--enable", "--disable", "--project"):
-        assert flag in result.output
+        assert flag in unstyle(result.output)
 
 
 @pytest.mark.parametrize(
