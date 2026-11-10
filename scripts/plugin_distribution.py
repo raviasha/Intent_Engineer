@@ -34,7 +34,28 @@ def extract_verified(archive: Path, expected: str, destination: Path) -> None:
         source.extractall(destination, filter="data")
 
 
+def verify_portable_paths(paths) -> None:
+    seen = {}
+    for relative in paths:
+        parts = Path(relative).parts
+        for end in range(1, len(parts) + 1):
+            prefix = "/".join(parts[:end])
+            folded = prefix.casefold()
+            previous = seen.setdefault(folded, prefix)
+            if previous != prefix:
+                raise ValueError(f"case-colliding package paths: {previous}, {prefix}")
+
+
+def remove_terminal_database(runtime: Path) -> None:
+    # The CLI uses Rich, not curses. Linux terminfo has case-colliding names
+    # that Git cannot check out faithfully on default macOS filesystems.
+    database = runtime / "python/share/terminfo"
+    if database.exists():
+        shutil.rmtree(database)
+
+
 def file_manifest(root: Path) -> dict:
+    verify_portable_paths(path.relative_to(root).as_posix() for path in root.rglob("*"))
     result = {}
     for path in sorted(root.rglob("*")):
         relative = path.relative_to(root).as_posix()
@@ -223,6 +244,7 @@ def build(target: str, output: Path, revision: str) -> None:
         package / "python-licenses/openssl-static-LICENSE.txt",
     )
     shutil.copy2(ROOT / "packaging/openssl-source.json", package / "openssl-source.json")
+    remove_terminal_database(runtime)
     materialize_symlinks(runtime)
     shutil.copy2(ROOT / "packaging/runtime.lock", package / "runtime.lock")
     shutil.copy2(ROOT / "packaging/build-constraints.txt", package / "build-constraints.txt")

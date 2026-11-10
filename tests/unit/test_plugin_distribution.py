@@ -174,3 +174,21 @@ def test_publication_waits_for_ci_and_all_platforms():
     )
     assert set(workflow["jobs"]["publish"]["needs"]) == {"source-check", "build"}
     assert "needs" not in workflow["jobs"]["build"]
+
+
+@pytest.mark.parametrize("paths", [("A", "a"), ("lib/Module.py", "lib/module.py")])
+def test_distribution_rejects_case_colliding_paths(paths):
+    with pytest.raises(ValueError, match="case-colliding"):
+        distribution().verify_portable_paths(paths)
+
+
+def test_unused_terminal_database_removed_without_touching_python(tmp_path):
+    database = tmp_path / "python/share/terminfo"
+    database.mkdir(parents=True)
+    (database / "unused").write_text("terminal data")
+    library = tmp_path / "python/lib"
+    library.mkdir()
+    (library / "keep.py").write_text("python runtime")
+    distribution().remove_terminal_database(tmp_path)
+    assert not database.exists()
+    assert (library / "keep.py").read_text() == "python runtime"
