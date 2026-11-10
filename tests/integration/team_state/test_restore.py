@@ -1070,8 +1070,9 @@ def test_fixed_ref_fetch_is_argv_only_bounded_and_credential_free(
     kwargs = calls["kwargs"]
     assert type(argv) is tuple
     assert type(kwargs) is dict
-    assert argv[:5] == (
+    assert argv[:6] == (
         sys.executable,
+        "-B",
         "-I",
         "-S",
         "-c",
