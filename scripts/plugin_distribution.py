@@ -106,14 +106,53 @@ def dependency_install_argv(python: Path, target: str) -> list[str]:
         "--only-binary=:all:",
     ]
     if target == "macos-x86_64":
-        # Upstream publishes no Intel macOS wheel for the pinned cbor2 release.
+        # Upstream publishes no Intel macOS wheel for these pinned releases.
         # Compile only this hash-verified source on the release runner.
         argv += [
-            "--no-binary=cbor2",
+            "--no-binary=cbor2,cryptography",
             "--build-constraint",
             str(ROOT / "packaging/build-constraints.txt"),
         ]
     return argv + ["-r", str(ROOT / "packaging/runtime.lock")]
+
+
+def prepare_static_openssl(temp_root: Path) -> dict[str, str]:
+    source = json.loads((ROOT / "packaging/openssl-source.json").read_text())
+    archive = temp_root / "openssl.tar.gz"
+    with (
+        urllib.request.urlopen(source["url"], timeout=120) as response,
+        archive.open("wb") as stream,
+    ):
+        shutil.copyfileobj(response, stream)
+    extracted = temp_root / "openssl-source"
+    extract_verified(archive, source["sha256"], extracted)
+    work = extracted / f"openssl-{source['version']}"
+    prefix = temp_root / "openssl-static"
+    subprocess.run(
+        [
+            "./Configure",
+            "darwin64-x86_64-cc",
+            "no-shared",
+            "no-module",
+            "no-tests",
+            f"--prefix={prefix}",
+            "--libdir=lib",
+        ],
+        cwd=work,
+        check=True,
+    )
+    subprocess.run(["make", "-j4"], cwd=work, check=True)
+    subprocess.run(["make", "install_sw"], cwd=work, check=True)
+    return {**os.environ, "OPENSSL_DIR": str(prefix), "OPENSSL_STATIC": "1"}
+
+
+def verify_macos_links(runtime: Path) -> None:
+    for extension in runtime.rglob("*.so"):
+        linked = subprocess.check_output(["otool", "-L", str(extension)], text=True)
+        for line in linked.splitlines()[1:]:
+            dependency = line.strip().split(" (", 1)[0]
+            if not dependency.startswith(("@", "/usr/lib/", "/System/Library/")):
+                raise ValueError(f"external native dependency: {extension.name}: {dependency}")
 
 
 def build(target: str, output: Path, revision: str) -> None:
@@ -140,7 +179,10 @@ def build(target: str, output: Path, revision: str) -> None:
             shutil.copyfileobj(response, stream)
         extract_verified(archive, source["sha256"], runtime)
         python = runtime / "python/bin/python3"
-        subprocess.run(dependency_install_argv(python, target), check=True)
+        build_env = prepare_static_openssl(temp_root) if target == "macos-x86_64" else None
+        subprocess.run(dependency_install_argv(python, target), check=True, env=build_env)
+        if target == "macos-x86_64":
+            verify_macos_links(runtime)
         subprocess.run(
             [
                 sys.executable,
@@ -176,6 +218,11 @@ def build(target: str, output: Path, revision: str) -> None:
         path.unlink()
     shutil.copy2(ROOT / "LICENSE", package / "LICENSE")
     shutil.copytree(ROOT / "packaging/python-licenses", package / "python-licenses")
+    shutil.copy2(
+        ROOT / "packaging/openssl-LICENSE.txt",
+        package / "python-licenses/openssl-static-LICENSE.txt",
+    )
+    shutil.copy2(ROOT / "packaging/openssl-source.json", package / "openssl-source.json")
     materialize_symlinks(runtime)
     shutil.copy2(ROOT / "packaging/runtime.lock", package / "runtime.lock")
     shutil.copy2(ROOT / "packaging/build-constraints.txt", package / "build-constraints.txt")

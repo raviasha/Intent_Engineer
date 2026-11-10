@@ -24,9 +24,15 @@ jobs:
         run: |
           test "$REF" = refs/heads/main
           test "$(gh api "repos/$REPOSITORY/commits/main" --jq .sha)" = "$REVISION"
-          gh api "repos/$REPOSITORY/actions/workflows/ci.yml/runs?head_sha=$REVISION&status=success" --jq '.workflow_runs | length' | awk '$1 > 0 {ok=1} END {exit !ok}'
+          for attempt in $(seq 1 80); do
+            result=$(gh api "repos/$REPOSITORY/actions/workflows/ci.yml/runs?head_sha=$REVISION" --jq '.workflow_runs[0] | [.status, (.conclusion // "")] | join(":")')
+            if [ "$result" = "completed:success" ]; then exit 0; fi
+            case "$result" in completed:*) echo "Source CI failed: $result"; exit 1 ;; esac
+            sleep 15
+          done
+          echo "Timed out waiting for source CI"
+          exit 1
   build:
-    needs: source-check
     strategy:
       fail-fast: false
       matrix:
@@ -67,7 +73,7 @@ jobs:
           path: ${{ matrix.target }}.tar.gz
           retention-days: 7
   publish:
-    needs: build
+    needs: [source-check, build]
     runs-on: ubuntu-22.04
     permissions:
       contents: write

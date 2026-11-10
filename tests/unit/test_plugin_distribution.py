@@ -137,14 +137,40 @@ def test_publication_requires_version_bump_for_changed_source(tmp_path):
 
 
 @pytest.mark.parametrize("target", ("macos-arm64", "macos-x86_64", "linux-x86_64"))
-def test_only_intel_cbor_may_build_from_hash_locked_source(target):
+def test_only_intel_missing_wheels_may_build_from_hash_locked_source(target):
     mod = distribution()
     argv = mod.dependency_install_argv(Path("/bundled/python"), target)
     assert "--require-hashes" in argv
     assert "--only-binary=:all:" in argv
-    assert ("--no-binary=cbor2" in argv) == (target == "macos-x86_64")
+    assert ("--no-binary=cbor2,cryptography" in argv) == (target == "macos-x86_64")
     if target == "macos-x86_64":
         assert "--build-constraint" in argv
         constraints = Path(argv[argv.index("--build-constraint") + 1]).read_text()
         assert "setuptools-rust==" in constraints
         assert "setuptools_scm==" in constraints
+
+
+@pytest.mark.parametrize(
+    "library", ["/usr/local/opt/openssl/lib/libssl.dylib", "/tmp/build/libcrypto.dylib"]
+)
+def test_intel_extensions_cannot_link_to_build_host_libraries(tmp_path, monkeypatch, library):
+    mod = distribution()
+    extension = tmp_path / "native.so"
+    extension.write_bytes(b"fixture")
+    monkeypatch.setattr(
+        mod.subprocess,
+        "check_output",
+        lambda *a, **k: f"native.so:\n\t{library} (compatibility version 1.0.0)\n",
+    )
+    with pytest.raises(ValueError, match="external native dependency"):
+        mod.verify_macos_links(tmp_path)
+
+
+def test_publication_waits_for_ci_and_all_platforms():
+    import yaml
+
+    workflow = yaml.safe_load(
+        (SCRIPT.parents[1] / ".github/workflows/plugin-marketplace.yml").read_text()
+    )
+    assert set(workflow["jobs"]["publish"]["needs"]) == {"source-check", "build"}
+    assert "needs" not in workflow["jobs"]["build"]
