@@ -1,10 +1,10 @@
 {
   ".codex-plugin/plugin.json": {
-    "sha256": "1747dd74ea361dfae7a227837e28a176378d83fae402b3f0bd2be9720d53e673",
+    "sha256": "e9c05b934d2d7857a3f1dd8829155aff71a33a50e7cf00c689d0ac4e3f5b588f",
     "executable": 0
   },
   ".mcp.json": {
-    "sha256": "b539d108933929e658248a52fde498eaf54b2f43ea2c72e64373995cbc719feb",
+    "sha256": "65429c6c5c539f7454bf53c0f2df9c7bb51e225b707df9c2f6d9df59965a3072",
     "executable": 0
   },
   "LICENSE": {
@@ -16,7 +16,7 @@
     "executable": 0
   },
   "distribution.json": {
-    "sha256": "c117d00cd52880e73d775675f17c815a56b9b7162eb499d7d3ad32227b8b88f2",
+    "sha256": "098e57b4e53ca25ab5a57f913e2bd2664019c63bc2a0688b45ddb095f2803359",
     "executable": 0
   },
   "hooks/hooks.json": {
@@ -5652,7 +5652,7 @@
     "executable": 0
   },
   "runtime/linux-x86_64/python/lib/python3.12/site-packages/intent_engineering/cli/background_onboarding.py": {
-    "sha256": "93c19a0a2df505f48d384f87e99bbbdd13c4f28b51dfb3ea0a7a0d38cb9b6a4a",
+    "sha256": "1f4025077ee8a22307c9a85f3eafe1b4a7a8105e1860aafaaeec794479a35f51",
     "executable": 0
   },
   "runtime/linux-x86_64/python/lib/python3.12/site-packages/intent_engineering/cli/background_sources.py": {
@@ -5692,7 +5692,7 @@
     "executable": 0
   },
   "runtime/linux-x86_64/python/lib/python3.12/site-packages/intent_engineering/cli/onboarding_hooks.py": {
-    "sha256": "5d0255abf94e933209c2fbf49cd60941f93758a86fdc82d121e8b7435fb6ee50",
+    "sha256": "4c9fdb9c97c94bf603da0c0c66f2c1eeec6cea478835df1ddc0a4a319f654718",
     "executable": 0
   },
   "runtime/linux-x86_64/python/lib/python3.12/site-packages/intent_engineering/cli/output.py": {
@@ -5920,7 +5920,7 @@
     "executable": 0
   },
   "runtime/linux-x86_64/python/lib/python3.12/site-packages/intent_engineering/integrations/mcp_server/background.py": {
-    "sha256": "91c7b45cc9e52d080592d28a019dcae48b0d223519ee18c522d3bc909acb3471",
+    "sha256": "573a47637b133d30a03273212297f0c2a3201858483e9583f6c717f059715e9c",
     "executable": 0
   },
   "runtime/linux-x86_64/python/lib/python3.12/site-packages/intent_engineering/integrations/mcp_server/intent_workflow.py": {
@@ -6036,7 +6036,7 @@
     "executable": 0
   },
   "runtime/linux-x86_64/python/lib/python3.12/site-packages/intent_engineering/intent_workflow/intent_monitor.py": {
-    "sha256": "cfdb5852ca106b236f054fe1e180d77a928e3a1e37e3de5c36b7eef7283d5047",
+    "sha256": "c6fce1e59b1182e1313b0ca0b5dadea8c76b78196ffabd452a29a213f762f5c5",
     "executable": 0
   },
   "runtime/linux-x86_64/python/lib/python3.12/site-packages/intent_engineering/intent_workflow/models.py": {
@@ -6080,7 +6080,7 @@
     "executable": 0
   },
   "runtime/linux-x86_64/python/lib/python3.12/site-packages/intent_engineering/intent_workflow/source_refresh.py": {
-    "sha256": "2be095548fe13e58c72c30116314669db85861ce2f85d2a98a25276be561c9c2",
+    "sha256": "09670e2654aeece26cdc8e9d257c5dc7e4e75f593f576b9d6c030ab1e8a78549",
     "executable": 0
   },
   "runtime/linux-x86_64/python/lib/python3.12/site-packages/intent_engineering/mutations/__init__.py": {
@@ -6320,11 +6320,11 @@
     "executable": 0
   },
   "runtime/linux-x86_64/python/lib/python3.12/site-packages/intent_engineering-0.1.0.dist-info/METADATA": {
-    "sha256": "9513e61b5ed93b19d77a1211463ed2b33b6a4a1117539e88cd7ed03bb80ef35a",
+    "sha256": "005213b7f7c71ffabc3943efff20dd8a199fd6ad7fcaf36d80d4670095289e21",
     "executable": 0
   },
   "runtime/linux-x86_64/python/lib/python3.12/site-packages/intent_engineering-0.1.0.dist-info/RECORD": {
-    "sha256": "94064bbde74cb074b5eccf21449a7524f4aa8bfb406a64495df4948007ca27d9",
+    "sha256": "b212f8ccf03b37f5722022d13edf04818ba6c3c66fd39a62863c213babc91128",
     "executable": 0
   },
   "runtime/linux-x86_64/python/lib/python3.12/site-packages/intent_engineering-0.1.0.dist-info/REQUESTED": {
@@ -21792,7 +21792,7 @@
     "executable": 0
   },
   "runtime/macos-arm64/python/lib/python3.12/site-packages/intent_engineering/cli/background_onboarding.py": {
-    "sha256": "93c19a0a2df505f48d384f87e99bbbdd13c4f28b51dfb3ea0a7a0d38cb9b6a4a",
+    "sha256": "1f4025077ee8a22307c9a85f3eafe1b4a7a8105e1860aafaaeec794479a35f51",
     "executable": 0
   },
   "runtime/macos-arm64/python/lib/python3.12/site-packages/intent_engineering/cli/background_sources.py": {
@@ -21832,7 +21832,7 @@
     "executable": 0
   },
   "runtime/macos-arm64/python/lib/python3.12/site-packages/intent_engineering/cli/onboarding_hooks.py": {
-    "sha256": "5d0255abf94e933209c2fbf49cd60941f93758a86fdc82d121e8b7435fb6ee50",
+    "sha256": "4c9fdb9c97c94bf603da0c0c66f2c1eeec6cea478835df1ddc0a4a319f654718",
     "executable": 0
   },
   "runtime/macos-arm64/python/lib/python3.12/site-packages/intent_engineering/cli/output.py": {
@@ -22060,7 +22060,7 @@
     "executable": 0
   },
   "runtime/macos-arm64/python/lib/python3.12/site-packages/intent_engineering/integrations/mcp_server/background.py": {
-    "sha256": "91c7b45cc9e52d080592d28a019dcae48b0d223519ee18c522d3bc909acb3471",
+    "sha256": "573a47637b133d30a03273212297f0c2a3201858483e9583f6c717f059715e9c",
     "executable": 0
   },
   "runtime/macos-arm64/python/lib/python3.12/site-packages/intent_engineering/integrations/mcp_server/intent_workflow.py": {
@@ -22176,7 +22176,7 @@
     "executable": 0
   },
   "runtime/macos-arm64/python/lib/python3.12/site-packages/intent_engineering/intent_workflow/intent_monitor.py": {
-    "sha256": "cfdb5852ca106b236f054fe1e180d77a928e3a1e37e3de5c36b7eef7283d5047",
+    "sha256": "c6fce1e59b1182e1313b0ca0b5dadea8c76b78196ffabd452a29a213f762f5c5",
     "executable": 0
   },
   "runtime/macos-arm64/python/lib/python3.12/site-packages/intent_engineering/intent_workflow/models.py": {
@@ -22220,7 +22220,7 @@
     "executable": 0
   },
   "runtime/macos-arm64/python/lib/python3.12/site-packages/intent_engineering/intent_workflow/source_refresh.py": {
-    "sha256": "2be095548fe13e58c72c30116314669db85861ce2f85d2a98a25276be561c9c2",
+    "sha256": "09670e2654aeece26cdc8e9d257c5dc7e4e75f593f576b9d6c030ab1e8a78549",
     "executable": 0
   },
   "runtime/macos-arm64/python/lib/python3.12/site-packages/intent_engineering/mutations/__init__.py": {
@@ -22460,11 +22460,11 @@
     "executable": 0
   },
   "runtime/macos-arm64/python/lib/python3.12/site-packages/intent_engineering-0.1.0.dist-info/METADATA": {
-    "sha256": "9513e61b5ed93b19d77a1211463ed2b33b6a4a1117539e88cd7ed03bb80ef35a",
+    "sha256": "005213b7f7c71ffabc3943efff20dd8a199fd6ad7fcaf36d80d4670095289e21",
     "executable": 0
   },
   "runtime/macos-arm64/python/lib/python3.12/site-packages/intent_engineering-0.1.0.dist-info/RECORD": {
-    "sha256": "bcbc4d2e894360fe4bbc0649e68bf3075f0a3824b96b800c599b4e8f1eec1328",
+    "sha256": "6413ab277356826338bf8b8fe844ffad5ad2d621805cddf415a9c89559ef6be0",
     "executable": 0
   },
   "runtime/macos-arm64/python/lib/python3.12/site-packages/intent_engineering-0.1.0.dist-info/REQUESTED": {
@@ -36516,7 +36516,7 @@
     "executable": 0
   },
   "runtime/macos-x86_64/python/lib/python3.12/site-packages/cryptography/hazmat/bindings/_rust.abi3.so": {
-    "sha256": "689ba04ad5ab509c453d384d32af58c949038d25ffba5613bb9229c141f962d0",
+    "sha256": "7b4fcb395c19c6e5c63b4ec429fd588ae2565ba83776f762e3baf4e4709fad6b",
     "executable": 1
   },
   "runtime/macos-x86_64/python/lib/python3.12/site-packages/cryptography/hazmat/bindings/openssl/__init__.py": {
@@ -36792,7 +36792,7 @@
     "executable": 0
   },
   "runtime/macos-x86_64/python/lib/python3.12/site-packages/cryptography-50.0.1.dist-info/RECORD": {
-    "sha256": "eba75774d060be2cdc0e7721b62d55977386625fc22dbc9eef4b74a531a7959c",
+    "sha256": "92e8d4a32764a87f3500080d2083001086696645c78f9d7aa95cd2220eb5e8d3",
     "executable": 0
   },
   "runtime/macos-x86_64/python/lib/python3.12/site-packages/cryptography-50.0.1.dist-info/REQUESTED": {
@@ -36816,7 +36816,7 @@
     "executable": 0
   },
   "runtime/macos-x86_64/python/lib/python3.12/site-packages/cryptography-50.0.1.dist-info/sboms/cryptography-rust.cyclonedx.json": {
-    "sha256": "30be314c13b8cd9451b5e1987c84d79cd17643bc35a494c481f512e844dca57c",
+    "sha256": "eae94d0864e41923051649193273d025376df9699b857dfaa7ca7c3a7054a68f",
     "executable": 0
   },
   "runtime/macos-x86_64/python/lib/python3.12/site-packages/h11/__init__.py": {
@@ -37728,7 +37728,7 @@
     "executable": 0
   },
   "runtime/macos-x86_64/python/lib/python3.12/site-packages/intent_engineering/cli/background_onboarding.py": {
-    "sha256": "93c19a0a2df505f48d384f87e99bbbdd13c4f28b51dfb3ea0a7a0d38cb9b6a4a",
+    "sha256": "1f4025077ee8a22307c9a85f3eafe1b4a7a8105e1860aafaaeec794479a35f51",
     "executable": 0
   },
   "runtime/macos-x86_64/python/lib/python3.12/site-packages/intent_engineering/cli/background_sources.py": {
@@ -37768,7 +37768,7 @@
     "executable": 0
   },
   "runtime/macos-x86_64/python/lib/python3.12/site-packages/intent_engineering/cli/onboarding_hooks.py": {
-    "sha256": "5d0255abf94e933209c2fbf49cd60941f93758a86fdc82d121e8b7435fb6ee50",
+    "sha256": "4c9fdb9c97c94bf603da0c0c66f2c1eeec6cea478835df1ddc0a4a319f654718",
     "executable": 0
   },
   "runtime/macos-x86_64/python/lib/python3.12/site-packages/intent_engineering/cli/output.py": {
@@ -37996,7 +37996,7 @@
     "executable": 0
   },
   "runtime/macos-x86_64/python/lib/python3.12/site-packages/intent_engineering/integrations/mcp_server/background.py": {
-    "sha256": "91c7b45cc9e52d080592d28a019dcae48b0d223519ee18c522d3bc909acb3471",
+    "sha256": "573a47637b133d30a03273212297f0c2a3201858483e9583f6c717f059715e9c",
     "executable": 0
   },
   "runtime/macos-x86_64/python/lib/python3.12/site-packages/intent_engineering/integrations/mcp_server/intent_workflow.py": {
@@ -38112,7 +38112,7 @@
     "executable": 0
   },
   "runtime/macos-x86_64/python/lib/python3.12/site-packages/intent_engineering/intent_workflow/intent_monitor.py": {
-    "sha256": "cfdb5852ca106b236f054fe1e180d77a928e3a1e37e3de5c36b7eef7283d5047",
+    "sha256": "c6fce1e59b1182e1313b0ca0b5dadea8c76b78196ffabd452a29a213f762f5c5",
     "executable": 0
   },
   "runtime/macos-x86_64/python/lib/python3.12/site-packages/intent_engineering/intent_workflow/models.py": {
@@ -38156,7 +38156,7 @@
     "executable": 0
   },
   "runtime/macos-x86_64/python/lib/python3.12/site-packages/intent_engineering/intent_workflow/source_refresh.py": {
-    "sha256": "2be095548fe13e58c72c30116314669db85861ce2f85d2a98a25276be561c9c2",
+    "sha256": "09670e2654aeece26cdc8e9d257c5dc7e4e75f593f576b9d6c030ab1e8a78549",
     "executable": 0
   },
   "runtime/macos-x86_64/python/lib/python3.12/site-packages/intent_engineering/mutations/__init__.py": {
@@ -38396,11 +38396,11 @@
     "executable": 0
   },
   "runtime/macos-x86_64/python/lib/python3.12/site-packages/intent_engineering-0.1.0.dist-info/METADATA": {
-    "sha256": "9513e61b5ed93b19d77a1211463ed2b33b6a4a1117539e88cd7ed03bb80ef35a",
+    "sha256": "005213b7f7c71ffabc3943efff20dd8a199fd6ad7fcaf36d80d4670095289e21",
     "executable": 0
   },
   "runtime/macos-x86_64/python/lib/python3.12/site-packages/intent_engineering-0.1.0.dist-info/RECORD": {
-    "sha256": "deb0551b8887773e3f1a84455def4b2534ed74e5072ad57bc270109cd0ffc18c",
+    "sha256": "f3df8e02961df3ffb1c33412910509c62294b4d2f651265f59b3c8113d1b060a",
     "executable": 0
   },
   "runtime/macos-x86_64/python/lib/python3.12/site-packages/intent_engineering-0.1.0.dist-info/REQUESTED": {
@@ -48160,7 +48160,7 @@
     "executable": 1
   },
   "scripts/monitor-hook.py": {
-    "sha256": "05bb7bf0eb6b16bae9eab4c4894a77d4f1eb2c53bba12e7f17174e2eb4c7a696",
+    "sha256": "47cb350b105bdded289e27c30ab722815ee1acfa7c0eb68680ecf092deead544",
     "executable": 1
   },
   "scripts/prompt-hook": {
@@ -48188,7 +48188,7 @@
     "executable": 1
   },
   "skills/intent-advisor/SKILL.md": {
-    "sha256": "f0c5b7de74cad527eae569e5e3c2d4a96392187b659afac7dd1a27d6503f38d2",
+    "sha256": "ff5f045ffa31b74c345b9f0ce0a0790463e127c504636e49d42c5fc3727d86ee",
     "executable": 0
   },
   "skills/intent-advisor/references/initial-reconciliation.md": {
@@ -48196,7 +48196,7 @@
     "executable": 0
   },
   "skills/intent-advisor/references/intent-monitor.md": {
-    "sha256": "4892098e17b7ba465385dc6e62d76984ddff1ecf2cc013ffaf9e6a3ae50359ae",
+    "sha256": "3d7147afe028a38d9e2ca51ba18ee6545d80da0357bbb0ab5ae90f32ccf6c954",
     "executable": 0
   },
   "skills/intent-advisor/references/reviewed-workflow.md": {
@@ -48204,7 +48204,7 @@
     "executable": 0
   },
   "skills/intent-advisor/references/source-refresh.md": {
-    "sha256": "2ca43c7a8287a7985f748baa026befb3183bf2cd66c8b74ba567f07f58b374cd",
+    "sha256": "eb48979b4e3f4101d452c6dd311071766d3cd3c6f679d21c3601c1462417e7dd",
     "executable": 0
   }
 }

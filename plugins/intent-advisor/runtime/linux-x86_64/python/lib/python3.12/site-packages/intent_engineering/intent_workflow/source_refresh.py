@@ -1,4 +1,4 @@
-"""Task-bound, host-reported source refresh; provider signals only invalidate state.
+"""Task-aligned, host-reported source refresh with bounded shared read receipts.
 
 State snapshots and read receipts live in the immutable evidence ledger, under the
 existing transaction lock. No remote credentials, polling service or webhook listener
@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING, Annotated, Any, Literal, cast
 
 from pydantic import Field, field_validator, model_validator
 
-from intent_engineering.core.models import JsonValue, is_nonterminal_case_status
+from intent_engineering.core.models import EvidenceRecord, JsonValue, is_nonterminal_case_status
 from intent_engineering.core.models.reconciliation import is_intent_requirement_case
 from intent_engineering.core.policy.access import evidence_allowed, refs_allowed
 from intent_engineering.intent_workflow.background import BackgroundIntentService, _digest
@@ -31,6 +31,7 @@ CONNECTOR = "conversation:source-refresh"
 ACTOR = "agent:source-refresh"
 Provider = Literal["notion", "confluence", "slack", "google-drive", "github", "local"]
 Refs = Annotated[tuple[Identity, ...], Field(max_length=512)]
+MAX_CHECK_AGE = timedelta(hours=1)
 
 
 class SourceSelection(BackgroundModel):
@@ -91,6 +92,7 @@ class RefreshRequest(BackgroundModel):
     turn_id: Identity
     observations: Annotated[tuple[SourceObservation, ...], Field(max_length=32)] = ()
     reconciliation_ref: Identity | None = None
+    force_refresh: bool = False
 
     @model_validator(mode="after")
     def unique_sources(self) -> RefreshRequest:
@@ -98,6 +100,17 @@ class RefreshRequest(BackgroundModel):
         if len(ids) != len(set(ids)):
             raise ValueError("duplicate source observations")
         return self
+
+
+class _Check(BackgroundModel):
+    observation: SourceObservation
+    generation: int
+    receipt_ref: str
+    success: bool
+    action: str
+    selection: SourceSelection | None = None
+    evidence_refs: tuple[str, ...] = ()
+    cached: bool = False
 
 
 class _Source(BackgroundModel):
@@ -110,14 +123,7 @@ class _Source(BackgroundModel):
     previous_refs: tuple[str, ...] = ()
     reconciled: bool = False
     reconciled_graph_version: int | None = None
-
-
-class _Check(BackgroundModel):
-    observation: SourceObservation
-    generation: int
-    receipt_ref: str
-    success: bool
-    action: str
+    latest_check: _Check | None = None
 
 
 class _Task(BackgroundModel):
@@ -126,6 +132,7 @@ class _Task(BackgroundModel):
     graph_version: int
     checks: dict[str, _Check] = Field(default_factory=dict)
     reconciliation_ref: str | None = None
+    require_fresh: bool = False
 
 
 class SourceRefreshService:
@@ -220,6 +227,7 @@ class SourceRefreshService:
                                 "dirty": True,
                                 "reconciled": False,
                                 "validator": None,
+                                "latest_check": None,
                             }
                         )
                     )
@@ -251,7 +259,11 @@ class SourceRefreshService:
                     raise ValueError("source signal changed")
             else:
                 source = source.model_copy(
-                    update={"generation": source.generation + 1, "dirty": True}
+                    update={
+                        "generation": source.generation + 1,
+                        "dirty": True,
+                        "latest_check": None,
+                    }
                 )
                 self._record(actor, now, "signal", key, material)
                 self._record(actor, now, "source", signal.source_id, source.model_dump(mode="json"))
@@ -346,12 +358,57 @@ class SourceRefreshService:
                 "success": valid,
             },
         )
-        return source, _Check(
+        check = _Check(
             observation=observation,
             generation=source.generation,
             receipt_ref=receipt,
             success=valid,
             action=action,
+            selection=source.selection,
+            evidence_refs=source.evidence_refs,
+        )
+        return source.model_copy(update={"latest_check": check if valid else None}), check
+
+    @staticmethod
+    def _valid_check(
+        check: _Check | None,
+        source: _Source,
+        now: datetime,
+        evidence: tuple[EvidenceRecord, ...],
+        principals: frozenset[str],
+        receipts: dict[str, dict[str, Any]],
+    ) -> bool:
+        if check is None:
+            return False
+        observation = check.observation
+        receipt = receipts.get(check.receipt_ref)
+        return (
+            check.success
+            and observation.complete
+            and observation.kind != "unavailable"
+            and observation.checked_at <= now + timedelta(seconds=60)
+            and now < observation.checked_at + MAX_CHECK_AGE
+            and source.initialized
+            and not source.dirty
+            and check.generation == source.generation
+            and check.selection == source.selection
+            and set(check.evidence_refs) == set(source.evidence_refs)
+            and (observation.kind == "content" or observation.validator is not None)
+            and observation.validator == source.validator
+            and (
+                observation.kind != "content"
+                or set(observation.evidence_refs) == set(source.evidence_refs)
+            )
+            and refs_allowed(
+                (*source.evidence_refs, *source.previous_refs, check.receipt_ref),
+                evidence,
+                principals,
+            )
+            and receipt is not None
+            and receipt["success"]
+            and receipt["observation"] == observation.model_dump(mode="json")
+            and receipt["selection"] == source.selection.model_dump(mode="json")
+            and set(receipt["evidence_refs"]) == set(source.evidence_refs)
         )
 
     def refresh(self, request: RefreshRequest) -> dict[str, Any]:
@@ -377,6 +434,7 @@ class SourceRefreshService:
             )
             if task.task != request.task:
                 raise ValueError("refresh task changed")
+            force_refresh = request.force_refresh or task.require_fresh
             checks = dict(task.checks)
             for observation in request.observations:
                 source = active.get(observation.source_id)
@@ -385,7 +443,7 @@ class SourceRefreshService:
                 if observation.generation != source.generation:
                     continue  # Return the current generation; never erase a racing signal.
                 prior = checks.get(observation.source_id)
-                if prior is not None and prior.observation == observation:
+                if prior is not None and not prior.cached and prior.observation == observation:
                     continue
                 changed, observed_check = self._check(
                     actor, principals, now, key, task, source, observation
@@ -394,27 +452,47 @@ class SourceRefreshService:
                 active[observation.source_id] = changed
             task = task.model_copy(update={"checks": checks})
             evidence = self.runtime.evidence()
+            # Newly submitted checks were appended after the initial event snapshot.
+            check_receipts = {
+                e["ref"]: e["value"] for e in self._events(actor) if e["kind"] == "check"
+            }
             work = []
             receipts: list[str] = []
             read_refs: set[str] = set()
             complete = bool(active)
             for source_id, source in sorted(active.items()):
-                check = checks.get(source_id)
-                success = (
-                    check is not None
-                    and check.success
-                    and not source.dirty
-                    and check.generation == source.generation
-                    and refs_allowed(source.evidence_refs, evidence, principals)
-                    and (
-                        check.observation.kind != "content"
-                        or set(check.observation.evidence_refs) == set(source.evidence_refs)
+                if not refs_allowed(
+                    (*source.evidence_refs, *source.previous_refs), evidence, principals
+                ):
+                    # Losing permission is an invalidation, even if an alias is later restored.
+                    source = source.model_copy(
+                        update={
+                            "dirty": True,
+                            "generation": source.generation + int(not source.dirty),
+                            "latest_check": None,
+                        }
                     )
-                    and (check.observation.validator == source.validator)
+                    active[source_id] = source
+                check = checks.get(source_id)
+                success = self._valid_check(
+                    check, source, now, evidence, principals, check_receipts
                 )
+                if force_refresh and check is not None and check.cached:
+                    success = False
+                if (
+                    not success
+                    and not force_refresh
+                    and self._valid_check(
+                        source.latest_check, source, now, evidence, principals, check_receipts
+                    )
+                ):
+                    assert source.latest_check is not None
+                    check = source.latest_check.model_copy(update={"cached": True})
+                    checks[source_id] = check
+                    success = True
                 complete = complete and success
                 action = (
-                    check.action
+                    ("reuse" if check.cached else check.action)
                     if success and check is not None
                     else "retry"
                     if check is not None and check.observation.kind == "unavailable"
@@ -434,8 +512,20 @@ class SourceRefreshService:
                         "validator": source.validator,
                         "evidence_refs": list(source.evidence_refs),
                         "previous_refs": list(source.previous_refs),
+                        "cached": bool(success and check is not None and check.cached),
+                        "checked_at": (
+                            check.observation.checked_at.isoformat() if success and check else None
+                        ),
+                        "expires_at": (
+                            (check.observation.checked_at + MAX_CHECK_AGE).isoformat()
+                            if success and check
+                            else None
+                        ),
                     }
                 )
+            task = task.model_copy(
+                update={"checks": checks, "require_fresh": force_refresh and not complete}
+            )
             needs_review = (
                 any(
                     not s.reconciled or s.reconciled_graph_version != graph.version
