@@ -282,6 +282,13 @@ def smoke(plugin: Path) -> None:
                 monitor.run(MonitorRequest(action="begin", worker_id="smoke-next"))["status"]
                 == "quiet"
             )
+            from intent_engineering.cli.dev import _start_or_reuse_background_service
+            from intent_engineering.intent_workflow.check import SharedStateRestoreStatus
+
+            assert _start_or_reuse_background_service(
+                project, SharedStateRestoreStatus.NOT_REQUIRED
+            )
+            anyio.run(check_mcp, launcher, project, environment)
             (project / "prd.md").write_text("Store project data remotely.")
             changed_cycle = monitor.run(MonitorRequest(action="begin", worker_id="smoke-delivery"))
             recommendation = BackgroundIntentService(runtime, clock=lambda: NOW).submit(
@@ -327,13 +334,6 @@ def smoke(plugin: Path) -> None:
             automatic = CodeReconciliationService(runtime).run(automatic=True)
             assert automatic["status"] == "on_demand_only"
             assert (project / "app.py").read_text() == changed
-            from intent_engineering.cli.dev import _start_or_reuse_background_service
-            from intent_engineering.intent_workflow.check import SharedStateRestoreStatus
-
-            assert _start_or_reuse_background_service(
-                project, SharedStateRestoreStatus.NOT_REQUIRED
-            )
-            anyio.run(check_mcp, launcher, project, environment)
             event = {
                 "hook_event_name": "UserPromptSubmit",
                 "session_id": "smoke",
