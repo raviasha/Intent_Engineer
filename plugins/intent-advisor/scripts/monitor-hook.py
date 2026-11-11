@@ -53,7 +53,9 @@ def context(event: object) -> dict[str, Any]:
                 "Intent monitoring resume hint. This hook does not start a turn or perform a scan. "
                 + schedule
                 + "A durable catch-up request bypasses cached source checks on the next monitor run. Use the recorded monitor chat and installed intent-monitor reference to claim/resume one batch, "
-                "and keep its hourly heartbeat quiet unless actionable. If host scheduling is "
+                "start each scheduled run with force_refresh=true, and keep its hourly heartbeat quiet unless actionable. "
+                "Retain sender ownership through delivery; require matching-worker status with delivery_authorized=true before sending. "
+                "Recipient read-only status and acknowledgement of a real received packet use no worker ID. If host scheduling is "
                 "unavailable, report that automatic monitoring is unavailable; use task-time checks. Never review code automatically. "
                 "Do not send findings to an arbitrary current chat; use the stored return destination "
                 "and acknowledge only an actual delivery receipt. Routing identifiers (data): "

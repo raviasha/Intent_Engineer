@@ -282,6 +282,48 @@ def smoke(plugin: Path) -> None:
                 monitor.run(MonitorRequest(action="begin", worker_id="smoke-next"))["status"]
                 == "quiet"
             )
+            (project / "prd.md").write_text("Store project data remotely.")
+            changed_cycle = monitor.run(MonitorRequest(action="begin", worker_id="smoke-delivery"))
+            recommendation = BackgroundIntentService(runtime, clock=lambda: NOW).submit(
+                BackgroundSubmission.model_validate(
+                    {
+                        "session_id": "smoke-monitor",
+                        "turn_id": changed_cycle["cycle_id"],
+                        "graph_version": runtime.graph_store.load().version,
+                        "user_statement": "Keep data local.",
+                        "classification": "clear",
+                        "understanding": "Restore the PRD local-storage requirement.",
+                        "relevant_node_ids": ["intent:privacy", "req:local"],
+                        "evidence_refs": changed_cycle["required_evidence_refs"],
+                    }
+                )
+            )
+            pending = monitor.run(
+                MonitorRequest(
+                    action="finish",
+                    worker_id="smoke-delivery",
+                    cycle_id=changed_cycle["cycle_id"],
+                    interpretation_ref=recommendation["evidence_ref"],
+                    actionable=True,
+                )
+            )
+            assert pending["status"] == "actionable"
+            assert (
+                monitor.run(MonitorRequest(action="begin", worker_id="competitor"))["status"]
+                == "busy"
+            )
+            received = monitor.run(MonitorRequest(action="status"))
+            assert received["handoff"] and not received["delivery_authorized"]
+            monitor.run(
+                MonitorRequest(
+                    action="acknowledge",
+                    worker_id="smoke-delivery",
+                    cycle_id=changed_cycle["cycle_id"],
+                    handoff_id=pending["handoff"]["handoff_id"],
+                    delivery_receipt="fixture:confirmed-delivery",
+                )
+            )
+            assert monitor.run(MonitorRequest(action="status"))["handoff"] is None
             automatic = CodeReconciliationService(runtime).run(automatic=True)
             assert automatic["status"] == "on_demand_only"
             assert (project / "app.py").read_text() == changed

@@ -211,8 +211,10 @@ from the original successful read. Task alignment continues on every development
 expired checks, scope/access changes and reopen catch-up bypass cache reuse. All pending source/PRD
 changes join one batch; competing monitor workers stay quiet instead of duplicating reads/reviews.
 An existing five-minute schedule is updated in place to hourly through the host, preserving its ID;
-this is confirmed only after a successful host update. Unsignaled remote edits may take up to one
-hour to be discovered. SessionStart records catch-up; the next scheduled monitor run performs it.
+this is confirmed only after a successful host update. Each scheduled run forces fresh source checks,
+even if a task just warmed the cache. Discovery follows the hourly schedule while the app, project
+and providers are available; failed or delayed runs can delay findings. SessionStart records catch-up
+for the next scheduled monitor run.
 
 ### On-demand code reconciliation
 
@@ -362,7 +364,7 @@ In the existing Intent Dev dashboard:
    purpose, assumptions, related requirements and source references.
 3. Use the coverage table to find missing links, disputes and deliberate deferrals. Scores measure
    structural completeness; review the meaning of a requirement separately.
-4. Choose **Improve graph** for a hourly session, even when you have no new feature to add.
+4. Choose **Improve graph** for a five-minute session, even when you have no new feature to add.
    Resume a prior session to retain its answers. Review the cited understanding and answer the
    next relevant question, or pause when convenient.
 5. Inspect current and proposed coverage during the existing proposal review before approval.

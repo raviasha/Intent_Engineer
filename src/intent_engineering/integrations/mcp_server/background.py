@@ -66,15 +66,18 @@ def register_background_tools(server: MCPServer[Any], runtime: Runtime) -> None:
         The host owns scheduling and reads selected sources with its authorized tools. Record
         automation_id only after actual host scheduler success; use hourly scheduling and update
         existing five-minute schedules in place. Use a stable worker_id for each host run across
-        begin/finish. A busy result means another worker owns the batch: stop without provider reads.
-        Reuse only service-validated cached checks within their original one-hour expiry; task
+        begin/finish and sender status/acknowledge. A busy result means another worker owns the
+        batch: stop without provider reads or delivery. Each scheduled hourly begin requires
+        force_refresh=True; task-time and within-batch checks can reuse validated receipts. Task
         alignment still runs. Reopen catch-up bypasses cache via durable hook metadata/force_refresh.
         Begin resumes a cycle and returns
         source-refresh work plus verified PRD evidence; use the returned session_id and cycle_id
         for the evidence-backed background interpretation. Finish validates current evidence.
         Stay silent for unchanged/aligned cycles. Deliver only a returned actionable handoff
-        to its recorded original agent with trusted human authorization, then acknowledge
-        confirmed receipt. Preserve the default model. No code review or document/code edits.
+        to its recorded original agent with trusted human authorization and live matching-worker
+        sender status with delivery_authorized=True. Retain the lease until confirmed receipt is
+        acknowledged. Status without a worker is read-only for the recipient, who may acknowledge
+        an actual received packet without claiming sender rights. Preserve the default model. No code review or document/code edits.
         """
         try:
             return IntentMonitorService(runtime).run(draft)

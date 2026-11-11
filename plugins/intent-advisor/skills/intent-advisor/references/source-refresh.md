@@ -123,6 +123,7 @@ reconciliation service and its verified snapshots; source refresh alone does not
 implementation evidence.
 
 For automatic checks without a new user task, follow [intent monitoring](intent-monitor.md).
-The host heartbeat checks selected sources and PRDs hourly while Codex is open,
+The host heartbeat forces fresh checks of selected sources and PRDs on every hourly run while
+Codex is open; a recently warmed task cache cannot postpone its next scheduled check. It
 resumes on its first run after reopening, and returns only actionable findings to the original agent.
 Source refresh never triggers ongoing code reconciliation; code review is on demand.

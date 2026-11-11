@@ -149,6 +149,10 @@ pending legacy proposals or fabricate approvals.
 
 After accepted setup, follow [intent monitoring](references/intent-monitor.md) to configure one
 hourly host heartbeat in this setup chat, record its actual automation ID, and run a cycle.
+Start each scheduled cycle with `force_refresh=true`. Retain the same worker through delivery,
+require live sender status with `delivery_authorized=true` before sending, and acknowledge the
+actual receipt to release its lease. Original recipients can validate read-only status and
+acknowledge real receipt without a sender worker, as the reference describes.
 Reuse selected sources, PRDs and original-agent routing. Verify authorization from trusted user
 history; the setup offer above includes monitoring. The host schedule checks while Codex is open
 and catches up on its first run after reopening. A hook alone cannot wake the agent. Return only

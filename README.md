@@ -19,7 +19,7 @@ it becomes a reviewable reconciliation case with its supporting evidence.
 The supplied [framework graph](graph/framework-intent-graph.yaml) dogfoods the
 same graph model used for a project.
 
-New to the project? Start with the [hourly user guide](docs/quick-start.md) for installation,
+New to the project? Start with the [five-minute user guide](docs/quick-start.md) for installation,
 onboarding, everyday development, graph assessment, team enrollment, and CI assurance.
 
 ## Guided developer journey
@@ -320,8 +320,10 @@ from the original successful read. Task alignment continues on every development
 expired checks, scope/access changes and reopen catch-up bypass cache reuse. All pending source/PRD
 changes join one batch; competing monitor workers stay quiet instead of duplicating reads/reviews.
 An existing five-minute schedule is updated in place to hourly through the host, preserving its ID;
-this is confirmed only after a successful host update. Unsignaled remote edits may take up to one
-hour to be discovered. SessionStart records catch-up; the next scheduled monitor run performs it.
+this is confirmed only after a successful host update. Each scheduled run forces fresh source checks,
+even if a task just warmed the cache. Discovery follows the hourly schedule while the app, project
+and providers are available; failed or delayed runs can delay findings. SessionStart records catch-up
+for the next scheduled monitor run.
 
 Deferred follow-up work is explicitly not shipped or reachable: test-to-code matching,
 automatic activation beyond the existing reviewed governance boundaries, and the broader

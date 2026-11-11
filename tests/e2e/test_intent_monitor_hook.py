@@ -36,7 +36,7 @@ def monitor(tmp_path, monkeypatch):
             return_host_id="host:local",
         )
     )
-    cycle = service.run(MonitorRequest(action="begin"))
+    cycle = service.run(MonitorRequest(action="begin", worker_id="run:sender"))
     review = BackgroundIntentService(runtime, clock=lambda: NOW).submit(
         submission(
             session_id="monitor:one",
@@ -49,6 +49,7 @@ def monitor(tmp_path, monkeypatch):
     service.run(
         MonitorRequest(
             action="finish",
+            worker_id="run:sender",
             cycle_id=cycle["cycle_id"],
             interpretation_ref=review["evidence_ref"],
             actionable=True,

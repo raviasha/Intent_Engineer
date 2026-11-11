@@ -694,7 +694,8 @@ ChangeSet. The original user continues working. See
 `docs/superpowers/specs/2026-11-09-prd-consistency-check-design.md`.
 
 After accepted setup, a host-owned hourly heartbeat in the existing setup/monitor chat
-checks selected intent sources and PRDs while Codex is open. Preserve durable checkpoints and
+forces fresh selected-source checks on each scheduled run and compares PRDs while Codex is open.
+Preserve durable checkpoints and
 compare current source membership/content after reopening, including additions and deletions.
 Source or PRD changes require evidence-backed interpretation; unchanged cycles remain quiet.
 Return only actionable recommendations or consequential clarifications to the recorded original

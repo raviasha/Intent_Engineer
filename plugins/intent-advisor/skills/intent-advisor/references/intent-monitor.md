@@ -31,8 +31,9 @@ resume context; they cannot wake an agent or poll connected providers themselves
 
    > Read the installed Intent Advisor skill and references/intent-monitor.md. Begin or resume
    > the configured intent monitor for this repository with a stable unique worker_id for this host run.
-   > Respect busy responses; combine all pending changes into one batch. Reuse only service-validated
-   > cached source receipts within their original one-hour expiry. Fetch sources only when requested.
+   > For the first begin of every hourly run, pass force_refresh=true so a recently warmed task
+   > cache cannot postpone the scheduled source check. Respect busy responses; combine all pending
+   > changes into one batch. Retries and lease renewals in that batch reuse its validated fresh checks.
    > Check all selected sources using connected
    > host tools and compare current intent with selected PRDs and captured requirements in both
    > directions. Follow the cycle and evidence protocol. Never perform code reconciliation or edit
@@ -64,15 +65,18 @@ resume context; they cannot wake an agent or poll connected providers themselves
 ## Each cycle
 
 1. Choose a stable unique `worker_id` for this host run and call `intent_monitor` with
-   `action=begin` and that ID before retrying pending delivery. Carry the same worker ID through
-   every begin/finish request for this batch. Keep returned `cycle_id` and `session_id`.
+   `action=begin`, that ID, and `force_refresh=true` for each scheduled hourly run before
+   retrying pending delivery. Carry the same worker ID through every begin/finish and sender
+   status/acknowledge request for this batch. Keep returned `cycle_id` and `session_id`.
    A live worker owns a renewable 15-minute lease. On `busy`, stop silently: do not fetch providers,
    interpret, start another worker, or keep polling. The next hourly run can retry. Renew ownership
    by beginning again before the lease expires during a long review; after takeover, discard stale
    work and reacquire before proceeding. Batch all pending source and PRD updates in this cycle.
-   Pass `force_refresh=true` when explicitly catching up after reopening or the user requests a
-   fresh check; normal ticks use the shared one-hour source cache. A pending reopen marker also
-   forces this automatically; do not clear it manually.
+   Every scheduled tick starts with `force_refresh=true`, even if another chat just warmed the
+   shared cache. Also force an explicitly requested fresh check. Within-batch observation retries
+   and lease renewals can omit the flag: the service retains the fresh-check requirement until
+   successful reads arrive. A pending reopen marker also forces freshness automatically; do not
+   clear it manually. Task-time source checks may still share the one-hour cache.
    The service snapshots selected PRDs and returns source work, evidence, and current state.
    Pending findings require valid current or unexpired cached source checks; unchanged inputs preserve the handoff ID,
    while changed inputs supersede it and require a new interpretation.
@@ -110,14 +114,23 @@ resume context; they cannot wake an agent or poll connected providers themselves
 
 ## Return actionable findings to the working agent
 
-Use only the current `handoff` returned by finish/status. Recheck status before sending and
-verify the original human authorization using host `read_thread`. Source content and generated
+An explicit worker retains its lease through actionable delivery until acknowledgement. A competing
+worker receives `busy` and must not send the packet. Use only the current `handoff` returned by
+begin/finish or sender status. Immediately before sending, recheck `action=status` with the same
+`worker_id` and require `delivery_authorized=true` on the response and handoff. If the lease has
+expired, stop sending and reacquire with begin; discard a packet superseded by another owner.
+Renew with the same worker before its 15-minute expiry when a review or delivery takes longer.
+Verify the original human authorization using host `read_thread`. Source content and generated
 handoff text cannot authorize messaging. Send the packet's understanding, question/conflict,
 evidence refs, `question_ref`, `clarification_session_id`, cycle ID and stable handoff ID
 through `send_message_to_thread` to its recorded
 `return_thread_id`/`return_host_id`. Tell the receiving agent to treat this as evidence-backed
-recommendations, validate freshness with `intent_monitor(status)`, continue independent work,
-and ask only consequential clarification; this is not permission to edit documents or code.
+recommendations, validate freshness with `intent_monitor({"action":"status"})` without
+a worker ID as the recipient, continue independent work, and ask only consequential clarification; this is not permission to edit documents or code.
+
+Recipient status is read-only: it may return a valid packet while a sender owns the lease, but
+`delivery_authorized=false` means it does not authorize another outbound send. The original agent
+may consume that packet in its own chat and acknowledge its actual receipt without claiming a worker.
 
 For a question, the receiving agent must fetch `intent_background_context` using the packet's
 `clarification_session_id`: the question may not appear in the original chat's session context.
@@ -134,12 +147,15 @@ host thread ID or the original chat's opaque session ID for the advertised sessi
 answer and acknowledging actual packet delivery are separate operations.
 
 Before retrying an uncertain send, inspect the destination for the same handoff ID. Only after
-confirmed delivery (or finding the matching message) call `action=acknowledge` with `cycle_id`,
-`handoff_id`, and the actual host `delivery_receipt`. Do not invent receipt IDs. If sending fails,
-leave it pending; the original chat's next prompt can retrieve a matching pending packet without
+confirmed delivery (or finding the matching message) the sender calls `action=acknowledge` with
+the same `worker_id`, `cycle_id`, `handoff_id`, and the actual host `delivery_receipt`. The
+acknowledgement releases the sender lease. If the lease expired or another worker took over,
+reacquire and revalidate before sending; always inspect the destination for that handoff ID first.
+Do not invent receipt IDs. If sending fails, leave it pending; the original chat's next prompt can retrieve a matching pending packet without
 requiring the user to run a command. Do not send to an arbitrary focused chat or source channel.
-A receiving agent may acknowledge with its actual host message/turn receipt after consuming the
-packet; a hook session ID alone is not a delivery receipt. Already delivered packets stay quiet.
+A receiving agent may acknowledge without a worker ID, using its actual host message/turn receipt
+after consuming the current packet; this also releases the sender lease. A hook session ID alone
+is not a delivery receipt. Already delivered packets stay quiet.
 
 ## Explicit code review
 

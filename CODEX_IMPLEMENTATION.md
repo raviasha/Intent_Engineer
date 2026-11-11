@@ -57,7 +57,8 @@ If an implementation simplification conflicts with these invariants, preserve th
 
 The November 10 intent-source monitor spec supersedes automatic ongoing code review.
 After accepted setup, use the host-owned hourly heartbeat in the existing monitor chat
-for selected intent sources and PRDs while Codex is open. Preserve durable checkpoints and
+for selected intent sources and PRDs while Codex is open. Force fresh source checks on every
+scheduled run; within-batch retries may reuse those checks. Preserve durable checkpoints and
 catch up against current source membership/content after reopening. Source and PRD changes
 require evidence-backed interpretation; only actionable findings or clarifications return to
 the recorded original agent, with confirmed delivery and stable deduplication. Missing access

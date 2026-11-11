@@ -45,7 +45,7 @@ def test_distinct_or_omitted_worker_cannot_read_or_interpret_live_batch(runtime,
     monkeypatch.setattr(service, "_refresh", forbidden)
     monkeypatch.setattr(service, "_prds", forbidden)
     for worker in ("run:two", None):
-        for action in ("begin", "status", "acknowledge"):
+        for action in ("begin", "status", "acknowledge") if worker else ("begin",):
             result = call(service, action, worker_id=worker)
             assert result["status"] == "busy"
             assert result["cycle_id"] == owner["cycle_id"]
@@ -381,3 +381,95 @@ def test_reopen_after_interpretation_requires_fresh_begin_before_finish_or_deliv
             cycle_id=first["cycle_id"],
             interpretation_ref=ref,
         )
+
+
+def actionable_owner(runtime, service):
+    cycle = call(service, "begin", worker_id="run:one")
+    return call(
+        service,
+        "finish",
+        worker_id="run:one",
+        cycle_id=cycle["cycle_id"],
+        interpretation_ref=review(runtime, cycle),
+        actionable=True,
+    )
+
+
+def test_sender_owns_actionable_packet_through_delivery_acknowledgement(runtime):
+    service = configured(runtime)
+    sent = actionable_owner(runtime, service)
+    assert sent["delivery_authorized"]
+    assert sent["handoff"]["delivery_authorized"]
+    assert call(service, "begin", worker_id="run:two")["status"] == "busy"
+    assert call(service, "status", worker_id="run:two")["status"] == "busy"
+    pending = call(service, "begin", worker_id="run:one")
+    assert pending["delivery_authorized"]
+    assert call(service, "begin", worker_id="run:two")["status"] == "busy"
+    ack = call(
+        service,
+        "acknowledge",
+        worker_id="run:one",
+        cycle_id=sent["cycle_id"],
+        handoff_id=sent["handoff"]["handoff_id"],
+        delivery_receipt="host:delivered",
+    )
+    assert ack["status"] == "quiet"
+    assert call(service, "begin", worker_id="run:two")["status"] == "quiet"
+
+
+def test_recipient_can_validate_and_acknowledge_without_sender_lease(runtime):
+    service = configured(runtime)
+    sent = actionable_owner(runtime, service)
+    recipient = call(service, "status")
+    assert recipient["status"] == "actionable"
+    assert recipient["handoff"]["handoff_id"] == sent["handoff"]["handoff_id"]
+    assert not recipient["delivery_authorized"]
+    assert not recipient["handoff"]["delivery_authorized"]
+    received = call(
+        service,
+        "acknowledge",
+        cycle_id=sent["cycle_id"],
+        handoff_id=sent["handoff"]["handoff_id"],
+        delivery_receipt="host:received",
+    )
+    assert received["status"] == "quiet"
+    assert call(service, "begin", worker_id="run:two")["status"] == "quiet"
+
+
+def test_expired_sender_status_never_authorizes_delivery_and_takeover_is_exclusive(runtime):
+    service = configured(runtime)
+    sent = actionable_owner(runtime, service)
+    later = IntentMonitorService(runtime, clock=lambda: NOW + timedelta(minutes=15))
+    expired = call(later, "status", worker_id="run:one")
+    assert not expired["delivery_authorized"]
+    takeover = call(later, "begin", worker_id="run:two")
+    assert takeover["delivery_authorized"]
+    assert takeover["handoff"]["handoff_id"] == sent["handoff"]["handoff_id"]
+    assert call(later, "status", worker_id="run:one")["status"] == "busy"
+    assert call(later, "begin", worker_id="run:three")["status"] == "busy"
+
+
+def test_scheduled_force_refresh_bypasses_newly_warmed_other_chat_receipt(runtime):
+    from intent_engineering.intent_workflow.source_refresh import RefreshRequest
+
+    service = configured(runtime)
+    service.refresh.sources(selection())
+    call(service, "begin")
+    first = call(service, "begin", observations=(observe([captured(runtime)], generation=1),))
+    call(service, "finish", cycle_id=first["cycle_id"], interpretation_ref=review(runtime, first))
+    later = NOW + timedelta(minutes=59)
+    service = IntentMonitorService(runtime, clock=lambda: later)
+    warm = service.refresh.refresh(
+        RefreshRequest(
+            task="Separate task",
+            session_id="chat:other",
+            turn_id="task:warm",
+            observations=(observe(kind="metadata", generation=2, checked_at=later),),
+            force_refresh=True,
+        )
+    )
+    assert warm["status"] == "ready"
+    scheduled = IntentMonitorService(runtime, clock=lambda: NOW + timedelta(hours=1))
+    tick = call(scheduled, "begin", worker_id="run:scheduled", force_refresh=True)
+    assert tick["status"] == "refresh_required"
+    assert not tick["source_refresh"]["sources"][0]["cached"]
