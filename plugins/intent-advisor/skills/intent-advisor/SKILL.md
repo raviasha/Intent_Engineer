@@ -25,7 +25,8 @@ write canonical state directly. Hook trust remains the user's decision.
 
 Intent Engineering runs in the background of normal development. Make a lightweight
 relevance check for each new task. For development, check selected source freshness using
-[source refresh](references/source-refresh.md) before dependent work. Routine checks and
+[source refresh](references/source-refresh.md) before dependent work. Shared source checks may be reused for at most one hour when the service validates them;
+still check each task against current captured intent and requirements. Routine checks and
 aligned work proceed silently. Do not
 announce routine checks, start a dashboard, request graph approval or
 WebAuthn, or create reports/exports unless the user asks. Match intent, requirements and
@@ -147,7 +148,7 @@ pending legacy proposals or fabricate approvals.
 ## Monitor intent and PRD updates automatically
 
 After accepted setup, follow [intent monitoring](references/intent-monitor.md) to configure one
-five-minute host heartbeat in this setup chat, record its actual automation ID, and run a cycle.
+hourly host heartbeat in this setup chat, record its actual automation ID, and run a cycle.
 Reuse selected sources, PRDs and original-agent routing. Verify authorization from trusted user
 history; the setup offer above includes monitoring. The host schedule checks while Codex is open
 and catches up on its first run after reopening. A hook alone cannot wake the agent. Return only

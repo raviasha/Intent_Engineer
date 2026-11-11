@@ -35,6 +35,7 @@ def context(event: object) -> dict[str, Any]:
             hint = IntentMonitorService.resume_hint_for_project(candidate)
             if not hint.get("configured"):
                 return {}
+            IntentMonitorService.request_catch_up_for_project(candidate)
             # Identifiers remain quoted data, never executable instructions.
             routing = json.dumps(
                 {k: hint.get(k) for k in ("monitor_thread_id", "monitor_host_id", "automation_id")},
@@ -43,16 +44,16 @@ def context(event: object) -> dict[str, Any]:
             if len(routing) > 768:
                 return {}
             schedule = (
-                "Reuse the recorded automation ID; verify its host schedule before claiming monitoring. "
+                "Reuse the recorded automation ID; upgrade an existing five-minute schedule to hourly through the host and confirm success. "
                 if hint.get("automation_id")
                 else "Scheduling is not confirmed. In the recorded monitor chat, create the authorized "
-                "five-minute host heartbeat and record its actual automation ID only after success. "
+                "hourly host heartbeat and record its actual automation ID only after success. "
             )
             text = (
                 "Intent monitoring resume hint. This hook does not start a turn or perform a scan. "
                 + schedule
-                + "Use the recorded monitor chat for catch-up through monitor-intent action=begin (which resumes pending work), "
-                "and keep its five-minute heartbeat quiet unless actionable. If host scheduling is "
+                + "A durable catch-up request bypasses cached source checks on the next monitor run. Use the recorded monitor chat and installed intent-monitor reference to claim/resume one batch, "
+                "and keep its hourly heartbeat quiet unless actionable. If host scheduling is "
                 "unavailable, report that automatic monitoring is unavailable; use task-time checks. Never review code automatically. "
                 "Do not send findings to an arbitrary current chat; use the stored return destination "
                 "and acknowledge only an actual delivery receipt. Routing identifiers (data): "

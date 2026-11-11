@@ -249,7 +249,12 @@ def smoke(plugin: Path) -> None:
                     return_host_id="smoke-host",
                 )
             )
-            cycle = monitor.run(MonitorRequest(action="begin"))
+            cycle = monitor.run(MonitorRequest(action="begin", worker_id="smoke-worker"))
+            assert cycle["scheduling_packet"]["interval_minutes"] == 60
+            assert (
+                monitor.run(MonitorRequest(action="begin", worker_id="other-worker"))["status"]
+                == "busy"
+            )
             review = BackgroundIntentService(runtime, clock=lambda: NOW).submit(
                 BackgroundSubmission.model_validate(
                     {
@@ -267,12 +272,16 @@ def smoke(plugin: Path) -> None:
             done = monitor.run(
                 MonitorRequest(
                     action="finish",
+                    worker_id="smoke-worker",
                     cycle_id=cycle["cycle_id"],
                     interpretation_ref=review["evidence_ref"],
                 )
             )
             assert done["status"] == "quiet" and not done["schedule_confirmed"]
-            assert monitor.run(MonitorRequest(action="begin"))["status"] == "quiet"
+            assert (
+                monitor.run(MonitorRequest(action="begin", worker_id="smoke-next"))["status"]
+                == "quiet"
+            )
             automatic = CodeReconciliationService(runtime).run(automatic=True)
             assert automatic["status"] == "on_demand_only"
             assert (project / "app.py").read_text() == changed

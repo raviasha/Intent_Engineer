@@ -19,7 +19,7 @@ it becomes a reviewable reconciliation case with its supporting evidence.
 The supplied [framework graph](graph/framework-intent-graph.yaml) dogfoods the
 same graph model used for a project.
 
-New to the project? Start with the [five-minute user guide](docs/quick-start.md) for installation,
+New to the project? Start with the [hourly user guide](docs/quick-start.md) for installation,
 onboarding, everyday development, graph assessment, team enrollment, and CI assurance.
 
 ## Guided developer journey
@@ -306,7 +306,7 @@ codebase. Ongoing code review is on demand: `intent reconcile-code --project . -
 Ordinary code edits and hooks never trigger semantic code review, including legacy enabled settings.
 An explicit review uses a signed-in current `codex` CLI and its normal model usage.
 
-After accepted setup, the host creates one five-minute heartbeat in the setup chat. It checks
+After accepted setup, the host creates one hourly heartbeat in the setup chat. It checks
 selected local folders and connected sources against selected PRDs and captured requirements,
 maintains clear graph intent, and sends only actionable recommendations or clarifications to the
 original working agent. No code or source/PRD documents are edited. Unchanged checks stay quiet.
@@ -314,6 +314,14 @@ The scheduler must confirm an actual automation ID; hooks alone do not poll prov
 agent. Local monitoring runs while Codex is open and catches up on the first scheduled check after
 reopening. Missing source access remains unknown and actionable, never a successful sync claim.
 See the [quick start](docs/quick-start.md#automatic-intent-and-prd-checks).
+
+Source-check caching is shared across chats in the same project/local actor for at most one hour
+from the original successful read. Task alignment continues on every development task. Known changes,
+expired checks, scope/access changes and reopen catch-up bypass cache reuse. All pending source/PRD
+changes join one batch; competing monitor workers stay quiet instead of duplicating reads/reviews.
+An existing five-minute schedule is updated in place to hourly through the host, preserving its ID;
+this is confirmed only after a successful host update. Unsignaled remote edits may take up to one
+hour to be discovered. SessionStart records catch-up; the next scheduled monitor run performs it.
 
 Deferred follow-up work is explicitly not shipped or reachable: test-to-code matching,
 automatic activation beyond the existing reviewed governance boundaries, and the broader

@@ -56,7 +56,7 @@ If an implementation simplification conflicts with these invariants, preserve th
 ## Current background workflow
 
 The November 10 intent-source monitor spec supersedes automatic ongoing code review.
-After accepted setup, use the host-owned five-minute heartbeat in the existing monitor chat
+After accepted setup, use the host-owned hourly heartbeat in the existing monitor chat
 for selected intent sources and PRDs while Codex is open. Preserve durable checkpoints and
 catch up against current source membership/content after reopening. Source and PRD changes
 require evidence-backed interpretation; only actionable findings or clarifications return to

@@ -54,14 +54,22 @@ def register_background_tools(server: MCPServer[Any], runtime: Runtime) -> None:
 
     @server.tool(
         annotations=ToolAnnotations(
-            read_only_hint=False, destructive_hint=False, idempotent_hint=True, open_world_hint=False,
+            read_only_hint=False,
+            destructive_hint=False,
+            idempotent_hint=True,
+            open_world_hint=False,
         )
     )
     def intent_monitor(draft: MonitorRequest) -> dict[str, Any]:
         """Configure and drive periodic intent/PRD checks in the existing host setup chat.
 
         The host owns scheduling and reads selected sources with its authorized tools. Record
-        automation_id only after actual host scheduler success. Begin resumes a cycle and returns
+        automation_id only after actual host scheduler success; use hourly scheduling and update
+        existing five-minute schedules in place. Use a stable worker_id for each host run across
+        begin/finish. A busy result means another worker owns the batch: stop without provider reads.
+        Reuse only service-validated cached checks within their original one-hour expiry; task
+        alignment still runs. Reopen catch-up bypasses cache via durable hook metadata/force_refresh.
+        Begin resumes a cycle and returns
         source-refresh work plus verified PRD evidence; use the returned session_id and cycle_id
         for the evidence-backed background interpretation. Finish validates current evidence.
         Stay silent for unchanged/aligned cycles. Deliver only a returned actionable handoff

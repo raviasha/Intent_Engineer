@@ -309,7 +309,7 @@ def test_source_change_after_submission_rotates_interpretation_identity(runtime)
     assert finish(runtime, service, second)["status"] == "quiet"
 
 
-def test_pending_delivery_still_requires_new_provider_check_each_cycle(runtime):
+def test_pending_delivery_reuses_shared_check_until_hourly_expiry(runtime):
     from tests.integration.intent_workflow.test_source_refresh import captured, observe, selection
 
     service = configured(runtime)
@@ -317,6 +317,14 @@ def test_pending_delivery_still_requires_new_provider_check_each_cycle(runtime):
     call(service, "begin")
     first = call(service, "begin", observations=(observe([captured(runtime)], generation=1),))
     packet = finish(runtime, service, first, actionable=True)["handoff"]
+    cached = call(service, "begin")
+    assert cached["status"] == "actionable"
+    assert cached["source_refresh"]["sources"][0]["cached"]
+    assert cached["handoff"]["handoff_id"] == packet["handoff_id"]
+    from datetime import timedelta
+
+    later = NOW + timedelta(hours=1)
+    service = IntentMonitorService(runtime, clock=lambda: later)
     next_poll = call(service, "begin")
     assert next_poll["status"] == "refresh_required"
     assert next_poll["source_refresh"]["sources"][0]["action"] == "check_revision"
@@ -324,11 +332,13 @@ def test_pending_delivery_still_requires_new_provider_check_each_cycle(runtime):
     checked = call(
         service,
         "begin",
-        observations=(observe(kind="metadata", generation=2, validator="scope:1"),),
+        observations=(
+            observe(kind="metadata", generation=2, validator="scope:1", checked_at=later),
+        ),
     )
     assert checked["status"] == "actionable"
     assert checked["handoff"]["handoff_id"] == packet["handoff_id"]
-    assert call(service, "begin")["status"] == "refresh_required"
+    assert call(service, "begin")["status"] == "actionable"
 
 
 def test_pending_delivery_discovers_changed_source_without_external_signal(runtime):
@@ -383,7 +393,7 @@ def test_new_receipts_after_submission_require_new_immutable_interpretation(runt
         ),
     )
     assert refreshed["cycle_id"] != first["cycle_id"]
-    assert refreshed["status"] == "refresh_required"
+    assert refreshed["status"] == "needs_interpretation"
 
 
 def test_pending_provider_poll_resumes_without_resetting_its_start(runtime):
@@ -394,7 +404,7 @@ def test_pending_provider_poll_resumes_without_resetting_its_start(runtime):
     call(service, "begin")
     first = call(service, "begin", observations=(observe([captured(runtime)], generation=1),))
     original = finish(runtime, service, first, actionable=True)
-    polling = call(service, "begin")
+    polling = call(service, "begin", force_refresh=True)
     restarted = IntentMonitorService(runtime, clock=lambda: NOW)
     again = call(restarted, "begin")
     assert polling["source_refresh"]["task_key"] == again["source_refresh"]["task_key"]

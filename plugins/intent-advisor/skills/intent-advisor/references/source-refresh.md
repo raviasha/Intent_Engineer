@@ -9,6 +9,14 @@ tools; this plugin stores local receipts and cannot perform those host reads its
    use distinct turn IDs for background interpretation submissions. The returned work list
    includes each source's bounded selection, generation, previous validator and action.
    `not_configured` means no enabled sources are selected, not that sources were checked.
+   The service shares successful checks across chats in this project/local actor for at most one
+   hour from the actual provider read. A source marked `cached` needs no remote read; preserve its
+   original receipt and `checked_at`/`expires_at`. Reuse never extends the expiry or means a new
+   provider observation. Still perform this task's intent/requirement alignment using current
+   context and honor blockers. Do not skip alignment because its sources were cached.
+   Known changes, scope/generation changes, failures and access changes invalidate reuse.
+   Use `force_refresh=true` for an explicit fresh-check request; follow the work returned by the
+   service rather than inventing freshness from an absent notification or copying timestamps.
 2. For `check_revision`, request a lightweight provider marker **only if it covers the whole
    scope**: content edits, new/deleted objects, membership and access changes. A Slack
    channel's newest-message timestamp misses edits and deletions and is insufficient.
@@ -115,6 +123,6 @@ reconciliation service and its verified snapshots; source refresh alone does not
 implementation evidence.
 
 For automatic checks without a new user task, follow [intent monitoring](intent-monitor.md).
-The host heartbeat checks selected sources and PRDs every five minutes while Codex is open,
+The host heartbeat checks selected sources and PRDs hourly while Codex is open,
 resumes on its first run after reopening, and returns only actionable findings to the original agent.
 Source refresh never triggers ongoing code reconciliation; code review is on demand.

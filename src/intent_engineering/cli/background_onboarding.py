@@ -186,7 +186,7 @@ def background_onboarding_command(
                         "authorization for ongoing monitoring in trusted original-chat history, configure "
                         "intent_monitor with selected PRD paths and actual setup/original thread and host "
                         "IDs, preserving the separate return session ID above. Create/reuse one host "
-                        "five-minute heartbeat in this setup chat using automation_update; record only "
+                        "hourly heartbeat in this setup chat using automation_update; record only "
                         "the confirmed automation ID and run the first cycle. Check intent sources and "
                         "PRDs while Codex is open and catch up on the first scheduled run after reopening. "
                         "Maintain clear graph intent/requirements and return only actionable recommendations "

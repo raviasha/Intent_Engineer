@@ -124,7 +124,7 @@ Source intent has highest priority; findings recommend changes without editing i
 artifacts. Test-to-code tracing remains deferred. See the background-workflow and
 initial-reconciliation specs in `docs/superpowers/specs`.
 
-After accepted setup, a host-owned five-minute heartbeat in the existing monitor chat checks
+After accepted setup, a host-owned hourly heartbeat in the existing monitor chat checks
 selected intent sources and PRDs while Codex is open. Durable checkpoints support catch-up
 against current state after reopening, including edits, additions and removals. Only actionable
 recommendations or clarifications return to the recorded original agent; unchanged and delivered

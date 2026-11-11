@@ -185,7 +185,7 @@ the pending reconciliation step; activating a graph alone does not compare it wi
 
 Accept source-connected setup and background monitoring. Select bounded intent sources (including
 local folders), PRD files and source authority. The setup agent assesses the existing codebase,
-returns initial findings to the original agent, then creates one five-minute heartbeat in the same
+returns initial findings to the original agent, then creates one hourly heartbeat in the same
 setup chat. It confirms the actual host schedule ID before claiming monitoring is active.
 
 The heartbeat checks intent sources and PRDs while Codex is open. After reopening, its first
@@ -205,6 +205,14 @@ and contradictory or outdated PRD statements. Missing access is unknown, not ali
 For an existing graph, ask: “Monitor my selected intent sources and PRD in the background and return
 recommendations here.” Existing source selections are reused. On plugin updates, review any changed
 hook trust request in Codex; the plugin does not enable trust on your behalf.
+
+Source-check caching is shared across chats in the same project/local actor for at most one hour
+from the original successful read. Task alignment continues on every development task. Known changes,
+expired checks, scope/access changes and reopen catch-up bypass cache reuse. All pending source/PRD
+changes join one batch; competing monitor workers stay quiet instead of duplicating reads/reviews.
+An existing five-minute schedule is updated in place to hourly through the host, preserving its ID;
+this is confirmed only after a successful host update. Unsignaled remote edits may take up to one
+hour to be discovered. SessionStart records catch-up; the next scheduled monitor run performs it.
 
 ### On-demand code reconciliation
 
@@ -354,7 +362,7 @@ In the existing Intent Dev dashboard:
    purpose, assumptions, related requirements and source references.
 3. Use the coverage table to find missing links, disputes and deliberate deferrals. Scores measure
    structural completeness; review the meaning of a requirement separately.
-4. Choose **Improve graph** for a five-minute session, even when you have no new feature to add.
+4. Choose **Improve graph** for a hourly session, even when you have no new feature to add.
    Resume a prior session to retain its answers. Review the cited understanding and answer the
    next relevant question, or pause when convenient.
 5. Inspect current and proposed coverage during the existing proposal review before approval.

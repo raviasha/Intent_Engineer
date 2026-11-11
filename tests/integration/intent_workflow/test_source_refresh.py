@@ -112,7 +112,7 @@ def test_initial_read_and_unchanged_metadata_reuse_without_content_or_interpreta
     assert service.refresh(request())["status"] == "not_configured"
     ready(runtime, service)
     before = runtime.evidence_store.ledger("background:notion")
-    assert service.refresh(request(turn_id="task:two"))["sources"][0]["action"] == "check_revision"
+    assert service.refresh(request(turn_id="task:two"))["sources"][0]["action"] == "reuse"
     result = service.refresh(
         request(
             turn_id="task:two",
@@ -313,7 +313,8 @@ def test_late_content_cannot_undo_a_newer_task_refresh(runtime):
     new = captured(runtime, "2", "Share reports.")
     service.refresh(request(turn_id="task:two", observations=[observe([new], validator="2")]))
     late = service.refresh(request(observations=[observe([old], validator="old-verified")]))
-    assert late["status"] == "refresh_required"
+    assert late["status"] == "needs_interpretation"
+    assert late["sources"][0]["cached"] is True
     assert late["sources"][0]["evidence_refs"] == [new]
 
 
@@ -349,7 +350,8 @@ def test_initial_reads_cannot_overtake_each_other(runtime):
         request(turn_id="task:two", observations=[observe([new], generation=1, validator="2")])
     )
     late = service.refresh(request(observations=[observe([old], generation=1)]))
-    assert late["status"] == "refresh_required"
+    assert late["status"] == "needs_interpretation"
+    assert late["sources"][0]["cached"] is True
     assert late["sources"][0]["evidence_refs"] == [new]
 
 

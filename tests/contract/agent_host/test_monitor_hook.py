@@ -99,7 +99,7 @@ def test_configured_hint_uses_only_metadata(tmp_path, monkeypatch, automation_id
     text = specific["additionalContext"]
     assert len(text) <= 2048
     assert "monitor-chat" in text
-    assert "five-minute" in text
+    assert "hourly" in text
     assert "does not start" in text
     assert "Never review code" in text
     if automation_id:
@@ -143,3 +143,38 @@ def test_real_configured_monitor_produces_resume_hint_without_review(tmp_path, m
     text = result["hookSpecificOutput"]["additionalContext"]
     assert "actual-monitor" in text
     assert "actual-schedule" in text
+
+
+def test_session_start_records_catch_up_without_provider_reads(tmp_path, monkeypatch):
+    initialize_project(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    calls = []
+    monkeypatch.setattr(
+        IntentMonitorService,
+        "resume_hint_for_project",
+        lambda _: {
+            "configured": True,
+            "automation_id": "existing-schedule",
+            "monitor_thread_id": "monitor",
+            "monitor_host_id": "host",
+        },
+    )
+    monkeypatch.setattr(
+        IntentMonitorService,
+        "request_catch_up_for_project",
+        lambda project: calls.append(project),
+        raising=False,
+    )
+    result = hook()(
+        {
+            "hook_event_name": "SessionStart",
+            "source": "resume",
+            "session_id": "parent",
+            "cwd": str(tmp_path),
+        }
+    )
+    assert calls == [tmp_path]
+    text = result["hookSpecificOutput"]["additionalContext"]
+    assert "hourly" in text
+    assert "does not start a turn" in text
+    assert "existing-schedule" in text
