@@ -473,3 +473,42 @@ def test_scheduled_force_refresh_bypasses_newly_warmed_other_chat_receipt(runtim
     tick = call(scheduled, "begin", worker_id="run:scheduled", force_refresh=True)
     assert tick["status"] == "refresh_required"
     assert not tick["source_refresh"]["sources"][0]["cached"]
+
+
+def test_forced_takeover_rechecks_crashed_owners_recent_read_and_keeps_own_retries(runtime):
+    service = configured(runtime)
+    service.refresh.sources(selection())
+    call(service, "begin", worker_id="run:crashed", force_refresh=True)
+    first_read_at = NOW + timedelta(minutes=5)
+    first_worker = IntentMonitorService(runtime, clock=lambda: first_read_at)
+    checked = call(
+        first_worker,
+        "begin",
+        worker_id="run:crashed",
+        observations=(observe([captured(runtime)], generation=1, checked_at=first_read_at),),
+    )
+    assert checked["status"] == "needs_interpretation"
+
+    next_tick = NOW + timedelta(hours=1)
+    recovering = IntentMonitorService(runtime, clock=lambda: next_tick)
+    takeover = call(recovering, "begin", worker_id="run:recovering", force_refresh=True)
+    assert takeover["status"] == "refresh_required"
+    assert takeover["source_refresh"]["task_key"] != checked["source_refresh"]["task_key"]
+    assert takeover["cycle_id"] != checked["cycle_id"]
+    same_worker = call(recovering, "begin", worker_id="run:recovering", force_refresh=True)
+    assert same_worker["status"] == "refresh_required"
+    assert same_worker["source_refresh"]["task_key"] == takeover["source_refresh"]["task_key"]
+    assert same_worker["cycle_id"] == takeover["cycle_id"]
+    refreshed = call(
+        recovering,
+        "begin",
+        worker_id="run:recovering",
+        force_refresh=True,
+        observations=(observe(kind="metadata", generation=2, checked_at=next_tick),),
+    )
+    assert refreshed["status"] == "needs_interpretation"
+    assert refreshed["source_refresh"]["task_key"] == takeover["source_refresh"]["task_key"]
+    assert refreshed["cycle_id"] == takeover["cycle_id"]
+    retry = call(recovering, "begin", worker_id="run:recovering", force_refresh=True)
+    assert retry["source_refresh"]["task_key"] == refreshed["source_refresh"]["task_key"]
+    assert retry["cycle_id"] == refreshed["cycle_id"]

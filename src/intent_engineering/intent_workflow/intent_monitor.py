@@ -445,7 +445,13 @@ class IntentMonitorService:
                 raise ValueError("stale monitor catch-up request; begin fresh verification")
             if draft.action == "begin" and (
                 (catch_up and cycle.get("catch_up_token") != catch_up)
-                or (draft.force_refresh and not cycle.get("forced_refresh"))
+                or (
+                    draft.force_refresh
+                    and (
+                        not cycle.get("forced_refresh")
+                        or cycle.get("forced_refresh_worker_id") != draft.worker_id
+                    )
+                )
             ):
                 state["sequence"] = state.get("sequence", 0) + 1
                 cycle["refresh_turn_id"] = "monitor-check:" + _digest(
@@ -453,6 +459,7 @@ class IntentMonitorService:
                 )
                 cycle["catch_up_token"] = catch_up
                 cycle["forced_refresh"] = draft.force_refresh
+                cycle["forced_refresh_worker_id"] = draft.worker_id
             # Persist the owner and refresh identity before any fallible evidence work.
             if draft.action == "begin":
                 target.atomic_write(json.dumps(state).encode(), mode=0o600)
@@ -497,6 +504,7 @@ class IntentMonitorService:
                         "started_at": self.clock().isoformat(),
                         "catch_up_token": catch_up,
                         "forced_refresh": draft.force_refresh or cycle.get("forced_refresh", False),
+                        "forced_refresh_worker_id": cycle.get("forced_refresh_worker_id"),
                         "refresh_turn_id": cycle.get("refresh_turn_id", cycle["id"]),
                     }
                     state["cycle"] = cycle
