@@ -204,7 +204,10 @@ def build_server(
         instructions = (
             "Use intent_background_context when relevant to the current task. Unrelated and "
             "aligned work proceeds silently. Use intent_background_submit to persist chat "
-            "clarification or maintain clear intent through validated ChangeSets. This path "
+            "clarification in the same chat or maintain clear intent through validated ChangeSets. "
+            "Capture supported brainstorming intent automatically before responding, even without "
+            "a code request or matching source. Save clear portions before asking remaining gaps, "
+            "using distinct submission turn IDs and fresh graph versions. This path "
             "does not require graph approval or WebAuthn. Background tools cannot create approvals. "
             "Preserve disagreements and pending legacy proposals. All other proposal, write "
             "and publication tools retain their independently authenticated approval contracts. "

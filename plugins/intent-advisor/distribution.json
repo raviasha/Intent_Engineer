@@ -1,8 +1,8 @@
 {
-  "source_revision": "2cba93f009de4e901c069731c66cead76e4ccd69",
+  "source_revision": "abd2d9f1b0d641ae6980b3b131ef2fd68ed505c0",
   "platforms": {
     "macos-arm64": {
-      "source_revision": "2cba93f009de4e901c069731c66cead76e4ccd69",
+      "source_revision": "abd2d9f1b0d641ae6980b3b131ef2fd68ed505c0",
       "target": "macos-arm64",
       "python_version": "3.12.16",
       "runtime_url": "https://github.com/astral-sh/python-build-standalone/releases/download/20261026/cpython-3.12.16+20261026-aarch64-apple-darwin-install_only_stripped.tar.gz",
@@ -217,10 +217,10 @@
           "version": "3.0.0"
         }
       ],
-      "plugin_version": "0.1.12"
+      "plugin_version": "0.1.13"
     },
     "macos-x86_64": {
-      "source_revision": "2cba93f009de4e901c069731c66cead76e4ccd69",
+      "source_revision": "abd2d9f1b0d641ae6980b3b131ef2fd68ed505c0",
       "target": "macos-x86_64",
       "python_version": "3.12.16",
       "runtime_url": "https://github.com/astral-sh/python-build-standalone/releases/download/20261026/cpython-3.12.16+20261026-x86_64-apple-darwin-install_only_stripped.tar.gz",
@@ -435,10 +435,10 @@
           "version": "3.0.0"
         }
       ],
-      "plugin_version": "0.1.12"
+      "plugin_version": "0.1.13"
     },
     "linux-x86_64": {
-      "source_revision": "2cba93f009de4e901c069731c66cead76e4ccd69",
+      "source_revision": "abd2d9f1b0d641ae6980b3b131ef2fd68ed505c0",
       "target": "linux-x86_64",
       "python_version": "3.12.16",
       "runtime_url": "https://github.com/astral-sh/python-build-standalone/releases/download/20261026/cpython-3.12.16+20261026-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz",
@@ -661,7 +661,7 @@
           "version": "3.0.0"
         }
       ],
-      "plugin_version": "0.1.12"
+      "plugin_version": "0.1.13"
     }
   }
 }

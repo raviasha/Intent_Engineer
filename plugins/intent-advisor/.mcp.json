@@ -4,7 +4,7 @@
       "command": "/bin/sh",
       "args": [
         "-c",
-        "exec \"${CODEX_HOME:-$HOME/.codex}/plugins/cache/intent-engineering-local/intent-advisor/0.1.12/scripts/intent\" \"$@\"",
+        "exec \"${CODEX_HOME:-$HOME/.codex}/plugins/cache/intent-engineering-local/intent-advisor/0.1.13/scripts/intent\" \"$@\"",
         "intent-advisor",
         "mcp",
         "--project",

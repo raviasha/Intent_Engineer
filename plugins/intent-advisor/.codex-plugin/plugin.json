@@ -1,6 +1,6 @@
 {
   "name": "intent-advisor",
-  "version": "0.1.12",
+  "version": "0.1.13",
   "description": "Refresh selected sources and maintain relevant intent during development.",
   "author": {
     "name": "Intent Engineering"

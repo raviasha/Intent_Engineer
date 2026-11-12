@@ -163,9 +163,19 @@ Ongoing code reconciliation is deliberate/on-demand (`intent reconcile-code --pr
 ordinary code edits and source changes never trigger it. Initial setup still assesses existing code.
 Do not label later code as verified merely because its task was aligned with intent and requirements.
 
+## Capture brainstorming as it happens
+
+After setup is accepted, treat feature brainstorming, planning, follow-up answers and changed
+constraints as intent-capture triggers, even when no code is requested and no connected source
+mentions the feature. Follow [conversation capture](references/conversation-capture.md) in the
+working chat on each relevant turn, before returning the response. Do not wait for an explicit
+“capture intent” request, the end of brainstorming, or the hourly monitor. A successful source
+refresh checks sources; it does not capture new meaning from this conversation.
+
 ## Consult only relevant intent
 
-Use the hook's `session_id` and `turn_id`. Without a hook, use the stable host chat/turn IDs
+Use the hook's `session_id` and use its `turn_id` as a base for distinct submission IDs
+(`:capture:1`, `:question:1`, `:refresh:1`); retain each ID for exact retries. Without a hook, use the stable host chat/turn IDs
 when available, or retain locally chosen opaque IDs for this chat and its turns. Never
 reuse a turn ID for a different submission. Read `intent_background_context(task,
 session_id)` when the task has relevant product meaning or you need existing intent or
