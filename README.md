@@ -191,7 +191,11 @@ Clients other than Codex that launch and connect stdio themselves may run
 ### Clarification and review
 
 The default background flow asks in the chat and retains quoted answers as versioned
-evidence. Clear meaning is maintained automatically. Agent inferences remain inferred;
+evidence. After accepted setup, feature brainstorming and follow-up answers automatically
+capture supported intent, even when connected sources do not mention the feature and no code
+is requested. The working agent saves clear meaning before asking about remaining consequential
+gaps in that same chat; it does not wait for the hourly monitor or a capture request. Tentative
+options and agent suggestions are not treated as accepted decisions. Agent inferences remain inferred;
 existing disputed positions and old pending proposals are preserved. A conversational
 conflict can be resolved by the answer to that question, with an auditable ChangeSet and
 without a second approval prompt. Cross-author disputes remain separate positions.

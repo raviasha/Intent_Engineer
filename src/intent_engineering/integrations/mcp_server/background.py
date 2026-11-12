@@ -194,7 +194,12 @@ def register_background_tools(server: MCPServer[Any], runtime: Runtime) -> None:
 
         This local maintenance path creates no approvals and leaves legacy proposals intact.
         User words are agent-reported statements; agent inferences remain inferred. Ask only
-        consequential missing-meaning or conflict questions, reusing available answers.
+        consequential missing-meaning or conflict questions in the working chat, reusing answers.
+        Capture supported meaning during brainstorming without waiting for a capture request or code
+        task, including features absent from connected sources. For mixed clear intent and a gap,
+        submit the clear portion first, then a question-only submission at the new graph version.
+        Derive distinct stable turn IDs for capture, question and source interpretation; exact
+        retries reuse their ID. Agent suggestions and ambiguous replies are not user decisions.
         """
         try:
             return service.submit(draft)
